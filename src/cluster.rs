@@ -691,6 +691,18 @@ impl ClusterNode {
         futures::future::join_all(sends).await;
     }
 
+    /// A planned leave (bounded by `bound`), then fail-stop.
+    async fn step_down(self: &Arc<Self>, bound: Duration, why: &str) {
+        STEP_DOWNS.inc();
+        tracing::error!(addr = %self.opts.addr, "{why} for a TTL: handing our shards over and stepping down");
+        match tokio::time::timeout(bound, self.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("stepping down: leave failed: {e:#}"),
+            Err(_) => tracing::warn!("stepping down: leave timed out"),
+        }
+        self.lost_now(&format!("{why}: stepped down"));
+    }
+
     /// Whether our advertised peer address answers a hello (as a peer's
     /// would) within `timeout`.
     async fn reachable(&self, timeout: Duration) -> bool {
@@ -903,19 +915,25 @@ async fn host_loop(me: Weak<ClusterNode>) {
     }
 }
 
-/// Peer reachability (docs/cluster.md, "Reachability"). Membership is the
-/// bucket lease, so a core its peers can't reach (a dead or blackholed
-/// peer port) would hold its shards for the whole partition: every event
-/// for its DIDs waits. Each core probes its own advertised address, the
-/// path its peers use; failing for a TTL, it hands its shards over (a
-/// planned leave, bounded by a TTL) and fail-stops.
+/// Peer reachability and a slow log (docs/cluster.md, "Failure handling").
+/// Membership is the bucket lease, so a core its peers can't reach (a dead
+/// or blackholed peer port) would hold its shards for the whole partition,
+/// and a core whose own bucket path crawls would hold every node's merged
+/// firehose at its log's watermark until its lease gave out. Each core
+/// probes its own advertised address, the path its peers use, and watches
+/// how long its oldest append has waited to be durable. Unreachable for a
+/// TTL, or slow for a TTL while most peer logs keep up (a bucket slow for
+/// everyone is no reason to leave), it hands its shards over (a planned
+/// leave, bounded by a TTL) and fail-stops.
 async fn reach_loop(me: Weak<ClusterNode>) {
     let (every, window) = match me.upgrade() {
         Some(n) => (n.opts.renew_every, n.opts.ttl),
         None => return,
     };
     let timeout = (window / 3).clamp(Duration::from_millis(200), Duration::from_secs(1));
+    let slow = (window / 3).max(Duration::from_secs(1));
     let mut failing_since: Option<Instant> = None;
+    let mut slow_since: Option<Instant> = None;
     let mut first = true;
     loop {
         if !std::mem::take(&mut first) {
@@ -926,11 +944,30 @@ async fn reach_loop(me: Weak<ClusterNode>) {
             return;
         }
         let Some(c) = n.cluster.clone() else { return };
-        // alone, nobody needs to reach us
+        // alone, nobody needs to reach us, nor waits on our log
         if c.peers().is_empty() {
             n.self_reachable.store(true, Ordering::Release);
-            failing_since = None;
+            (failing_since, slow_since) = (None, None);
             continue;
+        }
+        let age = n.log.as_ref().map_or(Duration::ZERO, |l| l.pending_age());
+        if age < slow / 2 || !c.joined() {
+            slow_since = None;
+        } else if age > slow {
+            let ages = n.followers.watermark_ages();
+            let keeping_up = ages.iter().filter(|a| **a < slow * 2).count();
+            if keeping_up * 2 > ages.len() {
+                let since = *slow_since.get_or_insert_with(Instant::now);
+                tracing::warn!(
+                    pending_ms = age.as_millis() as u64,
+                    slow_ms = since.elapsed().as_millis() as u64,
+                    "our log's appends are slow to land, our peers' aren't"
+                );
+                if since.elapsed() >= window {
+                    n.step_down(window, "our log is slow to land (our bucket path?)").await;
+                    return;
+                }
+            }
         }
         let probed = Instant::now();
         let ok = n.reachable(timeout).await;
@@ -947,14 +984,7 @@ async fn reach_loop(me: Weak<ClusterNode>) {
         if since.elapsed() < window {
             continue;
         }
-        STEP_DOWNS.inc();
-        tracing::error!(addr = %n.opts.addr, "peers can't reach us for a TTL: handing our shards over and stepping down");
-        match tokio::time::timeout(window, n.shutdown()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!("stepping down: leave failed: {e:#}"),
-            Err(_) => tracing::warn!("stepping down: leave timed out"),
-        }
-        n.lost_now("unreachable by peers: stepped down");
+        n.step_down(window, "unreachable by peers").await;
         return;
     }
 }
@@ -962,7 +992,7 @@ async fn reach_loop(me: Weak<ClusterNode>) {
 static STEP_DOWNS: std::sync::LazyLock<prometheus::IntCounter> = std::sync::LazyLock::new(|| {
     prometheus::register_int_counter!(
         "vlrelay_cluster_step_downs_total",
-        "Times this node left because its own advertised peer address stopped answering"
+        "Times this node left because its own advertised peer address stopped answering, or its log alone was slow to land"
     )
     .unwrap()
 });

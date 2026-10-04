@@ -288,6 +288,8 @@ pub struct NodeLog {
     /// appended from now on (a cluster span starts here).
     pub next_ordinal: Arc<AtomicU64>,
     pub stats: Arc<LogStats>,
+    /// When the oldest append not yet durable was submitted (None: none).
+    oldest_pending: Arc<parking_lot::Mutex<Option<Instant>>>,
     /// Durable batches as they finalize, for peers streaming this log
     /// (`cluster::follow`). A lagging receiver catches up from the bucket.
     live: tokio::sync::broadcast::Sender<Arc<LogBatch>>,
@@ -310,6 +312,7 @@ impl NodeLog {
         let last_durable_seq = Arc::new(AtomicI64::new(cfg.seq_floor));
         let next_ordinal = Arc::new(AtomicU64::new(0));
         let stats = Arc::new(LogStats::default());
+        let oldest_pending = Arc::new(parking_lot::Mutex::new(None));
         let log_id: Arc<str> = cfg.log_id.clone().into();
         let (live, _) = tokio::sync::broadcast::channel(LIVE_BATCHES);
         let seq = Sequencer {
@@ -326,6 +329,7 @@ impl NodeLog {
             live: live.clone(),
             on_fatal,
             lapsed_at: None,
+            oldest_pending: oldest_pending.clone(),
         };
         let task = tokio::spawn(seq.run(rx));
         Arc::new(NodeLog {
@@ -337,6 +341,7 @@ impl NodeLog {
             last_durable_seq,
             next_ordinal,
             stats,
+            oldest_pending,
             live,
             task: parking_lot::Mutex::new(Some(task)),
         })
@@ -369,6 +374,12 @@ impl NodeLog {
     /// Every durable batch from now on, in ordinal order.
     pub fn live(&self) -> tokio::sync::broadcast::Receiver<Arc<LogBatch>> {
         self.live.subscribe()
+    }
+
+    /// How long the oldest append not yet durable has waited (zero when
+    /// none): what a slow bucket path does to this log.
+    pub fn pending_age(&self) -> Duration {
+        self.oldest_pending.lock().map_or(Duration::ZERO, |t| t.elapsed())
     }
 
     /// True once nothing appended is still waiting to be durable.
@@ -414,6 +425,7 @@ struct Sequencer {
     on_fatal: Option<OnFatal>,
     /// When the lease was first seen lapsed (None while it's valid).
     lapsed_at: Option<Instant>,
+    oldest_pending: Arc<parking_lot::Mutex<Option<Instant>>>,
 }
 
 enum Lease {
@@ -535,6 +547,8 @@ impl Sequencer {
         let mut prefix_end = 0u64;
         let mut open = Open::new(&self.log_id);
         let mut inflight: FuturesOrdered<AbortOnDrop> = FuturesOrdered::new();
+        // per segment in flight, in ordinal order: its oldest append
+        let mut inflight_oldest: std::collections::VecDeque<Option<Instant>> = Default::default();
         let mut closed = false;
         let mut last_sealed = Instant::now();
         // sealing is held for a lapsed lease: retry then
@@ -551,6 +565,7 @@ impl Sequencer {
                 biased;
                 r = inflight.next(), if !inflight.is_empty() => {
                     let Some(r) = r else { continue };
+                    inflight_oldest.pop_front();
                     let (sealed, res) = match r {
                         Ok(v) => v,
                         Err(e) if e.is_cancelled() => return,
@@ -655,6 +670,7 @@ impl Sequencer {
                     heartbeat: o.heartbeat,
                 };
                 last_sealed = Instant::now();
+                inflight_oldest.push_back(sealed.acks.first().map(|a| a.2));
                 if !empty {
                     ordinal += 1;
                     self.next_ordinal.store(ordinal, Ordering::Release);
@@ -681,6 +697,8 @@ impl Sequencer {
                     (sealed, r)
                 })));
             }
+            *self.oldest_pending.lock() =
+                inflight_oldest.iter().flatten().next().copied().or_else(|| open.acks.first().map(|a| a.2));
             if closed && inflight.is_empty() && open.opened.is_none() {
                 return;
             }

@@ -171,6 +171,16 @@ impl Followers {
         self.map.lock().iter().map(|(k, f)| (k.clone(), f.floor)).collect()
     }
 
+    /// How far each followed log's watermark is behind our clock.
+    pub fn watermark_ages(&self) -> Vec<Duration> {
+        let now = vlpds::tid::now_micros() as i64;
+        self.map
+            .lock()
+            .values()
+            .map(|f| Duration::from_micros((now - (f.watermark.load(Ordering::Acquire) >> 8)).max(0) as u64))
+            .collect()
+    }
+
     pub fn followed(&self) -> Vec<String> {
         let mut v: Vec<String> = self.map.lock().keys().cloned().collect();
         v.sort();
