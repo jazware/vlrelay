@@ -712,22 +712,24 @@ async fn a_restarted_sequence_survives_a_stale_owners_cursor() {
     let (e, _) = reg.admit(&h, Tier::Default).await.unwrap();
     let s = ShardId(0);
     e.ack(1000);
-    a.write(s, &[(h.clone(), 1000)]).await.unwrap();
+    // one assignment epoch throughout: this is about generations alone (a
+    // claim by the new owner would refuse the stale writes outright)
+    a.write(s, &[(h.clone(), 1000)], 1).await.unwrap();
 
     b.load(s).await.unwrap();
     assert_eq!(b.get(&h), Some(1000));
     b.reset(&h);
-    b.write(s, &[(h.clone(), 50)]).await.unwrap();
+    b.write(s, &[(h.clone(), 50)], 1).await.unwrap();
 
-    a.write(s, &[(h.clone(), 1100)]).await.unwrap();
+    a.write(s, &[(h.clone(), 1100)], 1).await.unwrap();
     b.load(s).await.unwrap();
     assert_eq!(b.get(&h), Some(50), "the stale owner's write was ignored");
 
     a.load(s).await.unwrap();
     assert_eq!(a.get(&h), Some(50));
     assert_eq!(e.acked_seq(), Some(50), "the registry's cursor is the checkpoint's");
-    b.write(s, &[(h.clone(), 60)]).await.unwrap();
-    a.write(s, &[(h.clone(), 70)]).await.unwrap();
+    b.write(s, &[(h.clone(), 60)], 1).await.unwrap();
+    a.write(s, &[(h.clone(), 70)], 1).await.unwrap();
     b.load(s).await.unwrap();
     assert_eq!(b.get(&h), Some(70), "one generation merges by max again");
 

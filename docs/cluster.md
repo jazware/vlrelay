@@ -254,7 +254,7 @@ The log already refuses to PUT or ack once the lease lapses (the cluster sets `l
 |---|---|---|
 | `nodes/`, `writers/`, `assign/`, `cluster/version` | vlpds `Cluster` | leases, writer bytes, DID shard assignments, layout |
 | `assign-hosts/` | `cluster::hosts` | host shard layout and assignments |
-| `hostck/` | `cluster::hosts` | upstream cursors per host shard, each with its sequence generation (bumped on FutureCursor, so a stale owner's cursor of the old sequence can't win the max). Taking a host shard replaces the node's cursors with these |
+| `hostck/` | `cluster::hosts` | upstream cursors per host shard, each with its sequence generation (bumped on FutureCursor, so a stale owner's cursor of the old sequence can't win the max). Taking a host shard replaces the node's cursors with these. Each object also carries the host assignment epoch of the owner that claimed it on taking the shard: a write from a lower epoch (a previous owner that hasn't noticed) is refused, and nothing is checkpointed while the writer's lease is lapsed. |
 | `hosts/` | `node::cluster::BucketHosts` | host records (the registry) per host shard |
 | `log/{log_id}/` | `seq::NodeLog` | each core node's log, fenced at its end |
 | `dedupe/{did shard}/{log_id}` | `node::cluster::DedupeStore` | a DID shard owner's inherited restart-dedupe entries, while it has any |

@@ -538,6 +538,10 @@ impl ClusterNode {
                         if n.stop.load(Ordering::Acquire) {
                             return;
                         }
+                        // lapsed, our host shards may be someone else's by now
+                        if !n.lease_valid() {
+                            continue;
+                        }
                         if let Some(h) = &n.hosts
                             && let Err(e) = h.checkpoint().await
                         {
@@ -897,7 +901,9 @@ impl ClusterNode {
                         Err(e) => tracing::warn!("handing host shards over failed: {e:#}"),
                     }
                 }
-                if let Err(e) = h.checkpoint().await {
+                if c.lease_valid()
+                    && let Err(e) = h.checkpoint().await
+                {
                     tracing::warn!("final host checkpoint failed: {e:#}");
                 }
                 c.shutdown(&host).await

@@ -90,7 +90,10 @@ pub trait HostHandler: Send + Sync + 'static {
 
 /// Upstream cursors in the bucket, one object per host shard. Only a
 /// shard's owner writes it, but a zombie owner may still be writing, so
-/// every write merges by max under a CAS.
+/// every write is a CAS that carries the writer's host assignment epoch:
+/// an owner claims the object with its epoch when it takes the shard, and
+/// a write from a lower epoch is refused. Within an epoch writes merge by
+/// max.
 ///
 /// Each host's cursor carries the generation of its sequence, bumped when
 /// the host restarted it (FutureCursor). The max only merges cursors of one
@@ -107,7 +110,8 @@ pub struct Checkpoints {
     /// Hosts that restarted their sequence (FutureCursor): their next write
     /// starts a new generation with the cursor it carries.
     resets: Mutex<HashSet<Host>>,
-    written: Mutex<HashMap<ShardId, BTreeMap<String, i64>>>,
+    /// What we last wrote per shard, and at which assignment epoch.
+    written: Mutex<HashMap<ShardId, (u64, BTreeMap<String, i64>)>>,
     /// The upstream registry, whose acked cursors a shard's take replaces.
     pub(crate) registry: std::sync::OnceLock<Arc<crate::upstream::Registry>>,
     /// Hosts taken before their registry entry existed (a shard taken while
@@ -121,6 +125,9 @@ struct CheckpointDoc {
     cursors: BTreeMap<String, i64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     gens: BTreeMap<String, u64>,
+    /// The host assignment epoch of the owner that last claimed it.
+    #[serde(default)]
+    epoch: u64,
 }
 
 impl Checkpoints {
@@ -194,21 +201,41 @@ impl Checkpoints {
         self.gens.read().get(host).copied().unwrap_or(0)
     }
 
-    /// Merges `cursors` into the shard's object. Skips the PUT when nothing
-    /// moved since our last write.
-    pub async fn write(&self, shard: ShardId, cursors: &[(Host, i64)]) -> anyhow::Result<bool> {
+    /// Stamps the shard's object with the epoch of the assignment that
+    /// gave it to us, so the previous owner's writes are refused from now
+    /// on. False if a later owner already claimed it.
+    pub async fn claim(&self, shard: ShardId, epoch: u64) -> anyhow::Result<bool> {
+        self.write(shard, &[], epoch).await
+    }
+
+    /// Merges `cursors` into the shard's object as the owner at assignment
+    /// `epoch`. Skips the PUT when nothing moved since our last write, and
+    /// refuses (false) when the object belongs to a later epoch.
+    pub async fn write(&self, shard: ShardId, cursors: &[(Host, i64)], epoch: u64) -> anyhow::Result<bool> {
         let resets: HashSet<Host> = {
             let r = self.resets.lock();
             cursors.iter().filter(|(h, _)| r.contains(h)).map(|(h, _)| h.clone()).collect()
         };
         if resets.is_empty()
-            && let Some(prev) = self.written.lock().get(&shard)
+            && let Some((at, prev)) = self.written.lock().get(&shard)
+            && *at == epoch
             && cursors.iter().all(|(h, s)| prev.get(&h.0).is_some_and(|p| p >= s))
         {
             return Ok(false);
         }
         loop {
             let (mut doc, etag) = self.read(shard).await?;
+            if doc.epoch > epoch {
+                SUPERSEDED.inc();
+                tracing::warn!(
+                    shard = shard.0,
+                    ours = epoch,
+                    theirs = doc.epoch,
+                    "host checkpoint refused: a later owner claimed the shard"
+                );
+                return Ok(false);
+            }
+            doc.epoch = epoch;
             for (h, seq) in cursors {
                 let (ours, stored) = (self.generation(h), doc.gens.get(&h.0).copied().unwrap_or(0));
                 if resets.contains(h) {
@@ -241,7 +268,7 @@ impl Checkpoints {
                         g.insert(Host(h.clone()), doc.gens.get(h).copied().unwrap_or(0));
                     }
                     drop((c, g));
-                    self.written.lock().insert(shard, doc.cursors);
+                    self.written.lock().insert(shard, (epoch, doc.cursors));
                     return Ok(true);
                 }
                 Err(e) if is_conflict(&e) => continue,
@@ -250,6 +277,14 @@ impl Checkpoints {
         }
     }
 }
+
+static SUPERSEDED: std::sync::LazyLock<prometheus::IntCounter> = std::sync::LazyLock::new(|| {
+    prometheus::register_int_counter!(
+        "vlrelay_host_checkpoints_superseded_total",
+        "Host checkpoint writes refused because a later owner of the host shard claimed its hostck object"
+    )
+    .unwrap()
+});
 
 fn is_conflict(e: &object_store::Error) -> bool {
     matches!(e, object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. })
@@ -500,6 +535,7 @@ impl HostShards {
             if let Err(e) = self.checkpoints.load(*s).await {
                 tracing::warn!(shard = s.0, "reading host checkpoints failed: {e:#}");
             }
+            self.claim(*s).await;
         }
         if !report.adopted.is_empty() {
             tracing::info!(shards = ?report.adopted, "adopted host shards handed to us");
@@ -540,6 +576,7 @@ impl HostShards {
                     if let Err(e) = self.checkpoints.load(*s).await {
                         tracing::warn!(shard = s.0, "reading host checkpoints failed: {e:#}");
                     }
+                    self.claim(*s).await;
                     self.owned.write().insert(*s);
                     report.acquired.push(*s);
                 }
@@ -560,6 +597,21 @@ impl HostShards {
             v
         };
         Ok((report, nudges))
+    }
+
+    /// Our assignment epoch for `shard`, if the assignment as last read
+    /// names us.
+    fn our_epoch(&self, shard: ShardId) -> Option<u64> {
+        self.assigns.read().get(&shard).filter(|(a, _)| self.names_us(a)).map(|(a, _)| a.epoch)
+    }
+
+    /// Best effort: until it lands the previous owner's late writes still
+    /// merge by max, as before epochs, and the next checkpoint retries it.
+    async fn claim(&self, shard: ShardId) {
+        let Some(epoch) = self.our_epoch(shard) else { return };
+        if let Err(e) = self.checkpoints.claim(shard, epoch).await {
+            tracing::warn!(shard = shard.0, "claiming host checkpoints failed: {e:#}");
+        }
     }
 
     /// Hands shards above `target` to the members furthest below the fair
@@ -625,8 +677,10 @@ impl HostShards {
                 by.entry(self.layout.shard_of(&host.0)).or_default().push((host, seq));
             }
             for (s, cursors) in by {
-                if giving.contains(&s) {
-                    self.checkpoints.write(s, &cursors).await?;
+                if giving.contains(&s)
+                    && let Some(epoch) = self.our_epoch(s)
+                {
+                    self.checkpoints.write(s, &cursors, epoch).await?;
                 }
             }
         }
@@ -669,10 +723,12 @@ impl HostShards {
         }
         let mut n = 0;
         for (s, c) in by {
-            if self.checkpoints.write(s, &c).await? {
+            let Some(epoch) = self.our_epoch(s) else { continue };
+            if self.checkpoints.write(s, &c, epoch).await? {
                 n += 1;
             }
         }
+
         Ok(n)
     }
 
@@ -702,5 +758,33 @@ async fn ensure_layout(store: &Store, shards: u32) -> anyhow::Result<Layout> {
             Err(e) if is_conflict(&e) => continue,
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host owner that lost its shard keeps a checkpoint loop running
+    /// until it notices. Once the new owner claimed the object, those
+    /// writes are refused: they would raise cursors past what the new
+    /// owner's dedupe pruning saw, or undo its FutureCursor reset.
+    #[tokio::test]
+    async fn a_previous_owners_checkpoints_are_refused_once_the_new_owner_claims() {
+        let store = Store::memory(None);
+        let (old, new) = (Checkpoints::new(store.clone()), Checkpoints::new(store.clone()));
+        let s = ShardId(3);
+        let h = Host("pds.test".into());
+        assert!(old.write(s, &[(h.clone(), 100)], 1).await.unwrap());
+        new.load(s).await.unwrap();
+        assert!(new.claim(s, 2).await.unwrap());
+        new.reset(&h);
+        assert!(new.write(s, &[(h.clone(), 7)], 2).await.unwrap(), "a reset replaces the cursor");
+        assert!(!old.write(s, &[(h.clone(), 150)], 1).await.unwrap(), "the old epoch is refused");
+        let fresh = Checkpoints::new(store.clone());
+        fresh.load(s).await.unwrap();
+        assert_eq!(fresh.get(&h), Some(7));
+        assert!(new.write(s, &[(h.clone(), 9)], 2).await.unwrap());
+        assert!(!new.claim(s, 1).await.unwrap(), "a lower claim never takes it back");
     }
 }
