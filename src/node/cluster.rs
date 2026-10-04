@@ -864,7 +864,23 @@ enum Wait {
     },
 }
 
+/// A DID's stage lock and its shard's gate pass, for a write outside the
+/// stage (an admin takedown).
+pub struct OwnWrite<'a> {
+    _did: tokio::sync::MutexGuard<'a, ()>,
+    _shard: crate::cluster::DidHold,
+}
+
 impl Glue {
+    /// Takes `did`'s stage lock and holds its shard open, so a write and
+    /// its `#account` can't interleave with the stage's appends for it or
+    /// outlive our ownership. None if this node doesn't own the DID now.
+    pub async fn own_write(&self, did: &str) -> Option<OwnWrite<'_>> {
+        let lock = self.inflight.lock(did).await;
+        let hold = self.cluster.hold_did(did)?;
+        self.cluster.lease_valid().then_some(OwnWrite { _did: lock, _shard: hold })
+    }
+
     /// A duplicate is answered only once the copy it duplicates is durable.
     /// The first copy may still be in flight (a zombie host owner and the
     /// real one both sent it), and a host owner acks past a duplicate: if

@@ -299,6 +299,9 @@ async fn gated_apply(
     out.into_iter().map(|r| r.unwrap_or(Err(StageError::NotOwner))).collect()
 }
 
+/// A DID shard held open: [`ClusterNode::hold_did`].
+pub struct DidHold(#[allow(dead_code)] Pass);
+
 /// Inside a supervisor's stop timeout, and before our watchdog's fail-stop
 /// when our lease lapsed.
 const PEER_FENCE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -564,6 +567,15 @@ impl ClusterNode {
 
     pub fn did_shard(&self, did: &str) -> Option<ShardId> {
         self.layout().map(|l| l.shard_of(did))
+    }
+
+    /// Holds `did`'s shard open (a close waits for it to drop) while the
+    /// caller writes to it outside the stage. None if this node doesn't
+    /// serve it.
+    pub fn hold_did(&self, did: &str) -> Option<DidHold> {
+        let s = self.did_shard(did)?;
+        let (pass, ok) = self.gate.enter(&HashSet::from([s]));
+        ok.contains(&s).then_some(DidHold(pass))
     }
 
     /// This node serves `did`'s shard right now (open, not closing).

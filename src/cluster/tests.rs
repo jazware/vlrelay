@@ -731,3 +731,23 @@ async fn a_restarted_sequence_survives_a_stale_owners_cursor() {
     b.load(s).await.unwrap();
     assert_eq!(b.get(&h), Some(70), "one generation merges by max again");
 }
+
+/// An admin takedown's `#account` is appended outside the stage: its hold
+/// keeps the shard from closing under it, and a shard we don't serve gives
+/// none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_did_keeps_its_shard_open() {
+    let (store, ca, applied) = (Store::memory(None), Ca::new(), Arc::new(Applied::default()));
+    let n = spawn(&store, &ca, "solo", Role::Core, &applied).await;
+    let d = did(1);
+    eventually("the DID's shard is served", Duration::from_secs(10), || n.node.owns_did(&d)).await;
+    let shard = n.node.layout().unwrap().shard_of(&d);
+    let hold = n.node.hold_did(&d).expect("served here");
+    let gate = n.node.gate.clone();
+    let closing = tokio::spawn(async move { gate.close(&[shard]).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!closing.is_finished(), "the close waits for the hold");
+    drop(hold);
+    tokio::time::timeout(Duration::from_secs(5), closing).await.expect("the close finishes").unwrap();
+    assert!(n.node.hold_did(&d).is_none(), "closed: nothing to hold");
+}

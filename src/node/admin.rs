@@ -341,6 +341,12 @@ impl NodeAdmin {
         if self.node.state.get(did).await.map_err(internal)?.is_none() {
             return Err(AdminError::NotFound(format!("no account {did}")));
         }
+        let _own = match &self.node.cluster {
+            Some(g) => Some(g.own_write(did).await.ok_or_else(|| {
+                AdminError::Internal(anyhow::anyhow!("{did}'s shard isn't held here with a valid lease: try again"))
+            })?),
+            None => None,
+        };
         self.policy.engine.takedowns.record(did, takedown, by, reason).await?;
         let st = self
             .node
