@@ -249,7 +249,9 @@ export function Hosts() {
                 </span>
                 <span className={`num${r.eventsPerSec === 0 ? ' dim' : ''}`}>{r.eventsPerSec === 0 ? '0' : fmtSi(r.eventsPerSec)}{r.throttle != null && <span className="dim" title={`throttled to ${r.throttle}/s`}> ⌁</span>}</span>
                 <span className={`num ${errClass(r.errorRate)}`}>{fmtPct(r.errorRate)}</span>
-                <span className="num">{fmtNum(r.accounts)}</span>
+                <span className={`num${r.maxAccounts > 0 && r.accounts >= r.maxAccounts ? ' err-mid' : ''}`} title={r.maxAccounts > 0 && r.accounts >= r.maxAccounts ? `at its account cap (${fmtNum(r.maxAccounts)}): new accounts are created throttled` : undefined}>
+                  {fmtNum(r.accounts)}
+                </span>
                 <span className="num mono dim">{r.lastUpstreamSeq}</span>
                 <span className="num dim">{r.connectedSinceMs ? relTime(r.connectedSinceMs).replace(' ago', '') : '—'}</span>
                 <span className={`num ${lagClass(r.lagMs) || 'dim'}`} title="how far the reader is behind the host's stream">{r.lagMs ? fmtLag(r.lagMs) : '—'}</span>

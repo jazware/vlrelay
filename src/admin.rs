@@ -176,7 +176,8 @@ pub struct HostRow {
     pub accounts: u64,
     pub last_upstream_seq: i64,
     pub connected_since_ms: Option<i64>,
-    /// Upstream receive minus the host's own event time, p50 over the last minute.
+    /// How far the reader is behind the host's stream: the newest frame's
+    /// read time minus its event time, plus the time since while held back.
     pub lag_ms: f64,
     /// Operator throttle (events/s) on top of the tier, if any.
     pub throttle: Option<f64>,
@@ -184,6 +185,10 @@ pub struct HostRow {
     pub rule: Option<u64>,
     /// Owning node (host shard owner).
     pub node: String,
+    /// The account cap in force (tier, or an operator's per-host limit).
+    /// 0: unknown.
+    #[serde(default)]
+    pub max_accounts: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -262,6 +267,12 @@ pub enum HostAction {
     },
     Unban,
     Reconnect,
+    /// The host's own account cap in place of its tier's (indigo's
+    /// `changeLimits` `repo_limit`). None goes back to the tier's.
+    SetAccountLimit {
+        #[serde(rename = "maxAccounts")]
+        max_accounts: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

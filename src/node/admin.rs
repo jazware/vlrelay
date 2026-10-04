@@ -204,6 +204,11 @@ impl NodeAdmin {
             throttle: self.policy.throttle(&h.record.hostname),
             rule: self.policy.limits(&h.record.hostname).and_then(|l| l.rule),
             node: self.node.cfg.node_id.clone(),
+            max_accounts: self
+                .policy
+                .limits(&h.record.hostname)
+                .and_then(|l| l.limits)
+                .map_or(0, |l| l.max_accounts),
         }
     }
 

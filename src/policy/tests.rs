@@ -494,6 +494,13 @@ async fn for_host_and_admission_apply_rules_and_budgets() {
     assert_eq!(e.for_host(&r).limits.unwrap().events_per_sec, 50.1);
     tiers::apply_manual(&mut r, &Manual::Throttle(Some(1.5)), 0).unwrap();
     assert_eq!(e.for_host(&r).limits.unwrap().events_per_sec, 1.5);
+    // an operator's account cap replaces the tier's (indigo's per-host repo_limit)
+    assert_eq!(e.for_host(&r).limits.unwrap().max_accounts, 100);
+    tiers::apply_manual(&mut r, &Manual::AccountLimit(Some(50_000)), 0).unwrap();
+    let l = e.for_host(&r).limits.unwrap();
+    assert_eq!((l.max_accounts, l.events_per_sec), (50_000, 1.5));
+    tiers::apply_manual(&mut r, &Manual::AccountLimit(None), 0).unwrap();
+    assert_eq!(e.for_host(&r).limits.unwrap().max_accounts, 100);
     assert!(!e.for_host(&rec("s.example", Tier::Suspended, 0)).connect);
 
     let admit = |h: &'static str, by_admin| {

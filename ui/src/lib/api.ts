@@ -42,6 +42,8 @@ export type HostRow = {
   throttle: number | null
   rule: number | null
   node: string
+  /** The account cap in force (tier, or the host's own); 0 unknown. */
+  maxAccounts: number
 }
 
 export type History = {
@@ -110,6 +112,7 @@ export type HostAction =
   | { action: 'ban'; reason: string }
   | { action: 'unban' }
   | { action: 'reconnect' }
+  | { action: 'set-account-limit'; maxAccounts: number | null }
 
 export type HostDetail = {
   row: HostRow

@@ -440,6 +440,7 @@ impl PolicyAdmin {
             HostAction::Suspend { reason } => Manual::Suspend(reason.clone()),
             HostAction::Ban { reason } => Manual::Ban(reason.clone()),
             HostAction::Unban => Manual::Unban,
+            HostAction::SetAccountLimit { max_accounts } => Manual::AccountLimit(*max_accounts),
             HostAction::Reconnect => {
                 return Err(AdminError::BadRequest(
                     "reconnect is an upstream action, not a policy one".into(),

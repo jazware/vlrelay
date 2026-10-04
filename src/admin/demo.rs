@@ -1177,6 +1177,7 @@ impl Sim {
             connected_since_ms: h.connected_since,
             lag_ms: round2(h.lag),
             throttle: h.throttle,
+            max_accounts: if h.tier == "trusted" { 10_000_000 } else { 100 },
             rule: self
                 .rules
                 .iter()
@@ -1530,6 +1531,7 @@ impl AdminSource for Demo {
                     h.redial_at = Some(now + 2_000);
                 }
             }
+            HostAction::SetAccountLimit { .. } => {}
             HostAction::Reconnect => {
                 if matches!(h.status, HostStatus::Banned | HostStatus::Suspended) {
                     return Err(AdminError::BadRequest(

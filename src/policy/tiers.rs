@@ -40,6 +40,9 @@ pub struct HostPolicy {
     /// Operator throttle (events/s) on top of the tier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub throttle_eps: Option<f64>,
+    /// Operator account cap in place of the tier's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_accounts: Option<u64>,
     /// The last operator actions, newest last.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<serde_json::Value>,
@@ -189,6 +192,7 @@ pub fn step(
 pub enum Manual {
     SetTier(Tier),
     Throttle(Option<f64>),
+    AccountLimit(Option<u64>),
     Suspend(String),
     Ban(String),
     /// Lifts a suspension or a ban.
@@ -218,6 +222,7 @@ pub fn apply_manual(rec: &mut HostRecord, m: &Manual, now: u32) -> Result<(), St
             }
             s.throttle_eps = *eps;
         }
+        Manual::AccountLimit(n) => s.max_accounts = *n,
         Manual::Suspend(why) | Manual::Ban(why) => {
             let to = if matches!(m, Manual::Ban(_)) {
                 Tier::Banned

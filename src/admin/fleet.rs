@@ -514,6 +514,7 @@ mod tests {
             throttle: None,
             rule: None,
             node: String::new(),
+            max_accounts: 100,
         }
     }
 

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Chart } from '../components/Chart'
 import { Bar, InlineConfirm, Live, REASON_COLOR, REASON_LABEL, Sparkline, StatusPill, Tile, TierPill } from '../components/relay'
-import { CopyText, Empty, ErrorNotice, Loading, Panel } from '../components/ui'
+import { CopyText, Empty, ErrorNotice, Loading, Notice, Panel } from '../components/ui'
 import type { HostAction, HostDetail as HD, PolicyDoc, RejectReason } from '../lib/api'
 import { api, enc, errText } from '../lib/api'
 import { fmtLag, fmtNum, fmtSi, fmtTime, relTime, short } from '../lib/format'
@@ -9,6 +9,8 @@ import { Link } from '../lib/router'
 import { useApi } from '../lib/useApi'
 
 const POLL = 2000
+/** The one-click account cap for a real PDS: above every independent PDS today (~65k), below trusted's 10M. */
+const BIG_HOST_CAP = 1_000_000
 
 type Pending = { action: HostAction; label: string; msg: string; danger?: boolean; reason?: string }
 
@@ -26,6 +28,8 @@ function describe(a: HostAction): string {
       return 'unbanned'
     case 'reconnect':
       return 'reconnect'
+    case 'set-account-limit':
+      return a.maxAccounts == null ? "account cap back to the tier's" : `account cap → ${fmtNum(a.maxAccounts)}`
   }
 }
 
@@ -43,6 +47,9 @@ export function HostDetail({ host }: { host: string }) {
   const r = d.row
   const tiers = Object.keys(pol.data?.policy.tiers ?? { [r.tier]: null })
   const blocked = r.status === 'banned' || r.status === 'suspended'
+  const tierCap = pol.data?.policy.tiers[r.tier]?.maxAccounts
+  const ownCap = tierCap != null && d.limits.maxAccounts !== tierCap
+  const atCap = d.limits.maxAccounts > 0 && r.accounts >= d.limits.maxAccounts
 
   const ask = (p: Pending) => {
     setErr(undefined)
@@ -97,6 +104,26 @@ export function HostDetail({ host }: { host: string }) {
       </div>
       <ErrorNotice error={l.error} />
 
+      {atCap && d.limits.maxAccounts < BIG_HOST_CAP && (
+        <Notice kind="warn">
+          <strong>{host} is at its account cap</strong> ({fmtNum(r.accounts)} of {fmtNum(d.limits.maxAccounts)}). Every account the relay sees for the first time on this host is created throttled
+          and its commits are dropped. On a new relay that's every active account, so a real PDS with more than {fmtNum(d.limits.maxAccounts)} users hits this within minutes.
+          Raising the cap admits new accounts from now on; accounts already throttled stay throttled until an operator lifts them (untakedown).{' '}
+          <button
+            type="button"
+            className="btn sm primary"
+            onClick={() =>
+              ask({
+                action: { action: 'set-account-limit', maxAccounts: BIG_HOST_CAP },
+                label: 'Raise account cap',
+                msg: `Raise ${host}'s account cap to ${fmtNum(BIG_HOST_CAP)}? Its tier and event limits stay as they are.`,
+              })
+            }
+          >
+            Raise cap to {fmtNum(BIG_HOST_CAP)}
+          </button>
+        </Notice>
+      )}
       <Panel>
         <div className="actions-bar" role="toolbar" aria-label="Host actions">
           <label className="row" style={{ gap: 6 }}>
@@ -131,6 +158,15 @@ export function HostDetail({ host }: { host: string }) {
           {r.throttle != null && (
             <button type="button" className="btn sm" onClick={() => ask({ action: { action: 'throttle', eventsPerSec: null }, label: 'Lift throttle', msg: `Lift the ${r.throttle}/s throttle on ${host}?` })}>
               Lift throttle
+            </button>
+          )}
+          {ownCap && (
+            <button
+              type="button"
+              className="btn sm"
+              onClick={() => ask({ action: { action: 'set-account-limit', maxAccounts: null }, label: 'Tier account cap', msg: `Put ${host} back on its tier's account cap (${fmtNum(tierCap ?? 0)})?` })}
+            >
+              Tier account cap
             </button>
           )}
           <span className="sep" />

@@ -363,6 +363,9 @@ impl Engine {
             if let Some(c) = cap {
                 l.events_per_sec = l.events_per_sec.min(c);
             }
+            if let Some(m) = hp.max_accounts {
+                l.max_accounts = m;
+            }
             l
         });
         HostLimits {

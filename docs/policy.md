@@ -151,6 +151,32 @@ The relay isn't the limit, plc.directory is. Its pages measured 515 KB (2022 ops
 
 Each request needs a window to carry it, about rate × 0.64 s of them, so 4 windows cover up to ~6/s. The windows are even in time, not in ops, so the heavy 2023-2024 windows finish last. Real accounts' PDS hosts are ~35 characters against the fake's ~15, so expect ~100 bytes raw per DID: ~5.6 GB raw, ~3 GB in SSTs for 56M. The rates plc.directory allows aren't documented; start at the default and watch `vlrelay_plc_export{what="throttled"}`.
 
+## Big independent PDSes and the account cap
+
+The default tier holds a host to 100 accounts, as indigo does. On a relay that has just started, or
+has just added a host, every active account is one the relay hasn't seen, so a real PDS reaches the
+cap within minutes: on the [shadow run](shadow.md) eurosky.social (36k accounts), blacksky.app
+(42k) and atproto.brid.gy (65k) were each past 100 in the first ten minutes, and 3,508 of their
+accounts were created throttled over 90 minutes. Bluesky's own PDSes don't hit it because
+`*.host.bsky.network` is trusted (10M).
+
+indigo has the same cap and the same behavior. It counts the accounts it has seen on each host and
+never seeds the count from `listRepos`. bsky.network's operators raise the limit per host through
+`/admin/pds/changeLimits` (`repo_limit`), and raising it releases up to that many throttled
+accounts, oldest first, with an `#account` for each.
+
+In vlRelay:
+
+- An operator sets a host's own cap with the `set-account-limit` host action (`maxAccounts`, null
+  for the tier's cap again). It replaces the tier's `maxAccounts` for that host only, and the tier's
+  event limits stay. Host detail shows a warning on a host at its cap, with a one-click "Raise cap to
+  1,000,000" (above every independent PDS today, below trusted's 10M), and the Hosts list marks the
+  accounts column of every host at its cap.
+- Accounts created throttled before the raise stay throttled until an operator lifts them
+  (untakedown), unlike indigo, which releases them ([Gaps](#gaps)).
+- For a host you already know is real, raise its cap (or add a `tier` domain rule) before or right
+  after adding it, so the first wave of accounts isn't throttled.
+
 ## When a throttled host falls behind
 
 A host's limits block its reader instead of dropping frames (indigo does the same), so a host that
@@ -192,7 +218,7 @@ Actions are `alert` (log only), `case`, `throttle` and `throttle-and-case`. A pe
 
 - `engine.consumer_limits()` isn't enforced by `serve.rs` yet (connections per IP, consumers per node, the slow-consumer cutoff and the backfill limit come from vlpds's firehose options).
 - `LiveNodes` is `FixedNodes(1)`. The cluster module should pass one over its node leases.
-- A relay-throttled account stays throttled until an operator lifts it, even after its host drops below its cap.
+- A relay-throttled account stays throttled until an operator lifts it, even after its host drops below its cap or its cap is raised. indigo releases throttled accounts, oldest first, when a host's limit goes up.
 - Without `--plc-export`, a cold start resolves every account once at the PLC budget, so 56M accounts at the default 500/s take about 31 hours. With it, the export takes about 11 hours at the default 2 requests/s (below), off the lookup budget, and only did:web accounts and DIDs the export hasn't reached yet spend lookups. The export read itself can't go faster than plc.directory lets it.
 - The account cap and the per-host new-account rate are per node, so a host shard that moves starts them over from the record's count.
 - Peer nudges after a save aren't sent. Peers pick changes up within 10 s.
