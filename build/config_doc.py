@@ -34,7 +34,7 @@ SECTIONS = [
         "Log",
         "Time to firehose is about linger plus one segment PUT. Above ~50k events/s segments seal on size "
         "before the linger is up ([Performance](../perf.md)).",
-        ["linger-ms", "log-inflight", "max-segment-mb", "retention"],
+        ["linger-ms", "log-inflight", "max-segment-mb", "log-compression", "retention"],
     ),
     ("Pipeline and state", "", ["did-shards", "lanes", "ingest-threads"]),
     (

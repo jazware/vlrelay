@@ -63,6 +63,7 @@ Time to firehose is about linger plus one segment PUT. Above ~50k events/s segme
 | `--linger-ms <LINGER_MS>` |  | `25` | Segment linger (PLAN.md decision 1) |
 | `--log-inflight <LOG_INFLIGHT>` |  | `32` | Segment PUTs in flight at once |
 | `--max-segment-mb <MAX_SEGMENT_MB>` |  | `8` | A segment seals at this size even before its linger is up |
+| `--log-compression <LOG_COMPRESSION>` |  | `-1` | zstd level for log segments: 0 stores them uncompressed, negative levels are zstd's fast ones. Firehose frames are mostly hashes: on production frames -1 compresses 1.8x faster than 1 for 0.6% more bytes (docs/perf.md, iteration 5) |
 | `--retention <RETENTION>` |  | `72` | How long the log keeps events for cursor replay, in hours |
 
 ## Pipeline and state
