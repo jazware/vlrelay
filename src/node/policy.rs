@@ -182,8 +182,19 @@ fn oversized(reason: &str) -> bool {
 
 impl PolicyHooks {
     pub fn new(engine: Arc<Engine>, state: Arc<State>, dev_mode: bool) -> Arc<PolicyHooks> {
-        let (tx, rx) = mpsc::unbounded_channel();
         let raw: Arc<dyn HostStore> = state.clone();
+        Self::with_hosts(engine, state, raw, dev_mode)
+    }
+
+    /// With the host records somewhere other than the state shards (a
+    /// cluster keeps them in the bucket).
+    pub fn with_hosts(
+        engine: Arc<Engine>,
+        state: Arc<State>,
+        raw: Arc<dyn HostStore>,
+        dev_mode: bool,
+    ) -> Arc<PolicyHooks> {
+        let (tx, rx) = mpsc::unbounded_channel();
         let hosts: Arc<dyn HostStore> = Arc::new(Notifying { inner: raw, tx: tx.clone() });
         Arc::new(PolicyHooks {
             admin: Arc::new(PolicyAdmin::new(engine.clone(), hosts.clone())),

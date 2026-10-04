@@ -79,6 +79,10 @@ e2e *args:
 e2e-policy *args:
     tests/e2e/policy.sh {{args}}
 
+# Cluster e2e: 3 core relays + an edge + a replica on one prefix, kill -9 / SIGTERM / rejoin under load (tests/e2e/cluster.sh)
+e2e-cluster *args:
+    tests/e2e/cluster.sh {{args}}
+
 # ---- benchbox (scripts/benchbox.sh) --------------------------------------------
 
 # Ship the working tree (tracked + uncommitted) to benchbox:~/vlrelay-dev

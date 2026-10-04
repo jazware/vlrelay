@@ -61,6 +61,14 @@ struct Args {
     /// Examples of each kind of discrepancy to print.
     #[arg(long, default_value_t = 10)]
     show: usize,
+    /// Write every relay event as `seq did key` lines, in arrival order, to
+    /// compare streams from different nodes of one cluster.
+    #[arg(long)]
+    seq_out: Option<String>,
+    /// Write `unix_ms latency_ms` per matched event (at the later side's
+    /// arrival), to find the pauses around a failover.
+    #[arg(long)]
+    lat_out: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -202,11 +210,16 @@ fn classify(frame: &[u8]) -> Result<Option<Classified>, String> {
     }))
 }
 
+/// `base` may list several servers separated by commas (nodes of one
+/// cluster): a socket that closes or can't connect moves to the next one,
+/// resuming from its cursor.
 async fn subscribe(side: Side, src: usize, base: String, tx: mpsc::UnboundedSender<Msg>) {
-    let url = subscribe_url(&base);
+    let urls: Vec<String> = base.split(',').map(subscribe_url).collect();
+    let mut at = 0usize;
     let mut cursor: Option<i64> = None;
     let mut backoff = Duration::from_millis(250);
     loop {
+        let url = urls[at % urls.len()].clone();
         let u = match cursor {
             Some(c) => format!("{url}?cursor={c}"),
             None => url.clone(),
@@ -281,6 +294,11 @@ async fn subscribe(side: Side, src: usize, base: String, tx: mpsc::UnboundedSend
                     what: format!("connect {u}: {e}"),
                 });
             }
+        }
+        if urls.len() > 1 {
+            at += 1;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -403,6 +421,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let start = Instant::now();
+    let start_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
     let warm_end = start + Duration::from_secs(args.warmup);
     let collect_end = start + Duration::from_secs(args.duration);
     let end = collect_end
@@ -433,6 +452,15 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    use std::io::Write;
+    let open = |p: &Option<String>| -> anyhow::Result<Option<std::io::BufWriter<std::fs::File>>> {
+        Ok(match p {
+            Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
+            None => None,
+        })
+    };
+    let mut seq_out = open(&args.seq_out)?;
+    let mut lat_out = open(&args.lat_out)?;
     let mut tick = tokio::time::interval(Duration::from_secs(args.report_secs.max(1)));
     tick.tick().await;
     let deadline = tokio::time::sleep_until(end.into());
@@ -559,6 +587,11 @@ async fn main() -> anyhow::Result<()> {
         if !relay_on {
             continue;
         }
+        if side == Side::Relay
+            && let Some(w) = seq_out.as_mut()
+        {
+            writeln!(w, "{seq} {did} {key}")?;
+        }
         let wk = (did.clone(), key);
         match waiting.remove(&wk) {
             Some(w) if w.side != side => {
@@ -576,6 +609,10 @@ async fn main() -> anyhow::Result<()> {
                         0
                     };
                     lat.saturating_record(us.max(1));
+                    if let Some(w) = lat_out.as_mut() {
+                        let t = start_ms + re_at.max(up_at).duration_since(start).as_millis();
+                        writeln!(w, "{t} {:.1}", us as f64 / 1000.0)?;
+                    }
                     lat_kind
                         .entry(kind)
                         .or_insert_with(hist)
@@ -608,6 +645,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    for w in [seq_out.as_mut(), lat_out.as_mut()].into_iter().flatten() {
+        w.flush()?;
+    }
     for ((did, key), w) in &waiting {
         let c = counts.entry(w.kind).or_default();
         match w.side {

@@ -79,7 +79,7 @@ struct UpstreamExtra {
     errors: ErrorCounters,
 }
 
-fn tier_to_state(t: upstream::Tier) -> state::Tier {
+pub(crate) fn tier_to_state(t: upstream::Tier) -> state::Tier {
     match t {
         upstream::Tier::Trusted => state::Tier::Trusted,
         upstream::Tier::Default => state::Tier::Default,
@@ -101,7 +101,7 @@ fn tier_from_state(t: state::Tier) -> upstream::Tier {
     }
 }
 
-fn to_upstream(r: &state::HostRecord) -> upstream::HostRecord {
+pub(crate) fn to_upstream(r: &state::HostRecord) -> upstream::HostRecord {
     let x: UpstreamExtra =
         r.extra.get("upstream").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
     upstream::HostRecord {
@@ -114,6 +114,24 @@ fn to_upstream(r: &state::HostRecord) -> upstream::HostRecord {
         admitted_ms: if x.admitted_ms > 0 { x.admitted_ms } else { r.first_seen as u64 * 1000 },
         account_count: r.account_count.max(0) as u64,
         errors: x.errors,
+    }
+}
+
+/// A registry row's connection state, upstream-only fields and acked
+/// cursor, onto the host's record (the tier is the caller's call).
+pub(crate) fn apply_upstream(rec: &mut state::HostRecord, r: &upstream::HostRecord) {
+    rec.conn = match r.status {
+        HostStatus::Active | HostStatus::Throttled => state::Conn::Active,
+        HostStatus::Idle => state::Conn::Idle,
+        HostStatus::Connecting | HostStatus::Backoff => state::Conn::Offline,
+    };
+    let x =
+        UpstreamExtra { admitted_ms: r.admitted_ms, last_connected_ms: r.last_connected_ms, errors: r.errors.clone() };
+    if let Ok(v) = serde_json::to_value(x) {
+        rec.extra.insert("upstream".into(), v);
+    }
+    if let Some(c) = r.acked_seq {
+        rec.cursor = rec.cursor.max(c);
     }
 }
 

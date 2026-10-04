@@ -15,6 +15,9 @@ struct Entry {
     since: Option<Instant>,
     /// Lowest log ordinal a durable copy landed in.
     ordinal: Option<u64>,
+    /// A copy was lost (the cluster couldn't reach the DID's owner): the
+    /// cursor waits here until a replayed copy finishes.
+    failed: bool,
 }
 
 #[derive(Default)]
@@ -61,18 +64,36 @@ impl Tracker {
         let h = m.get_mut(host)?;
         let e = h.seqs.get_mut(&seq)?;
         e.pending = e.pending.saturating_sub(1);
+        e.failed = false;
         if let Some(o) = ordinal {
             e.ordinal = Some(e.ordinal.map_or(o, |x| x.min(o)));
         }
         let mut acked = None;
         while let Some(first) = h.seqs.first_entry() {
-            if first.get().pending > 0 {
+            if first.get().pending > 0 || first.get().failed {
                 break;
             }
             acked = Some(*first.key());
             first.remove();
         }
         acked
+    }
+
+    /// A copy that will never finish: the host's cursor stays below `seq`
+    /// until the host replays it and that copy finishes.
+    pub fn fail(&self, host: &Host, seq: i64) {
+        if seq <= 0 {
+            return;
+        }
+        if let Some(e) = self.hosts.lock().get_mut(host).and_then(|h| h.seqs.get_mut(&seq)) {
+            e.pending = e.pending.saturating_sub(1);
+            e.failed = true;
+        }
+    }
+
+    /// Frames of `host` still in the pipeline.
+    pub fn pending_for(&self, host: &Host) -> usize {
+        self.hosts.lock().get(host).map_or(0, |h| h.seqs.values().filter(|e| e.pending > 0).count())
     }
 
     pub fn snapshot(&self) -> Snapshot {

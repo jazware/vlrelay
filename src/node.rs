@@ -40,6 +40,7 @@
 pub mod acks;
 pub mod adapters;
 pub mod admin;
+pub mod cluster;
 pub mod metrics;
 pub mod policy;
 
@@ -173,6 +174,9 @@ pub enum Submitted {
     /// Already applied (a replay): nothing to append.
     Duplicate,
     Rejected(Rejection),
+    /// Handed to the cluster's forwarder: resolves with the DID owner's
+    /// outcome once it's durable there, a duplicate or rejected.
+    Forwarded(oneshot::Receiver<Result<crate::cluster::forward::Outcome, crate::cluster::forward::ForwardError>>),
 }
 
 /// The DID owner's side of the pipeline. Calls for one DID come in the
@@ -394,6 +398,8 @@ pub struct Node {
     pub ingest: tokio::runtime::Handle,
     pub started_ms: i64,
     pub recovery: Mutex<RecoveryReport>,
+    /// A core cluster node's cluster half (docs/cluster.md).
+    pub cluster: Option<Arc<cluster::Glue>>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -415,6 +421,24 @@ fn endpoint_fn(dev_mode: bool, explicit: HashMap<Host, String>) -> upstream::End
         let local = name == "localhost" || name.parse::<std::net::IpAddr>().is_ok() || name.starts_with('[');
         if dev_mode && local { format!("http://{}", h.0) } else { format!("https://{}", h.0) }
     })
+}
+
+/// The `--host` upstreams: each normalized, and its scheme kept.
+fn cli_hosts(cfg: &NodeConfig) -> anyhow::Result<(HashMap<Host, String>, Vec<Host>)> {
+    let mut explicit = HashMap::new();
+    let mut cli_hosts = Vec::new();
+    for h in &cfg.hosts {
+        let host = upstream::normalize_hostname(h, cfg.dev_mode).map_err(|e| anyhow::anyhow!("--host {h}: {e}"))?;
+        let base = if h.starts_with("http://") || h.starts_with("ws://") {
+            anyhow::ensure!(cfg.dev_mode, "--host {h}: plain http needs --dev-mode");
+            format!("http://{}", host.0)
+        } else {
+            format!("https://{}", host.0)
+        };
+        explicit.insert(host.clone(), base);
+        cli_hosts.push(host);
+    }
+    Ok((explicit, cli_hosts))
 }
 
 impl Node {
@@ -495,19 +519,7 @@ impl Node {
         report.took_ms = t0.elapsed().as_millis() as u64;
         tracing::info!(?report, "recovered");
 
-        let mut explicit = HashMap::new();
-        let mut cli_hosts = Vec::new();
-        for h in &cfg.hosts {
-            let host = upstream::normalize_hostname(h, cfg.dev_mode).map_err(|e| anyhow::anyhow!("--host {h}: {e}"))?;
-            let base = if h.starts_with("http://") || h.starts_with("ws://") {
-                anyhow::ensure!(cfg.dev_mode, "--host {h}: plain http needs --dev-mode");
-                format!("http://{}", host.0)
-            } else {
-                format!("https://{}", host.0)
-            };
-            explicit.insert(host.clone(), base);
-            cli_hosts.push(host);
-        }
+        let (explicit, cli_hosts) = cli_hosts(&cfg)?;
         let mut ucfg = UpstreamConfig::new(cfg.dev_mode);
         ucfg.endpoint = endpoint_fn(cfg.dev_mode, explicit);
         ucfg.limits = cfg.upstream_limits.clone();
@@ -524,6 +536,61 @@ impl Node {
 
         let ttf = Arc::new(Ttf::default());
         let local = LocalOwner::start(state.clone(), log.clone(), ttf.clone());
+        let owner: Arc<dyn DidOwner> = local.clone();
+        let cli_tier = cfg.cli_host_tier;
+        let node = Node::assemble(
+            cfg,
+            store,
+            manager.clone(),
+            crawler,
+            state,
+            identity,
+            log,
+            srv,
+            local,
+            owner,
+            ttf,
+            replayed,
+            report,
+            hooks.clone(),
+            None,
+            rx,
+        )?;
+        manager.start().await?;
+        for h in manager.hosts() {
+            tracing::info!(host = %h.record.hostname, acked = ?h.record.acked_seq, tier = h.record.tier.as_str(), "upstream resumes");
+        }
+        for h in cli_hosts {
+            manager.admit(&h, cli_tier).await?;
+        }
+        if let Some(h) = &hooks {
+            h.spawn();
+        }
+        Ok(node)
+    }
+
+    /// The pipeline around the parts `start` (or `start_cluster`) built:
+    /// the ingest runtime, the lanes, the dispatcher and the background
+    /// loops.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        cfg: NodeConfig,
+        store: Store,
+        manager: Arc<Manager>,
+        crawler: Arc<upstream::Crawler>,
+        state: Arc<State>,
+        identity: Arc<IdentityCache<HttpFetch>>,
+        log: Arc<NodeLog>,
+        srv: Arc<Serve>,
+        local: Arc<LocalOwner>,
+        owner: Arc<dyn DidOwner>,
+        ttf: Arc<Ttf>,
+        replayed: HashMap<Host, HashSet<i64>>,
+        report: RecoveryReport,
+        hooks: Option<Arc<policy::PolicyHooks>>,
+        cluster: Option<Arc<cluster::Glue>>,
+        rx: mpsc::Receiver<UpstreamFrame>,
+    ) -> anyhow::Result<Arc<Node>> {
         let ingest = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(cfg.ingest_threads)
             .thread_name("ingest")
@@ -549,7 +616,7 @@ impl Node {
             identity,
             log,
             serve: srv,
-            owner: local.clone(),
+            owner,
             local,
             acks: acks::Tracker::default(),
             ttf,
@@ -561,25 +628,19 @@ impl Node {
             ingest: ingest_handle.clone(),
             started_ms: upstream::host::now_ms() as i64,
             recovery: Mutex::new(report),
+            cluster,
         });
         for rx in lane_rx {
             ingest_handle.spawn(node.clone().lane(rx));
         }
         ingest_handle.spawn(node.clone().dispatch(rx));
         tokio::spawn(node.clone().tap());
-        tokio::spawn(node.clone().checkpoints());
+        // a cluster node checkpoints in node::cluster
+        if node.cluster.is_none() {
+            tokio::spawn(node.clone().checkpoints());
+        }
         tokio::spawn(node.clone().sampler());
 
-        manager.start().await?;
-        for h in manager.hosts() {
-            tracing::info!(host = %h.record.hostname, acked = ?h.record.acked_seq, tier = h.record.tier.as_str(), "upstream resumes");
-        }
-        for h in cli_hosts {
-            manager.admit(&h, cfg.cli_host_tier).await?;
-        }
-        if let Some(h) = &hooks {
-            h.spawn();
-        }
         Ok(node)
     }
 
@@ -683,6 +744,10 @@ impl Node {
                 Submitted::Rejected(r) => {
                     self.reject(&host, &did, useq, r);
                     self.finish(&host, useq, None);
+                }
+                Submitted::Forwarded(rx) => {
+                    let node = self.clone();
+                    tokio::spawn(async move { node.forwarded(rx, host, did, useq, kind).await });
                 }
             }
         }
@@ -968,8 +1033,12 @@ impl Node {
     }
 
     /// Stops reading upstreams and writes their cursors. The log isn't
-    /// closed: what's durable stays, and the next start fences it.
+    /// closed: what's durable stays, and the next start fences it. A
+    /// cluster node first hands its host and DID shards over.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
+        if let Some(g) = &self.cluster {
+            g.cluster.shutdown().await?;
+        }
         self.manager.shutdown().await
     }
 }
