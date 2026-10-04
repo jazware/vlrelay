@@ -1,0 +1,62 @@
+[package]
+name = "vlrelay"
+version = "0.1.0"
+edition = "2024"
+description = "An atproto relay whose only durable state is an object store"
+license = "MIT"
+publish = false
+
+[dependencies]
+# vlpds's library: the log, segments, merger, leases, store, slots, limiter,
+# crypto, MST, CAR and DID resolution. Factored into shared crates once the
+# relay settles which pieces it needs.
+# the public vlpds at the commit this one was exported against
+vlpds = { git = "https://github.com/jazware/vlpds", rev = "5780aa5a1cde49512ebc278a244c94823c6adbc1" }
+anyhow = "1"
+axum = { version = "0.8", features = ["ws", "macros", "http2"] }
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[patch.crates-io]
+slatedb = { git = "https://github.com/jazware/slatedb", rev = "2a79077e0da057c4673137195409edfe7bb673c4" }
+slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "2a79077e0da057c4673137195409edfe7bb673c4" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 1
+
+[profile.dev-release]
+inherits = "release"
+opt-level = 2
+lto = false
+debug = "line-tables-only"
+codegen-units = 256
+incremental = true
+
+[profile.dev-release.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+opt-level = 1
+debug = 0
+lto = false
+codegen-units = 256
+
+[profile.test.package."*"]
+opt-level = 2
+codegen-units = 16
