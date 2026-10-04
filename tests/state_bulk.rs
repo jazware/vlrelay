@@ -135,6 +135,12 @@ async fn bulk() {
     let (k, el) = run(st.clone(), ids.clone(), workers, 1, batch).await;
     let rate = k as f64 / el.as_secs_f64();
     println!("create: {k} in {:.2}s = {:.0}/s node, {:.0}/s per shard", el.as_secs_f64(), rate, rate / shards as f64);
+    // one version of every record in the SSTs: the per-DID cost
+    for s in st.shards() {
+        s.flush_memtable().await.unwrap();
+    }
+    let bytes: u64 = st.shards().iter().map(|s| s.sst_bytes()).sum();
+    println!("bucket after create: {bytes} SST bytes = {:.1} bytes/DID", bytes as f64 / n as f64);
 
     let (k, el) = run(st.clone(), ids.clone(), workers, 2, batch).await;
     let rate = k as f64 / el.as_secs_f64();
@@ -152,7 +158,7 @@ async fn bulk() {
     }
     println!("flush: {:.2}s", t.elapsed().as_secs_f64());
     let bytes: u64 = st.shards().iter().map(|s| s.sst_bytes()).sum();
-    println!("bucket: {bytes} SST bytes = {:.1} bytes/DID", bytes as f64 / n as f64);
+    println!("bucket after update (two versions until compaction): {bytes} SST bytes = {:.1} bytes/DID", bytes as f64 / n as f64);
     let raw: usize = ids.iter().take(10_000).map(|d| record::did_key(d).len()).sum::<usize>()
         + futures_rec_len(&st, &ids[..10_000.min(n)]).await;
     println!("raw key+value: {:.1} bytes/DID (first 10k)", raw as f64 / 10_000.min(n) as f64);

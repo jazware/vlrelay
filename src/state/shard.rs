@@ -40,6 +40,8 @@ struct Pending {
     by_ticket: HashMap<u64, (Arc<str>, Arc<Record>)>,
 }
 
+type RecordLru = lru::LruCache<Arc<str>, Arc<Record>>;
+
 const CACHE_WAYS: usize = 16;
 const STRIPES: usize = 1024;
 
@@ -49,7 +51,7 @@ pub struct ShardState {
     pub lo: u32,
     pub hi: u32,
     pub db: Arc<Db>,
-    cache: Box<[Mutex<lru::LruCache<Arc<str>, Arc<Record>>>]>,
+    cache: Box<[Mutex<RecordLru>]>,
     pending: Mutex<Pending>,
     /// Serializes each DID's applies (a DID's events must apply in order,
     /// and the identity lookup inside one is async).
