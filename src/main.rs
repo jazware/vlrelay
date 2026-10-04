@@ -67,6 +67,9 @@ struct Args {
     /// Threads verifying events (default: the core count, at most 16).
     #[arg(long)]
     ingest_threads: Option<usize>,
+    /// DID document fetches per second, all DIDs together.
+    #[arg(long, default_value_t = 50.0)]
+    did_lookups_per_sec: f64,
     /// Node id: the node log's id prefix.
     #[arg(long, default_value = "relay")]
     node_id: String,
@@ -121,10 +124,12 @@ async fn run(a: Args) -> anyhow::Result<()> {
         cfg.ingest_threads = n.max(1);
     }
     cfg.hosts = a.hosts.clone();
+    cfg.identity.lookups_per_sec = a.did_lookups_per_sec;
+    cfg.identity.burst = (a.did_lookups_per_sec * 2.0).max(1.0);
     if dev_mode {
         // every DID in a dev network is new, and PLC is local
-        cfg.identity.lookups_per_sec = 1000.0;
-        cfg.identity.burst = 1000.0;
+        cfg.identity.lookups_per_sec = cfg.identity.lookups_per_sec.max(1000.0);
+        cfg.identity.burst = cfg.identity.burst.max(1000.0);
     }
     let node = Node::start(store, cfg).await?;
 

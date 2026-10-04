@@ -37,14 +37,19 @@ pub struct Snapshot {
 
 impl Tracker {
     /// A frame read off `host`'s socket (seq 0: one without a seq).
-    pub fn begin(&self, host: &Host, seq: i64) {
+    /// Returns false when this seq is already in the pipeline or done but
+    /// not yet acked: a replay after a reconnect.
+    pub fn begin(&self, host: &Host, seq: i64) -> bool {
         if seq <= 0 {
-            return;
+            return true;
         }
         let mut m = self.hosts.lock();
-        let e = m.entry(host.clone()).or_default().seqs.entry(seq).or_default();
+        let seqs = &mut m.entry(host.clone()).or_default().seqs;
+        let first = !seqs.contains_key(&seq);
+        let e = seqs.entry(seq).or_default();
         e.pending += 1;
         e.since.get_or_insert_with(Instant::now);
+        first
     }
 
     /// The frame is done. Returns the host's new ack cursor, if it moved.
@@ -113,8 +118,8 @@ mod tests {
     fn a_replayed_seq_needs_both_copies() {
         let t = Tracker::default();
         let h = Host("pds".into());
-        t.begin(&h, 5);
-        t.begin(&h, 5);
+        assert!(t.begin(&h, 5));
+        assert!(!t.begin(&h, 5));
         assert_eq!(t.finish(&h, 5, None), None);
         assert_eq!(t.finish(&h, 5, None), Some(5));
     }

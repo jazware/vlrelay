@@ -119,6 +119,8 @@ pub struct Checked {
     pub frame: Bytes,
     pub span: SeqSpan,
     pub received: Instant,
+    /// The first copy of this upstream seq (not a reconnect's replay).
+    pub first_sighting: bool,
 }
 
 #[derive(Clone)]
@@ -286,6 +288,18 @@ impl DidOwner for LocalOwner {
                 let _ = self.commits.send(PendingCommit { durable, ticket: Some(a.ticket), tx, received: c.received });
                 Submitted::Appended(rx)
             }
+            // A #sync may restate the head the last #commit left (a
+            // reactivation does): it's news to consumers, not a replay,
+            // unless this very upstream seq was seen before.
+            Ok(Applied::Duplicate) if matches!(c.kind, CheckedKind::Sync(_)) && c.first_sighting => {
+                let shard = self.state.shard_id_of_slot(vlpds::slots::slot_of(&c.did));
+                let meta = EventMeta { did: c.did, host: c.host, upstream_seq: c.upstream_seq, shard: shard.0 };
+                let ev = seq::Event { meta, frame: Box::new(Spliced { frame: c.frame, span: c.span }), delta: None };
+                let durable = self.log.submit(vec![ev]).await;
+                let (tx, rx) = oneshot::channel();
+                let _ = self.commits.send(PendingCommit { durable, ticket: None, tx, received: c.received });
+                Submitted::Appended(rx)
+            }
             Ok(Applied::Duplicate) => Submitted::Duplicate,
             Err(state::Reject::Stale { .. }) => Submitted::Duplicate,
             Err(e) => Submitted::Rejected(state_rejection(&e)),
@@ -349,6 +363,7 @@ static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::n
 struct Job {
     frame: UpstreamFrame,
     received: Instant,
+    first: bool,
 }
 
 pub struct Node {
@@ -571,7 +586,7 @@ impl Node {
                 }
             };
             metrics::EVENTS_IN.with_label_values(&[r.kind.as_str()]).inc();
-            self.acks.begin(&f.host, f.upstream_seq);
+            let first = self.acks.begin(&f.host, f.upstream_seq);
             let did = match (r.kind, r.did) {
                 (Kind::Commit | Kind::Sync | Kind::Identity | Kind::Account, Some(d)) => d,
                 (k, _) => {
@@ -587,7 +602,7 @@ impl Node {
             }
             let lane = &self.lanes[lane_of(did, self.lanes.len())];
             metrics::LANE_QUEUED.inc();
-            if lane.send(Job { frame: f, received }).await.is_err() {
+            if lane.send(Job { frame: f, received, first }).await.is_err() {
                 return;
             }
         }
@@ -660,7 +675,7 @@ impl Node {
 
     /// The host owner's stage: strict parse and the stateless checks.
     async fn check(&self, job: Job) -> Result<Option<Checked>, (String, Rejection)> {
-        let Job { frame: f, received } = job;
+        let Job { frame: f, received, first } = job;
         let t0 = Instant::now();
         let ev = cpu(f.frame.len(), || event::parse(f.frame.clone(), &event::Limits::default()))
             .map_err(|r| (String::new(), Rejection::verify(r)))?;
@@ -673,6 +688,7 @@ impl Node {
             frame,
             span,
             received,
+            first_sighting: first,
         };
         let opts = verify::Options::default();
         let out = match ev {
