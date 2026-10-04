@@ -37,8 +37,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Seed rows: `0x03 ‖ slot ‖ DID`, outside the `0x01` state records so
-/// `listRepos` scans never walk them. A split or merge doesn't carry them
-/// yet ([`crate::state::RESHARD_FAMILIES`]).
+/// `listRepos` scans never walk them. A split or merge carries them with the
+/// rest ([`crate::state::RESHARD_FAMILIES`]).
 pub const SEED_TAG: u8 = 0x03;
 
 /// Seed rows of slots [lo, hi).

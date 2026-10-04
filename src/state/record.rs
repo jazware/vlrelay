@@ -13,8 +13,8 @@
 //! ```
 //!
 //! Host rows get their own tag so a shard's hosts are one short scan, not a
-//! walk over its DIDs. A split/merge clone carries only `0x01` today
-//! ([`super::RESHARD_FAMILIES`] and [`super::CLONE_FAMILIES`]).
+//! walk over its DIDs. A split/merge clone carries every tag
+//! ([`super::RESHARD_FAMILIES`]).
 
 use bytes::{BufMut, Bytes};
 use sha2::{Digest, Sha256};
