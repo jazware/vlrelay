@@ -766,6 +766,7 @@ impl Sim {
             did_shard: shard,
             node: self.did_shards[shard as usize].clone().unwrap_or_default(),
             did,
+            archive: None,
         }
     }
 
@@ -1407,6 +1408,8 @@ impl AdminSource for Demo {
                 .count() as u32,
             top_hosts: idx.iter().take(12).map(|&i| s.row(&s.hosts[i])).collect(),
             history: hist,
+            stream_events_per_sec: round2(last.ev_in),
+            by_node: Vec::new(),
         })
     }
 
@@ -1721,6 +1724,12 @@ impl AdminSource for Demo {
                     ),
                     cpu: round2((ev_in / 6_000.0 + ev_out / 400_000.0).min(7.6)),
                     mem_bytes: (9.5e9 + ev_in * 6.0e4) as u64,
+                    role: "core".into(),
+                    stale: false,
+                    error: None,
+                    reported_ms: now,
+                    bytes_out_per_sec: consumers.iter().map(|c| c.bytes_per_sec).sum(),
+                    stream_seq: s.last_seq,
                 }
             })
             .collect();

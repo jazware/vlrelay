@@ -75,6 +75,25 @@ export type Overview = {
   openCases: number
   topHosts: HostRow[]
   history: History
+  /** The merged stream's own rate; eventsOutPerSec sums every node's emits. */
+  streamEventsPerSec?: number
+  /** Each node's share. The totals above sum the nodes that aren't stale. */
+  byNode?: NodeTotals[]
+}
+
+export type NodeTotals = {
+  node: string
+  role: string
+  stale: boolean
+  error: string | null
+  eventsInPerSec: number
+  eventsOutPerSec: number
+  bytesInPerSec: number
+  bytesOutPerSec: number
+  consumers: number
+  hostsConnected: number
+  hostsTotal: number
+  rejectsPerSec: number
 }
 
 export type HostList = { total: number; hosts: HostRow[] }
@@ -150,6 +169,13 @@ export type NodeView = {
   logDurabilityLagMs: number
   cpu: number
   memBytes: number
+  role?: string
+  /** It didn't answer this round: its numbers are 0, not its last ones. */
+  stale?: boolean
+  error?: string | null
+  reportedMs?: number
+  bytesOutPerSec?: number
+  streamSeq?: number
 }
 export type ClusterView = { nodes: NodeView[]; hostShards: (string | null)[]; didShards: (string | null)[]; lastSeq: number }
 
@@ -168,7 +194,89 @@ export type Account = {
   rejectsLastHour: number
   didShard: number
   node: string
+  archive?: AccountArchive
 }
+
+export type AccountArchive = {
+  wanted: boolean
+  mirrored: boolean
+  rev: string | null
+  fetching: boolean
+  staging: boolean
+  lastError: string | null
+  takedownAtMs: number | null
+}
+
+// ---------------------------------------------------------------- operations
+
+export type ArchiveCounts = {
+  mirrored: number
+  queued: number
+  running: number
+  failed: number
+  fetched: number
+  retried: number
+  bytes: number
+  records: number
+  sstBytes: number
+  applied: number
+  mismatches: number
+  healed: number
+  sweptAtMs: number
+}
+export type ArchiveView = {
+  mode: string
+  policyVersion: number
+  totals: ArchiveCounts
+  nodes: { node: string; stale: boolean; counts: ArchiveCounts }[]
+  errors: { node: string; did: string; error: string }[]
+}
+
+export type PlcWindow = { fromMs: number; afterMs: number; untilMs: number | null; ops: number; done: boolean; progress: number }
+export type PlcView = {
+  enabled: boolean
+  leader: string | null
+  caughtUp: boolean
+  ops: number
+  opsPerSec: number
+  written: number
+  requests: number
+  throttled: number
+  errors: number
+  restarts: number
+  newestMs: number
+  windows: PlcWindow[]
+  checkpointMs: number
+  nodes: { node: string; stale: boolean; leader: boolean; ops: number; opsPerSec: number; throttled: number; errors: number }[]
+}
+
+export type SeqPair = { key: number; timeMs: number; seq: number }
+export type SeqView = {
+  nodes: { node: string; role: string; stale: boolean; head: number; latest: SeqPair | null }[]
+  boundaries: { key: number; timeMs: number; seqs: Record<string, number>; agree: boolean }[]
+  agree: boolean
+}
+
+export type PipelineNode = {
+  node: string
+  stale: boolean
+  ackPending: number
+  oldestPendingMs: number
+  laneQueued: number
+  dedupeEntries: number
+  pausedHosts: number
+  gauges: Record<string, number>
+}
+export type PipelineHost = {
+  host: string
+  node: string
+  inflight: number
+  inflightCap: number | null
+  paused: boolean
+  status: HostStatus | null
+  eventsPerSec: number
+}
+export type PipelineView = { nodes: PipelineNode[]; hosts: PipelineHost[] }
 
 export type CaseStatus = 'open' | 'acknowledged' | 'resolved' | 'dismissed'
 export type Case = {

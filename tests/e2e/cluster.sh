@@ -74,10 +74,12 @@ hosts=$(sed 's/^/--host /' dev/state/hosts | tr '\n' ' ')
 declare -a node_pid
 pub() { echo $((base + $1)); }
 start_node() { # i role
-  local i=$1 role=$2
+  local i=$1 role=$2 followers=""
+  # the cores' dashboards include the edge's and the replica's numbers
+  [ "$role" = core ] && followers="--admin-follower http://127.0.0.1:$(pub 4),http://127.0.0.1:$(pub 5)"
   dev/capped.sh "${RELAY_MEM_MB:-3072}" "$target/vlrelay" --role "$role" --node-id "n$i" \
     --listen "127.0.0.1:$(pub "$i")" --peer-listen "127.0.0.1:$((base + 10 + i))" \
-    --advertise-url "https://127.0.0.1:$((base + 10 + i))" $common $hosts >>"$out/n$i.log" 2>&1 &
+    --advertise-url "https://127.0.0.1:$((base + 10 + i))" $common $hosts $followers --admin-token e2e-cluster-admin >>"$out/n$i.log" 2>&1 &
   node_pid[$i]=$!
   pids+=($!)
   for _ in $(seq 1 150); do
@@ -170,6 +172,22 @@ echo "$t_load" >"$out/t_load_ms"
 rc=0
 for k in "${!checks[@]}"; do
   wait "${checks[$k]}" || { echo "e2e-cluster: checker ${names[$k]} FAILED"; rc=1; }
+done
+# every core's dashboard sees all five nodes, and its totals are their sums
+for i in 1 2 3; do
+  curl -sf -u admin:e2e-cluster-admin "http://127.0.0.1:$(pub "$i")/admin/api/overview" >"$out/overview-n$i.json" || true
+  python3 - "$out/overview-n$i.json" "n$i" <<'EOF' || rc=1
+import json, sys
+o = json.load(open(sys.argv[1]))
+nodes = o.get("byNode", [])
+fresh = [n for n in nodes if not n["stale"]]
+ok = sorted(n["node"] for n in fresh) == ["n1", "n2", "n3", "n4", "n5"]
+for k in ["eventsInPerSec", "eventsOutPerSec", "consumers", "hostsTotal"]:
+    ok = ok and abs(sum(n[k] for n in fresh) - o[k]) < 1e-6
+print(f"e2e-cluster: {sys.argv[2]} dashboard: {len(fresh)}/{len(nodes)} nodes, {o['consumers']} consumers, "
+      f"{o['eventsInPerSec']:.0f} events/s in, totals {'match' if ok else 'DO NOT match'} the nodes")
+sys.exit(0 if ok else 1)
+EOF
 done
 for i in 1 2 3 4 5; do
   curl -sf "http://127.0.0.1:$(pub "$i")/metrics" | grep -E '^vlrelay_|^vlpds_cluster' >"$out/metrics-n$i.txt" || true

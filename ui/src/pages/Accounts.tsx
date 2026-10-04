@@ -1,12 +1,20 @@
 import { useEffect, useRef, useState } from 'react'
 import { CopyText, Empty, ErrorNotice, Loading, PageHead, Panel } from '../components/ui'
 import { InlineConfirm, Live } from '../components/relay'
-import { api, enc, errText, type Account } from '../lib/api'
+import { api, enc, errText, type Account, type AccountArchive } from '../lib/api'
 import { fmtNum, fmtTime, relTime, short } from '../lib/format'
 import { useAction } from '../lib/hooks'
 import { Link, navigate, useSearch } from '../lib/router'
 import { useApi, useKey } from '../lib/useApi'
 import './pages2.css'
+
+function ArchiveState({ a }: { a: AccountArchive }) {
+  if (a.fetching) return <span className="pill amber">{a.mirrored ? 'mirrored, re-fetching' : 'fetching'}</span>
+  if (a.mirrored) return <span className="pill accent">mirrored</span>
+  if (a.lastError) return <span className="pill danger">fetch failed</span>
+  if (a.wanted) return <span className="pill amber">wanted, not mirrored yet</span>
+  return <span className="muted">not archived (policy doesn't cover its host)</span>
+}
 
 export function AccountStatus({ status }: { status: string }) {
   const cls =
@@ -198,6 +206,35 @@ export function AccountDetail({ did }: { did: string }) {
             <dd>
               <span className="mono">{a.didShard}</span> <span className="muted">on {a.node}</span>
             </dd>
+            {a.archive && (
+              <>
+                <dt>Archive</dt>
+                <dd>
+                  <ArchiveState a={a.archive} />
+                </dd>
+                {a.archive.rev && (
+                  <>
+                    <dt>Mirror rev</dt>
+                    <dd className="mono">
+                      {a.archive.rev}
+                      {a.archive.rev !== a.rev && <span className="muted small"> (sync state at {a.rev})</span>}
+                    </dd>
+                  </>
+                )}
+                {a.archive.takedownAtMs && (
+                  <>
+                    <dt>Mirror deletion</dt>
+                    <dd title={fmtTime(a.archive.takedownAtMs)}>taken down {relTime(a.archive.takedownAtMs)}; deleted after the takedown retention</dd>
+                  </>
+                )}
+                {a.archive.lastError && (
+                  <>
+                    <dt>Last fetch error</dt>
+                    <dd className="err-mid small">{a.archive.lastError}</dd>
+                  </>
+                )}
+              </>
+            )}
           </dl>
         </Panel>
         <Panel title="Takedown" desc="A takedown drops the account's events on this relay and serves it as taken down. The host keeps the repo." danger={!!a.takedown}>

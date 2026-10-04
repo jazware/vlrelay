@@ -9,6 +9,7 @@ import { Hosts } from './Hosts'
 import { HostDetail } from './HostDetail'
 import { Consumers } from './Consumers'
 import { Cluster } from './Cluster'
+import { Ops } from './Ops'
 import { Rules } from './Rules'
 import { Policy } from './Policy'
 import { AccountDetail, Accounts } from './Accounts'
@@ -21,6 +22,7 @@ const TABS = [
   { to: '/admin/cases', label: 'Cases', key: 'c' },
   { to: '/admin/consumers', label: 'Consumers', key: 's' },
   { to: '/admin/cluster', label: 'Cluster', key: 'n' },
+  { to: '/admin/ops', label: 'Operations', key: 'b' },
   { to: '/admin/accounts', label: 'Accounts', key: 'a' },
   { to: '/admin/rules', label: 'Domain rules', key: 'r' },
   { to: '/admin/policy', label: 'Policy', key: 'p' },
@@ -74,6 +76,7 @@ export function AdminApp({ path }: { path: string }) {
   else if ((m = match('/admin/hosts/:host', p))) page = <HostDetail host={m.host} />
   else if (p === '/admin/consumers') page = <Consumers />
   else if (p === '/admin/cluster') page = <Cluster />
+  else if (p === '/admin/ops') page = <Ops />
   else if (p === '/admin/rules') page = <Rules />
   else if (p === '/admin/policy') page = <Policy />
   else if (p === '/admin/accounts') page = <Accounts />

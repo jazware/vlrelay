@@ -17,7 +17,7 @@ busy relay (below).
 
 | Method | Path | Body / query | Returns |
 |---|---|---|---|
-| GET | `overview` | | `Overview`: events/s in and out, bytes/s, consumers, hosts connected/total and by status, rejects/s by reason, time to firehose p50/p99, log durability lag, open cases, the busiest hosts and 5 min of 1 s history for the charts |
+| GET | `overview` | | `Overview`: events/s in and out, bytes/s, consumers, hosts connected/total and by status, rejects/s by reason, time to firehose p50/p99, log durability lag, open cases, the busiest hosts and 5 min of 1 s history for the charts. On a cluster also `byNode` (each node's share, stale ones flagged) and `streamEventsPerSec` |
 | GET | `hosts` | `q`, `tier`, `status`, `sort`, `desc`, `limit` (default 10,000), `offset` | `{total, hosts: HostRow[]}` |
 | GET | `hosts/{host}` | | `HostDetail`: the row, the limits in force, rejects by reason, a sample of recent rejects, 2 min of per-second events and rejects, operator actions, open cases |
 | POST | `hosts/{host}/action` | `{"action": "set-tier", "tier"}`, `{"action": "throttle", "eventsPerSec": n or null}`, `{"action": "suspend", "reason"}`, `{"action": "ban", "reason"}`, `{"action": "unban"}`, `{"action": "reconnect"}` | the updated `HostRow` |
@@ -28,10 +28,14 @@ busy relay (below).
 | GET, PUT | `policy/full` | PUT `{baseVersion, policy, note}` | `FullPolicyDoc`: the engine's whole document (tier limits, transitions, spam thresholds and actions, cluster budgets, consumer limits, crawl settings) |
 | GET | `domain-rules/audit` | | `PolicyAudit[]` of the domain rules, newest first |
 | GET | `consumers` | | `Consumer[]` |
-| POST | `consumers/{id}/kick` | | 204 |
-| GET | `cluster` | | nodes (lease, shards, rates, build) and the owner of every host shard and DID shard |
+| POST | `consumers/{id}/kick` | `node` (ids are per node; default the node answering) | 204 |
+| GET | `cluster` | | nodes (role, lease, shards, rates, consumers, stream seq, CPU, memory, build, `stale`) and the owner of every host shard and DID shard |
+| GET | `ops/pipeline` | | `PipelineView`: per core the events in flight (read, not yet durable), the oldest one's age, the lane queue, restart-dedupe entries, paused readers and every pipeline gauge; the hosts with the most in flight or a paused reader |
+| GET | `ops/seq` | | `SeqView`: each node's stream head and newest seq checkpoint, and the recent 10 s boundaries with the seq each node counted, flagged where they disagree |
+| GET | `ops/archive` | | `ArchiveView`: archival mode and policy version, mirrored repos, fetch queue (queued, running), failed, retried, fetched bytes and records, mismatches, per core, and the newest fetch failures |
+| GET | `ops/plc` | | `PlcView`: the core reading the PLC export, ops read and their rate, written, throttled (429s), errors, caught up or not, per-window progress from the stored checkpoint, per core |
 | GET | `accounts` | `q`: a DID, a handle or a prefix | up to 100 `Account`s |
-| GET | `accounts/{did}` | | `Account` |
+| GET | `accounts/{did}` | | `Account`, with `archive` (wanted, mirrored, mirror rev, fetching, staging, last fetch error, takedown time) on an archiving relay |
 | POST | `accounts/{did}/takedown` | `{reason}` (required) | `Account` |
 | POST | `accounts/{did}/untakedown` | | `Account` |
 | GET | `cases` | `status`: open, acknowledged, resolved, dismissed | `Case[]`, worst severity first |
@@ -59,6 +63,46 @@ their events/s, bytes/s and cursor lag, and a kick drops the socket at once. Acc
 DID, a handle or a handle prefix ending in `*`, matched against the DID documents in the identity
 cache (every account with recent traffic).
 
+`GET /admin/api/archive` (archival's raw counters, this node's shards only), `.../archive/fetch` and
+`.../archive/desync` are docs/archival.md's. `ops/archive` is the cluster's summary.
+
+## On a cluster
+
+Any core node's dashboard shows the whole cluster. The node answering asks every other member for
+its own numbers over the peer admin RPC (`node::peer_admin`) and adds them up (`admin::fleet`):
+
+| Member | Found from | Asked at | Auth |
+|---|---|---|---|
+| core | the leases | its peer listener, `/internal/relay/v1/admin/{report,hosts,host,reconnect,consumers,kick,account,accounts,takedown}` | peer mTLS and the internal token |
+| edge, replica | `--admin-follower URL` on each core (repeatable or comma-separated; `VLRELAY_ADMIN_FOLLOWERS`) | its public listener, `/admin/api/node/{report,consumers,kick}` | the admin token (`--admin-token` on the follower, the same as the cores') |
+
+Followers answer on their public listener because a replica has no peer listener and a core's peer
+client only trusts origins that hold a lease. A core with no `--admin-token` still serves the peer
+routes, so a dashboard on another core can include it.
+
+- **Totals are sums over the nodes that answered.** Overview rates, bytes, consumers, hosts and
+  rejects add up; time to firehose and durability lag take the worst node; history adds the
+  per-second samples by time. `byNode` lists each node's share, so the totals equal the sum of the
+  rows. `eventsOutPerSec` sums every node's emits; `streamEventsPerSec` is the stream's own rate.
+- **Stale members.** A member that errors or takes over 1.5 s is `stale` for that round, with the
+  error. Its rows show zeros (the UI shows dashes) and it's left out of the sums, so the page never
+  waits on a dead node. A killed core stays listed until its lease lapses, then drops off; a
+  follower stays listed (as stale) until it answers again. One round of reports is shared by the
+  requests of one refresh (0.8 s), so the pages don't multiply peer calls.
+- **Hosts.** Every host is listed once, from the core reading it (its host shard owner) with its
+  live rate. A host whose owner didn't answer shows this node's registry row with no rate, under the
+  owner's name. A host's detail page and a reconnect go to the owner; tier, throttle, suspend and
+  ban go through the shared policy store as before.
+- **Consumers** are every node's, edges and replicas included, each with its `node`. Kicks go to
+  that node.
+- **Accounts.** An account's page and a takedown go to its DID shard's owner, which holds its state.
+  A handle search asks every core (handles are cached by the core reading the account's host) and
+  merges the answers.
+- **Pipeline** gauges are every `vlrelay_*` gauge whose name says in-flight, pending, queued,
+  backlog, paused, cap, dedupe or lag, read by name, so the in-flight caps and pause metrics the
+  pipeline adds show up without a dashboard change. `inflightCap` per host is null until the relay
+  has one.
+
 ## Demo backend
 
 ```bash
@@ -76,4 +120,6 @@ events/s. There are ~25 consumers (a couple replaying from old cursors), a 3-nod
 host shards and 256 DID shards, and cases open when a host crosses a threshold. Actions, rules,
 policy edits and takedowns change the simulation, but nothing is persisted.
 
-Screenshots: `docs/assets/dashboard-overview.jpg`, `docs/assets/dashboard-hosts.jpg`.
+Screenshots: `docs/assets/dashboard-overview.jpg`, `docs/assets/dashboard-hosts.jpg` (the demo);
+`docs/assets/dashboard-overview-cluster.jpg`, `docs/assets/dashboard-cluster.jpg` (a dev cluster of
+three cores, an edge and a replica under load, one core killed).

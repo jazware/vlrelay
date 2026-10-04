@@ -35,6 +35,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # vlpds's exactly: a different feature set would rebuild these and vlpds.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures = "0.3"
+# getrusage, for the dashboard's CPU per node
+libc = "0.2"
 hdrhistogram = "7"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls", "stream"] }
@@ -68,7 +70,6 @@ path = "src/bin/devnet.rs"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-libc = "0.2"
 # differential tests against a second atproto implementation, as vlpds does
 shrike = { version = "=0.7.0", default-features = false, features = ["syntax", "cbor", "crypto", "mst", "repo", "car", "sync"] }
 

@@ -78,6 +78,11 @@ struct Args {
     /// Turns on /admin (dashboard and API) with this token.
     #[arg(long, env = "VLRELAY_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
+    /// An edge's or a replica's public URL (repeatable, or comma-separated),
+    /// for a core's dashboard to include its numbers and consumers. They
+    /// answer with the same --admin-token.
+    #[arg(long = "admin-follower", env = "VLRELAY_ADMIN_FOLLOWERS", value_delimiter = ',')]
+    admin_followers: Vec<String>,
     /// A built dashboard (`ui/dist`); default: this tree's, if built.
     #[arg(long)]
     ui_dir: Option<PathBuf>,
@@ -273,10 +278,21 @@ async fn run(a: Args) -> anyhow::Result<()> {
     if a.crawl {
         app = app.merge(node.crawler.router());
     }
-    if let Some(token) = a.admin_token.clone().filter(|t| !t.is_empty()) {
-        let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
+    let token = a.admin_token.clone().filter(|t| !t.is_empty());
+    // a core answers its peers' dashboards even without a dashboard of its own
+    let admin_src = (token.is_some() || node.cluster.is_some()).then(|| {
         let policy = node.policy.clone().expect("the relay always runs the policy engine");
-        let src = Arc::new(NodeAdmin::new(node.clone(), policy, vlrelay::admin::demo::Demo::start(42)));
+        let demo = vlrelay::admin::demo::Demo::start(42);
+        let src = NodeAdmin::new(node.clone(), policy, demo)
+            .with_followers(a.admin_followers.clone(), token.clone().unwrap_or_default());
+        Arc::new(src)
+    });
+    if let (Some(g), Some(src)) = (&node.cluster, &admin_src) {
+        let _ = g.admin.set(Arc::downgrade(src));
+    }
+    // admin_src stays bound for the life of `run`: the peer slot holds it weakly
+    if let (Some(token), Some(src)) = (token, admin_src.clone()) {
+        let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
         app = app.merge(vlrelay::admin::app(src, token.clone(), ui));
         app = app.merge(vlrelay::archive::admin::router(node.state.clone(), token));
     }
@@ -357,11 +373,16 @@ async fn run_follower(
     if let Some(p) = peer {
         vlrelay::cluster::peer::spawn_listener(&node, p)?;
     }
-    let app = axum::Router::new()
+    let mut app = axum::Router::new()
         .route("/xrpc/_health", axum::routing::get(health))
         .route("/metrics", axum::routing::get(|| async { vlpds::metrics::render() }))
-        .merge(node.serve.router())
-        .layer(middleware::map_response(server_header));
+        .merge(node.serve.router());
+    // the cores' dashboards read this node's numbers and consumers here
+    if let Some(token) = a.admin_token.clone().filter(|t| !t.is_empty()) {
+        let fa = vlrelay::node::peer_admin::FollowerAdmin::start(node.clone());
+        app = app.merge(vlrelay::node::peer_admin::follower_router(fa, token));
+    }
+    let app = app.layer(middleware::map_response(server_header));
     let listener = tokio::net::TcpListener::bind(a.listen).await?;
     tracing::info!(addr = %a.listen, role = ?setup.role, "vlrelay listening");
     let server =

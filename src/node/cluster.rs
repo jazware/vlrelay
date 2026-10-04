@@ -147,6 +147,8 @@ pub struct Glue {
     /// Opened at their current epoch with every earlier span durable in
     /// their state.
     clean: Mutex<std::collections::HashSet<ShardId>>,
+    /// The node's admin, for the peer admin RPC (`node::peer_admin`).
+    pub admin: super::peer_admin::Slot,
 }
 
 impl Node {
@@ -228,6 +230,7 @@ impl Node {
             dedupe: DedupeStore::new(store.clone(), log.log_id.to_string()),
             markers: Mutex::new(HashMap::new()),
             clean: Mutex::new(Default::default()),
+            admin: Default::default(),
         });
         let node = Node::assemble(
             cfg,
@@ -262,7 +265,8 @@ impl Node {
             &cluster,
             peer,
             crate::archive::wiring::peer_reads(node.state.clone(), cluster.internal_token().to_string())
-                .merge(crate::plc_seed::peer::router(seed_owner.clone())),
+                .merge(crate::plc_seed::peer::router(seed_owner.clone()))
+                .merge(super::peer_admin::core_router(glue.admin.clone(), cluster.internal_token().to_string())),
         )?;
         if let Some(pc) = &node.cfg.plc_export {
             let sink = Arc::new(crate::plc_seed::peer::ForwardSink::new(seed_owner));
@@ -291,7 +295,7 @@ impl Node {
 impl Glue {
     /// The admin's cluster view: members from the leases, owners from the
     /// assignments as last read. Rates and resources are this node's only;
-    /// a peer's are 0 until peers report them.
+    /// `admin::fleet::fill_cluster` fills in every member's.
     pub fn view(&self, node: &Node) -> crate::admin::ClusterView {
         let c = &self.cluster;
         let host_shards = c.hosts.as_ref().map(|h| h.owners()).unwrap_or_default();
@@ -327,6 +331,12 @@ impl Glue {
                     addr: l.addr,
                     cpu: 0.0,
                     mem_bytes: 0,
+                    role: "core".into(),
+                    stale: false,
+                    error: None,
+                    reported_ms: 0,
+                    bytes_out_per_sec: 0.0,
+                    stream_seq: 0,
                 }
             })
             .collect();

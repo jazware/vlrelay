@@ -145,6 +145,11 @@ impl Serve {
         s
     }
 
+    /// The newest `n` stream seq checkpoints this node knows (docs/seq.md).
+    pub fn seq_checkpoints(&self, n: usize) -> Vec<(i64, i64)> {
+        self.seqs.recent(n)
+    }
+
     /// The connected consumers, by id.
     pub fn consumers(&self) -> Vec<ConsumerSnapshot> {
         let head = self.firehose.last_emitted.load(Ordering::Acquire);

@@ -84,6 +84,10 @@ pub struct Stats {
     pub replayed: AtomicU64,
     pub deleted_repos: AtomicU64,
     pub deleted_rows: AtomicU64,
+    /// Live mirrors on this node's shards, as the last sweep counted them.
+    pub mirrors: AtomicU64,
+    /// When that sweep finished (unix ms; 0: none yet).
+    pub swept_at_ms: AtomicU64,
 }
 
 #[derive(Default)]

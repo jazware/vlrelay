@@ -10,12 +10,14 @@ const POLL = 2000
 
 const fmtLag = (ms: number) => (ms < 1000 ? `${ms.toFixed(0)} ms` : ms < 120_000 ? `${(ms / 1000).toFixed(1)} s` : ms < 7_200_000 ? `${(ms / 60_000).toFixed(0)} min` : `${(ms / 3_600_000).toFixed(1)} h`)
 const lagClass = (ms: number) => (ms > 60_000 ? 'err-hi' : ms > 500 ? 'err-mid' : '')
+/** Consumer ids are per node. */
+const keyOf = (c: Consumer) => `${c.node}/${c.id}`
 
 export function Consumers() {
   const l = useApi<Consumer[]>('consumers', undefined, POLL)
   const [q, setQ] = useState('')
-  const [sel, setSel] = useState<number | null>(null)
-  const [kick, setKick] = useState<number | null>(null)
+  const [sel, setSel] = useState<string | null>(null)
+  const [kick, setKick] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<unknown>()
   const [kicked, setKicked] = useState<string>()
@@ -24,15 +26,16 @@ export function Consumers() {
     const n = q.trim().toLowerCase()
     return (l.data ?? [])
       .filter((c) => !n || c.ip.includes(n) || c.userAgent.toLowerCase().includes(n) || c.node.includes(n))
-      .sort((a, b) => Number(b.backfilling) - Number(a.backfilling) || b.lagMs - a.lagMs || a.id - b.id)
+      .sort((a, b) => Number(b.backfilling) - Number(a.backfilling) || b.lagMs - a.lagMs || a.node.localeCompare(b.node) || a.id - b.id)
   }, [l.data, q])
-  const idx = rows.findIndex((c) => c.id === sel)
+  const idx = rows.findIndex((c) => keyOf(c) === sel)
 
   useKey(
     (e) => {
       if (kick !== null) return
-      if (e.key === 'j' || e.key === 'ArrowDown') setSel(rows[Math.min(rows.length - 1, idx + 1)]?.id ?? null)
-      else if (e.key === 'k' || e.key === 'ArrowUp') setSel(rows[Math.max(0, idx - 1)]?.id ?? null)
+      const at = (i: number) => (rows[i] ? keyOf(rows[i]) : null)
+      if (e.key === 'j' || e.key === 'ArrowDown') setSel(at(Math.min(rows.length - 1, idx + 1)))
+      else if (e.key === 'k' || e.key === 'ArrowUp') setSel(at(Math.max(0, idx - 1)))
       else if (e.key === 'x' && sel !== null) setKick(sel)
       else return
       e.preventDefault()
@@ -52,9 +55,10 @@ export function Consumers() {
     setBusy(true)
     setErr(undefined)
     try {
-      await api(`consumers/${kick}/kick`, { method: 'POST' })
-      const c = all.find((x) => x.id === kick)
-      setKicked(c ? `${c.ip} (${c.userAgent || 'no user agent'})` : `consumer ${kick}`)
+      const c = all.find((x) => keyOf(x) === kick)
+      if (!c) throw new Error(`consumer ${kick} is gone`)
+      await api(`consumers/${c.id}/kick`, { method: 'POST', params: { node: c.node } })
+      setKicked(`${c.ip} (${c.userAgent || 'no user agent'}) on ${c.node}`)
       if (sel === kick) setSel(null)
       setKick(null)
       l.reload()
@@ -110,8 +114,8 @@ export function Consumers() {
             </thead>
             <tbody>
               {rows.map((c) => (
-                <Fragment key={c.id}>
-                  <tr className={`link${c.id === sel ? ' sel' : ''}`} onClick={() => setSel(c.id)}>
+                <Fragment key={keyOf(c)}>
+                  <tr className={`link${keyOf(c) === sel ? ' sel' : ''}`} onClick={() => setSel(keyOf(c))}>
                     <td className="mono">{c.ip}</td>
                     <td className="muted">{c.userAgent || '—'}</td>
                     <td>{c.node}</td>
@@ -130,14 +134,14 @@ export function Consumers() {
                         onClick={(e) => {
                           e.stopPropagation()
                           setErr(undefined)
-                          setKick(c.id)
+                          setKick(keyOf(c))
                         }}
                       >
                         Kick
                       </button>
                     </td>
                   </tr>
-                  {kick === c.id && (
+                  {kick === keyOf(c) && (
                     <tr>
                       <td colSpan={10} style={{ paddingTop: 0 }}>
                         <InlineConfirm open danger action="Kick" busy={busy} error={err ? errText(err) : undefined} onConfirm={doKick} onCancel={() => setKick(null)}>

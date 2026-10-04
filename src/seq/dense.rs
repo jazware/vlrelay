@@ -156,6 +156,15 @@ impl DenseSeqs {
         *self.0.own_log.lock() = Some(log_id.to_string());
     }
 
+    /// The newest `n` (key, seq) pairs this node knows, oldest first: the
+    /// ones it computed itself and the ones it listed.
+    pub fn recent(&self, n: usize) -> Vec<(i64, i64)> {
+        let st = self.0.st.lock();
+        let mut v: Vec<(i64, i64)> = st.known.iter().rev().take(n).map(|(k, s)| (*k, *s)).collect();
+        v.reverse();
+        v
+    }
+
     /// Brings `known` up to date with the bucket.
     async fn refresh(&self) -> anyhow::Result<()> {
         let from = self.0.st.lock().listed;

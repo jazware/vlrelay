@@ -532,6 +532,48 @@ table.data tbody tr.sel td {
 table.data tbody tr.sel td:first-child {
   box-shadow: inset 3px 0 0 var(--accent);
 }
+table.data tbody tr.stale td {
+  background: var(--danger-wash);
+}
+table.data tbody tr.stale td:first-child {
+  box-shadow: inset 3px 0 0 var(--danger);
+}
+table.data tfoot td {
+  font-weight: 600;
+  border-top: 1px solid var(--rule2);
+}
+
+/* operations */
+.progress {
+  position: relative;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--rule);
+  overflow: hidden;
+  min-width: 120px;
+}
+.progress > i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--accent);
+  border-radius: 4px;
+}
+.progress.done > i {
+  background: var(--ok);
+}
+.gauges {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 16px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.gauges .num {
+  text-align: right;
+}
+.ops-sub {
+  margin: 4px 0 10px;
+}
 
 /* diff */
 .diff {

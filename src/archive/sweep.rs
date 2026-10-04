@@ -28,6 +28,8 @@ pub fn spawn<C: Chain>(a: Arc<Archive>, state: Arc<StateStore<C>>) {
             match sweep_once(&a, &state, rescan).await {
                 Ok(r) => {
                     seen_version = Some(v);
+                    a.stats.mirrors.store(r.mirrors as u64, Relaxed);
+                    a.stats.swept_at_ms.store(crate::state::now_secs() as u64 * 1000, Relaxed);
                     if r.deleted + r.queued + r.swept > 0 {
                         tracing::info!(?r, "archive sweep");
                     }

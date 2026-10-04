@@ -46,6 +46,7 @@ pub mod adapters;
 pub mod admin;
 pub mod cluster;
 pub mod metrics;
+pub mod peer_admin;
 pub mod policy;
 
 use crate::event::{self, Kind, SeqSpan};

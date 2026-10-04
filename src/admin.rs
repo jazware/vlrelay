@@ -7,6 +7,7 @@
 
 pub mod demo;
 mod diff;
+pub mod fleet;
 mod ui;
 
 use axum::{
@@ -112,6 +113,33 @@ pub struct Overview {
     pub top_hosts: Vec<HostRow>,
     /// One sample per `sample_secs`, oldest first, so charts fill on first load.
     pub history: History,
+    /// The merged stream's own rate (what one consumer of the whole stream
+    /// gets); `events_out_per_sec` sums every node's emits.
+    #[serde(default)]
+    pub stream_events_per_sec: f64,
+    /// What each node contributed. The totals above are their sums over the
+    /// nodes that answered.
+    #[serde(default)]
+    pub by_node: Vec<NodeTotals>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeTotals {
+    pub node: String,
+    /// `core`, `edge`, `replica`, or `single`.
+    pub role: String,
+    /// It didn't answer this round: its numbers are 0 and left out of the sums.
+    pub stale: bool,
+    pub error: Option<String>,
+    pub events_in_per_sec: f64,
+    pub events_out_per_sec: f64,
+    pub bytes_in_per_sec: f64,
+    pub bytes_out_per_sec: f64,
+    pub consumers: u32,
+    pub hosts_connected: u32,
+    pub hosts_total: u32,
+    pub rejects_per_sec: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -392,6 +420,12 @@ pub struct Consumer {
     pub backfilling: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct KickQuery {
+    /// The node serving the consumer (ids are per node); default this one.
+    pub node: Option<String>,
+}
+
 // ---------------------------------------------------------------- cluster
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -423,8 +457,26 @@ pub struct NodeView {
     pub events_out_per_sec: f64,
     /// Sequenced but not yet durable, as time.
     pub log_durability_lag_ms: f64,
+    /// Cores busy over the last sample.
     pub cpu: f64,
     pub mem_bytes: u64,
+    /// `core`, `edge` or `replica`.
+    #[serde(default)]
+    pub role: String,
+    /// It didn't answer this round (down, hung or partitioned): the numbers
+    /// above are 0, not its last ones.
+    #[serde(default)]
+    pub stale: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// When its numbers were last read (unix ms; 0: never).
+    #[serde(default)]
+    pub reported_ms: i64,
+    #[serde(default)]
+    pub bytes_out_per_sec: f64,
+    /// The last seq its merged stream emitted.
+    #[serde(default)]
+    pub stream_seq: i64,
 }
 
 // ---------------------------------------------------------------- accounts
@@ -447,6 +499,29 @@ pub struct Account {
     pub rejects_last_hour: u64,
     pub did_shard: u32,
     pub node: String,
+    /// The mirror, on an archiving relay (None: archival is off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<AccountArchive>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountArchive {
+    /// The policy wants this account mirrored.
+    pub wanted: bool,
+    /// A live mirror exists (getRepo serves it).
+    pub mirrored: bool,
+    /// The mirror's head rev.
+    pub rev: Option<String>,
+    /// A fetch is queued or running.
+    pub fetching: bool,
+    /// A fetch's rows are staged but not switched in yet.
+    pub staging: bool,
+    /// The newest fetch failure still in the error list.
+    pub last_error: Option<String>,
+    /// When the sweeper first saw it taken down (unix ms); the mirror goes
+    /// `takedownRetentionHours` later.
+    pub takedown_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -548,6 +623,200 @@ pub struct CaseUpdate {
     pub note: String,
 }
 
+// ---------------------------------------------------------------- operations
+
+/// Archival mode across the core nodes (each mirrors its own DID shards).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveView {
+    /// `off`, `all`, `tiers` or `hosts`.
+    pub mode: String,
+    pub policy_version: u64,
+    pub totals: ArchiveCounts,
+    pub nodes: Vec<ArchiveNode>,
+    /// The newest fetch failures, newest last.
+    pub errors: Vec<ArchiveError>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveCounts {
+    /// Live mirrors, as the last sweep counted them.
+    pub mirrored: u64,
+    /// Waiting for a fetch slot.
+    pub queued: u64,
+    /// Fetching now.
+    pub running: u64,
+    /// Gave up after every retry (since start).
+    pub failed: u64,
+    pub fetched: u64,
+    pub retried: u64,
+    /// CAR bytes fetched since start.
+    pub bytes: u64,
+    pub records: u64,
+    /// SST bytes of the shards the mirrors live in.
+    pub sst_bytes: u64,
+    /// Live commits applied to mirrors since start.
+    pub applied: u64,
+    pub mismatches: u64,
+    pub healed: u64,
+    pub swept_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveNode {
+    pub node: String,
+    pub stale: bool,
+    pub counts: ArchiveCounts,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveError {
+    pub node: String,
+    pub did: String,
+    pub error: String,
+}
+
+/// PLC export seeding (docs/policy.md): one core reads the export, the
+/// lowest-named live one.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlcView {
+    /// Some node runs with `--plc-export`.
+    pub enabled: bool,
+    pub leader: Option<String>,
+    pub caught_up: bool,
+    pub ops: u64,
+    /// Ops read per second, over the leader's last few seconds.
+    pub ops_per_sec: f64,
+    pub written: u64,
+    pub requests: u64,
+    /// Requests the directory answered 429.
+    pub throttled: u64,
+    pub errors: u64,
+    pub restarts: u64,
+    /// The newest `createdAt` read (unix ms).
+    pub newest_ms: i64,
+    /// The stored checkpoint's windows (written every 10 s).
+    pub windows: Vec<PlcWindow>,
+    pub checkpoint_ms: i64,
+    pub nodes: Vec<PlcNode>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlcWindow {
+    pub from_ms: i64,
+    /// Read up to here.
+    pub after_ms: i64,
+    /// None: the last window, which follows the tail.
+    pub until_ms: Option<i64>,
+    pub ops: u64,
+    pub done: bool,
+    /// 0..1 of the window's time span.
+    pub progress: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlcNode {
+    pub node: String,
+    pub stale: bool,
+    pub leader: bool,
+    pub ops: u64,
+    pub ops_per_sec: f64,
+    pub throttled: u64,
+    pub errors: u64,
+}
+
+/// Stream seq checkpoints (docs/seq.md): every node numbers the merged
+/// stream on its own, so at each boundary they must all agree.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeqView {
+    pub nodes: Vec<SeqNode>,
+    /// The newest boundaries any node knows, newest first.
+    pub boundaries: Vec<SeqBoundary>,
+    /// Every boundary two or more nodes know has one seq.
+    pub agree: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeqNode {
+    pub node: String,
+    pub role: String,
+    pub stale: bool,
+    /// The last seq its stream emitted.
+    pub head: i64,
+    /// Its newest checkpoint.
+    pub latest: Option<SeqPair>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeqPair {
+    pub key: i64,
+    /// The boundary as unix ms (`key >> 8` is unix µs).
+    pub time_ms: i64,
+    pub seq: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeqBoundary {
+    pub key: i64,
+    pub time_ms: i64,
+    /// Node -> the seq it counted at this boundary (absent: it doesn't know it).
+    pub seqs: BTreeMap<String, i64>,
+    pub agree: bool,
+}
+
+/// The ack backlog and restart dedupe: what's been read off upstream
+/// sockets and isn't done yet, per node and per host.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineView {
+    pub nodes: Vec<PipelineNode>,
+    /// Hosts with events in flight or a paused reader, most in flight first.
+    pub hosts: Vec<PipelineHost>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineNode {
+    pub node: String,
+    pub stale: bool,
+    /// Upstream events read but not yet durable, rejected or skipped.
+    pub ack_pending: u64,
+    /// Age of the oldest of them.
+    pub oldest_pending_ms: f64,
+    /// Events queued in front of the lanes.
+    pub lane_queued: u64,
+    /// (host, upstream seq) pairs held for restart dedupe (cluster DID owners).
+    pub dedupe_entries: u64,
+    pub paused_hosts: u32,
+    /// Every relay gauge about in-flight work, queues, backlogs, caps and
+    /// pauses, as `name{label="v"}`, so new ones show up as they land.
+    pub gauges: BTreeMap<String, f64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineHost {
+    pub host: String,
+    pub node: String,
+    pub inflight: u64,
+    /// The host's in-flight cap, once the relay has one.
+    pub inflight_cap: Option<u64>,
+    /// Its reader is paused (over its rate, or the pipeline is full).
+    pub paused: bool,
+    pub status: Option<HostStatus>,
+    pub events_per_sec: f64,
+}
+
 // ---------------------------------------------------------------- source trait
 
 #[derive(Debug, thiserror::Error)]
@@ -636,6 +905,34 @@ pub trait AdminSource: Send + Sync + 'static {
 
     fn consumers(&self) -> impl Future<Output = AdminResult<Vec<Consumer>>> + Send;
     fn kick_consumer(&self, id: u64, by: &str) -> impl Future<Output = AdminResult<()>> + Send;
+    /// A consumer of `node` (ids are per node); None is this node.
+    fn kick_consumer_on(
+        &self,
+        node: Option<&str>,
+        id: u64,
+        by: &str,
+    ) -> impl Future<Output = AdminResult<()>> + Send {
+        let other = node.map(str::to_string);
+        async move {
+            match other {
+                Some(n) => Err(AdminError::NotFound(format!("no node {n}"))),
+                None => self.kick_consumer(id, by).await,
+            }
+        }
+    }
+
+    fn archive_view(&self) -> impl Future<Output = AdminResult<ArchiveView>> + Send {
+        async { Err(AdminError::NotFound("archival isn't available on this relay".into())) }
+    }
+    fn plc_view(&self) -> impl Future<Output = AdminResult<PlcView>> + Send {
+        async { Err(AdminError::NotFound("PLC export seeding isn't available on this relay".into())) }
+    }
+    fn seq_view(&self) -> impl Future<Output = AdminResult<SeqView>> + Send {
+        async { Err(AdminError::NotFound("seq checkpoints aren't available on this relay".into())) }
+    }
+    fn pipeline_view(&self) -> impl Future<Output = AdminResult<PipelineView>> + Send {
+        async { Err(AdminError::NotFound("pipeline numbers aren't available on this relay".into())) }
+    }
 
     fn cluster(&self) -> impl Future<Output = AdminResult<ClusterView>> + Send;
 
@@ -705,6 +1002,10 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
         .route("/admin/api/consumers", get(consumers::<S>))
         .route("/admin/api/consumers/{id}/kick", post(kick::<S>))
         .route("/admin/api/cluster", get(cluster::<S>))
+        .route("/admin/api/ops/archive", get(archive_view::<S>))
+        .route("/admin/api/ops/plc", get(plc_view::<S>))
+        .route("/admin/api/ops/seq", get(seq_view::<S>))
+        .route("/admin/api/ops/pipeline", get(pipeline_view::<S>))
         .route("/admin/api/accounts", get(accounts::<S>))
         .route("/admin/api/accounts/{did}", get(account::<S>))
         .route("/admin/api/accounts/{did}/takedown", post(takedown::<S>))
@@ -833,9 +1134,26 @@ async fn case_detail<S: AdminSource>(
 async fn consumers<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Vec<Consumer>>> {
     Ok(Json(c.src.consumers().await?))
 }
-async fn kick<S: AdminSource>(State(c): Ax<S>, Path(id): Path<u64>) -> AdminResult<StatusCode> {
-    c.src.kick_consumer(id, BY).await?;
+async fn kick<S: AdminSource>(
+    State(c): Ax<S>,
+    Path(id): Path<u64>,
+    Query(q): Query<KickQuery>,
+) -> AdminResult<StatusCode> {
+    let node = q.node.as_deref().filter(|n| !n.is_empty());
+    c.src.kick_consumer_on(node, id, BY).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+async fn archive_view<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<ArchiveView>> {
+    Ok(Json(c.src.archive_view().await?))
+}
+async fn plc_view<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<PlcView>> {
+    Ok(Json(c.src.plc_view().await?))
+}
+async fn seq_view<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<SeqView>> {
+    Ok(Json(c.src.seq_view().await?))
+}
+async fn pipeline_view<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<PipelineView>> {
+    Ok(Json(c.src.pipeline_view().await?))
 }
 async fn cluster<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<ClusterView>> {
     Ok(Json(c.src.cluster().await?))

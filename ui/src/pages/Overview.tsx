@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import { Chart, type Series } from '../components/Chart'
 import { Bar, HOST_STATUSES, Live, REASON_COLOR, REASON_LABEL, StatusPill, Tile, TierPill } from '../components/relay'
-import { ErrorNotice, Loading, Panel } from '../components/ui'
+import { ErrorNotice, Loading, Notice, Panel, Status } from '../components/ui'
 import type { HostStatus, Overview as O, RejectReason } from '../lib/api'
 import { enc } from '../lib/api'
 import { fmtBytes, fmtNum, fmtSi } from '../lib/format'
@@ -65,7 +65,12 @@ export function Overview() {
       <ErrorNotice error={l.error} />
       <div className="tiles hero">
         <Tile big k="Events in per second" v={fmtSi(o.eventsInPerSec)} sub={`${fmtRate(o.bytesInPerSec)} from ${fmtNum(o.hostsConnected)} hosts`} />
-        <Tile big k="Events out per second" v={fmtSi(o.eventsOutPerSec)} sub={`${fmtSi(o.rejectsPerSec)}/s rejected`} />
+        <Tile
+          big
+          k="Events out per second"
+          v={fmtSi(o.eventsOutPerSec)}
+          sub={(o.byNode?.length ?? 0) > 1 ? `all nodes; the stream itself ${fmtSi(o.streamEventsPerSec ?? 0)}/s` : `${fmtSi(o.rejectsPerSec)}/s rejected`}
+        />
         <Tile big k="Consumers" v={fmtNum(o.consumers)} sub={`${fmtRate(o.bytesOutPerSec)} out`} />
         <Tile big k="Time to firehose p50 / p99" v={<>{fmtMs(o.timeToFirehoseP50Ms)}<small>/ {fmtMs(o.timeToFirehoseP99Ms)}</small></>} tone={p99Tone} sub="upstream receive → subscribeRepos" />
       </div>
@@ -85,6 +90,8 @@ export function Overview() {
           sub="spam and abuse thresholds"
         />
       </div>
+
+      {(o.byNode?.length ?? 0) > 1 && <ByNode o={o} />}
 
       <HostStatusBar counts={o.hostsByStatus} total={o.hostsTotal} />
 
@@ -184,6 +191,80 @@ export function Overview() {
         </div>
       </div>
     </>
+  )
+}
+
+/** Each node's share of the totals above, which sum the nodes that answered. */
+function ByNode({ o }: { o: O }) {
+  const rows = o.byNode ?? []
+  const stale = rows.filter((n) => n.stale)
+  return (
+    <Panel
+      flush
+      title="By node"
+      desc="The totals above are the sum of these rows. A node that didn't answer shows dashes and is left out."
+      actions={<Link to="/admin/cluster">Cluster</Link>}
+    >
+      {stale.length > 0 && (
+        <div style={{ padding: '0 14px' }}>
+          <Notice kind="err">
+            {stale.map((n) => `${n.node}: ${n.error ?? 'no answer'}`).join('; ')}
+          </Notice>
+        </div>
+      )}
+      <div className="table-wrap">
+        <table className="data compact">
+          <thead>
+            <tr>
+              <th>Node</th>
+              <th>Role</th>
+              <th className="num">Events in/s</th>
+              <th className="num">Events out/s</th>
+              <th className="num">Bytes in/s</th>
+              <th className="num">Bytes out/s</th>
+              <th className="num">Consumers</th>
+              <th className="num">Hosts</th>
+              <th className="num">Rejects/s</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((n) => {
+              const d = <span className="muted">—</span>
+              return (
+                <tr key={n.node} className={n.stale ? 'stale' : ''}>
+                  <td>
+                    <b>{n.node}</b> {n.stale && <Status kind="bad">stale</Status>}
+                  </td>
+                  <td>{n.role}</td>
+                  <td className="num">{n.stale ? d : fmtSi(n.eventsInPerSec)}</td>
+                  <td className="num">{n.stale ? d : fmtSi(n.eventsOutPerSec)}</td>
+                  <td className="num">{n.stale ? d : fmtRate(n.bytesInPerSec)}</td>
+                  <td className="num">{n.stale ? d : fmtRate(n.bytesOutPerSec)}</td>
+                  <td className="num">{n.stale ? d : fmtNum(n.consumers)}</td>
+                  <td className="num">{n.stale ? d : `${fmtNum(n.hostsConnected)} / ${fmtNum(n.hostsTotal)}`}</td>
+                  <td className="num">{n.stale ? d : fmtSi(n.rejectsPerSec)}</td>
+                </tr>
+              )
+            })}
+          </tbody>
+          <tfoot>
+            <tr>
+              <td>Total</td>
+              <td className="muted">{rows.length - stale.length} of {rows.length} nodes</td>
+              <td className="num">{fmtSi(o.eventsInPerSec)}</td>
+              <td className="num">{fmtSi(o.eventsOutPerSec)}</td>
+              <td className="num">{fmtRate(o.bytesInPerSec)}</td>
+              <td className="num">{fmtRate(o.bytesOutPerSec)}</td>
+              <td className="num">{fmtNum(o.consumers)}</td>
+              <td className="num">
+                {fmtNum(o.hostsConnected)} / {fmtNum(o.hostsTotal)}
+              </td>
+              <td className="num">{fmtSi(o.rejectsPerSec)}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    </Panel>
   )
 }
 
