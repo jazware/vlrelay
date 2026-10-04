@@ -52,7 +52,10 @@ pub struct Snapshot {
 impl Tracker {
     /// A frame read off `host`'s socket (seq 0: one without a seq).
     /// Returns false when this seq is already in the pipeline or done but
-    /// not yet acked: a replay after a reconnect.
+    /// not yet acked: a replay after a reconnect. A seq whose earlier copies
+    /// all failed (fenced, given up, or left behind by a new socket) is a
+    /// first sighting: none of them landed, and a `#sync` that restates the
+    /// head is only appended on a first sighting.
     pub fn begin(&self, host: &Host, seq: i64) -> bool {
         self.begin_at(host, seq, 0, Instant::now())
     }
@@ -67,12 +70,13 @@ impl Tracker {
             m.insert(host.clone(), HostAcks::default());
         }
         let h = m.get_mut(host).expect("inserted above");
-        let first = !h.seqs.contains_key(&seq);
+        let first = h.seqs.get(&seq).is_none_or(|e| e.failed);
         if epoch < h.epoch {
             return first;
         }
         let e = h.seqs.entry(seq).or_default();
         e.pending += 1;
+        e.failed = false;
         e.since.get_or_insert(at);
         first
     }
@@ -215,12 +219,29 @@ mod tests {
         t.connected(&h, 2, Some(3), false);
         assert_eq!(t.finish(&h, 4, 1, None), None, "the old socket's copies no longer count");
         assert_eq!(t.pending_for(&h), 0);
-        assert!(!t.begin_at(&h, 4, 2, at), "4 was seen: a replay");
+        assert!(t.begin_at(&h, 4, 2, at), "4's only copy was left behind: nothing of it landed");
         assert_eq!(t.finish(&h, 4, 2, None), Some(4));
         t.begin_at(&h, 5, 2, at);
         t.begin_at(&h, 6, 2, at);
         assert_eq!(t.finish(&h, 6, 2, None), None);
         assert_eq!(t.finish(&h, 5, 2, None), Some(6));
+    }
+
+    /// minio-errors: a fenced copy of a `#sync` restating the head made its
+    /// replay a non-first sighting, so the DID owner dropped it as a
+    /// duplicate of a copy that never landed.
+    #[test]
+    fn a_failed_copy_leaves_the_replay_a_first_sighting() {
+        let t = Tracker::default();
+        let h = Host("pds".into());
+        assert!(t.begin(&h, 7));
+        assert!(!t.begin(&h, 7), "a copy in flight may land");
+        t.fail(&h, 7, 0);
+        t.fail(&h, 7, 0);
+        assert!(t.begin(&h, 7));
+        assert!(!t.begin(&h, 7), "the replayed copy is in flight");
+        assert_eq!(t.finish(&h, 7, 0, None), None);
+        assert_eq!(t.finish(&h, 7, 0, None), Some(7));
     }
 
     /// After FutureCursor the old sequence's acks must not push the new
