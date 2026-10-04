@@ -1210,7 +1210,17 @@ impl ShardHost for ClusterNode {
     }
 
     async fn close_many(&self, shards: Vec<ShardId>) -> Vec<(ShardId, anyhow::Result<()>)> {
-        self.gate.close(&shards).await;
+        // This runs inside vlpds's step, which holds its step lock: a batch
+        // that never finishes (its log's segment PUTs retry without end)
+        // would wedge every later step, renewals of shards and leaves
+        // included. Past the lapse window the watchdog would fail-stop us
+        // anyway; this does it while we still say why.
+        let bound = self.opts.ttl + self.opts.skew * 2;
+        if tokio::time::timeout(bound, self.gate.close(&shards)).await.is_err() {
+            let why = format!("closing DID shards {shards:?}: batches still in flight after {bound:?}");
+            self.lost_now(&why);
+            return shards.into_iter().map(|s| (s, Err(anyhow::anyhow!("{why}")))).collect();
+        }
         if let Some(log) = &self.log
             && let Err(e) = log.append(Vec::new()).await
         {

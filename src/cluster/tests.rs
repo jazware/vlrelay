@@ -793,6 +793,42 @@ async fn a_held_did_keeps_its_shard_open() {
     assert!(n.node.hold_did(&d).is_none(), "closed: nothing to hold");
 }
 
+struct Hang;
+
+#[async_trait::async_trait]
+impl DidStage for Hang {
+    async fn apply(&self, _batch: Vec<Forwarded>) -> Vec<StageResult> {
+        std::future::pending().await
+    }
+}
+
+/// A shard close waits for its in-flight batches inside vlpds's step,
+/// under its step lock. A batch that never finishes (segment PUTs that
+/// retry forever) fail-stops the node after the lapse window instead of
+/// wedging every later step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_stuck_on_an_endless_batch_fail_stops() {
+    let (store, ca, applied) = (Store::memory(None), Ca::new(), Arc::new(Applied::default()));
+    let a = spawn(&store, &ca, "node-a", Role::Core, &applied).await;
+    let total = a.node.layout().unwrap().shards.len();
+    let ac = a.node.cluster.clone().unwrap();
+    eventually("a holds every shard", Duration::from_secs(10), || ac.owned().len() == total).await;
+    let lost = Arc::new(AtomicBool::new(false));
+    let l = lost.clone();
+    a.node.on_lost(Box::new(move |_| l.store(true, Ordering::SeqCst)));
+    a.node.set_stage(Arc::new(Hang));
+    let n = a.node.clone();
+    tokio::spawn(async move { n.forward(fwd(1, 1)).await });
+    eventually("a batch in flight", Duration::from_secs(5), || !a.node.gate.inflight.lock().is_empty()).await;
+    let shard = a.node.did_shard(&did(1)).unwrap();
+    let t0 = Instant::now();
+    let rs = ShardHost::close_many(&*a.node, vec![shard]).await;
+    assert!(rs.iter().all(|(_, r)| r.is_err()), "the close fails");
+    assert!(lost.load(Ordering::SeqCst), "and the node fail-stops");
+    assert!(t0.elapsed() < Duration::from_secs(5), "within the lapse window: {:?}", t0.elapsed());
+    a.node.halt();
+}
+
 /// An edge's certificate and the shared token get it streams and hellos
 /// only. Forwards, nudges, key invalidations and fences of a live core's
 /// log want a leased core, and a fence of one's own log is always allowed.
