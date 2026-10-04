@@ -41,7 +41,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Serve hosts (and optionally the fake PLC) and stream events.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Subscribe to hosts, count events/s and optionally check every frame.
     Consume(ConsumeArgs),
     /// Generate every event and fault kind, check them with vlpds's code,
@@ -194,7 +194,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     match cli.cmd {
-        Cmd::Run(a) => rt.block_on(run(a)),
+        Cmd::Run(a) => rt.block_on(run(*a)),
         Cmd::Consume(a) => rt.block_on(consume(a)),
         Cmd::Selftest => rt.block_on(selftest(SelftestOpts::default())),
     }
@@ -465,25 +465,24 @@ async fn consume(a: ConsumeArgs) -> anyhow::Result<()> {
                 bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
                 let _ = local.record(b.len() as u64);
                 n += 1;
-                if n % 4096 == 0 {
+                if n.is_multiple_of(4096) {
                     let _ = hist.lock().add(&local);
                     local.reset();
                 }
-                if let Ok((_, n)) = vlpds::cbor::ValueRef::decode_prefix(&b) {
-                    if let Ok(body) = vlpds::cbor::ValueRef::decode(&b[n..]) {
-                        if let Some(vlpds::cbor::ValueRef::Int(s)) = body.get("seq") {
-                            if *s <= last {
-                                regress.fetch_add(1, Ordering::Relaxed);
-                            }
-                            last = last.max(*s);
+                if let Ok((_, n)) = vlpds::cbor::ValueRef::decode_prefix(&b)
+                    && let Ok(body) = vlpds::cbor::ValueRef::decode(&b[n..])
+                {
+                    if let Some(vlpds::cbor::ValueRef::Int(s)) = body.get("seq") {
+                        if *s <= last {
+                            regress.fetch_add(1, Ordering::Relaxed);
                         }
-                        if !senders.is_empty() {
-                            let did =
-                                body.get("repo").or_else(|| body.get("did")).and_then(|v| v.as_str()).unwrap_or("");
-                            let shard = did.bytes().fold(0usize, |h, c| h.wrapping_mul(31).wrapping_add(c as usize))
-                                % senders.len();
-                            let _ = senders[shard].send((g, b));
-                        }
+                        last = last.max(*s);
+                    }
+                    if !senders.is_empty() {
+                        let did = body.get("repo").or_else(|| body.get("did")).and_then(|v| v.as_str()).unwrap_or("");
+                        let shard = did.bytes().fold(0usize, |h, c| h.wrapping_mul(31).wrapping_add(c as usize))
+                            % senders.len();
+                        let _ = senders[shard].send((g, b));
                     }
                 }
             }
@@ -512,7 +511,7 @@ async fn consume(a: ConsumeArgs) -> anyhow::Result<()> {
         "events": e,
         "events_per_s": (e as f64 / secs).round(),
         "mb_per_s": (b as f64 / secs / 1e6 * 10.0).round() / 10.0,
-        "mean_bytes": if e > 0 { b / e } else { 0 },
+        "mean_bytes": b.checked_div(e).unwrap_or(0),
         "seq_regressions": regress.load(Ordering::Relaxed),
     });
     {

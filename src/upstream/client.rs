@@ -419,6 +419,8 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
 }
 
 #[cfg(test)]
+// tungstenite fixes the handshake callback's error type (a full HTTP response).
+#[allow(clippy::result_large_err)]
 pub(crate) mod tests {
     use super::*;
 
@@ -465,7 +467,7 @@ pub(crate) mod tests {
         cfg.endpoint = Arc::new(|h: &Host| format!("http://{}", h.0));
 
         let relay = ws_server(Some("indigo-relay/v0.0.0 (atproto-relay)")).await;
-        let err = connect(&cfg, &relay, None).await.err().expect("a relay upstream is refused");
+        let err = connect(&cfg, &relay, None).await.expect_err("a relay upstream is refused");
         assert!(err.to_string().contains("it's a relay"), "{err}");
 
         let pds = ws_server(Some("vlpds/1.0")).await;

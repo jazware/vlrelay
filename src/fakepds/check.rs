@@ -129,10 +129,10 @@ impl Checker {
             return Err((Fail::Signature, did));
         }
         let prev = self.heads.get(&did).cloned();
-        if let Some((prev_rev, _)) = &prev {
-            if rev <= *prev_rev {
-                return Err((Fail::RevOrder, format!("{rev} after {prev_rev}")));
-            }
+        if let Some((prev_rev, _)) = &prev
+            && rev <= *prev_rev
+        {
+            return Err((Fail::RevOrder, format!("{rev} after {prev_rev}")));
         }
         if kind == "sync" {
             self.heads.insert(did.clone(), (rev, data));
@@ -197,10 +197,10 @@ impl Checker {
             return Err((Fail::Inversion, format!("inverted to {inverted}, prevData {prev_data:?}")));
         }
         self.heads.insert(did.clone(), (rev.clone(), data));
-        if let Some((prev_rev, prev_d)) = prev {
-            if s("since").as_deref() != Some(prev_rev.as_str()) || prev_data != Some(prev_d) {
-                return Err((Fail::Chain, format!("since {:?} / prevData don't follow {prev_rev}", s("since"))));
-            }
+        if let Some((prev_rev, prev_d)) = prev
+            && (s("since").as_deref() != Some(prev_rev.as_str()) || prev_data != Some(prev_d))
+        {
+            return Err((Fail::Chain, format!("since {:?} / prevData don't follow {prev_rev}", s("since"))));
         }
         Ok(Checked { kind, did, ops: parsed.len() })
     }

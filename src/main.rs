@@ -451,6 +451,13 @@ fn default_did_shards(role: Option<vlrelay::cluster::Role>) -> u32 {
     }
 }
 
+fn with_real_ip(app: axum::Router, trusted: &[vlrelay::serve::Cidr]) -> axum::Router {
+    if trusted.is_empty() {
+        return app;
+    }
+    app.layer(middleware::from_fn_with_state(Arc::new(trusted.to_vec()), vlrelay::serve::real_ip))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,11 +479,4 @@ mod tests {
         }
         assert_eq!(default_did_shards(None), 4);
     }
-}
-
-fn with_real_ip(app: axum::Router, trusted: &[vlrelay::serve::Cidr]) -> axum::Router {
-    if trusted.is_empty() {
-        return app;
-    }
-    app.layer(middleware::from_fn_with_state(Arc::new(trusted.to_vec()), vlrelay::serve::real_ip))
 }

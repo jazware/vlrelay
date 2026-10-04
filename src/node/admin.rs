@@ -487,7 +487,7 @@ impl NodeAdmin {
             })
             .collect();
         let paused_hosts = hosts.iter().filter(|h| h.paused).count() as u32;
-        hosts.sort_by(|a, b| b.inflight.cmp(&a.inflight));
+        hosts.sort_by_key(|h| std::cmp::Reverse(h.inflight));
         hosts.truncate(100);
         let node = admin::PipelineNode {
             node: self.id().to_string(),

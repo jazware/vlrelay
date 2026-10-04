@@ -217,34 +217,34 @@ pub fn run_emitter(
         let now = vlpds::events::now_rfc3339();
         for e in es.iter_mut() {
             let f = &e.host.faults;
-            if let (Some((secs, every)), Some(t)) = (f.stall, e.next_stall) {
-                if now_i >= t {
-                    e.host.stalled.store(true, Ordering::Relaxed);
-                    e.stall_end = Some(now_i + Duration::from_secs_f64(secs));
-                    e.next_stall = Some(t + Duration::from_secs_f64(every));
-                }
+            if let (Some((secs, every)), Some(t)) = (f.stall, e.next_stall)
+                && now_i >= t
+            {
+                e.host.stalled.store(true, Ordering::Relaxed);
+                e.stall_end = Some(now_i + Duration::from_secs_f64(secs));
+                e.next_stall = Some(t + Duration::from_secs_f64(every));
             }
             if e.stall_end.is_some_and(|t| now_i >= t) {
                 e.host.stalled.store(false, Ordering::Relaxed);
                 e.stall_end = None;
             }
-            if let (Some((every, down)), Some(t)) = (f.disconnect, e.next_disconnect) {
-                if now_i >= t {
-                    e.host.disconnect_all(Duration::from_secs_f64(down));
-                    e.next_disconnect = Some(t + Duration::from_secs_f64(every));
-                }
+            if let (Some((every, down)), Some(t)) = (f.disconnect, e.next_disconnect)
+                && now_i >= t
+            {
+                e.host.disconnect_all(Duration::from_secs_f64(down));
+                e.next_disconnect = Some(t + Duration::from_secs_f64(every));
             }
-            if let (Some((every, n)), Some(t)) = (f.replay, e.next_replay) {
-                if now_i >= t {
-                    e.host.replay(n);
-                    e.next_replay = Some(t + Duration::from_secs_f64(every));
-                }
+            if let (Some((every, n)), Some(t)) = (f.replay, e.next_replay)
+                && now_i >= t
+            {
+                e.host.replay(n);
+                e.next_replay = Some(t + Duration::from_secs_f64(every));
             }
-            if let (Some(every), Some(t)) = (f.restart, e.next_restart) {
-                if now_i >= t {
-                    e.host.restart();
-                    e.next_restart = Some(t + Duration::from_secs_f64(every));
-                }
+            if let (Some(every), Some(t)) = (f.restart, e.next_restart)
+                && now_i >= t
+            {
+                e.host.restart();
+                e.next_restart = Some(t + Duration::from_secs_f64(every));
             }
             // Ornstein-Uhlenbeck on log(rate multiplier)
             e.log_m += -theta * e.log_m * dt + shape.sigma * (2.0 * theta * dt).sqrt() * normal(&mut rng);
@@ -304,6 +304,8 @@ async fn describe(State(h): State<Arc<HostState>>) -> Json<serde_json::Value> {
     }))
 }
 
+// The error is the handler's reply, returned as-is.
+#[allow(clippy::result_large_err)]
 fn own_did(h: &HostState, q: &HashMap<String, String>) -> Result<(String, u32), Response> {
     let did = q.get("did").cloned().unwrap_or_default();
     match h.layout.parse_did(&did) {
@@ -427,10 +429,10 @@ async fn stream(h: Arc<HostState>, mut sock: WebSocket, cursor: Option<i64>) {
         let _ = sock.send(Message::Close(None)).await;
         return;
     };
-    if let Some(i) = info {
-        if sock.send(Message::Binary(i)).await.is_err() {
-            return;
-        }
+    if let Some(i) = info
+        && sock.send(Message::Binary(i)).await.is_err()
+    {
+        return;
     }
     for chunk in backlog.chunks(256) {
         for f in chunk {

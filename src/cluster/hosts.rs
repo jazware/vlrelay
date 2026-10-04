@@ -91,6 +91,9 @@ pub trait HostHandler: Send + Sync + 'static {
     fn acked(&self) -> Vec<(Host, i64)>;
 }
 
+/// A shard's last written cursors, with the assignment epoch they were written at.
+type Written = (u64, BTreeMap<String, i64>);
+
 /// Upstream cursors in the bucket, one object per host shard. Only a
 /// shard's owner writes it, but a zombie owner may still be writing, so
 /// every write is a CAS that carries the writer's host assignment epoch:
@@ -114,7 +117,7 @@ pub struct Checkpoints {
     /// starts a new generation with the cursor it carries.
     resets: Mutex<HashSet<Host>>,
     /// What we last wrote per shard, and at which assignment epoch.
-    written: Mutex<HashMap<ShardId, (u64, BTreeMap<String, i64>)>>,
+    written: Mutex<HashMap<ShardId, Written>>,
     /// The upstream registry, whose acked cursors a shard's take replaces.
     pub(crate) registry: std::sync::OnceLock<Arc<crate::upstream::Registry>>,
     /// Hosts taken before their registry entry existed (a shard taken while
