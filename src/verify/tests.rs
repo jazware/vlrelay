@@ -63,6 +63,8 @@ fn synthetic_histories_verify_and_chain() {
                 let v = verify_commit(&c, &key)
                     .unwrap_or_else(|e| panic!("{curve:?} initial={initial} round={round}: {e}"));
                 assert_eq!(v.prev_data, c.prev_data);
+                // synth commits carry no `since`: only an empty repo's first is a creation
+                assert_eq!(v.created, initial == 0 && round == 0, "initial={initial} round={round}");
                 state = Some(check_chain(state.as_ref(), &v).expect("chain"));
                 assert_eq!(check_chain(state.as_ref(), &v), Err(ChainError::Duplicate));
             }
@@ -381,6 +383,7 @@ fn chain_rules() {
         commit,
         data,
         prev_data,
+        created: false,
     };
     use VerifiedKind::*;
 

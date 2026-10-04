@@ -59,6 +59,7 @@ fn claim(did: &str, n: u64) -> CommitClaim {
         commit: c("c"),
         data: c("d"),
         prev_data: (n > 0).then(|| Cid::dag_cbor(format!("{did}d{}", n - 1).as_bytes())),
+        since: (n > 0).then(|| Tid::from_parts(1_760_000_000_000_000 + (n - 1) * 1000, 0)),
     }
 }
 

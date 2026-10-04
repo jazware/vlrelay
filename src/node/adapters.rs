@@ -3,7 +3,7 @@
 //! store's host records behind the upstream registry, and the node log
 //! behind the state store's replay.
 
-use crate::identity::{IdentityCache, LookupError};
+use crate::identity::{Fetch, HttpFetch, IdentityCache, LookupError};
 use crate::seq::{self, Logged};
 use crate::state::{self, Chain, HostStore as _, IdentityError, IdentitySource, ReplaySource, StateDelta, StateStore};
 use crate::types::Host;
@@ -25,6 +25,10 @@ impl Chain for VerifyChain {
         state::ChainState { rev: v.rev, commit: v.commit, data: v.data }
     }
 
+    fn created(&self, v: &Self::Verified) -> bool {
+        v.created
+    }
+
     fn check_chain(
         &self,
         prev: Option<&state::ChainState>,
@@ -44,13 +48,12 @@ impl Chain for VerifyChain {
 }
 
 /// The DID document cache as the state store's [`IdentitySource`].
-pub struct CacheIdentity(pub Arc<IdentityCache>);
+pub struct CacheIdentity<F: Fetch = HttpFetch>(pub Arc<IdentityCache<F>>);
 
 #[async_trait::async_trait]
-impl IdentitySource for CacheIdentity {
+impl<F: Fetch> IdentitySource for CacheIdentity<F> {
     async fn resolve(&self, did: &str, fresh: bool) -> Result<Option<state::Identity>, IdentityError> {
-        let r = if fresh { self.0.refresh(did).await } else { self.0.resolve(did).await };
-        match r {
+        match self.0.lookup_paced(did, fresh).await {
             Ok(id) => Ok(Some(state::Identity {
                 pds: id.pds_host.clone(),
                 signing_key: id.signing_key_multibase.as_deref().and_then(multikey_bytes).map(state::SigningKey),

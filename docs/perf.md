@@ -186,7 +186,7 @@ Changes:
   - the committer and the sequencer read the clock once per batch.
 - On a cache miss, the host stage seeds the DID document cache from the DID's state record. That needs this node to hold the record, and the key there to have been resolved within the cache's TTL. A key that then fails a signature is refreshed as before. The seeded entry has no handle, so the admin views show none for it until the next `#identity` or refresh. In the restart e2e, after the kill -9, all but ~5 of ~2,370 identity stages finished under 0.5 ms, so the restarted node wasn't going back to PLC for every DID.
 
-The bench needed a change too. The policy wiring's account gate allows 6,000 new accounts a minute across the cluster, and every one of the fleet's 100k DIDs is a new account to a fresh relay. So the first post-rebase runs deferred almost everything. `perf.sh` now starts the relay with `--admin-token perf` and lifts the new-account budgets, caps and the PLC lookup budget through `PUT /admin/api/policy/full` before the warmup.
+The bench needed a change too. The policy wiring's account gate allows 6,000 new accounts a minute across the cluster, and every one of the fleet's 100k DIDs is a new account to a fresh relay. So the first post-rebase runs deferred almost everything. `perf.sh` now starts the relay with `--admin-token perf` and lifts the new-account budgets, caps and the PLC lookup budget through `PUT /admin/api/policy/full` before the warmup. Since then the gate only rate-limits newly created repos (docs/policy.md), and the fleet's accounts are established, so `perf.sh` lifts only the PLC budget.
 
 100k offered, MinIO with O_DIRECT off, against iteration 3:
 

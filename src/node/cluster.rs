@@ -457,7 +457,8 @@ fn static_reason(r: &str) -> &'static str {
 /// the first copy the host owner saw.
 ///
 /// kind u8 | first u8 | span u32 u32 | commit/sync: vkind u8, rev u64,
-/// commit cid, data cid, prev_data (u8 flag + cid) | account: active u8,
+/// commit cid, data cid, prev_data (u8 flags: 1 = a cid follows, 2 = the
+/// repo's first commit; + cid) | account: active u8,
 /// status (u16 len + bytes, 0xffff = none)
 fn encode_meta(c: &Checked) -> Bytes {
     let mut b = Vec::with_capacity(120);
@@ -481,12 +482,13 @@ fn encode_meta(c: &Checked) -> Bytes {
             b.put_u64(v.rev.0);
             cid(&mut b, &v.commit);
             cid(&mut b, &v.data);
+            let created = (v.created as u8) << 1;
             match &v.prev_data {
                 Some(p) => {
-                    b.put_u8(1);
+                    b.put_u8(1 | created);
                     cid(&mut b, p);
                 }
-                None => b.put_u8(0),
+                None => b.put_u8(created),
             }
         }
         CheckedKind::Identity => {}
@@ -531,8 +533,10 @@ fn decode_meta(did: &str, mut r: Bytes) -> anyhow::Result<Meta> {
             let commit = cid(&mut r)?;
             let data = cid(&mut r)?;
             anyhow::ensure!(r.remaining() >= 1, "short verified");
-            let prev_data = if r.get_u8() == 1 { Some(cid(&mut r)?) } else { None };
-            let v = Verified { kind: vkind, did: did.to_string(), rev, commit, data, prev_data };
+            let flags = r.get_u8();
+            let prev_data = if flags & 1 != 0 { Some(cid(&mut r)?) } else { None };
+            let created = flags & 2 != 0;
+            let v = Verified { kind: vkind, did: did.to_string(), rev, commit, data, prev_data, created };
             if tag == 0 { CheckedKind::Commit(v) } else { CheckedKind::Sync(v) }
         }
         2 => CheckedKind::Identity,
@@ -1260,6 +1264,7 @@ mod tests {
             commit: cid(1),
             data: cid(2),
             prev_data: Some(cid(3)),
+            created: false,
         };
         let mk = |kind| Checked {
             did: "did:plc:x".into(),
@@ -1273,6 +1278,7 @@ mod tests {
         };
         for kind in [
             CheckedKind::Commit(v.clone()),
+            CheckedKind::Commit(Verified { prev_data: None, created: true, ..v.clone() }),
             CheckedKind::Sync(Verified { kind: VerifiedKind::Sync, prev_data: None, ..v.clone() }),
             CheckedKind::Identity,
             CheckedKind::Account { active: false, status: Some("deactivated".into()) },

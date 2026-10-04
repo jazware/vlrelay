@@ -9,8 +9,12 @@
 //!   or the domain rules change version, and every [`RESYNC_EVERY`] for
 //!   writes this node didn't make.
 //! - requestCrawl goes through `Engine::admit_host` ([`Admission`]).
-//! - New accounts go through [`AccountGate`]: the host's account cap, its
-//!   new-accounts-per-hour limit and the cluster's new-account budget.
+//! - Accounts this node hasn't seen go through [`AccountGate`]. Every one
+//!   counts toward its host's account cap. Only newly created ones (a
+//!   repo's first commit) spend the host's new-accounts-per-hour limit and
+//!   the cluster's new-account budget, and only they are new-account
+//!   signals: to a relay starting cold, every established account is
+//!   unknown, not new.
 //! - DID document fetches spend the cluster's PLC budget.
 //! - Rejects, commits, identity events and new accounts become spam signals.
 //! - The driver (tier steps, trips, cases) runs here.
@@ -19,7 +23,7 @@ use super::State;
 use crate::policy::admin::PolicyAdmin;
 use crate::policy::driver::Driver;
 use crate::policy::{self, Admit, AdmitRequest, BudgetKind, Engine, HostLimits, RejectHost, Signal, SignalKind};
-use crate::state::{self, HostCounts, HostKey, HostPage, HostRecord, HostStore, HostUpdate, NewAccount};
+use crate::state::{self, Arrival, HostCounts, HostKey, HostPage, HostRecord, HostStore, HostUpdate, NewAccount};
 use crate::types::Host;
 use crate::upstream::{self, Admission, CrawlError, HostPolicy, Manager, PolicySource};
 use parking_lot::Mutex;
@@ -31,6 +35,13 @@ use tokio::sync::mpsc;
 /// Catches host records written elsewhere (a peer, the counter flush) and
 /// time-based limits.
 pub const RESYNC_EVERY: Duration = Duration::from_secs(30);
+
+/// Newly created accounts whose event was deferred, so their later events
+/// (which no longer look like a creation) still wait for the rate budget.
+/// Bounded: past it a deferred account's next event is only first-seen,
+/// and its host's account cap still holds.
+const DEFERRED_MAX: usize = 100_000;
+const DEFERRED_FOR: Duration = Duration::from_secs(3_600);
 
 /// The engine as a `NodeConfig` field.
 #[derive(Clone)]
@@ -85,6 +96,7 @@ pub struct PolicyHooks {
     pub driver: Arc<Driver>,
     state: Arc<State>,
     cache: Mutex<HashMap<String, HostState>>,
+    deferred: Mutex<HashMap<String, Instant>>,
     changed: mpsc::UnboundedSender<String>,
     changed_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
     manager: OnceLock<Weak<Manager>>,
@@ -203,6 +215,7 @@ impl PolicyHooks {
             hosts,
             state,
             cache: Mutex::new(HashMap::new()),
+            deferred: Mutex::new(HashMap::new()),
             changed: tx,
             changed_rx: Mutex::new(Some(rx)),
             manager: OnceLock::new(),
@@ -399,39 +412,75 @@ impl PolicySource for PolicyHooks {
 }
 
 /// Past the host's account cap an account is created throttled, as indigo
-/// does. Past a rate (the host's new accounts per hour, the cluster's per
-/// minute) its event is dropped and nothing is created, so a burst of
-/// real accounts on a fresh relay isn't throttled for good.
+/// does. A newly created account past a rate (the host's new accounts per
+/// hour, the cluster's per minute) has its event dropped and is remembered,
+/// so its next event asks again; nothing about it is throttled for good.
+/// Established accounts seen for the first time only meet the cap.
 impl state::AccountGate for PolicyHooks {
-    fn admit_account(&self, host: &str, did: &str) -> NewAccount {
+    fn admit_account(&self, host: &str, did: &str, how: Arrival) -> NewAccount {
+        let now = Instant::now();
+        let was_deferred = {
+            let mut d = self.deferred.lock();
+            match d.get(did) {
+                Some(at) if now.duration_since(*at) < DEFERRED_FOR => true,
+                Some(_) => {
+                    d.remove(did);
+                    false
+                }
+                None => false,
+            }
+        };
+        let (counts, created) = match how {
+            Arrival::FirstSeen => (true, false),
+            Arrival::Created => (true, true),
+            Arrival::FirstCommit { created } => (false, created),
+        };
+        let rated = created || was_deferred;
+        if !counts && !rated {
+            return NewAccount::Admit;
+        }
         let mut c = self.cache.lock();
         let verdict = 'v: {
             if let Some(st) = c.get_mut(host)
                 && let Some(l) = &st.limits.limits
             {
-                if l.max_accounts > 0 && st.accounts >= l.max_accounts as i64 {
+                if counts && l.max_accounts > 0 && st.accounts >= l.max_accounts as i64 {
                     super::metrics::ACCOUNTS_THROTTLED.with_label_values(&["host_cap"]).inc();
                     break 'v NewAccount::Throttle;
                 }
-                if l.new_accounts_per_hour > 0
-                    && !st.new_accounts.try_take(l.new_accounts_per_hour as f64, Instant::now())
+                if rated
+                    && l.new_accounts_per_hour > 0
+                    && !st.new_accounts.try_take(l.new_accounts_per_hour as f64, now)
                 {
                     super::metrics::ACCOUNTS_DEFERRED.with_label_values(&["host_rate"]).inc();
                     break 'v NewAccount::Defer;
                 }
             }
-            if !self.engine.try_take(BudgetKind::NewAccountsPerMin, 1.0) {
+            if rated && !self.engine.try_take(BudgetKind::NewAccountsPerMin, 1.0) {
                 super::metrics::ACCOUNTS_DEFERRED.with_label_values(&["cluster_budget"]).inc();
                 break 'v NewAccount::Defer;
             }
-            if let Some(st) = c.get_mut(host) {
+            if counts && let Some(st) = c.get_mut(host) {
                 st.accounts += 1;
                 st.admitted_since_sync += 1;
             }
             NewAccount::Admit
         };
         drop(c);
-        if verdict != NewAccount::Defer {
+        if verdict == NewAccount::Defer {
+            let mut d = self.deferred.lock();
+            if d.len() >= DEFERRED_MAX {
+                d.retain(|_, at| now.duration_since(*at) < DEFERRED_FOR);
+            }
+            if d.len() < DEFERRED_MAX || d.contains_key(did) {
+                d.insert(did.to_string(), now);
+            }
+        } else if was_deferred {
+            self.deferred.lock().remove(did);
+        }
+        // once per creation, deferred or not, so a farm trips its threshold
+        // at the rate it creates accounts, not the rate they're let in
+        if created && !was_deferred {
             self.engine.record_signal(Signal::new(SignalKind::NewAccount, host, Some(did)));
         }
         verdict
@@ -535,16 +584,33 @@ mod tests {
         add_host(&state, "capped.example", Tier::Default).await;
         add_host(&state, "young.example", Tier::New).await;
         hooks.load().await.unwrap();
-        let admit = |h: &str, i: u32| hooks.admit_account(h, &format!("did:plc:{h}{i}"));
+        let did = |h: &str, i: u32| format!("did:plc:{h}{i}");
+        let admit = |h: &str, i: u32| hooks.admit_account(h, &did(h, i), Arrival::Created);
         use NewAccount::*;
         assert_eq!([admit("capped.example", 1), admit("capped.example", 2), admit("capped.example", 3)], [
             Admit, Admit, Throttle
         ]);
         assert_eq!([admit("young.example", 1), admit("young.example", 2)], [Admit, Defer]);
-        // admitted and throttled accounts are new-account signals, deferred ones not yet
+        // every creation is a new-account signal once, whatever the verdict
         let now = policy::store::now_ms();
         assert_eq!(hooks.engine.signals.snapshot("capped.example", None, now).get("new-accounts"), Some(&3.0));
-        assert_eq!(hooks.engine.signals.snapshot("young.example", None, now).get("new-accounts"), Some(&1.0));
+        assert_eq!(hooks.engine.signals.snapshot("young.example", None, now).get("new-accounts"), Some(&2.0));
+        // a deferred creation's later events, which don't look like one, still wait
+        let young2 = did("young.example", 2);
+        assert_eq!(hooks.admit_account("young.example", &young2, Arrival::FirstSeen), Defer);
+        assert_eq!(hooks.admit_account("young.example", &young2, Arrival::FirstCommit { created: false }), Defer);
+        assert_eq!(hooks.engine.signals.snapshot("young.example", None, now).get("new-accounts"), Some(&2.0));
+        // established accounts seen for the first time skip the rate (spent
+        // here) and aren't signals, but meet the cap
+        let seen = |i: u32| hooks.admit_account("young.example", &format!("did:plc:seen{i}"), Arrival::FirstSeen);
+        assert_eq!((0..99).filter(|i| seen(*i) == Admit).count(), 99);
+        assert_eq!(seen(99), Throttle);
+        assert_eq!(hooks.accounts("young.example"), Some(100));
+        assert_eq!(hooks.engine.signals.snapshot("young.example", None, now).get("new-accounts"), Some(&2.0));
+        // a known account's first commit counts nothing unless it's a creation
+        assert_eq!(hooks.admit_account("young.example", "did:plc:known", Arrival::FirstCommit { created: false }), Admit);
+        assert_eq!(hooks.admit_account("young.example", "did:plc:known", Arrival::FirstCommit { created: true }), Defer);
+        assert_eq!(hooks.accounts("young.example"), Some(100));
         // an hourly limit holds an hour's allowance, not one second's
         edit_policy(&hooks, |p| p.tiers.default.new_accounts_per_hour = 50).await;
         add_host(&state, "busy.example", Tier::Default).await;
@@ -559,6 +625,174 @@ mod tests {
         hooks.refresh_host("open.example").await.unwrap();
         assert_eq!(admit("open.example", 1), Admit);
         assert_eq!(admit("open.example", 2), Defer);
+    }
+
+    #[tokio::test]
+    async fn a_farm_of_new_repos_trips_the_rate_and_a_case_where_old_accounts_dont() {
+        let (hooks, state) = setup().await;
+        edit_policy(&hooks, |p| {
+            p.tiers.default.max_accounts = 10_000;
+            p.tiers.default.new_accounts_per_hour = 100;
+            p.spam.host_new_accounts.limit = 120.0;
+            p.spam.host_new_accounts.action = policy::SpamAction::ThrottleAndCase;
+        })
+        .await;
+        add_host(&state, "farm.example", Tier::Default).await;
+        add_host(&state, "old.example", Tier::Default).await;
+        hooks.load().await.unwrap();
+        let run = |h: &str, how: Arrival| {
+            (0..1_000).map(|i| hooks.admit_account(h, &format!("did:plc:{h}{i}"), how)).collect::<Vec<_>>()
+        };
+        let farm = run("farm.example", Arrival::Created);
+        let old = run("old.example", Arrival::FirstSeen);
+        let count = |v: &[NewAccount], x| v.iter().filter(|a| **a == x).count();
+        // an hour's allowance, then the rest wait
+        assert_eq!((count(&farm, NewAccount::Admit), count(&farm, NewAccount::Defer)), (100, 900));
+        assert_eq!(count(&old, NewAccount::Admit), 1_000);
+        let r = hooks.driver.process_trips().await.unwrap();
+        assert_eq!(r.moved.len(), 1, "{r:?}");
+        assert_eq!(r.cases.len(), 1, "{r:?}");
+        hooks.refresh_host("farm.example").await.unwrap();
+        hooks.refresh_host("old.example").await.unwrap();
+        assert_eq!(hp(&hooks, "farm.example").tier, upstream::Tier::Throttled);
+        assert_eq!(hp(&hooks, "old.example").tier, upstream::Tier::Default);
+        let now = policy::store::now_ms();
+        assert_eq!(hooks.engine.signals.snapshot("old.example", None, now).get("new-accounts"), None);
+    }
+
+    /// A DID document service that answers for any DID, with one key.
+    struct AnyDid {
+        key: String,
+        pds: String,
+        fetches: std::sync::atomic::AtomicU64,
+    }
+
+    impl crate::identity::Fetch for Arc<AnyDid> {
+        async fn fetch(&self, did: &str) -> Result<serde_json::Value, crate::identity::LookupError> {
+            self.fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(serde_json::json!({
+                "id": did,
+                "alsoKnownAs": [],
+                "verificationMethod": [{"id": format!("{did}#atproto"), "type": "Multikey", "controller": did, "publicKeyMultibase": self.key}],
+                "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": self.pds}],
+            }))
+        }
+    }
+
+    /// A relay with an empty state store meets 50k established accounts
+    /// through one trusted host: the host stage's lookup, signature and MST
+    /// checks, then the DID owner's step with the gate. Every event lands;
+    /// the PLC budget paces them and nothing is deferred.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_cold_start_paces_established_accounts_without_dropping_any() {
+        use crate::identity::{IdentityCache, Options};
+        use crate::verify::synth::{Curve, Repo, Signer};
+        use std::sync::atomic::Ordering::Relaxed;
+        const DIDS: usize = 50_000;
+        const PLC_PER_SEC: f64 = 10_000.0;
+        let host = "pds.cold.example";
+        let fetch = Arc::new(AnyDid {
+            key: Signer::new(Curve::K256, 7).multibase(),
+            pds: format!("https://{host}"),
+            fetches: Default::default(),
+        });
+        let identity = Arc::new(IdentityCache::new(fetch.clone(), Options {
+            lookups_per_sec: 1e9,
+            burst: 1e9,
+            // short, so lookups over the cluster budget take the paced retry
+            max_budget_wait: Duration::from_millis(20),
+            ..Options::default()
+        }));
+        let store = Store::memory(None);
+        let layout = vlpds::slots::Layout::uniform(4).shards;
+        let state = Arc::new(StateStore::new(
+            store.clone(),
+            layout.clone(),
+            VerifyChain,
+            Arc::new(crate::node::adapters::CacheIdentity(identity.clone())),
+            ApplyConfig::default(),
+        ));
+        for s in layout {
+            state.open_shard(s.id, None).await.unwrap();
+        }
+        let engine = Engine::new(store, "n1", Arc::new(FixedNodes::new(1)));
+        let hooks = PolicyHooks::new(engine, state.clone(), false);
+        state.set_account_gate(hooks.clone());
+        let e = hooks.engine.clone();
+        identity.set_budget_gate(Arc::new(move || e.try_take(BudgetKind::PlcLookupsPerSec, 1.0)));
+        edit_policy(&hooks, |p| p.cluster.plc_lookups_per_sec = PLC_PER_SEC).await;
+        add_host(&state, host, Tier::Trusted).await;
+        hooks.load().await.unwrap();
+
+        // one commit per account, each with prevData: none is its repo's first
+        let mut makers = Vec::new();
+        for t in 0..8usize {
+            makers.push(tokio::task::spawn_blocking(move || {
+                (t..DIDS)
+                    .step_by(8)
+                    .map(|i| {
+                        let did = crate::state::tests::plc(i as u64 + 1);
+                        let mut r = Repo::new(&did, Signer::new(Curve::K256, 7), 1);
+                        let ops = r.mixed_ops(1);
+                        (did, r.commit(&ops))
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut frames = Vec::with_capacity(DIDS);
+        for g in makers {
+            frames.extend(g.await.unwrap());
+        }
+        let frames = Arc::new(frames);
+
+        let t0 = Instant::now();
+        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..64 {
+            let (frames, next, identity, state) = (frames.clone(), next.clone(), identity.clone(), state.clone());
+            workers.push(tokio::spawn(async move {
+                let mut out = Vec::new();
+                loop {
+                    let i = next.fetch_add(1, Relaxed);
+                    let Some((did, frame)) = frames.get(i) else { return out };
+                    let crate::event::Event::Commit(c) =
+                        crate::event::parse(frame.clone(), &crate::event::Limits::default()).unwrap()
+                    else {
+                        panic!("not a commit")
+                    };
+                    let id = identity.lookup_paced(did, false).await.unwrap();
+                    let v = crate::verify::verify_commit(&c, id.signing_key.as_ref().unwrap()).unwrap();
+                    assert!(!v.created && v.prev_data.is_some());
+                    let h = Host(host.into());
+                    let r = state
+                        .apply(state::Incoming { did, host: &h, now: state::now_secs(), kind: state::EventKind::Commit(v) })
+                        .await;
+                    out.push(r);
+                }
+            }));
+        }
+        let mut accepted = 0;
+        let mut rejects = HashMap::new();
+        for w in workers {
+            for r in w.await.unwrap() {
+                match r {
+                    Ok(state::Applied::Append(a)) if a.new_account => accepted += 1,
+                    other => *rejects.entry(format!("{other:?}")).or_insert(0) += 1,
+                }
+            }
+        }
+        let took = t0.elapsed();
+        assert!(rejects.is_empty(), "{rejects:?}");
+        assert_eq!(accepted, DIDS);
+        assert_eq!(fetch.fetches.load(Relaxed), DIDS as u64);
+        // a second of budget in the bucket, then PLC_PER_SEC: ~4 s at the least
+        let floor = (DIDS as f64 - PLC_PER_SEC) / PLC_PER_SEC;
+        assert!(took.as_secs_f64() >= floor * 0.9, "{took:?}");
+        assert!(identity.stats.over_budget.load(Relaxed) > 0, "the budget never ran out in {took:?}");
+        assert_eq!(hooks.accounts(host), Some(DIDS as u64));
+        let now = policy::store::now_ms();
+        assert_eq!(hooks.engine.signals.snapshot(host, None, now).get("new-accounts"), None);
+        assert!(hooks.deferred.lock().is_empty());
     }
 
     #[tokio::test]

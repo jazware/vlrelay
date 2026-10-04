@@ -83,9 +83,9 @@ send() { curl -sf -u "admin:$token" -X "$1" -H 'content-type: application/json' 
 
 # Thresholds a one-minute run can trip, and hourly caps it can't: the
 # defaults (indigo's 2,600 events/h for an untrusted host) would throttle
-# the clean hosts too. On a fresh relay every account is new, so the
-# new-accounts threshold sits above a clean host's 50 and below the spam
-# host's first burst.
+# the clean hosts too. Only brand-new repos are new accounts (a clean
+# host's 50 established ones aren't), so the new-accounts threshold only
+# has to sit below the spam host's first burst of 200.
 get policy/full | python3 -c '
 import json, sys
 d = json.load(sys.stdin)

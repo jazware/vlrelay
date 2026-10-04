@@ -226,6 +226,10 @@ impl Default for Options {
 }
 
 type Outcome = Result<Arc<Identity>, LookupError>;
+
+/// How long [`IdentityCache::lookup_paced`] sleeps before asking a spent
+/// budget again, on top of the `max_budget_wait` the lookup already waited.
+const OVER_BUDGET_RETRY: Duration = Duration::from_millis(50);
 type Flight = Arc<OnceCell<Outcome>>;
 
 struct Entry {
@@ -339,6 +343,24 @@ impl<F: Fetch> IdentityCache<F> {
     /// signature fails against the cached key).
     pub async fn refresh(&self, did: &str) -> Outcome {
         self.lookup(did, true).await
+    }
+
+    /// [`Self::resolve`] (or [`Self::refresh`] when `fresh`), waiting out a
+    /// spent lookup budget instead of failing. The budget paces a cold
+    /// start's millions of unknown DIDs: an event that waits holds up its
+    /// lane and, through it, its host's socket, where failing would drop it.
+    pub async fn lookup_paced(&self, did: &str, fresh: bool) -> Outcome {
+        loop {
+            let r = if fresh {
+                self.refresh(did).await
+            } else {
+                self.resolve(did).await
+            };
+            match r {
+                Err(LookupError::OverBudget) => tokio::time::sleep(OVER_BUDGET_RETRY).await,
+                r => return r,
+            }
+        }
     }
 
     pub fn invalidate(&self, did: &str) {

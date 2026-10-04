@@ -903,8 +903,7 @@ impl Node {
         }
         let mut tries = 0u32;
         loop {
-            let r = if fresh { self.identity.refresh(did).await } else { self.identity.resolve(did).await };
-            match r {
+            match self.identity.lookup_paced(did, fresh).await {
                 Ok(id) => return Ok(id),
                 Err(e @ (LookupError::NotFound | LookupError::BadDid)) => {
                     return Err(Rejection { reason: "unknown_did", detail: e.to_string() });

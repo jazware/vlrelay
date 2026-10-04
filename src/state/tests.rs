@@ -70,6 +70,7 @@ pub(crate) fn claim(did: &str, n: u64) -> CommitClaim {
         commit: cid(&format!("{did}c{n}")),
         data: cid(&format!("{did}d{n}")),
         prev_data: (n > 0).then(|| cid(&format!("{did}d{}", n - 1))),
+        since: (n > 0).then(|| rev(n - 1)),
     }
 }
 
@@ -615,9 +616,12 @@ async fn update_host_is_atomic_against_counter_flushes() {
 struct CapGate(AtomicU32);
 
 impl AccountGate for CapGate {
-    fn admit_account(&self, _host: &str, did: &str) -> NewAccount {
+    fn admit_account(&self, _host: &str, did: &str, how: Arrival) -> NewAccount {
         if did == plc(9) {
             return NewAccount::Defer;
+        }
+        if matches!(how, Arrival::FirstCommit { .. }) {
+            return NewAccount::Admit;
         }
         if self.0.fetch_add(1, Relaxed) < 1 { NewAccount::Admit } else { NewAccount::Throttle }
     }
@@ -658,4 +662,53 @@ async fn accounts_past_the_gate_are_created_throttled() {
     let mut r = Record::new(HostKey::of("pds.example"), NOW);
     r.relay_throttled = true;
     assert_eq!(Record::decode(&r.encode()).unwrap(), r);
+}
+
+#[derive(Default)]
+struct LogGate(Mutex<Vec<(String, Arrival)>>);
+
+impl AccountGate for LogGate {
+    fn admit_account(&self, _host: &str, did: &str, how: Arrival) -> NewAccount {
+        self.0.lock().push((did.to_string(), how));
+        NewAccount::Admit
+    }
+}
+
+#[tokio::test]
+async fn only_a_repos_first_commit_is_a_creation() {
+    let id = MapIdentity::new();
+    let st = open(1, id.clone(), ApplyConfig::default()).await;
+    let gate = Arc::new(LogGate::default());
+    st.set_account_gate(gate.clone());
+    let h = host("pds.example");
+    let dids: Vec<String> = (1..=4).map(plc).collect();
+    for (i, d) in dids.iter().enumerate() {
+        id.set(d, "pds.example", i as u8);
+    }
+    let ident = |d: &str| {
+        let (st, h) = (st.clone(), h.clone());
+        let d = d.to_string();
+        async move { st.apply(Incoming { did: &d, host: &h, now: NOW, kind: EventKind::Identity }).await }
+    };
+    // an established repo's commit (prevData and since set), then a brand-new repo's
+    commit(&st, &dids[0], &h, claim(&dids[0], 7), NOW).await.unwrap();
+    commit(&st, &dids[1], &h, claim(&dids[1], 0), NOW).await.unwrap();
+    // #identity first, the way a PDS announces a new account, then the first commit
+    ident(&dids[2]).await.unwrap();
+    commit(&st, &dids[2], &h, claim(&dids[2], 0), NOW).await.unwrap();
+    ident(&dids[3]).await.unwrap();
+    commit(&st, &dids[3], &h, claim(&dids[3], 5), NOW).await.unwrap();
+    // later commits don't ask
+    for (d, n) in dids.iter().zip([8, 1, 1, 6]) {
+        commit(&st, d, &h, claim(d, n), NOW).await.unwrap();
+    }
+    use Arrival::*;
+    assert_eq!(*gate.0.lock(), vec![
+        (dids[0].clone(), FirstSeen),
+        (dids[1].clone(), Created),
+        (dids[2].clone(), FirstSeen),
+        (dids[2].clone(), FirstCommit { created: true }),
+        (dids[3].clone(), FirstSeen),
+        (dids[3].clone(), FirstCommit { created: false }),
+    ]);
 }

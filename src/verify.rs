@@ -271,6 +271,10 @@ pub struct Verified {
     pub data: Cid,
     /// #commit only; None for a sync 1.0 commit or a #sync.
     pub prev_data: Option<Cid>,
+    /// The repo's first commit: no `since`, and no `prevData` or the empty
+    /// tree's. Only these make an account "newly created" to the policy;
+    /// an established account the relay hasn't seen yet is just unknown.
+    pub created: bool,
 }
 
 /// The decoded commit object (repo v3).
@@ -410,6 +414,9 @@ pub fn verify_commit_with(
         commit: c.commit,
         data: obj.data,
         prev_data: c.prev_data,
+        created: c.since.is_none()
+            && c.prev_data
+                .is_none_or(|p| p == *vlpds::recent_writes::EMPTY_ROOT),
     })
 }
 
@@ -587,6 +594,7 @@ pub fn verify_sync_with(
         commit,
         data: obj.data,
         prev_data: None,
+        created: false,
     })
 }
 

@@ -19,6 +19,8 @@ pub trait Chain: Send + Sync + 'static {
     type Verified: Send + Sync;
     /// The head the commit claims to produce.
     fn claimed(&self, v: &Self::Verified) -> ChainState;
+    /// The repo's first commit (see `verify::Verified::created`).
+    fn created(&self, v: &Self::Verified) -> bool;
     fn check_chain(&self, prev: Option<&ChainState>, v: &Self::Verified) -> Result<ChainState, ChainError>;
 }
 
@@ -42,14 +44,15 @@ impl ChainError {
     }
 }
 
-/// What a sync 1.1 commit claims, for [`StubChain`]: rev, commit, data, and
-/// prevData.
+/// What a sync 1.1 commit claims, for [`StubChain`]: rev, commit, data,
+/// prevData and since.
 #[derive(Clone, Copy, Debug)]
 pub struct CommitClaim {
     pub rev: Tid,
     pub commit: Cid,
     pub data: Cid,
     pub prev_data: Option<Cid>,
+    pub since: Option<Tid>,
 }
 
 /// Rev must move forward and prevData must match. A missing prevData (a
@@ -60,6 +63,9 @@ impl Chain for StubChain {
     type Verified = CommitClaim;
     fn claimed(&self, v: &CommitClaim) -> ChainState {
         ChainState { rev: v.rev, commit: v.commit, data: v.data }
+    }
+    fn created(&self, v: &CommitClaim) -> bool {
+        v.since.is_none() && v.prev_data.is_none()
     }
     fn check_chain(&self, prev: Option<&ChainState>, v: &CommitClaim) -> Result<ChainState, ChainError> {
         if let Some(p) = prev {
@@ -93,10 +99,25 @@ pub trait IdentitySource: Send + Sync {
     async fn resolve(&self, did: &str, fresh: bool) -> Result<Option<Identity>, IdentityError>;
 }
 
-/// The policy engine's decision on a DID the relay hasn't seen before.
+/// The policy engine's decision on an account it hasn't seen before.
 pub trait AccountGate: Send + Sync {
-    /// Called for a new account once its host checked out.
-    fn admit_account(&self, host: &str, did: &str) -> NewAccount;
+    /// Called once the account's host checked out.
+    fn admit_account(&self, host: &str, did: &str, how: Arrival) -> NewAccount;
+}
+
+/// How an account reaches the [`AccountGate`]. A relay starting cold sees
+/// every established account for the first time, so only a repo's first
+/// commit marks a newly created one: the rate caps and the new-account spam
+/// signal are for those, the host's account cap for every account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arrival {
+    /// Unknown here, and its event isn't its repo's first commit.
+    FirstSeen,
+    /// Unknown here, and its event is its repo's first commit.
+    Created,
+    /// Known (an `#identity` or `#account` came first) with no commit yet:
+    /// this is its first. `created` when it's the repo's first.
+    FirstCommit { created: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -384,8 +405,24 @@ impl<C: Chain> StateStore<C> {
             }
             Err(e) => return Err(e),
         }
-        if new_account && let Some(g) = self.account_gate() {
-            match g.admit_account(&ev.host.0, ev.did) {
+        let created = matches!(&ev.kind, EventKind::Commit(v) if self.chain.created(v));
+        let arrival = if new_account {
+            Some(if created { Arrival::Created } else { Arrival::FirstSeen })
+        } else if rec.chain.is_none()
+            && matches!(ev.kind, EventKind::Commit(_) | EventKind::Sync { .. })
+            && (created || !rec.drops_commits())
+        {
+            // a creation usually announces itself with #identity and
+            // #account before its first commit; a throttled one still
+            // counts as created, for the spam signal
+            Some(Arrival::FirstCommit { created })
+        } else {
+            None
+        };
+        if let Some(how) = arrival
+            && let Some(g) = self.account_gate()
+        {
+            match g.admit_account(&ev.host.0, ev.did, how) {
                 NewAccount::Admit => {}
                 NewAccount::Throttle => rec.relay_throttled = true,
                 NewAccount::Defer => return Err(Reject::NewAccountDeferred),

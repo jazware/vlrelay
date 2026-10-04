@@ -25,15 +25,18 @@ They match indigo's relay where the reference notes give a number.
 
 | Setting | Default | indigo |
 |---|---|---|
-| Accounts per host (`tiers.default.maxAccounts`) | 100 | `--default-account-limit` 100 |
+| Accounts per host (`tiers.default.maxAccounts`), every account the host serves | 100 | `--default-account-limit` 100 |
 | Accounts per trusted host | 10,000,000 | `TrustedRepoLimit` |
+| Newly created accounts per host (`tiers.*.newAccountsPerHour`) | 100 (`default`), 25 (`new`), 10 (`throttled`), none (`trusted`) | none |
+| Newly created accounts per cluster (`cluster.newAccountsPerMin`) | 6,000 | none |
+| DID lookups (`cluster.plcLookupsPerSec`) | 500/s across the cluster | none (per-process `--did-lookups-per-sec`) |
 | Untrusted events | 50 + n/1000 per s, 2,500 + n per h, 20,000 + 10n per day | same formula |
 | Trusted events | 5,000/s, 50M/h, 500M/day | same |
 | Trusted domains (`crawl.trustedDomains`) | `*.host.bsky.network` | same |
 | New hosts per day (`cluster.newHostsPerDay`) | 50, shared across the cluster | 50, per process |
 | New host tier | `new` for 7 clean days, then `default` | no tiers |
 
-The relay-only defaults are guesses to tune against real traffic. Auto-throttle trips at 50% failed frames over a sweep interval with at least 200 frames. A throttled host recovers after an hour without a trip. The spam thresholds are 300 new accounts an hour per host, 600 records a minute per account and 600 failed frames a minute per host. The trusted tier is never auto-throttled, since throttling the big PDSes for a buggy minute would stall most of the network.
+The relay-only defaults are guesses to tune against real traffic. Auto-throttle trips at 50% failed frames over a sweep interval with at least 200 frames. A throttled host recovers after an hour without a trip. The spam thresholds are 300 newly created accounts an hour per host, 600 records a minute per account and 600 failed frames a minute per host. The trusted tier is never auto-throttled, since throttling the big PDSes for a buggy minute would stall most of the network.
 
 There are two deliberate departures from indigo. Trusted-domain and allow-listed hosts don't spend the daily new-host budget (indigo counts everything but admin requests). And a failed counter read refuses the crawl, where indigo answers 200 when its ban lookup fails.
 
@@ -75,9 +78,14 @@ The state host record. The policy engine writes it (operator actions through `Po
 
 ### State and the node
 
-- New accounts go through `state::AccountGate` once, after their host checks out. The gate records `NewAccount` and then checks the host's account cap (`maxAccounts`), its `newAccountsPerHour` and the cluster's `NewAccountsPerMin` budget. An account past any of them is created throttled (`relay_throttled`, status `throttled`): its commits are dropped, an upstream `#account` doesn't lift it, and an operator's untakedown does. The cap counts the record's `account_count` plus the accounts admitted since the last sync, so it can lag by one counter flush (5 s), never overcount.
+- Accounts go through `state::AccountGate` after their host checks out. The gate tells a **newly created** account from one that's only **first seen**. A relay that starts cold sees all ~56M established accounts for the first time, and none of them is new.
+  - Newly created means the event is the repo's first commit: a `#commit` with no `since`, and no `prevData` or the empty tree's (`verify::Verified::created`, carried to a remote DID owner in the forward's meta flags). A PDS usually announces a new account with `#identity` and `#account` first. So the gate is asked again at a known account's first commit (`Arrival::FirstCommit`), as well as when an unknown DID shows up (`FirstSeen` or `Created`).
+  - Every account counts toward its host's cap (`maxAccounts`, indigo's per-host account limit). Past it the account is created throttled (`relay_throttled`, status `throttled`): its commits are dropped, an upstream `#account` doesn't lift it, and an operator's untakedown does. The cap counts the record's `account_count` plus the accounts admitted since the last sync, so it can lag by one counter flush (5 s), never overcount. Bluesky's PDSes (`*.host.bsky.network`) are trusted, at 10M each, well above the ~0.5-1M accounts a mushroom holds. An untrusted PDS is held to 100, as in indigo.
+  - Only newly created accounts spend the host's `newAccountsPerHour` and the cluster's `NewAccountsPerMin` budget, and only they are `NewAccount` signals. The signal is recorded once per creation, deferred or not, so a farm trips `hostNewAccounts` at the rate it creates accounts. Past a rate the event is dropped (`new_account_deferred`) and the DID is remembered for an hour (100k at most), so its later events, which no longer look like a creation, wait for the budget too.
+  - First-seen accounts aren't deferred. Each costs a DID lookup, which the PLC budget paces (below).
+  - Creation can be faked: a farm can send a first commit with a made-up `since` and `prevData`, and the relay holds no earlier state to check them against. The host's account cap still applies, and that's 100 for an untrusted host. Checking the DID's PLC creation op would catch it, but that's an audit-log fetch per unknown DID (56M on a cold start), so it isn't done.
 - Accepted commits are `Record` signals (count 1).
-- DID document fetches spend the cluster's `PlcLookupsPerSec` share (`IdentityCache::set_budget_gate`), waiting up to the cache's `max_budget_wait` for it.
+- DID document fetches spend the cluster's `PlcLookupsPerSec` share (`IdentityCache::set_budget_gate`), waiting up to the cache's `max_budget_wait` for it. The host stage and the DID owner look up through `IdentityCache::lookup_paced`, which waits again whenever the budget is spent. The event holds its lane, so the backpressure reaches the host's socket, and nothing is dropped for want of budget. Before this, three spent-budget waits dropped the event as `identity_unavailable` and acked it upstream. A failed fetch still gives up after three tries.
 - A takedown or its reversal is written to `policy/takedowns/audit/` (one object per action, If-None-Match) and `policy/takedowns/current/{sha256(did)}.json` (who, when, why, for the account page) before the account changes, and logged on `vlrelay::audit`.
 
 ### Operator API
@@ -97,6 +105,7 @@ Actions are `alert` (log only), `case`, `throttle` and `throttle-and-case`. A pe
 - `engine.consumer_limits()` isn't enforced by `serve.rs` yet (connections per IP, consumers per node, the slow-consumer cutoff and the backfill limit come from vlpds's firehose options).
 - `LiveNodes` is `FixedNodes(1)`. The cluster module should pass one over its node leases.
 - A relay-throttled account stays throttled until an operator lifts it, even after its host drops below its cap.
+- A cold start resolves every account once at the PLC budget, so 56M accounts at the default 500/s take about 31 hours. Seeding from another relay's DID cache would shorten that.
 - The account cap and the per-host new-account rate are per node, so a host shard that moves starts them over from the record's count.
 - Peer nudges after a save aren't sent. Peers pick changes up within 10 s.
 - The new-hosts counter is per UTC day. indigo uses a sliding 24 h window.
