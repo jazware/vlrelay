@@ -1,6 +1,6 @@
 # vlRelay: node performance
 
-How many events a second one relay node takes, and how fast they reach the firehose. The target in `docs/design.html` is 100k events/s on 3 nodes of 8 cores and 32 GB, so about 33k/s per node.
+How many events a second one relay node takes, and how fast they reach the firehose. The target in `docs/design.html` is 100k events/s on 3 nodes of 8 cores and 32 GB, so about 33k/s per node. Iteration 6 measures a 3-node cluster against the whole target.
 
 ## The bench
 
@@ -293,6 +293,177 @@ Tests on this build:
 
 The e2e runs use an `http://` MinIO, so they cover the signed path. The unsigned path ran in the 75k-110k steps above against MinIO, with every event accounted for.
 
+## Iteration 6: 3-node cluster (7d7f33c1)
+
+The target is 100k events/s on 3 nodes of 8 cores and 32 GB. benchbox can't host three 8-core nodes and a fleet fast enough to load them, so the cluster is scaled down: 3 core nodes, each with 6 hardware threads (3 physical cores and their SMT siblings) and a 7 GB cap. The same cores also ran one node without `--cluster`, so the cluster's cost per event compares with a single node's on identical hardware.
+
+### The bench
+
+`scripts/cluster-perf.sh` (87a37c8e) does what `perf.sh` does, for three nodes:
+
+```
+scripts/cluster-perf.sh up                       # MinIO (O_DIRECT off), peer certs from `vlpds admin tls`
+scripts/cluster-perf.sh step NAME RATE [SECS]    # 3 fresh cores on a new prefix, then the fleet; $PERF_HOME/out/NAME.json
+SINGLE=1 scripts/cluster-perf.sh step ...        # node 1 alone, without --cluster, on the same cores
+scripts/cluster-perf.sh down
+```
+
+| | CPUs | Memory cap |
+|---|---|---|
+| n1, n2, n3 | 5-7,21-23 / 8-10,24-26 / 11-13,27-29 | 7 GB each (7.5 GB at 120k+) |
+| Fleet (4 fakepds x 10 hosts x 2,500 accounts) | 0-4,14-20,30-31, shared | 3 GB each (3.5 GB at 120k+) |
+| MinIO (one, on benchbox's disk) | shared | 3 GB |
+| `e2e_check` on n1 | shared | 3 GB (not run at 120k+) |
+
+- The cores run with `--cluster --did-shards 12 --host-shards 64`, peer mTLS on loopback with certificates from `vlpds admin tls`, `--s3-unsigned-payload true`, and the PLC budget lifted as in `perf.sh`.
+- The fleet starts only once the three cores have joined and spread the host shards (`SETTLE`, 15 s). The fleet's 40 hosts landed on the three cores by hash: 15-17, 15 and 8-9.
+- Every core gets the same 40 `--host` flags. Each host connects on the core that owns its host shard.
+- Per node, the summary has the same numbers as `perf.sh`: accepted/s, time to firehose, CPU per pool and stage, RSS and rejects. Cluster-wide, it adds:
+  - forwards: events to the local stage and to peers, bytes, and the batch round trip (new metrics, fd7c8546);
+  - each log's lag: our oldest append not yet durable, and each followed peer log's watermark behind our clock, sampled every 100 ms;
+  - bytes on the peer sockets, from `ss`;
+  - MinIO's PUT/s;
+  - `e2e_check` against n1;
+  - with `SAME=1`, every node's stream over the same window, compared seq by seq.
+
+Caveats:
+
+- It's one box. The three nodes share the memory bus, the L3 and one MinIO on one disk. Loopback stands in for the NICs, so the forward hop and the log streams cost CPU (TLS, copies) but no network latency.
+- The nodes are 3 cores + SMT, not 8 cores. Below, "µs/event" is the CPU time of all three nodes per accepted event, in hardware-thread seconds. On the same 6 threads, a single node costs ~90 µs/event, where the same build on 8 whole cores (iteration 5) costs ~70.
+- MinIO's PUT latency sets the time to firehose from ~60k/s up, as in the single-node ladder. PUT p50 was 205 ms at 60k and 410-819 ms at 90k and above. The benchbox disk was shared with other benches throughout.
+- The fleet runs on 14 threads shared with MinIO and the checker. At 150k offered it couldn't keep up (below).
+
+### Bugs the bench found
+
+| Commit | What |
+|---|---|
+| d00c96b3 | **Forward batches were too big for the peer listener.** A forward batch takes up to 512 events, and 512 production-sized frames are ~3 MB. axum's default body limit is 2 MB. So under load, owners answered 413, the forward retried for its 20 s budget and gave up, and the host replayed into the same loop. At 33k/s, most forwards failed and accounts desynchronized. Batches are now capped at 4 MiB, and the forward route takes 10 MiB (a full batch plus the largest upstream frame). |
+| 7d7f33c1 | **The merge queue spilled at 90k/s.** vlpds's merger holds up to 256 MiB while it waits for the slowest log's watermark, and past that it reads a log back from the bucket. At ~100k/s, 256 MiB is half a second, less than a linger plus one slow PUT. Each node spilled every few seconds (968 segments in a minute), and the read-back couldn't keep up: the stream fell 25 s behind, 6.8k/s out against 98k/s in. vlRelay now sets 1 GiB (`serve::MERGE_QUEUE_BYTES`). The same step then kept up, with the time to firehose at p50 373 ms and p99 1.0 s. |
+
+The harness needed fixes too:
+
+- The fd limits. A systemd user unit's soft limit is 1024. A core passed it at startup, and so did fakepds process 0, whose PLC took all three cores' lookups. Lookups then timed out, after 5 s each, and those held whole forward batches.
+- The startup handoff. Started together with the fleet, the first core to join took every host shard and handed most of them over seconds later. The next owner resumes from the acked cursor, and above ~60k/s that cursor was older than the fleet's replay ring, which holds seconds (a real PDS keeps days). The gap desynchronized those accounts for the whole step. That's why the fleet now starts after `SETTLE`.
+- The fleet's memory. At 120k/s, 3 GB per fakepds process wasn't enough and one process was OOM-killed mid-step.
+
+### The ladder
+
+The build is 7d7f33c1. `e2e TTF` is upstream emit to emit on n1's stream, measured by `e2e_check`. `Relay TTF` is the nodes' own histogram, at its bucket bounds. CPU is out of 18 threads. The per-pool columns are µs of that pool's CPU per accepted event.
+
+| Offered | Accepted/s | e2e TTF p50 / p99 | Relay TTF p50 / p99 | PUT p50 / p99 | CPU | µs/event | Main | Ingest | Commit pool | PUT/s | Peer MB/s | RSS max | Rejects | e2e |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 33k | 34.2k | 181 / 484 ms | 141 / 360 ms | 102 / 205 ms | 5.57 | 163 | 90.6 | 57.6 | 12.0 | 141 | 521 | 1.7 GB | 0 | clean, all 3 streams identical |
+| 60k | 63.7k | 362 / 699 ms | 360 / 576 ms | 205 / 410 ms | 9.93 | 156 | 80.8 | 60.1 | 13.8 | 113 | 932 | 2.2 GB | 0 | clean |
+| 90k | 96.9k | 783 ms / 1.9 s | 576 ms / 1.5 s | 410 / 819 ms | 14.47 | 149 | 72.9 | 61.9 | 13.4 | 124 | 1,304 | 4.3 GB | 0 | clean |
+| 90k (2nd run) | 98.0k | 1.4 / 3.0 s | 0.9-1.5 / 1.5 s | 819 / 819 ms | 14.96 | 153 | 76.4 | 61.6 | 13.4 | 117 | 1,310 | 4.5 GB | 0 | clean |
+| 120k | 120.8k | not run | 0.9-1.5 / 1.5-2.4 s | 819 / 819 ms | 17.21 | 142 | 68.4 | 61.7 | 12.2 | 129 | 1,533 | 5.9 GB | 0 | out 104-115k/s, backlog growing |
+| 150k | 32.6k | not run | | | 5.32 | | | | | | | | 900 `identity_unavailable` | collapsed in warmup |
+
+The same 6 threads as n1, one node without `--cluster`:
+
+| Offered | Accepted/s | e2e TTF p50 / p99 | PUT p50 | CPU (of 6) | µs/event | Main | Ingest | Commit pool | PUT/s | e2e |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 25k | 26.6k | 69 / 135 ms | 51 ms | 2.49 | 93.5 | 24.4 | 56.0 | 12.0 | 48 | clean |
+| 33k | 34.0k | 55 / 164 ms | 26 ms | 3.08 | 90.6 | 22.6 | 55.0 | 12.1 | 48 | clean |
+| 50k | 54.0k | 104 / 408 ms | 102 ms | 4.82 | 89.2 | 20.7 | 54.8 | 12.8 | 49 | clean |
+
+What the ladder shows:
+
+- **Correctness.** Every step that kept up was clean. `e2e_check` found 0 missing, reordered or duplicated events across 2.4-6.5M events per step. At 33k, all three nodes' streams over the same window (847,161 events) had the same events at the same seqs, in the same order. No node logged a seq checkpoint disagreement.
+- **Capacity.** The three nodes take ~98k/s cleanly. At 120k they take 120.8k/s on 17.2 of their 18 threads, which is the CPU ceiling. There, the merged stream trails intake (104-115k/s out) and the ack backlog grows.
+- **150k didn't get past warmup, and that's a harness limit.** The fleet's PLC, on the shared fleet cores, stopped answering in time, so cold DID-document lookups timed out. Each timed-out lookup on a DID owner holds its forward batch for up to 5 s, so all three nodes stalled: the apply stage waited 40 s per second, and the nodes used 1.8 cores each. It does show a real coupling, though (next steps).
+- **Latency.** At 33k the cluster's time to firehose is p50 181 ms and p99 484 ms. The single node on the same cores and the same MinIO session does p50 55 ms and p99 164 ms. A cluster node emits an event only once every log's watermark has passed it, so the slowest of three logs sets the pace. Each log also seals on linger at a third of the rate, which tripled the PUTs: 141/s against 48/s. From 90k up, MinIO's 410-819 ms PUTs dominate, as they did for a single node.
+- **Balance.** DID shards split 4/4/4, so every node's log and committers carry a third of the events. Host shards split by hash, and the 40 hosts landed 15-17/15/8-9, so n3 verified about half what n1 did (ingest 1.3 against 2.2 cores at 90k).
+
+### Forwarding and the merged stream
+
+Two thirds of the events are forwarded (`remote_share` 0.66-0.68 at every step), as random DIDs over 3 owners predict.
+
+| Per event | Forwarded | Local |
+|---|---|---|
+| Forward hop bytes | 5.0-5.8 KB: the frame plus ~90 B (DID, host, seq, meta) | 0 |
+| Forward CPU (send, receive, HTTP/2 and TLS) | ~15 µs | ~0: the stage is called directly |
+| Batch round trip p50 | the time to durable: 141 ms at 33k, 225 ms at 60k, 576-922 ms at 90k | the same |
+
+The round trip is the owner's time to durable, so it's the same for local and remote batches. On loopback, the network hop doesn't show at these histogram bounds.
+
+The merged stream is a cost on every event, forwarded or not. Each node streams its own log to both peers and merges all three logs:
+
+| | Per event |
+|---|---|
+| Peer bytes | 12.7-15.2 KB: the log streams carry raw frames to 2 peers (~11 KB), plus the forwards (~3.8 KB) |
+| CPU | ~20 µs: receiving peer logs, serving ours, the merge (TLS and copies included) |
+| Peer traffic per node at 100k/s | ~440 MB/s (3.5 Gb/s) each way, before any consumer |
+
+Per node, a log's lag behind the merge was:
+
+| Rate | Own log's oldest pending append, p50 / p99 | Peer watermarks, p50 / p99 |
+|---|---|---|
+| 33k | 88 / 360 ms | 141 / 577 ms |
+| 60k | 141-225 / 360 ms | 360 / 577 ms |
+| 90k | 360-576 / 922 ms | 360-576 ms / 0.9-1.5 s |
+
+That's PUT plus linger, plus ~100-300 ms for the stream hop and the peer's own lag.
+
+### Cost per event: the cluster against one node
+
+On the same 6 threads, the cluster costs 142-156 µs/event from 60k up (163 at 33k, where fixed costs weigh more). One node costs 89-94. That's ~1.65x, or +55-65 µs per event:
+
+| Pool | One node | Cluster (60-120k) | Difference |
+|---|---|---|---|
+| Main runtime | 21-24 | 68-81 | +47-57 |
+| Ingest (verify, dispatch) | 55-56 | 60-62 | +5 |
+| Commit pool (zstd) | 12-13 | 12-14 | +1 |
+
+**Profile at the knee** (`PERF_RECORD=1`, n1, 10 s at 97k/s cluster-wide, 8.5k samples). By pool, main is 49%, ingest 40%, the commit pool 9% and firehose 2%. A single node at 75k was main 25%, ingest 58%, commit pool 16%. Within main:
+
+| Where | Share of main | µs per cluster event |
+|---|---|---|
+| Receiving peers' log streams (`vlpds::remote::follow_log`, websocket over TLS) | 14.4% | ~10.5 |
+| Serving our log to peers (`follow::serve_stream`) | 8.3% | ~6 |
+| HTTP/2 and TLS of the forward RPC | 6.9% | ~5 |
+| Forward send (lanes, `encode_batch`) and receive (`decode_batch`) | 7.0% | ~5 |
+| SlateDB (memtable, flush) | 7.1% | ~5 |
+| Merge and dense renumbering | 4.7% | ~3.5 |
+| DID-owner stage (`Stage::apply_did`) | 4.1% | ~3 |
+| Upstream sockets, committer, sequencer | 11.3% | single-node work |
+| SipHash and `RandomState` (std `HashMap`s on the path) | ~5.8% | ~4 |
+| vdso `clock_gettime` | 3.5% | ~2.5 |
+
+Across those rows, `memcpy` is 23% of main: 9.2 points in receiving log streams, 5.0 in serving them, and 2.1 in the sequencer. TLS (AES-GCM) is 13.6%: 4.7 points receiving, 4.0 serving and 4.0 forwarding. Of the cluster-specific costs that were asked about:
+
+- **Forward serialization.** Sending and receiving (the lanes, `encode_batch`, `decode_batch`: copies and UTF-8 checks) is ~8 µs per forwarded event. The RPC transport around them (HTTP/2, TLS) is another ~7.5.
+- **Peer TLS.** ~10 µs/event, about 7% of a node.
+- **The follow and merge path.** ~20 µs/event, the largest cluster cost. It's mostly copies and TLS of raw frames, twice per event (one log to two peers).
+- **Dense-seq renumbering.** Under 1 µs. `seq::skip` and `event::skip` together are under 1% of main.
+
+Past the two bugs above, nothing cheap showed up. The cluster's costs are copies and crypto in proportion to the bytes on the peer links, and the way to cut them is to send fewer bytes ("Not done, next").
+
+### Extrapolation to 3 x 8 cores
+
+Measured: 142-156 µs per event (hardware-thread seconds), at the ceiling ~120k/s on 18 threads.
+
+| Reading of "8 cores" | CPU per event | 100k/s needs | Of 3 x 8 | CPU ceiling |
+|---|---|---|---|---|
+| 8 vCPUs (4 cores + SMT, as on cloud VMs; what was measured, scaled) | ~150 µs per thread | 15 threads | 62% | ~160k/s |
+| 8 physical cores (as in iterations 0-5; single node 70 µs there vs 90 here) | ~117 µs per core | 11.7 cores | 49% | ~205k/s |
+
+Next to the single-node ladder:
+
+| | One node, 8 cores (iteration 5) | 3-node cluster, 3 x 6 threads (here) |
+|---|---|---|
+| Clean, every event checked | 90-95k/s | ~98k/s |
+| At the CPU ceiling | ~106k/s on 7.2 of 8 cores | ~121k/s on 17.2 of 18 threads |
+| CPU per event | 65-70 µs | 142-156 µs (90 µs for one node on these threads) |
+| TTF at 33k, p50 / p99 | 63 / 141 ms | 181 / 484 ms |
+| Peak RSS | 4.6 GB at 110k | 5.9 GB per node at 120k |
+
+**Verdict: 100k events/s on 3 nodes of 8 cores and 32 GB holds, with headroom.** On CPU it takes 50-60% of the cluster: 1.6x headroom if "8 cores" means 8 vCPUs, ~2x if it means 8 physical cores. Memory is a non-issue: 4-6 GB per node at 100-120k against 32. Three things qualify that:
+
+- **The time to firehose at 100k is MinIO-bound here.** It was p50 0.8-1.4 s and p99 1.9-3.0 s, behind 410-819 ms PUTs. The merge waits for the slowest of three logs, so a cluster's tail tracks the worst PUT among them. S3 needs measuring.
+- **The peer links carry ~3.5 Gb/s each way per node at 100k,** before consumers. Each full-firehose consumer is another ~4.3 Gb/s at 100k/s. The cores want 25 GbE, or consumers should be on edges and replicas.
+- **Host placement is by hash, and ingest load follows hosts.** Here one node verified half what another did. With a few big PDSes carrying most of the network, one core could carry far more than a third of the verify load.
+
 ## The per-node ceiling
 
 One node with 8 pinned cores sustains ~90-95k events/s, every event checked, with 0 rejects and a clean e2e. That's 2.8x the 33k/s target. It takes ~106k/s at its CPU ceiling (7.2 of 8 cores), where latency grows with any backlog. So the ceiling is the CPU.
@@ -336,6 +507,11 @@ So a node serving many consumers wants a fan-out tier (replicas or edges), not m
 
 ## Not done, next
 
+- **Compressed log streams between cores.** A core streams raw frames to each peer, ~11 KB per event in all, and receiving and serving them is ~20 µs/event of copies and TLS (iteration 6). Its sealed segments are already zstd'd, 1.56x on production frames. Streaming those would cut the peer bytes, and the copy and TLS cost with them, by about a third, for a decompress on each receiver. Worth measuring.
+- **A DID owner's lookup holds a forward batch.** The owner's apply can resolve a DID document, and a lookup that times out (5 s) holds the whole batch it's in, along with one of its lane's 4 batch slots. When the fleet's PLC fell behind at 150k, every node stalled. The host owner has just resolved the key, so it could pass it along in `meta`. Or the owner could answer a slow DID's events apart from the rest of the batch.
+- **Cold DID lookups cost ~1.7x on a cluster.** 100k cold DIDs took 177k PLC fetches across three cores, against 104k on one node, because the host owner and the DID owner each resolve. `--plc-export` seeding covers this in production.
+- **Host shards placed by load.** Placement is by hash, and verify cost follows hosts. With 40 equal hosts the cores got 15-17, 15 and 8-9.
+- **std `HashMap`s on the cluster path** (the forward lanes' per-DID sets, `Stage::apply`'s grouping). SipHash and `RandomState` were ~6% of the main runtime at 97k/s, ~4 µs/event. `types::FastMap` is there for it.
 - **CPU.** Still the ceiling. The signature is about a third of it and is the floor. What's left above it is spread thin: outside secp256k1 and zstd, nothing is over ~2% of samples.
 - **Compression.** zstd -1 is still ~14% of the node's CPU on the fleet, ~7% on production frames. -3 would save ~1.4 µs more on production for 1.8% more bytes, and raw segments all of it for 57% more. That's a cost decision for the operator, so the default stops at -1.
 - **The upstream read buffer.** tungstenite reads 16 KB at a time (`read_buffer_bytes`), about three frames per `recv`, and `recv` is ~2% of samples. 64 KB would cut the syscalls but costs 48 KB more per host connection, ~150 MB across 3,000 hosts.
