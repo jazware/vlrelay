@@ -274,6 +274,11 @@ impl PolicyHooks {
         self.cache.lock().get(host).map(|s| s.limits.clone())
     }
 
+    /// Accounts on a host: the record's count plus those admitted since.
+    pub fn accounts(&self, host: &str) -> Option<u64> {
+        self.cache.lock().get(host).map(|s| s.accounts.max(0) as u64)
+    }
+
     /// The operator throttle on a host (events/s), as last synced.
     pub fn throttle(&self, host: &str) -> Option<f64> {
         self.cache.lock().get(host).and_then(|s| s.throttle_eps)

@@ -156,7 +156,13 @@ export function Policy() {
       </div>
       <p className="muted small">
         Tier limits and spam thresholds are one versioned object: a save lands on every node at once, and a save against a stale version is refused.{' '}
-        <span className="mono">v{base.version}</span>, updated <span title={fmtTime(base.updatedAtMs)}>{relTime(base.updatedAtMs)}</span> by {base.updatedBy}.
+        {base.version === 0 ? (
+          <>The relay runs on the defaults: nothing has been saved yet.</>
+        ) : (
+          <>
+            <span className="mono">v{base.version}</span>, updated <span title={fmtTime(base.updatedAtMs)}>{relTime(base.updatedAtMs)}</span> by {base.updatedBy}.
+          </>
+        )}
       </p>
       {saved !== undefined && !dirty && <Notice kind="ok">Saved as version {saved}.</Notice>}
       {conflict && (
@@ -482,7 +488,13 @@ function AdvancedPolicy({ onSaved }: { onSaved: () => void }) {
       {!open ? (
         base ? (
           <p className="muted small">
-            <span className="mono">v{base.version}</span>, updated <span title={fmtTime(base.updatedAtMs)}>{relTime(base.updatedAtMs)}</span> by {base.updatedBy}
+            {base.version === 0 ? (
+              <>Defaults, never saved</>
+            ) : (
+              <>
+                <span className="mono">v{base.version}</span>, updated <span title={fmtTime(base.updatedAtMs)}>{relTime(base.updatedAtMs)}</span> by {base.updatedBy}
+              </>
+            )}
             {base.note && <> ({base.note})</>}.{dirty && ` ${changes.length} unsaved change${changes.length === 1 ? '' : 's'}.`}
           </p>
         ) : (

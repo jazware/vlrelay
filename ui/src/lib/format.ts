@@ -6,6 +6,8 @@ export function fmtTime(s?: string | number | null): string {
 }
 
 export function relTime(ms: number): string {
+  // 0 is the API's "never"
+  if (!ms) return '—'
   const d = Math.round((Date.now() - ms) / 1000)
   const abs = Math.abs(d)
   const unit = abs < 60 ? [abs, 's'] : abs < 3600 ? [Math.round(abs / 60), 'm'] : abs < 86400 ? [Math.round(abs / 3600), 'h'] : [Math.round(abs / 86400), 'd']

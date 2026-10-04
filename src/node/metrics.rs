@@ -138,6 +138,7 @@ pub struct HostSeries {
     pub rejects: VecDeque<f64>,
     last_frames: u64,
     last_rejects: u64,
+    primed: bool,
 }
 
 impl HostSeries {
@@ -145,7 +146,7 @@ impl HostSeries {
         let ev = frames.saturating_sub(self.last_frames) as f64;
         let rj = rejects.saturating_sub(self.last_rejects) as f64;
         // the first sample has no previous one to diff against
-        let first = self.t.is_empty();
+        let first = !std::mem::replace(&mut self.primed, true);
         self.last_frames = frames;
         self.last_rejects = rejects;
         if first {

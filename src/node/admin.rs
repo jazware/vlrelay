@@ -96,7 +96,7 @@ impl NodeAdmin {
             status: status(h),
             events_per_sec: rate,
             error_rate: ratio,
-            accounts: h.record.account_count,
+            accounts: self.policy.accounts(&h.record.hostname).unwrap_or(h.record.account_count),
             last_upstream_seq: h.received_seq.unwrap_or(0),
             connected_since_ms: (h.record.status == HostStatus::Active)
                 .then_some(h.record.last_connected_ms.map(|m| m as i64))
