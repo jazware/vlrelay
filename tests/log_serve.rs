@@ -38,6 +38,7 @@ fn event(upstream_seq: i64, size: usize) -> Event {
     Event {
         meta: EventMeta { did, host: Host("pds.test".into()), upstream_seq, shard: 0 },
         frame: Box::new(SeqSplice::parse(Bytes::from(raw)).unwrap()),
+        delta: None,
     }
 }
 

@@ -70,8 +70,11 @@ pub const DEFAULT_RETENTION: Duration = Duration::from_secs(72 * 3600);
 /// Durable batches a peer stream may fall behind by before it's dropped.
 const LIVE_BATCHES: usize = 4096;
 
-/// The key of the one mutation each relay entry carries.
+/// The key of the mutation every relay entry carries.
 pub const META_KEY: &[u8] = b"relay/meta";
+/// The key of an entry's optional second mutation: the DID owner's state
+/// delta (`state::StateDelta::encode`), what a shard's next owner replays.
+pub const DELTA_KEY: &[u8] = b"relay/delta";
 
 /// Re-encodes an event's frame with its relay seq, straight into the open
 /// segment. The verify workstream's `event.rs` owns parsing; anything it
@@ -161,6 +164,7 @@ impl EventMeta {
 pub struct Event {
     pub meta: EventMeta,
     pub frame: Box<dyn EncodeWithSeq>,
+    pub delta: Option<Bytes>,
 }
 
 /// An appended batch, durable.
@@ -424,8 +428,12 @@ impl Open {
         let mut seqs = Vec::with_capacity(p.events.len());
         for ev in p.events {
             let seq = wm.assign();
-            let meta = [Mutation { key: Bytes::from_static(META_KEY), val: Some(ev.meta.encode()) }];
-            let range = self.seg.push(seq, ShardId(ev.meta.shard), 0, |out| ev.frame.encode_with_seq(seq, out), &meta);
+            let meta = Mutation { key: Bytes::from_static(META_KEY), val: Some(ev.meta.encode()) };
+            let muts = match ev.delta {
+                Some(d) => vec![meta, Mutation { key: Bytes::from_static(DELTA_KEY), val: Some(d) }],
+                None => vec![meta],
+            };
+            let range = self.seg.push(seq, ShardId(ev.meta.shard), 0, |out| ev.frame.encode_with_seq(seq, out), &muts);
             self.frames.push((seq, range));
             seqs.push(seq);
         }
@@ -773,6 +781,7 @@ pub struct Logged {
     pub seq: i64,
     pub meta: EventMeta,
     pub frame: Bytes,
+    pub delta: Option<Bytes>,
 }
 
 /// The events of one segment (None: missing; Some(empty) for a fence).
@@ -798,7 +807,8 @@ pub async fn read_segment(store: &Store, log_id: &str, ordinal: u64) -> anyhow::
                         .ok_or_else(|| {
                             anyhow::anyhow!("segment {log_id}/{ordinal}: entry {} has no relay meta", e.seq)
                         })?;
-                    Ok(Logged { seq: e.seq, meta, frame: e.frame })
+                    let delta = e.muts.iter().find(|m| &m.key[..] == DELTA_KEY).and_then(|m| m.val.clone());
+                    Ok(Logged { seq: e.seq, meta, frame: e.frame, delta })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()
                 .map(Some)

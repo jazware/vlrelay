@@ -234,6 +234,7 @@ async fn run(a: Args) {
                                 shard: 0,
                             },
                             frame: Box::new(templates[k].clone()),
+                            delta: None,
                         }
                     })
                     .collect();

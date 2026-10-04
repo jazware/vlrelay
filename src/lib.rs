@@ -5,6 +5,7 @@ pub mod admin;
 pub mod cluster;
 pub mod event;
 pub mod identity;
+pub mod node;
 pub mod policy;
 pub mod seq;
 pub mod serve;
