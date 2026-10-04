@@ -417,7 +417,7 @@ State and endpoints:
 Decided in the design doc:
 
 - Sync 1.1 is enforced. A failed `prevData` or inversion check drops the event and marks the account `desynchronized` until a `#sync` (or a fresh `getRepo` on archival shards) resets it. indigo only logs these.
-- Takedowns filter the replay window as well as the live stream, through the takedown list in the bucket.
+- Takedowns filter the replay window as well as the live stream, through the takedown list in the bucket. Not built yet: today a takedown stops the account's new events and emits its `#account`, but events already in the replay window are still served (see [policy.md, Gaps](policy.md#gaps)).
 - A slow consumer falls back to reading segments, so catch-up doesn't trip `ConsumerTooSlow` before it reaches live.
 - The relay seq is the merge key of the node logs, so seqs are time-ordered ids with gaps instead of a dense counter. The spec allows gaps.
 - Account migrations: the DID owner only accepts events from the host its fresh DID document names, and re-resolves when that changes (PLAN decision 3). That's what indigo does too, but per DID owner instead of per host.
