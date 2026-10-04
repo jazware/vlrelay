@@ -205,3 +205,70 @@ impl Checker {
         Ok(Checked { kind, did, ops: parsed.len() })
     }
 }
+
+/// What a full repo CAR holds once [`check_repo`] accepts it.
+pub struct RepoCar {
+    pub commit: Cid,
+    pub rev: String,
+    pub records: usize,
+}
+
+/// Checks a getRepo CAR for `did` as a relay bootstrapping from it would:
+/// one root, every block hashes to its CID, the commit is the account's
+/// and signed by its key, and the tree rebuilt from the records alone has
+/// the commit's `data` as its root. Also the streamable order's first two
+/// blocks: the commit, then the root node.
+pub fn check_repo(layout: &Layout, did: &str, bytes: &[u8]) -> Result<RepoCar, String> {
+    let (roots, blocks) = car::read_car(bytes).map_err(|e| format!("CAR: {e}"))?;
+    let [root] = roots[..] else {
+        return Err(format!("{} roots", roots.len()));
+    };
+    let mut map: HashMap<Cid, &[u8]> = HashMap::with_capacity(blocks.len());
+    for (c, b) in &blocks {
+        if !car::block_matches(c, b) {
+            return Err(format!("block {c} doesn't match its CID"));
+        }
+        map.insert(*c, b);
+    }
+    if blocks.first().map(|b| b.0) != Some(root) {
+        return Err("the commit isn't the first block".into());
+    }
+    let commit = Value::decode(map[&root]).map_err(|e| format!("commit: {e}"))?;
+    let Value::Map(fields) = &commit else {
+        return Err("commit isn't a map".into());
+    };
+    if commit.get("did").and_then(|v| v.as_str()) != Some(did) || !matches!(commit.get("version"), Some(Value::Int(3)))
+    {
+        return Err("commit did or version".into());
+    }
+    let rev = commit.get("rev").and_then(|v| v.as_str()).ok_or("no rev")?.to_string();
+    let Some(Value::Link(data)) = commit.get("data") else {
+        return Err("no data".into());
+    };
+    let Some(Value::Bytes(sig)) = commit.get("sig") else {
+        return Err("unsigned".into());
+    };
+    let (g, i) = layout.parse_did(did).ok_or("not a fleet DID")?;
+    let unsigned = Value::Map(fields.iter().filter(|(k, _)| k != "sig").cloned().collect()).to_cbor();
+    if !vlpds::crypto::verify_k256(&layout.key(g, i).public_key_sec1(), &unsigned, sig).unwrap_or(false) {
+        return Err("bad signature".into());
+    }
+    if blocks.get(1).map(|b| b.0) != Some(*data) {
+        return Err("the root node isn't the second block".into());
+    }
+    let tree = Tree::load_from_blocks(&map, *data).map_err(|e| format!("load: {e:?}"))?;
+    let mut leaves = Vec::new();
+    tree.walk(&mut |k, c| leaves.push((k.to_vec(), c)));
+    let mut rebuilt = Tree::new();
+    for (k, c) in &leaves {
+        if !map.contains_key(c) {
+            return Err(format!("record {c} missing"));
+        }
+        rebuilt.insert_no_proof(k, *c).map_err(|e| format!("rebuild: {e:?}"))?;
+    }
+    let got = rebuilt.root_cid().map_err(|e| format!("rebuild: {e:?}"))?;
+    if got != *data {
+        return Err(format!("records rebuild to {got}, commit data is {data}"));
+    }
+    Ok(RepoCar { commit: root, rev, records: leaves.len() })
+}

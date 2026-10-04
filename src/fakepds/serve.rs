@@ -3,7 +3,7 @@
 //! xrpc surface, and the fake PLC directory.
 
 use super::fleet::Layout;
-use super::generate::{HostFaults, HostQueue, Pending};
+use super::generate::{HostFaults, HostQueue, Pending, Repos};
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
@@ -41,7 +41,9 @@ pub struct HostState {
     pub queue: Arc<HostQueue>,
     ring: Mutex<Ring>,
     tx: broadcast::Sender<Batch>,
-    heads: Mutex<HashMap<u32, (Cid, Tid)>>,
+    /// Each account's repo as the generators last left it, which is up to
+    /// the pre-generated pool ahead of the stream.
+    pub repos: Arc<Repos>,
     stalled: AtomicBool,
     down_until: Mutex<Option<Instant>>,
     kill: watch::Sender<u64>,
@@ -57,6 +59,7 @@ impl HostState {
         layout: Layout,
         faults: HostFaults,
         queue: Arc<HostQueue>,
+        repos: Arc<Repos>,
         ring_cap: usize,
         broadcast_cap: usize,
     ) -> Arc<HostState> {
@@ -67,7 +70,7 @@ impl HostState {
             queue,
             ring: Mutex::new(Ring { items: VecDeque::new(), bytes: 0, cap: ring_cap, seq: 0 }),
             tx: broadcast::channel(broadcast_cap).0,
-            heads: Mutex::new(HashMap::new()),
+            repos,
             stalled: AtomicBool::new(false),
             down_until: Mutex::new(None),
             kill: watch::channel(0).0,
@@ -94,14 +97,6 @@ impl HostState {
             p.finish(ring.seq, now, &mut out);
             bytes += out.len() as u64;
             frames.push((ring.seq, Bytes::from(out)));
-        }
-        {
-            let mut heads = self.heads.lock();
-            for p in items {
-                if let Some(h) = p.head {
-                    heads.insert(p.did_idx, h);
-                }
-            }
         }
         for (s, f) in &frames {
             ring.bytes += f.len();
@@ -266,8 +261,11 @@ pub fn router(h: Arc<HostState>) -> Router {
         .route("/xrpc/com.atproto.sync.listRepos", get(list_repos))
         .route("/xrpc/com.atproto.sync.getRepoStatus", get(repo_status))
         .route("/xrpc/com.atproto.sync.getLatestCommit", get(latest_commit))
+        .route("/xrpc/com.atproto.sync.getRepo", get(get_repo))
         .route("/xrpc/_health", get(|| async { Json(json!({"version": "fakepds"})) }))
-        .fallback(|| async { xrpc_err(StatusCode::NOT_IMPLEMENTED, "MethodNotImplemented", "fakepds doesn't serve this") })
+        .fallback(|| async {
+            xrpc_err(StatusCode::NOT_IMPLEMENTED, "MethodNotImplemented", "fakepds doesn't serve this")
+        })
         .with_state(h)
 }
 
@@ -297,13 +295,8 @@ fn own_did(h: &HostState, q: &HashMap<String, String>) -> Result<(String, u32), 
 async fn list_repos(State(h): State<Arc<HostState>>, Query(q): Query<HashMap<String, String>>) -> Response {
     let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(500).clamp(1, 1000);
     let after = q.get("cursor").and_then(|v| v.parse::<u32>().ok());
-    let mut heads: Vec<(u32, Cid, Tid)> = h
-        .heads
-        .lock()
-        .iter()
-        .filter(|(i, _)| after.is_none_or(|a| **i > a))
-        .map(|(i, (c, r))| (*i, *c, *r))
-        .collect();
+    let mut heads: Vec<(u32, Cid, Tid)> = h.repos.heads();
+    heads.retain(|x| after.is_none_or(|a| x.0 > a));
     heads.sort_unstable_by_key(|x| x.0);
     heads.truncate(limit);
     let cursor = (heads.len() == limit).then(|| heads.last().map(|x| x.0.to_string())).flatten();
@@ -324,8 +317,8 @@ async fn repo_status(State(h): State<Arc<HostState>>, Query(q): Query<HashMap<St
         Err(r) => return r,
     };
     let mut body = json!({"did": did, "active": true});
-    if let Some((_, rev)) = h.heads.lock().get(&i) {
-        body["rev"] = json!(rev.to_string());
+    if let Some(s) = h.repos.get(i) {
+        body["rev"] = json!(s.rev.to_string());
     }
     Json(body).into_response()
 }
@@ -335,9 +328,25 @@ async fn latest_commit(State(h): State<Arc<HostState>>, Query(q): Query<HashMap<
         Ok(x) => x,
         Err(r) => return r,
     };
-    match h.heads.lock().get(&i) {
-        Some((c, rev)) => Json(json!({"cid": c.to_string(), "rev": rev.to_string()})).into_response(),
-        None => xrpc_err(StatusCode::BAD_REQUEST, "RepoNotFound", "no commit emitted yet"),
+    match h.repos.get(i) {
+        Some(s) => Json(json!({"cid": s.commit.to_string(), "rev": s.rev.to_string()})).into_response(),
+        None => xrpc_err(StatusCode::BAD_REQUEST, "RepoNotFound", "no commit yet"),
+    }
+}
+
+/// The whole repo from one snapshot, so its root is what getLatestCommit
+/// returned at the same moment. `since` is ignored: always the full repo.
+async fn get_repo(State(h): State<Arc<HostState>>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let (_, i) = match own_did(&h, &q) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let Some(s) = h.repos.get(i) else {
+        return xrpc_err(StatusCode::BAD_REQUEST, "RepoNotFound", "no commit yet");
+    };
+    match s.car() {
+        Ok(car) => ([(axum::http::header::CONTENT_TYPE, "application/vnd.ipld.car")], car).into_response(),
+        Err(e) => xrpc_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", &e.to_string()),
     }
 }
 

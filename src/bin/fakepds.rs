@@ -20,7 +20,7 @@ mod serve;
 use clap::{Args, Parser, Subcommand};
 use fleet::Layout;
 use futures::StreamExt;
-use generate::{Gen, GenCfg, GenStats, HostFaults, HostQueue, KindMix, Label, SizeMix};
+use generate::{Gen, GenCfg, GenStats, HostFaults, HostQueue, KindMix, Label, Repos, SizeMix};
 use parking_lot::RwLock;
 use serve::{HostState, Shape};
 use std::collections::BTreeMap;
@@ -106,7 +106,7 @@ struct RunArgs {
     #[arg(long, default_value_t = 50)]
     initial_records: usize,
     /// Records per account above which deletes outpace creates. Memory is
-    /// ~250 bytes per record, so accounts x this bounds the trees.
+    /// ~260 bytes per record, so accounts x this bounds the trees.
     #[arg(long, default_value_t = 100)]
     target_records: usize,
     #[arg(long, default_value_t = 5200.0)]
@@ -199,6 +199,7 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
     let w = weights(a.hosts, a.skew);
     let wsum: f64 = w.iter().sum();
     let rates: Vec<f64> = w.iter().map(|x| a.rate * x / wsum).collect();
+    let repos: Vec<Arc<Repos>> = (0..a.hosts).map(|_| Arc::default()).collect();
     let cfg = Arc::new(GenCfg {
         layout: layout.clone(),
         host_base: a.host_base,
@@ -211,6 +212,7 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
         mix: KindMix { identity: a.identity_share, account: a.account_share, sync: a.sync_share },
         faults: faults.clone(),
         weights: w.clone(),
+        repos: repos.clone(),
     });
     let pool_bytes = a.pool_mb.map_or(a.rate * a.size_p50 * 1.1 * a.pregen_secs.max(0.5) * 1.25, |m| (m << 20) as f64);
     let queues: Arc<Vec<Arc<HostQueue>>> =
@@ -241,7 +243,15 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
         // a stalled host's subscribers fall behind by the whole stall
         let lag = a.lag_secs + faults[l].stall.map_or(0.0, |(secs, _)| secs);
         let bcap = ((lag * ticks_per_s) as usize).max(16);
-        let h = HostState::new(g, layout.clone(), faults[l].clone(), queues[l].clone(), ring_cap(w[l]), bcap);
+        let h = HostState::new(
+            g,
+            layout.clone(),
+            faults[l].clone(),
+            queues[l].clone(),
+            repos[l].clone(),
+            ring_cap(w[l]),
+            bcap,
+        );
         let addr = format!("{}:{}", a.bind, a.fleet.port_base as u32 + g);
         let lis = tokio::net::TcpListener::bind(&addr).await.map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
         tokio::spawn(axum::serve(lis, serve::router(h.clone())).into_future());
@@ -258,7 +268,12 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
     while stats.iter().any(|s| s.ready.load(Ordering::Acquire) == 0) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    tracing::info!(secs = t0.elapsed().as_secs_f64(), accounts = a.hosts as u64 * a.dids as u64, threads, "accounts built");
+    tracing::info!(
+        secs = t0.elapsed().as_secs_f64(),
+        accounts = a.hosts as u64 * a.dids as u64,
+        threads,
+        "accounts built"
+    );
     let want = (a.rate * a.pregen_secs) as u64;
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -283,7 +298,8 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
     let scale = Arc::new(AtomicU64::new(1f64.to_bits()));
     let et = a.emit_threads.clamp(1, hosts.len().max(1));
     for e in 0..et {
-        let mine: Vec<_> = hosts.iter().enumerate().filter(|(i, _)| i % et == e).map(|(i, h)| (h.clone(), rates[i])).collect();
+        let mine: Vec<_> =
+            hosts.iter().enumerate().filter(|(i, _)| i % et == e).map(|(i, h)| (h.clone(), rates[i])).collect();
         let (shape, stop, scale) = (shape.clone(), stop.clone(), scale.clone());
         std::thread::Builder::new()
             .name(format!("emit-{e}"))
@@ -427,8 +443,10 @@ async fn consume(a: ConsumeArgs) -> anyhow::Result<()> {
                             last = last.max(*s);
                         }
                         if !senders.is_empty() {
-                            let did = body.get("repo").or_else(|| body.get("did")).and_then(|v| v.as_str()).unwrap_or("");
-                            let shard = did.bytes().fold(0usize, |h, c| h.wrapping_mul(31).wrapping_add(c as usize)) % senders.len();
+                            let did =
+                                body.get("repo").or_else(|| body.get("did")).and_then(|v| v.as_str()).unwrap_or("");
+                            let shard = did.bytes().fold(0usize, |h, c| h.wrapping_mul(31).wrapping_add(c as usize))
+                                % senders.len();
                             let _ = senders[shard].send((g, b));
                         }
                     }
@@ -442,7 +460,12 @@ async fn consume(a: ConsumeArgs) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let (e, b) = (events.load(Ordering::Relaxed), bytes.load(Ordering::Relaxed));
         let dt = last.0.elapsed().as_secs_f64();
-        eprintln!("{:>4}s {:>9.0} ev/s {:>8.1} MB/s", begin.elapsed().as_secs(), (e - last.1) as f64 / dt, (b - last.2) as f64 / dt / 1e6);
+        eprintln!(
+            "{:>4}s {:>9.0} ev/s {:>8.1} MB/s",
+            begin.elapsed().as_secs(),
+            (e - last.1) as f64 / dt,
+            (b - last.2) as f64 / dt / 1e6
+        );
         last = (Instant::now(), e, b);
     }
     for t in tasks {
@@ -519,7 +542,12 @@ async fn selftest(o: SelftestOpts) -> anyhow::Result<()> {
     let layout = Layout::new("selftest", "http://127.0.0.1", port_base);
     let hosts = 5u32;
     let mut faults = vec![HostFaults::default(); hosts as usize];
-    for f in ["badsig:0:rate=0.03", "gap:1:rate=0.03,heal=2", "foreign:2:rate=0.03", "spam:3:rate=500,secs=1,every=2,delay=0"] {
+    for f in [
+        "badsig:0:rate=0.03",
+        "gap:1:rate=0.03,heal=2",
+        "foreign:2:rate=0.03",
+        "spam:3:rate=500,secs=1,every=2,delay=0",
+    ] {
         generate::parse_fault(f, 0, hosts, &mut faults)?;
     }
     let cfg = Arc::new(GenCfg {
@@ -534,6 +562,7 @@ async fn selftest(o: SelftestOpts) -> anyhow::Result<()> {
         mix: KindMix { identity: 0.01, account: 0.01, sync: 0.01 },
         faults: faults.clone(),
         weights: vec![1.0; hosts as usize],
+        repos: (0..hosts).map(|_| Arc::default()).collect(),
     });
     let t0 = Instant::now();
     let mut g = Gen::new(cfg.clone(), 0)?;
@@ -569,7 +598,12 @@ async fn selftest(o: SelftestOpts) -> anyhow::Result<()> {
             if got != expected(p.label) && !(p.label == Label::AfterGap && first_sight) {
                 bad += 1;
                 if bad <= 10 {
-                    eprintln!("host {h} #{i} {:?}: expected {:?}, got {:?}", p.label, expected(p.label), r.as_ref().err());
+                    eprintln!(
+                        "host {h} #{i} {:?}: expected {:?}, got {:?}",
+                        p.label,
+                        expected(p.label),
+                        r.as_ref().err()
+                    );
                 }
             }
             *matrix.entry((p.label, got.map_or("ok".into(), |f| format!("{f:?}")))).or_default() += 1;
@@ -602,7 +636,8 @@ async fn selftest(o: SelftestOpts) -> anyhow::Result<()> {
     let mut states = Vec::new();
     for h in 0..hosts {
         let q = Arc::new(HostQueue::new(usize::MAX));
-        let st = HostState::new(h, layout.clone(), HostFaults::default(), q, 1 << 30, 1024);
+        let st =
+            HostState::new(h, layout.clone(), HostFaults::default(), q, cfg.repos[h as usize].clone(), 1 << 30, 1024);
         let lis = tokio::net::TcpListener::bind(("127.0.0.1", port_base + h as u16)).await?;
         tokio::spawn(axum::serve(lis, serve::router(st.clone())).into_future());
         st.publish(&per_host[h as usize], &now);
@@ -620,7 +655,9 @@ async fn selftest(o: SelftestOpts) -> anyhow::Result<()> {
         let want = &frames[h as usize];
         let mut got = 0usize;
         while got < want.len() {
-            let m = tokio::time::timeout(Duration::from_secs(10), ws.next()).await?.ok_or_else(|| anyhow::anyhow!("closed"))??;
+            let m = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("closed"))??;
             let tokio_tungstenite::tungstenite::Message::Binary(b) = m else { continue };
             let (label, f) = &want[got];
             let r = c.check(&layout, h, &b).err().map(|e| e.0);
@@ -644,15 +681,115 @@ async fn selftest(o: SelftestOpts) -> anyhow::Result<()> {
         }
     }
     let lr: serde_json::Value =
-        reqwest::get(format!("{}/xrpc/com.atproto.sync.listRepos?limit=1000", layout.host_url(0))).await?.json().await?;
+        reqwest::get(format!("{}/xrpc/com.atproto.sync.listRepos?limit=1000", layout.host_url(0)))
+            .await?
+            .json()
+            .await?;
     let listed = lr["repos"].as_array().map_or(0, Vec::len);
-    println!("fake PLC: 4 DIDs resolved through vlpds's DidResolver, {plc_bad} wrong; host 0 listRepos: {listed} repos");
+    println!(
+        "fake PLC: 4 DIDs resolved through vlpds's DidResolver, {plc_bad} wrong; host 0 listRepos: {listed} repos"
+    );
 
-    if bad > 0 || wire_bad > 0 || plc_bad > 0 || listed == 0 {
-        anyhow::bail!("selftest failed: {bad} in-process, {wire_bad} over the wire, {plc_bad} PLC, {listed} listed");
+    // getRepo: full CARs that match getLatestCommit, a spam account's
+    // first commit included, and another host's DID refused
+    let http = reqwest::Client::new();
+    let mut repo_bad = 0u64;
+    let mut repo_records = 0usize;
+    // host 3's events all went to spam accounts, so only those have commits
+    let mut accounts: Vec<(u32, u32)> =
+        (0..hosts).filter(|h| *h != 3).flat_map(|h| [0u32, 1, 7, 20, 39].map(|i| (h, i))).collect();
+    accounts.extend([(3, cfg.dids), (3, cfg.dids + 77)]);
+    for &(h, i) in &accounts {
+        match get_repo_checked(&http, &layout, h, i).await {
+            Ok(c) => repo_records += c.records,
+            Err(e) => {
+                repo_bad += 1;
+                eprintln!("getRepo host {h} account {i}: {e}");
+            }
+        }
+    }
+    let foreign = http
+        .get(format!("{}/xrpc/com.atproto.sync.getRepo?did={}", layout.host_url(0), layout.did(1, 0)))
+        .send()
+        .await?;
+    let refused = foreign.status() == reqwest::StatusCode::BAD_REQUEST
+        && foreign.json::<serde_json::Value>().await?["error"] == "RepoNotFound";
+
+    // a gap commit moves the head without a frame: getRepo serves it anyway
+    let revs = |r: &Repos| -> std::collections::HashMap<u32, String> {
+        r.heads().into_iter().map(|(i, _, rev)| (i, rev.to_string())).collect()
+    };
+    let mut unsent = Vec::new();
+    let mut gapped = None;
+    for _ in 0..100_000 {
+        let before = revs(&cfg.repos[1]);
+        let n0 = unsent.len();
+        g.next(1, &mut unsent)?;
+        if unsent.len() == n0 {
+            gapped =
+                revs(&cfg.repos[1]).into_iter().find(|(i, r)| before.get(i) != Some(r)).map(|(i, r)| (i, r, before));
+            break;
+        }
+    }
+    let (gi, grev, before) = gapped.ok_or_else(|| anyhow::anyhow!("no gap commit on host 1"))?;
+    match get_repo_checked(&http, &layout, 1, gi).await {
+        Ok(c) if c.rev == grev && before.get(&gi) != Some(&grev) => {}
+        Ok(c) => {
+            repo_bad += 1;
+            eprintln!("getRepo after a gap: rev {} want {grev} (was {:?})", c.rev, before.get(&gi));
+        }
+        Err(e) => {
+            repo_bad += 1;
+            eprintln!("getRepo after a gap: {e}");
+        }
+    }
+
+    let snap = cfg.repos[0].get(0).ok_or_else(|| anyhow::anyhow!("host 0 account 0 has no commit"))?;
+    let t2 = Instant::now();
+    let mut car_len = 0;
+    for _ in 0..200 {
+        car_len = snap.car()?.len();
+    }
+    println!(
+        "getRepo: {} CARs checked (one after a gap, {repo_records} records in the others), {repo_bad} bad, other host's DID refused: {refused}; a {}-record repo is {car_len} B, built in {:.0} µs",
+        accounts.len() + 1,
+        snap.recs.len(),
+        t2.elapsed().as_secs_f64() * 1e6 / 200.0
+    );
+
+    if bad > 0 || wire_bad > 0 || plc_bad > 0 || listed == 0 || repo_bad > 0 || !refused {
+        anyhow::bail!(
+            "selftest failed: {bad} in-process, {wire_bad} over the wire, {plc_bad} PLC, {listed} listed, {repo_bad} getRepo, foreign refused {refused}"
+        );
     }
     println!("selftest ok");
     Ok(())
+}
+
+/// getLatestCommit, then getRepo, for account `i` of host `h`: the CAR must
+/// pass [`check::check_repo`] and name the same commit and rev.
+async fn get_repo_checked(http: &reqwest::Client, layout: &Layout, h: u32, i: u32) -> anyhow::Result<check::RepoCar> {
+    let did = layout.did(h, i);
+    let base = layout.host_url(h);
+    let lc: serde_json::Value = http
+        .get(format!("{base}/xrpc/com.atproto.sync.getLatestCommit?did={did}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let r = http.get(format!("{base}/xrpc/com.atproto.sync.getRepo?did={did}")).send().await?.error_for_status()?;
+    let ct = r.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    anyhow::ensure!(ct == "application/vnd.ipld.car", "content type {ct}");
+    let body = r.bytes().await?;
+    let car = check::check_repo(layout, &did, &body).map_err(|e| anyhow::anyhow!(e))?;
+    anyhow::ensure!(
+        lc["cid"].as_str() == Some(car.commit.to_string().as_str()) && lc["rev"].as_str() == Some(car.rev.as_str()),
+        "getLatestCommit {lc} but the CAR is {} at {}",
+        car.commit,
+        car.rev
+    );
+    Ok(car)
 }
 
 #[cfg(test)]

@@ -19,11 +19,16 @@ Each host listens on its own port (`PORT_BASE + g`, where `g` is the host's glob
 |---|---|
 | `com.atproto.sync.subscribeRepos` | The stream, with cursors. A cursor in the replay ring replays from there, an older one gets `#info OutdatedCursor` first, and a future one gets a `FutureCursor` error and a close. A subscriber more than `--lag-secs` (1) behind gets `ConsumerTooSlow` and a close. |
 | `com.atproto.server.describeServer` | `did:web:h<g>.fakepds.test` and the host's handle domain |
-| `com.atproto.sync.listRepos` | every account that has emitted a commit, with its head and rev |
-| `com.atproto.sync.getRepoStatus`, `getLatestCommit` | from the emitted heads (always `active`) |
+| `com.atproto.sync.listRepos` | every account that has a commit, with its head and rev |
+| `com.atproto.sync.getRepoStatus`, `getLatestCommit` | the account's head (always `active`) |
+| `com.atproto.sync.getRepo` | the whole repo as a CAR (`application/vnd.ipld.car`): the commit as the root, then every MST node and record in vlpds's streamable order. `since` is ignored, so it's always the full repo. |
 | `/xrpc/_health` | 200 |
 
-Anything else gets 501 `MethodNotImplemented`. That includes `getRepo`, so a relay that wants to resync a desynchronized account from the host can't yet (see Gaps).
+Anything else gets 501 `MethodNotImplemented`.
+
+The head these serve is the repo's, not the stream's. It moves when a generator applies a commit, and that's up to `--pregen-secs` ahead of emission. A commit swallowed by a `gap` fault moves it too. So a relay that bootstraps from getRepo can get a rev it hasn't seen on the stream yet, the same as with a real PDS. It should drop stream commits at or below that rev, and the next one chains from it. getRepo and getLatestCommit read the same per-account snapshot, so their commit and rev agree at any moment.
+
+getRepo rebuilds the record bytes on each request instead of storing them (see Records). In the selftest an 80-record repo (50 small initial records, the rest ~5 KB commit records) is about 165 KB and takes 0.2-0.4 ms of one core to build on the Mac. It's built on the host's tokio threads, so a bootstrap storm costs the fleet process CPU.
 
 Every account has a real secp256k1 key and a real MST built with vlpds's `mst::Tree`. A commit is built the way vlpds's own repo worker builds one. The ops go into the tree, `write_diff_blocks` gives the new nodes and the proof nodes, the commit is signed with `crypto::Keypair`, and the CAR carries the signed commit, those nodes and the new records. The frame comes from `events::commit_frame` with `since` and `prevData` set. So a commit passes the full sync 1.1 checks: CAR root, block hashes, signature, rev order, `since`/`prevData` chaining and MST inversion.
 
@@ -49,7 +54,11 @@ The defaults match the production measurements in `docs/reference-notes.md` (#co
 
 A record's text is padded so the frame lands on the sampled size, after subtracting the commit, CAR overhead and a running average of the account's MST bytes. The text is random English-ish words, so it compresses about as well as real posts do. Measured on a 40 s benchbox run, every frame on the wire was p50 5,311 B, p90 7,743 B, p99 10,303 B, mean 5,245 B. That's close enough to production that frame size shouldn't skew a relay bench.
 
-Each account starts with `--initial-records` (50) records, so commits carry real proof paths. Production repos are much bigger, and their proofs are deeper. Raise it if the relay's MST inversion cost matters to the bench. Memory goes up by about 250 bytes per record (see below).
+Each account starts with `--initial-records` (50) records, so commits carry real proof paths. They're small, 150-600 bytes. Production repos are much bigger, and their proofs are deeper. Raise it if the relay's MST inversion cost matters to the bench (or the size of a getRepo). Memory goes up by about 260 bytes per record: 263 measured from 50 to 250 initial records over 20,000 accounts, down from 308 before records were rebuilt from state. Building them costs startup time: 20,000 accounts with 250 records each took 4.9 s on 4 threads of a busy Mac, against 3.4 s before.
+
+### Records
+
+Nobody keeps a record's bytes. They're a pure function of 64 bytes of state: a seed, the collection, the rkey, the target size and the `createdAt` second. The seed hashes the account's DID (so the fleet seed, host and account) with the account's write counter. The text comes from the seed, so the same state always gives the same bytes and the same CID. A commit builds its records once for the CAR, and getRepo builds them again from the state. Each account keeps that state for its live records next to its MST.
 
 ### Rate and burstiness
 
@@ -79,7 +88,7 @@ A local run with one of each on 8 hosts, checked by `consume --verify`, counted 
 
 ## Checking the frames
 
-`fakepds selftest` generates 15,000 events over 5 hosts with every fault on, checks them in process, then serves them on real ports and checks them again over a websocket from cursor 0, byte for byte. It also resolves DIDs through the fake PLC and checks `listRepos`. The checker (`src/fakepds/check.rs`) is built from vlpds's `cbor`, `car`, `mst` and `crypto` modules. It verifies the CAR root and every block hash, the commit's DID, rev, version and signature, the rev order, `since`/`prevData` against the last commit it saw for the account, and the inversion of every op on the CAR's partial tree back to `prevData`. Every clean event passes and every faulty one fails the check it should. `cargo test --bin fakepds` runs a smaller version.
+`fakepds selftest` generates 15,000 events over 5 hosts with every fault on, checks them in process, then serves them on real ports and checks them again over a websocket from cursor 0, byte for byte. It also resolves DIDs through the fake PLC and checks `listRepos`. Then it fetches getRepo for 23 accounts, one of them right after a `gap` commit that moved the head without a frame, and checks each CAR as a bootstrapping relay would: every block hashes to its CID, the commit is signed by the account's key, the tree rebuilt from the records alone has the commit's `data` as its root, and the commit and rev match getLatestCommit. Another host's DID gets `RepoNotFound`. The checker (`src/fakepds/check.rs`) is built from vlpds's `cbor`, `car`, `mst` and `crypto` modules. It verifies the CAR root and every block hash, the commit's DID, rev, version and signature, the rev order, `since`/`prevData` against the last commit it saw for the account, and the inversion of every op on the CAR's partial tree back to `prevData`. Every clean event passes and every faulty one fails the check it should. `cargo test --bin fakepds` runs a smaller version.
 
 `fakepds consume` subscribes to hosts (`--host URL` repeatable, or `--count N` for the fleet's first N), prints events/s every second and a JSON summary with the frame size percentiles and seq regressions. `--verify` runs the same checker on every frame on `--verify-threads` threads, sharded by DID. Verifying 63k events/s took ~2 cores on the Mac, so checking a whole 160k/s fleet needs ~5 cores more. `e2e_check` is the tool for relay-vs-upstream comparisons.
 
@@ -94,7 +103,7 @@ A local run with one of each on 8 hosts, checked by `consume --verify`, counted 
 
 So a fakepds process costs about 4 cores per 100k events/s with subscribers attached, nearly all of it generation. Four processes on benchbox put out well over the relay's 100k target, and the consumer saw 0 seq regressions. Run the fleet on the same box as the relay only if it has the cores to spare. Otherwise point `ADVERTISE` and `BIND` at an address the relay can reach.
 
-Memory per process is the pool, the replay ring (`--replay-mb`, 256), up to `--lag-secs` of frames still owed to subscribers, and the accounts' trees, which grow to about accounts x `--target-records` x 250 bytes. `fleet.sh` runs each process in a systemd scope with `MemoryMax=$MEM` (6G) on Linux and under `dev/capped.sh` on macOS. Size `MEM` from that sum. A 2G cap with the old 1 GB default pool got a process killed within 20 s.
+Memory per process is the pool, the replay ring (`--replay-mb`, 256), up to `--lag-secs` of frames still owed to subscribers, and the accounts' trees, which grow to about accounts x `--target-records` x 260 bytes. `fleet.sh` runs each process in a systemd scope with `MemoryMax=$MEM` (6G) on Linux and under `dev/capped.sh` on macOS. Size `MEM` from that sum. A 2G cap with the old 1 GB default pool got a process killed within 20 s.
 
 ## fleet.sh
 
@@ -112,7 +121,7 @@ WHERE=benchbox PROCS=4 HOSTS=10 DIDS=2500 RATE=40000 GEN=6 MEM=6G DURATION=600 s
 
 ## Gaps
 
-- No `getRepo`. The trees live in the generator threads and record bytes aren't kept, so a relay can't fetch a full repo to resync. `#sync` after a gap is the only way back for now.
+- getRepo ignores `since` and always sends the full repo. Accounts that haven't committed yet (only their `--initial-records`) get `RepoNotFound`.
 - `#account` is always `active: true`. There's no deactivate/reactivate cycle, so the relay's inactive-account path isn't exercised.
 - secp256k1 keys only. vlpds signs with libsecp256k1 and has no p256 signer.
 - Handles (`u<i>.h<g>.fakepds.test`) don't resolve, so a relay that verifies handles will mark them invalid.
