@@ -46,12 +46,35 @@ for n in names:
         if v:
             fail.append(f"{n}: {v} {what}")
 
-cr = open(f"{out}/cluster-report.txt").read() if os.path.exists(f"{out}/cluster-report.txt") else ""
-for line in cr.splitlines():
-    if line.startswith("identical"):
-        print(line)
-        if "MISMATCH" in line or "empty" in line:
-            fail.append(line)
+# every stream the same events at the same seqs. cluster_report.py compares
+# the checkers' keys, whose #identity/#account occurrence counts depend on
+# where each socket started; here those counts are dropped.
+seqs = {}
+for n in names:
+    try:
+        rows = (l.split(" ", 2) for l in open(f"{out}/seqs-{n}.txt"))
+        seqs[n] = {int(s): (d, re.sub(r"#\d+$", "", k.strip())) for s, d, k in rows if int(s) > 0}
+    except OSError:
+        pass
+ref = "core1" if "core1" in seqs else next(iter(seqs), None)
+for n in names:
+    if n not in seqs or n == ref:
+        continue
+    a, b = seqs[ref], seqs[n]
+    if not a or not b:
+        fail.append(f"identical {ref} vs {n}: empty stream")
+        continue
+    lo, hi = max(min(a), min(b)), min(max(a), max(b))
+    ka = {s: v for s, v in a.items() if lo <= s <= hi}
+    kb = {s: v for s, v in b.items() if lo <= s <= hi}
+    only_a, only_b = len(ka.keys() - kb.keys()), len(kb.keys() - ka.keys())
+    differ = sum(1 for s in ka.keys() & kb.keys() if ka[s] != kb[s])
+    ok = only_a == 0 and only_b == 0 and differ == 0
+    line = (f"identical {ref} vs {n}: {len(ka)} events in the shared seq range, only in {ref} {only_a}, "
+            f"only in {n} {only_b}, different {differ}: {'OK' if ok else 'MISMATCH'}")
+    print(line)
+    if not ok:
+        fail.append(line)
 
 # acked-but-lost: a missing event the host's checkpoint had already passed
 ck = {}
@@ -113,8 +136,8 @@ if marks:
 exits = []
 for line in open(f"{out}/exits.txt") if os.path.exists(f"{out}/exits.txt") else []:
     p = line.split()
-    if len(p) == 3:
-        exits.append((p[0], int(p[1]), int(p[2])))
+    if len(p) == 4:
+        exits.append((p[1], int(p[2]), int(p[3])))
 if exits:
     print("\n== node exits (the supervisor restarted each)")
     for node, t, rc in exits:
