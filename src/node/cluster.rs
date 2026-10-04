@@ -143,6 +143,7 @@ pub struct Glue {
     /// `committed` as the previous checkpoint tick read it.
     committed_prev: AtomicU64,
     hostck: HostCks,
+    dedupe: DedupeStore,
     markers: Mutex<HashMap<ShardId, u64>>,
 }
 
@@ -211,6 +212,7 @@ impl Node {
             committed: AtomicU64::new(0),
             committed_prev: AtomicU64::new(0),
             hostck: HostCks::new(store.clone()),
+            dedupe: DedupeStore::new(store.clone(), log.log_id.to_string()),
             markers: Mutex::new(HashMap::new()),
         });
         let node = Node::assemble(
@@ -336,6 +338,9 @@ impl Glue {
                 if let Err(e) = self.checkpoint_shard(s.id, prev).await {
                     tracing::warn!(shard = %s.id, "checkpoint failed: {e:#}");
                 }
+                if let Err(e) = self.persist_dedupe(s.id).await {
+                    tracing::warn!(shard = %s.id, "dedupe set write failed: {e:#}");
+                }
             }
             if let Err(e) = self.state.flush_host_counts(&*self.hosts).await {
                 tracing::warn!("host counts flush failed: {e:#}");
@@ -361,6 +366,16 @@ impl Glue {
             m = m.and_then(|m| o.checked_sub(1).map(|o| m.min(o)));
         }
         m
+    }
+
+    /// Writes the shard's inherited dedupe entries (those our marker doesn't
+    /// protect) when they changed. Our own appends need no copy: the marker
+    /// for our log stays below them, so the next owner replays them.
+    async fn persist_dedupe(&self, id: ShardId) -> anyhow::Result<()> {
+        if !self.cluster.lease_valid() {
+            return Ok(());
+        }
+        self.dedupe.write(id, self.recent.inherited(id.0)).await
     }
 
     async fn checkpoint_shard(&self, id: ShardId, committed: u64) -> anyhow::Result<()> {
@@ -898,6 +913,20 @@ impl Recent {
         });
     }
 
+    /// The shard's entries replayed from another log or inherited from an
+    /// earlier owner's set, sorted.
+    pub fn inherited(&self, shard: u32) -> Vec<DedupeEntry> {
+        let m = self.m.lock();
+        let mut v: Vec<DedupeEntry> = m
+            .iter()
+            .flat_map(|(h, s)| {
+                s.iter().filter(|(_, e)| e.shard == shard && e.ordinal.is_none()).map(|(q, e)| (h.clone(), *q, e.did))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
     pub fn min_ordinal(&self, shard: u32) -> Option<u64> {
         self.m.lock().values().flat_map(|s| s.values()).filter(|e| e.shard == shard).filter_map(|e| e.ordinal).min()
     }
@@ -908,6 +937,74 @@ impl Recent {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// Each DID shard's inherited dedupe entries, one object per (shard, log):
+/// `dedupe/{shard}/{log_id}`. An owner that crashes before the hosts'
+/// checkpoints pass what it inherited would otherwise take those entries
+/// with it, since its open already moved the earlier log's marker past them.
+/// Only the shard's owner writes its own object; the next owner reads every
+/// log of the shard's history and deletes the earlier ones once its own is
+/// written.
+/// (host, upstream seq, [`did_key`]) of one dedupe entry.
+type DedupeEntry = (Host, i64, u64);
+
+struct DedupeStore {
+    store: Store,
+    log_id: String,
+    /// What each shard's object holds as last written (absent: no object).
+    written: Mutex<HashMap<ShardId, Vec<DedupeEntry>>>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct DedupeDoc {
+    #[serde(default)]
+    entries: Vec<(String, i64, u64)>,
+}
+
+impl DedupeStore {
+    fn new(store: Store, log_id: String) -> DedupeStore {
+        DedupeStore { store, log_id, written: Mutex::new(HashMap::new()) }
+    }
+
+    fn path(&self, shard: ShardId, log_id: &str) -> Path {
+        Path::from(format!("{}/dedupe/{}/{log_id}", self.store.prefix, shard.key()))
+    }
+
+    async fn read(&self, shard: ShardId, log_id: &str) -> anyhow::Result<Vec<DedupeEntry>> {
+        match self.store.raw.get(&self.path(shard, log_id)).await {
+            Ok(r) => {
+                let doc: DedupeDoc = serde_json::from_slice(&r.bytes().await?)?;
+                Ok(doc.entries.into_iter().map(|(h, q, d)| (Host(h), q, d)).collect())
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Our object for the shard holds `entries`: written when they changed,
+    /// deleted when they're gone.
+    async fn write(&self, shard: ShardId, entries: Vec<DedupeEntry>) -> anyhow::Result<()> {
+        if self.written.lock().get(&shard).map_or(entries.is_empty(), |w| *w == entries) {
+            return Ok(());
+        }
+        if entries.is_empty() {
+            self.delete(shard, &self.log_id).await?;
+            self.written.lock().remove(&shard);
+            return Ok(());
+        }
+        let doc = DedupeDoc { entries: entries.iter().map(|(h, q, d)| (h.0.clone(), *q, *d)).collect() };
+        self.store.raw.put(&self.path(shard, &self.log_id), PutPayload::from(serde_json::to_vec(&doc)?)).await?;
+        self.written.lock().insert(shard, entries);
+        Ok(())
+    }
+
+    async fn delete(&self, shard: ShardId, log_id: &str) -> anyhow::Result<()> {
+        match self.store.raw.delete(&self.path(shard, log_id)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -1043,10 +1140,34 @@ impl Shards {
                 }
             }
         }
+        // What earlier owners inherited themselves: entries whose log marker
+        // a previous open already moved past (two crashes in a row).
+        let mut logs: Vec<&str> = Vec::new();
+        for sp in history {
+            if !logs.contains(&sp.log_id.as_str()) {
+                logs.push(&sp.log_id);
+            }
+        }
+        let mut inherited = 0;
+        for l in &logs {
+            for (h, useq, did) in g.dedupe.read(id, l).await? {
+                g.recent.replayed(&h, useq, did, id.0);
+                inherited += 1;
+            }
+        }
+        // ours is written before any event is routed here, so a crash right
+        // after this open loses nothing; then the earlier copies can go
+        g.dedupe.write(id, g.recent.inherited(id.0)).await?;
+        for l in logs.into_iter().filter(|l| *l != g.dedupe.log_id) {
+            if let Err(e) = g.dedupe.delete(id, l).await {
+                tracing::warn!(shard = %id, log = l, "deleting an earlier dedupe set failed: {e:#}");
+            }
+        }
         tracing::info!(
             shard = %id,
             spans = history.len(),
             replayed = n,
+            inherited,
             open_ms = opened.as_millis() as u64,
             replay_ms = (t0.elapsed() - opened).as_millis() as u64,
             "opened DID shard"
@@ -1488,6 +1609,43 @@ mod tests {
         assert!(inf.watch("did:b").is_some(), "the newer append is still in flight");
         inf.done("did:b", id2, tx2, false);
         assert!(!durable(rx, Duration::from_secs(1)).await, "a failed append is no duplicate to ack");
+    }
+
+    /// The two-crash gap: B inherits A's entries by replaying A's log past
+    /// A's marker, and its open moves that marker past them. If B crashes
+    /// before the hosts' checkpoints pass them, C gets them back only from
+    /// B's persisted set.
+    #[tokio::test]
+    async fn inherited_dedupe_survives_a_second_crash() {
+        let store = Store::memory(None);
+        let shard = ShardId(3);
+        let h = Host("pds.test".into());
+        let b = Recent::default();
+        b.replayed(&h, 41, did_key("did:a"), 3);
+        assert!(b.claim(&h, 42, "did:a", 3, 7), "B's own append");
+        b.settle(&h, 42, "did:a", 7);
+        assert_eq!(b.inherited(3), vec![(h.clone(), 41, did_key("did:a"))], "only what B's marker doesn't cover");
+        let bs = DedupeStore::new(store.clone(), "log-b".into());
+        bs.write(shard, b.inherited(3)).await.unwrap();
+
+        // B crashes; C opens the shard with A's and B's logs in its history
+        let c = Recent::default();
+        let cs = DedupeStore::new(store.clone(), "log-c".into());
+        for l in ["log-a", "log-b"] {
+            for (h, q, d) in cs.read(shard, l).await.unwrap() {
+                c.replayed(&h, q, d, 3);
+            }
+        }
+        assert!(!c.claim(&h, 41, "did:a", 3, 0), "the #identity A appended is still a replay on C");
+        cs.write(shard, c.inherited(3)).await.unwrap();
+        cs.delete(shard, "log-b").await.unwrap();
+        assert!(cs.read(shard, "log-b").await.unwrap().is_empty());
+        assert_eq!(cs.read(shard, "log-c").await.unwrap().len(), 1);
+
+        // pruned past the checkpoint: C's object goes away
+        c.prune(&HashMap::from([(h.clone(), 41)]), Duration::from_secs(60));
+        cs.write(shard, c.inherited(3)).await.unwrap();
+        assert!(cs.read(shard, "log-c").await.unwrap().is_empty());
     }
 
     /// The FutureCursor gap: a host whose sequence restarts reuses seqs the
