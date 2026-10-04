@@ -433,4 +433,31 @@ pub(crate) mod tests {
         let bare = ws_server(None).await;
         connect(&cfg, &bare, Some(5)).await.expect("no Server header connects");
     }
+
+    /// A newly admitted host is subscribed at its live head, as indigo does:
+    /// no cursor, so the PDS sends nothing it emitted before.
+    #[tokio::test]
+    async fn a_new_host_is_subscribed_without_a_cursor() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = Host(format!("127.0.0.1:{}", l.local_addr().unwrap().port()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            let cb = |r: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                      resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                let _ = tx.send(r.uri().to_string());
+                Ok(resp)
+            };
+            let _ws = tokio_tungstenite::accept_hdr_async(s, cb).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let mut cfg = UpstreamConfig::new(true);
+        cfg.endpoint = Arc::new(|h: &Host| format!("http://{}", h.0));
+        let (m, _rx) = super::super::Manager::new(cfg, Arc::new(super::super::MemHostStore::default()), None);
+        m.start().await.unwrap();
+        m.admit(&host, super::super::Tier::Default).await.unwrap();
+        let uri = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        assert_eq!(uri, "/xrpc/com.atproto.sync.subscribeRepos");
+        m.shutdown().await.unwrap();
+    }
 }
