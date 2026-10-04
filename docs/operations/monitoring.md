@@ -17,6 +17,7 @@ There are no alert rules or Grafana dashboards for vlRelay yet. The operator das
 | Is the bucket slow? | `vlrelay_durable_lag_ms`, `vlrelay_time_to_durable_seconds`, `vlpds_segment_put_seconds{partition="relay"}` |
 | Are upstreams sending bad data? | `vlrelay_events_rejected_total` by `reason` |
 | Are hosts connected? | `vlrelay_hosts` by `status` |
+| Is a host reader falling behind? | `vlrelay_host_read_lag_max_seconds`, `vlrelay_hosts_lagging` (more than a minute behind) |
 | Who's reading? | `vlrelay_consumers` |
 
 ## The vlrelay series
@@ -37,6 +38,8 @@ Defined in `src/node/metrics.rs` and `src/node/cluster.rs`.
 | `vlrelay_stage_busy_us_total` | counter | `stage` | Microseconds spent in a stage, summed over events |
 | `vlrelay_durable_lag_ms` | gauge | | Mean append-to-durable time over the last second |
 | `vlrelay_hosts` | gauge | `status` | Upstream hosts by status |
+| `vlrelay_host_read_lag_max_seconds` | gauge | | The furthest any host reader on this node is behind its host's stream: the newest frame's age when it was read (read time minus the event's `time`), plus the time since while the reader is held back by its limits |
+| `vlrelay_hosts_lagging` | gauge | | Hosts whose reader is more than a minute behind. Hosts and host detail on the dashboard show each host's lag |
 | `vlrelay_consumers` | gauge | | Connected `subscribeRepos` consumers |
 | `vlrelay_identity_cache_entries` | gauge | | DID documents in the identity cache: the DIDs looked up within the TTL (1 h). Expired entries are swept every minute; at 2^20 an arbitrary eighth goes too |
 | `vlrelay_ack_pending` | gauge | | Upstream events read but not yet durable, rejected or skipped |

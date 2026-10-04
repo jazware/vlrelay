@@ -3,7 +3,7 @@ import { HOST_STATUSES, Live, StatusPill, TierPill } from '../components/relay'
 import { ErrorNotice, Loading } from '../components/ui'
 import type { HostList, HostRow, HostStatus } from '../lib/api'
 import { enc } from '../lib/api'
-import { fmtNum, fmtSi, relTime } from '../lib/format'
+import { fmtLag, fmtNum, fmtSi, lagClass, relTime } from '../lib/format'
 import { navigate, useSearch } from '../lib/router'
 import { useApi, useKey } from '../lib/useApi'
 
@@ -252,7 +252,7 @@ export function Hosts() {
                 <span className="num">{fmtNum(r.accounts)}</span>
                 <span className="num mono dim">{r.lastUpstreamSeq}</span>
                 <span className="num dim">{r.connectedSinceMs ? relTime(r.connectedSinceMs).replace(' ago', '') : '—'}</span>
-                <span className={`num${r.lagMs > 1000 ? ' err-mid' : ' dim'}`}>{r.lagMs ? `${fmtSi(r.lagMs)} ms` : '—'}</span>
+                <span className={`num ${lagClass(r.lagMs) || 'dim'}`} title="how far the reader is behind the host's stream">{r.lagMs ? fmtLag(r.lagMs) : '—'}</span>
                 <span className="dim">{r.node}</span>
               </div>
             )

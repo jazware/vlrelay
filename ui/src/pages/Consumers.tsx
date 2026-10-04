@@ -3,13 +3,11 @@ import { InlineConfirm, Live, Tile } from '../components/relay'
 import { ErrorNotice, Loading, Notice, Panel } from '../components/ui'
 import type { Consumer } from '../lib/api'
 import { api, errText } from '../lib/api'
-import { fmtBytes, fmtNum, fmtSi, fmtTime, relTime } from '../lib/format'
+import { fmtBytes, fmtLag, fmtNum, fmtSi, fmtTime, lagClass, relTime } from '../lib/format'
 import { useApi, useKey } from '../lib/useApi'
 
 const POLL = 2000
 
-const fmtLag = (ms: number) => (ms < 1000 ? `${ms.toFixed(0)} ms` : ms < 120_000 ? `${(ms / 1000).toFixed(1)} s` : ms < 7_200_000 ? `${(ms / 60_000).toFixed(0)} min` : `${(ms / 3_600_000).toFixed(1)} h`)
-const lagClass = (ms: number) => (ms > 60_000 ? 'err-hi' : ms > 500 ? 'err-mid' : '')
 /** Consumer ids are per node. */
 const keyOf = (c: Consumer) => `${c.node}/${c.id}`
 

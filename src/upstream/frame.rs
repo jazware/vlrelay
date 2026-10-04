@@ -6,9 +6,12 @@ use vlpds::cbor::ValueRef;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Peek<'a> {
     /// `op: 1`. `seq` is absent on frame types that don't carry one.
+    /// `time` is the event's own timestamp, for how far behind the host
+    /// reader is.
     Message {
         t: &'a str,
         seq: Option<i64>,
+        time: Option<&'a str>,
     },
     Info {
         name: &'a str,
@@ -49,7 +52,7 @@ pub fn peek(frame: &[u8]) -> Result<Peek<'_>, PeekError> {
                 None => None,
                 Some(_) => return Err(PeekError::Body("seq is not an integer".into())),
             };
-            Ok(Peek::Message { t, seq })
+            Ok(Peek::Message { t, seq, time: text("time") })
         }
         -1 => {
             let error = text("error").ok_or_else(|| PeekError::Body("error frame without error".into()))?;
@@ -89,7 +92,15 @@ mod tests {
             "#commit",
             &[("seq", Value::Int(42)), ("repo", Value::Text("did:plc:x".into())), ("blocks", Value::Bytes(vec![0; 9]))],
         );
-        assert_eq!(peek(&f).unwrap(), Peek::Message { t: "#commit", seq: Some(42) });
+        assert_eq!(peek(&f).unwrap(), Peek::Message { t: "#commit", seq: Some(42), time: None });
+        let f = encode_message(
+            "#commit",
+            &[("seq", Value::Int(7)), ("time", Value::Text("2026-10-04T14:23:10.141Z".into()))],
+        );
+        assert_eq!(
+            peek(&f).unwrap(),
+            Peek::Message { t: "#commit", seq: Some(7), time: Some("2026-10-04T14:23:10.141Z") }
+        );
         let f = encode_message("#info", &[("name", Value::Text("OutdatedCursor".into()))]);
         assert_eq!(peek(&f).unwrap(), Peek::Info { name: "OutdatedCursor", message: None });
         let f = encode_error("FutureCursor", "cursor in the future");

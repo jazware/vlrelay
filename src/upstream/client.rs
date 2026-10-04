@@ -190,7 +190,12 @@ impl HostTask {
                 }
             };
             let seq = match peek(&data) {
-                Ok(Peek::Message { seq, .. }) => seq,
+                Ok(Peek::Message { seq, time, .. }) => {
+                    if let Some(t) = time.and_then(event_time_ms) {
+                        self.entry.note_event_time(t);
+                    }
+                    seq
+                }
                 Ok(Peek::Info { name, message }) => {
                     if name == "OutdatedCursor" {
                         self.entry.count_error(|c| c.outdated_cursor += 1);
@@ -281,6 +286,12 @@ impl HostTask {
     fn queue_capacity_hint(&self) -> usize {
         self.cfg.host_queue_frames
     }
+}
+
+/// An event's `time` as unix ms. Anything unparseable is ignored: the lag
+/// is a gauge for operators, not a check.
+fn event_time_ms(t: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(t).ok().map(|d| d.timestamp_millis())
 }
 
 /// Exponential with equal jitter: half the step fixed, half random, so a

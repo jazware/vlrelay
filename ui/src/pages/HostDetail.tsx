@@ -4,7 +4,7 @@ import { Bar, InlineConfirm, Live, REASON_COLOR, REASON_LABEL, Sparkline, Status
 import { CopyText, Empty, ErrorNotice, Loading, Panel } from '../components/ui'
 import type { HostAction, HostDetail as HD, PolicyDoc, RejectReason } from '../lib/api'
 import { api, enc, errText } from '../lib/api'
-import { fmtNum, fmtSi, fmtTime, relTime, short } from '../lib/format'
+import { fmtLag, fmtNum, fmtSi, fmtTime, relTime, short } from '../lib/format'
 import { Link } from '../lib/router'
 import { useApi } from '../lib/useApi'
 
@@ -171,7 +171,7 @@ export function HostDetail({ host }: { host: string }) {
         <Tile k="Error rate" v={`${(r.errorRate * 100).toFixed(r.errorRate < 0.1 ? 2 : 0)}%`} tone={r.errorRate >= 0.1 ? 'bad' : r.errorRate >= 0.02 ? 'warn' : undefined} sub="rejected frames, last minute" />
         <Tile k="Accounts" v={fmtNum(r.accounts)} sub={`max ${fmtNum(d.limits.maxAccounts)}`} tone={r.accounts > d.limits.maxAccounts ? 'bad' : undefined} />
         <Tile k="New accounts per hour" v={fmtNum(d.newAccountsPerHour)} sub={`limit ${fmtNum(d.limits.newAccountsPerHour)}`} tone={d.newAccountsPerHour > d.limits.newAccountsPerHour ? 'bad' : undefined} />
-        <Tile k="Lag" v={r.lagMs ? `${fmtSi(r.lagMs)} ms` : '—'} sub="receive minus event time" />
+        <Tile k="Lag" v={r.lagMs ? fmtLag(r.lagMs) : '—'} sub="behind the host's stream (read time minus event time)" tone={r.lagMs > 600_000 ? 'bad' : r.lagMs > 60_000 ? 'warn' : undefined} />
         <Tile k="Connected" v={r.connectedSinceMs ? relTime(r.connectedSinceMs).replace(' ago', '') : '—'} sub={r.connectedSinceMs ? fmtTime(r.connectedSinceMs) : 'not connected'} />
         <Tile k="Upstream seq" v={<span className="mono">{r.lastUpstreamSeq}</span>} sub={`host shard on ${r.node}`} />
       </div>

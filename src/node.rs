@@ -71,6 +71,10 @@ use vlpds::store::Store;
 
 pub type State = StateStore<VerifyChain>;
 
+/// A host reader this far behind opens a case ([`Node::lag_cases`]).
+pub const LAG_CASE_MS: i64 = 10 * 60_000;
+const LAG_CASE_EVERY: Duration = Duration::from_secs(300);
+
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
     /// The node log's id prefix.
@@ -345,7 +349,10 @@ impl DidOwner for LocalOwner {
                 };
                 let durable = self.log.submit(vec![ev]).await;
                 let (tx, rx) = oneshot::channel();
-                self.commit(a.ticket.shard.0, PendingCommit { durable, ticket: Some(a.ticket), tx, received: c.received });
+                self.commit(
+                    a.ticket.shard.0,
+                    PendingCommit { durable, ticket: Some(a.ticket), tx, received: c.received },
+                );
                 Submitted::Appended(rx)
             }
             // A #sync may restate the head the last #commit left (a
@@ -513,7 +520,8 @@ impl Node {
         for s in &layout {
             state.open_shard(s.id, None).await?;
         }
-        let archive = cfg.policy.as_ref().map(|p| crate::archive::wiring::install(&state, p.0.clone(), identity.clone()));
+        let archive =
+            cfg.policy.as_ref().map(|p| crate::archive::wiring::install(&state, p.0.clone(), identity.clone()));
         // after a restart every DID misses the cache: its state record or
         // its export entry fills it, where resolving them all again at
         // --did-lookups-per-sec would take hours
@@ -1052,6 +1060,46 @@ impl Node {
         }
     }
 
+    /// Opens (or adds to) a case for each host whose reader is more than
+    /// [`LAG_CASE_MS`] behind, at most every [`LAG_CASE_EVERY`] per host. A
+    /// host held to its limits that long is losing ground, and the PDS will
+    /// cut the socket with `ConsumerTooSlow` once it's past its own outbox.
+    fn lag_cases(&self, lags: &[(&str, i64)], last: &mut HashMap<String, Instant>) {
+        let Some(p) = self.policy.clone() else { return };
+        last.retain(|_, at| at.elapsed() < LAG_CASE_EVERY);
+        for &(host, lag) in lags {
+            if lag < LAG_CASE_MS || last.contains_key(host) {
+                continue;
+            }
+            last.insert(host.to_string(), Instant::now());
+            let (host, node, engine) = (host.to_string(), self.cfg.node_id.clone(), p.engine.clone());
+            tokio::spawn(async move {
+                let o = crate::policy::cases::CaseOpen {
+                    kind: "read-lag".into(),
+                    host: host.clone(),
+                    did: None,
+                    severity: crate::admin::Severity::High,
+                    summary: format!("{host}: reader {} min behind the host's stream", lag / 60_000),
+                    observed: lag as f64 / 1000.0,
+                    threshold: LAG_CASE_MS as f64 / 1000.0,
+                    auto_action: None,
+                    evidence: crate::policy::cases::Evidence {
+                        at_ms: upstream::host::now_ms() as i64,
+                        observed: lag as f64 / 1000.0,
+                        threshold: LAG_CASE_MS as f64 / 1000.0,
+                        window_secs: 0,
+                        node,
+                        detail: Some("raise the host's limits or tier, or it will fall out of the PDS's outbox".into()),
+                        signals: Default::default(),
+                    },
+                };
+                if let Err(e) = engine.cases.open_or_update(o).await {
+                    tracing::warn!(host, "read-lag case not opened: {e:#}");
+                }
+            });
+        }
+    }
+
     /// One sample per second for the dashboard and the gauges.
     async fn sampler(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -1062,6 +1110,7 @@ impl Node {
         let mut prev_bytes_out = 0u64;
         let mut prev_rejects: HashMap<&'static str, u64> = HashMap::new();
         let mut prev_lat = (0u64, 0u64);
+        let mut lag_cased: HashMap<String, Instant> = HashMap::new();
         let mut first = true;
         loop {
             tick.tick().await;
@@ -1114,9 +1163,16 @@ impl Node {
                     metrics::PLC_EXPORT.with_label_values(&[k]).set(v.load(Ordering::Relaxed) as i64);
                 }
                 metrics::PLC_EXPORT.with_label_values(&["caught_up"]).set(s.caught_up.load(Ordering::Relaxed) as i64);
-                metrics::PLC_EXPORT.with_label_values(&["newest"]).set((s.newest_ms.load(Ordering::Relaxed) / 1000) as i64);
+                metrics::PLC_EXPORT
+                    .with_label_values(&["newest"])
+                    .set((s.newest_ms.load(Ordering::Relaxed) / 1000) as i64);
             }
             metrics::IDENTITY_CACHE.set(self.identity.len() as i64);
+            let lags: Vec<(&str, i64)> =
+                hosts.iter().filter_map(|h| Some((h.record.hostname.as_str(), h.read_lag_ms?))).collect();
+            metrics::HOST_READ_LAG_MAX.set(lags.iter().map(|l| l.1 / 1000).max().unwrap_or(0));
+            metrics::HOSTS_LAGGING.set(lags.iter().filter(|l| l.1 > 60_000).count() as i64);
+            self.lag_cases(&lags, &mut lag_cased);
             let mut by_status: HashMap<&'static str, i64> = HashMap::new();
             for h in &hosts {
                 *by_status.entry(admin::host_status_label(h)).or_default() += 1;

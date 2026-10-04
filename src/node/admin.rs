@@ -200,7 +200,7 @@ impl NodeAdmin {
             connected_since_ms: (h.record.status == HostStatus::Active)
                 .then_some(h.record.last_connected_ms.map(|m| m as i64))
                 .flatten(),
-            lag_ms: 0.0,
+            lag_ms: h.read_lag_ms.unwrap_or(0) as f64,
             throttle: self.policy.throttle(&h.record.hostname),
             rule: self.policy.limits(&h.record.hostname).and_then(|l| l.rule),
             node: self.node.cfg.node_id.clone(),

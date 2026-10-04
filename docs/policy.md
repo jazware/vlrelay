@@ -151,6 +151,35 @@ The relay isn't the limit, plc.directory is. Its pages measured 515 KB (2022 ops
 
 Each request needs a window to carry it, about rate × 0.64 s of them, so 4 windows cover up to ~6/s. The windows are even in time, not in ops, so the heavy 2023-2024 windows finish last. Real accounts' PDS hosts are ~35 characters against the fake's ~15, so expect ~100 bytes raw per DID: ~5.6 GB raw, ~3 GB in SSTs for 56M. The rates plc.directory allows aren't documented; start at the default and watch `vlrelay_plc_export{what="throttled"}`.
 
+## When a throttled host falls behind
+
+A host's limits block its reader instead of dropping frames (indigo does the same), so a host that
+sends more than its tier allows doesn't lose events right away. It falls behind its own stream, and
+the backlog sits in the PDS's outbox. A PDS keeps a bounded outbox per subscriber, and once we're
+past it the PDS sends `ConsumerTooSlow` and closes the socket. We reconnect from our cursor, and
+whatever the PDS no longer holds between that cursor and its replay window is gone. On the
+[shadow run](shadow.md) eurosky.social, auto-throttled to 5 events/s and 2,500 an hour while it
+sends ~6/s, was ~50 minutes behind after an hour and was cut off.
+
+Each host's lag is measured as the newest frame's age when it was read (read time minus the event's
+`time`), plus the time since while the reader is held back. It's on Hosts and host detail, in
+`vlrelay_host_read_lag_max_seconds` and `vlrelay_hosts_lagging`, and a reader more than 10 minutes
+behind opens a `read-lag` case (re-checked every 5 minutes per host). PDS clocks are in the number,
+so it's good to seconds, not milliseconds.
+
+What the relay could do once a host is far behind, and why it does only the case for now:
+
+| Option | Keeps | Costs |
+|---|---|---|
+| Keep blocking (today, plus the case) | Every event the PDS still holds; a spammer's flood stays slow | A legitimately busy host keeps falling behind until an operator raises its limits or the PDS cuts us off |
+| Raise the host's limits automatically past a lag | Freshness for real hosts | Defeats the throttle for exactly the hosts it's meant for: a spam flood also lags |
+| Skip ahead to the live head (reconnect with no cursor) | Freshness, and the socket | Loses the backlog on purpose, for every account on the host |
+| Drop frames over the limit instead of blocking | Freshness | Loses events while the host is still reachable, and consumers see gaps with no `#sync` |
+
+Losing events is worse than being late, and only an operator knows whether a host is busy or
+abusive, so the relay keeps blocking and asks: the case names the host and how far behind it is,
+and the fix is a tier or limit change on that host.
+
 ## Spam counting
 
 Each threshold has a fixed-size Space-Saving table: `spam.trackHosts` keys per host rule (1,024) and `spam.trackAccounts` per account rule (8,192), over a sliding window. A new key replaces the lightest one and inherits its count as error, so any key above total/capacity stays in the table. Thresholds are checked against `count - error`, which never overstates a key, so churn through thousands of quiet hosts can't trip a false positive. A key trips at most once per window.

@@ -74,3 +74,10 @@ export function seqWriter(seq?: string | null): number | undefined {
     return undefined
   }
 }
+
+/** A lag in ms as ms, s, min or h. */
+export const fmtLag = (ms: number) =>
+  ms < 1000 ? `${ms.toFixed(0)} ms` : ms < 120_000 ? `${(ms / 1000).toFixed(1)} s` : ms < 7_200_000 ? `${(ms / 60_000).toFixed(0)} min` : `${(ms / 3_600_000).toFixed(1)} h`
+
+/** Over a minute is bad, over half a second worth a look. */
+export const lagClass = (ms: number) => (ms > 60_000 ? 'err-hi' : ms > 500 ? 'err-mid' : '')

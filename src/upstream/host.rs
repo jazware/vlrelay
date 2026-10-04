@@ -181,6 +181,10 @@ pub struct HostEntry {
     /// Bumped on every tier or limit change; the host task retunes its
     /// buckets when it sees a new one.
     limits_gen: AtomicU64,
+    /// When the newest frame was read, and the `time` it carried (unix ms,
+    /// 0 for none yet).
+    read_at_ms: AtomicI64,
+    read_event_ms: AtomicI64,
 }
 
 impl HostEntry {
@@ -201,7 +205,27 @@ impl HostEntry {
             dirty: AtomicBool::new(false),
             limits: Mutex::new(None),
             limits_gen: AtomicU64::new(0),
+            read_at_ms: AtomicI64::new(0),
+            read_event_ms: AtomicI64::new(0),
         }
+    }
+
+    pub(crate) fn note_event_time(&self, event_ms: i64) {
+        self.read_event_ms.store(event_ms, Ordering::Relaxed);
+        self.read_at_ms.store(now_ms() as i64, Ordering::Relaxed);
+    }
+
+    /// How far behind the host's own stream the reader is: the newest
+    /// frame's age when it was read, plus the time since, while the reader
+    /// is held back by its limits (a quiet host isn't behind). PDS clock
+    /// skew is in it too, so read it in seconds and minutes, not ms.
+    pub fn read_lag_ms(&self) -> Option<i64> {
+        let (at, ev) = (self.read_at_ms.load(Ordering::Relaxed), self.read_event_ms.load(Ordering::Relaxed));
+        if at == 0 {
+            return None;
+        }
+        let held = if self.status() == HostStatus::Throttled { now_ms() as i64 - at } else { 0 };
+        Some((at - ev + held).max(0))
     }
 
     /// The limits the host task enforces.
@@ -311,6 +335,7 @@ impl HostEntry {
             frames: self.frames.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
             connects: self.connects.load(Ordering::Relaxed),
+            read_lag_ms: self.read_lag_ms(),
         }
     }
 }
@@ -325,6 +350,7 @@ pub struct HostView {
     pub frames: u64,
     pub bytes: u64,
     pub connects: u64,
+    pub read_lag_ms: Option<i64>,
 }
 
 pub struct Registry {
@@ -531,6 +557,21 @@ pub fn normalize_hostname(input: &str, dev_mode: bool) -> Result<Host, HostnameE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_lag_counts_held_time_only_while_throttled() {
+        let e = HostEntry::from_record(&HostRecord::new(&Host("pds.example.com".into()), Tier::Default));
+        assert_eq!(e.read_lag_ms(), None);
+        e.note_event_time(now_ms() as i64 - 30_000);
+        let lag = e.read_lag_ms().unwrap();
+        assert!((30_000..31_000).contains(&lag), "{lag}");
+        // a reader held back by its limits keeps falling behind between frames
+        e.read_at_ms.fetch_sub(60_000, Ordering::Relaxed);
+        e.read_event_ms.fetch_sub(60_000, Ordering::Relaxed);
+        assert!(e.read_lag_ms().unwrap() < 31_000);
+        e.set_status(HostStatus::Throttled);
+        assert!(e.read_lag_ms().unwrap() >= 90_000);
+    }
 
     fn ok(s: &str) -> String {
         normalize_hostname(s, false).unwrap().0
