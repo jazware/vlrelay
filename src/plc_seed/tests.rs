@@ -367,3 +367,15 @@ async fn an_identity_event_newer_than_the_export_wins() {
     assert_eq!(r.plc.doc_fetches.load(Relaxed), 1);
     run.abort();
 }
+
+#[tokio::test]
+async fn an_op_no_newer_than_the_stored_one_writes_nothing() {
+    let r = rig(1, 4, export::now_ms() - 3_600_000).await;
+    let did = r.plc.layout.did(0, 1);
+    let seed = |ms: u64| Seed { created_ms: ms, tombstone: false, key: None, pds: Some("pds.test".into()) };
+    assert_eq!(r.seeds.apply(vec![(did.clone(), seed(2_000))]).await.unwrap().written, 1);
+    for ms in [1_000, 2_000] {
+        assert_eq!(r.seeds.apply(vec![(did.clone(), seed(ms))]).await.unwrap().written, 0);
+    }
+    assert_eq!(r.seeds.get(&did).await.unwrap().unwrap().created_ms, 2_000);
+}

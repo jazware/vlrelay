@@ -341,6 +341,7 @@ impl<C: Chain> LocalSeeds<C> {
             // (a leadership handover) write the same ops, so the worst race
             // briefly keeps an op a few seconds older.
             let mut wb = slatedb::WriteBatch::new();
+            let before = out.written;
             for (did, seed) in &ops {
                 let k = seed_key(did);
                 let prev = match s.db.get(&k).await? {
@@ -360,7 +361,10 @@ impl<C: Chain> LocalSeeds<C> {
                 wb.put(k, seed.encode());
                 out.written += 1;
             }
-            s.db.write(wb).await?;
+            // SlateDB refuses an empty batch
+            if out.written > before {
+                s.db.write(wb).await?;
+            }
         }
         Ok(out)
     }

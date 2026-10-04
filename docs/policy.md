@@ -139,6 +139,8 @@ A host stage that doesn't hold the DID asks the owner (`GET /internal/relay/v1/p
 | Their first commits after seeding | 100,000 accepted, 0 PLC document fetches |
 | Restart after a quarter (4,996 of 20,000 ops) | resumed from both windows' cursors and read the other 15,005 (one op twice, at a millisecond boundary) |
 
+Against the dev network's real did-method-plc (`VLRELAY_PLC_EXPORT=1 just e2e`): 36 ops read, none invalid, 30 cache misses seeded and 28 PLC fetches, one per `#identity` (forced refreshes), with the e2e passing. `VLRELAY_PLC_EXPORT=1 just e2e-cluster --duration 60` passes too: the reader moved to another core after the kill -9 and the SIGTERM and resumed from the checkpoint each time, and host stages filled 38 misses from their DIDs' owners.
+
 The relay isn't the limit, plc.directory is. Its pages measured 515 KB (2022 ops, legacy `create`), 711 KB (2024) and 934 KB (2026), about 0.7 KB an op, so the ~80M ops behind 56M DIDs (an estimate: ~1.4 ops a DID) are ~56 GB. Cold start at 1,000 ops a request:
 
 | `--plc-export-rate` | Cold start | Download |
