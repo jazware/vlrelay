@@ -259,13 +259,15 @@ impl LogReplay {
 
     /// Every (host, upstream seq) the cached tails hold, for hosts whose
     /// durable cursor is below it.
-    pub fn logged_above(&self, cursor: impl Fn(&Host) -> i64) -> HashMap<Host, std::collections::HashSet<i64>> {
-        let mut out: HashMap<Host, std::collections::HashSet<i64>> = HashMap::new();
+    /// (upstream seq, `did_key`) of each logged event past its host's cursor.
+    pub fn logged_above(&self, cursor: impl Fn(&Host) -> i64) -> HashMap<Host, std::collections::HashSet<(i64, u64)>> {
+        let mut out: HashMap<Host, std::collections::HashSet<(i64, u64)>> = HashMap::new();
         for (_, _, t) in self.cache.lock().values() {
             for (_, evs) in t.iter() {
                 for e in evs {
                     if e.meta.upstream_seq > 0 && e.meta.upstream_seq > cursor(&e.meta.host) {
-                        out.entry(e.meta.host.clone()).or_default().insert(e.meta.upstream_seq);
+                        let k = (e.meta.upstream_seq, super::cluster::did_key(&e.meta.did));
+                        out.entry(e.meta.host.clone()).or_default().insert(k);
                     }
                 }
             }

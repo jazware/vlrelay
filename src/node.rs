@@ -483,9 +483,10 @@ pub struct Node {
     pub dash: Mutex<Dash>,
     pub rejects: Mutex<HashMap<Host, HostRejects>>,
     pub policy: Option<Arc<policy::PolicyHooks>>,
-    /// (host, upstream seq) pairs already in an earlier log past the host's
-    /// durable cursor: the replay after a restart drops them.
-    replayed: Mutex<HashMap<Host, HashSet<i64>>>,
+    /// (host, upstream seq, `did_key`) already in an earlier log past the
+    /// host's durable cursor: the replay after a restart drops them. The DID
+    /// tells a replay from a restarted sequence's event at the same seq.
+    replayed: Mutex<HashMap<Host, HashSet<(i64, u64)>>>,
     /// Per DID, the newest local append not yet durable: a duplicate of it
     /// (a replay on a new socket) is acked only once it is. A lane handles
     /// all of a DID's events, so no lock spans the submit and this.
@@ -707,7 +708,7 @@ impl Node {
         local: Arc<LocalOwner>,
         owner: Arc<dyn DidOwner>,
         ttf: Arc<Ttf>,
-        replayed: HashMap<Host, HashSet<i64>>,
+        replayed: HashMap<Host, HashSet<(i64, u64)>>,
         report: RecoveryReport,
         hooks: Option<Arc<policy::PolicyHooks>>,
         cluster: Option<Arc<cluster::Glue>>,
@@ -759,6 +760,10 @@ impl Node {
         manager.on_connect(Arc::new(move |host: &Host, epoch, cursor, restarted| {
             if let Some(n) = weak.upgrade() {
                 n.acks.connected(host, epoch, cursor, restarted);
+                if restarted {
+                    // what's logged belongs to the old sequence
+                    n.replayed.lock().remove(host);
+                }
             }
         }));
         for rx in lane_rx {
@@ -799,7 +804,7 @@ impl Node {
                     continue;
                 }
             };
-            if self.already_logged(&f.host, f.upstream_seq) {
+            if self.already_logged(&f.host, f.upstream_seq, did) {
                 metrics::EVENTS_DUPLICATE.with_label_values(&["restart_log"]).inc();
                 self.finish(&f.host, f.upstream_seq, f.epoch, None);
                 continue;
@@ -813,14 +818,14 @@ impl Node {
         }
     }
 
-    fn already_logged(&self, host: &Host, seq: i64) -> bool {
+    fn already_logged(&self, host: &Host, seq: i64, did: &str) -> bool {
         let mut r = self.replayed.lock();
         if r.is_empty() {
             return false;
         }
         match r.get_mut(host) {
             Some(s) => {
-                let hit = s.remove(&seq);
+                let hit = s.remove(&(seq, cluster::did_key(did)));
                 if s.is_empty() {
                     r.remove(host);
                 }
