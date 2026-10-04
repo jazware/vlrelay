@@ -110,6 +110,10 @@ pub struct Checkpoints {
     written: Mutex<HashMap<ShardId, BTreeMap<String, i64>>>,
     /// The upstream registry, whose acked cursors a shard's take replaces.
     pub(crate) registry: std::sync::OnceLock<Arc<crate::upstream::Registry>>,
+    /// Hosts taken before their registry entry existed (a shard taken while
+    /// starting): the entry, seeded from its host record, gets the stored
+    /// cursor on its first connect.
+    unrestored: Mutex<HashSet<Host>>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -128,6 +132,7 @@ impl Checkpoints {
             resets: Default::default(),
             written: Default::default(),
             registry: Default::default(),
+            unrestored: Default::default(),
         })
     }
 
@@ -155,16 +160,23 @@ impl Checkpoints {
         let reg = self.registry.get();
         let (mut c, mut g) = (self.cursors.write(), self.gens.write());
         let mut r = self.resets.lock();
+        let mut later = self.unrestored.lock();
         for (h, seq) in &doc.cursors {
             let host = Host(h.clone());
-            if let Some(e) = reg.and_then(|reg| reg.get(&host)) {
-                e.restore_cursor(*seq);
+            match reg.and_then(|reg| reg.get(&host)) {
+                Some(e) => {
+                    e.restore_cursor(*seq);
+                    later.remove(&host);
+                }
+                None => {
+                    later.insert(host.clone());
+                }
             }
             r.remove(&host);
             g.insert(host.clone(), doc.gens.get(h).copied().unwrap_or(0));
             c.insert(host, *seq);
         }
-        drop((c, g, r));
+        drop((c, g, r, later));
         self.written.lock().remove(&shard);
         Ok(doc.cursors.len())
     }
@@ -257,7 +269,15 @@ impl ClusterCursors {
 
 impl crate::upstream::CursorSource for ClusterCursors {
     fn durable_cursor(&self, host: &Host) -> Option<i64> {
-        let local = self.checkpoints.registry.get().and_then(|r| r.get(host)).and_then(|e| e.acked_seq());
+        let entry = self.checkpoints.registry.get().and_then(|r| r.get(host));
+        if let Some(e) = &entry
+            && self.checkpoints.unrestored.lock().remove(host)
+            && let Some(c) = self.checkpoints.get(host)
+        {
+            e.restore_cursor(c);
+            return Some(c);
+        }
+        let local = entry.and_then(|e| e.acked_seq());
         local.max(self.checkpoints.get(host))
     }
 

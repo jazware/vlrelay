@@ -730,6 +730,21 @@ async fn a_restarted_sequence_survives_a_stale_owners_cursor() {
     a.write(s, &[(h.clone(), 70)]).await.unwrap();
     b.load(s).await.unwrap();
     assert_eq!(b.get(&h), Some(70), "one generation merges by max again");
+
+    // a starting node takes the shard before its registry has the host,
+    // whose entry is then seeded from a stale host record
+    use crate::upstream::CursorSource;
+    let c = hosts::Checkpoints::new(store.clone());
+    c.load(s).await.unwrap();
+    let reg2 = Arc::new(Registry::new(Arc::new(MemHostStore::default())));
+    let (e2, _) = reg2.admit(&h, Tier::Default).await.unwrap();
+    e2.ack(1000);
+    let cur = hosts::ClusterCursors { checkpoints: c };
+    cur.set_registry(reg2);
+    assert_eq!(cur.durable_cursor(&h), Some(70));
+    assert_eq!(e2.acked_seq(), Some(70));
+    e2.ack(80);
+    assert_eq!(cur.durable_cursor(&h), Some(80), "then our own acks count");
 }
 
 /// An admin takedown's `#account` is appended outside the stage: its hold
