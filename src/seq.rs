@@ -66,8 +66,9 @@ pub const DEFAULT_LINGER: Duration = Duration::from_millis(25);
 pub const DEFAULT_MAX_SEGMENT_BYTES: usize = 8 << 20;
 pub const DEFAULT_MAX_SEGMENT_EVENTS: usize = 65_536;
 /// Past ~50k events/s a segment seals on size, not linger, and its PUT takes
-/// ~100 ms on MinIO: 4 in flight capped a node at ~50k events/s (docs/perf.md).
-pub const DEFAULT_INFLIGHT: usize = 16;
+/// 100-400 ms on MinIO: 4 in flight capped a node at ~50k events/s, 16 at
+/// ~85k (docs/perf.md). The bytes held are at most this many segments.
+pub const DEFAULT_INFLIGHT: usize = 32;
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(72 * 3600);
 /// Durable batches a peer stream may fall behind by before it's dropped.
 const LIVE_BATCHES: usize = 4096;

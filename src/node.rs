@@ -360,12 +360,12 @@ async fn committer(
                     vlpds::lifecycle::fail_stop(4, &format!("state commit failed: {e}"));
                 }
                 since.store(0, Ordering::Release);
+                ttf.durable_batch(batch.iter().filter_map(|(r, _, _, received)| {
+                    r.as_ref().ok().map(|d| (d.seqs.as_slice(), *received))
+                }));
                 for (r, _, tx, received) in batch {
-                    if let Ok(d) = &r {
+                    if r.is_ok() {
                         metrics::TIME_TO_DURABLE.observe(received.elapsed().as_secs_f64());
-                        for s in &d.seqs {
-                            ttf.durable(*s, received);
-                        }
                     }
                     let _ = tx.send(r);
                 }
@@ -924,9 +924,7 @@ impl Node {
             let now = Instant::now();
             let (batches, _) = fh.from_ring(last);
             for b in batches {
-                for (seq, _) in &b.events {
-                    self.ttf.emitted(*seq, now);
-                }
+                self.ttf.emitted_batch(b.events.iter().map(|(seq, _)| *seq), now);
                 metrics::EVENTS_OUT.inc_by(b.events.len() as u64);
                 last = b.last;
             }

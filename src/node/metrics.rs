@@ -111,22 +111,30 @@ impl Ttf {
         let _ = h.record((d.as_micros() as u64).max(1));
     }
 
-    pub fn durable(&self, seq: i64, received: Instant) {
+    /// Durable events: each one's relay seqs and when its frame arrived.
+    pub fn durable_batch<'a>(&self, done: impl IntoIterator<Item = (&'a [i64], Instant)>) {
         let mut i = self.inner.lock();
-        match i.emitted.remove(&seq) {
-            Some(at) => Self::record(&mut i, at.saturating_duration_since(received)),
-            None => {
-                i.received.insert(seq, received);
+        for (seqs, received) in done {
+            for &seq in seqs {
+                match i.emitted.remove(&seq) {
+                    Some(at) => Self::record(&mut i, at.saturating_duration_since(received)),
+                    None => {
+                        i.received.insert(seq, received);
+                    }
+                }
             }
         }
     }
 
-    pub fn emitted(&self, seq: i64, at: Instant) {
+    /// Events the merger emitted at `at`.
+    pub fn emitted_batch(&self, seqs: impl IntoIterator<Item = i64>, at: Instant) {
         let mut i = self.inner.lock();
-        match i.received.remove(&seq) {
-            Some(r) => Self::record(&mut i, at.saturating_duration_since(r)),
-            None => {
-                i.emitted.insert(seq, at);
+        for seq in seqs {
+            match i.received.remove(&seq) {
+                Some(r) => Self::record(&mut i, at.saturating_duration_since(r)),
+                None => {
+                    i.emitted.insert(seq, at);
+                }
             }
         }
     }
