@@ -76,6 +76,9 @@ struct RunArgs {
     /// Serve the fake PLC directory on this port (one process per fleet).
     #[arg(long)]
     plc_port: Option<u16>,
+    /// Another PLC directory for DIDs that aren't the fleet's.
+    #[arg(long)]
+    plc_fallback: Option<String>,
     /// Events/s for this process, split over its hosts.
     #[arg(long, default_value_t = 10000.0)]
     rate: f64,
@@ -136,7 +139,8 @@ struct RunArgs {
     bursts_per_min: f64,
     /// kind:hosts[:k=v,...], repeatable. Kinds: badsig (rate), gap (rate,
     /// heal), foreign (rate), spam (rate, secs, every, delay), stall (secs,
-    /// every), disconnect (every, down), replay (every, count). Hosts are
+    /// every), disconnect (every, down), replay (every, count), restart
+    /// (every: the sequence starts over, FutureCursor). Hosts are
     /// global indexes: `all`, `3`, `0,2-4`.
     #[arg(long)]
     fault: Vec<String>,
@@ -261,7 +265,7 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
     if let Some(p) = a.plc_port {
         let addr = format!("{}:{p}", a.bind);
         let lis = tokio::net::TcpListener::bind(&addr).await.map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
-        tokio::spawn(axum::serve(lis, serve::plc_router(layout.clone())).into_future());
+        tokio::spawn(axum::serve(lis, serve::plc_router(layout.clone(), a.plc_fallback.clone())).into_future());
         println!("PLC {}:{p}", a.fleet.advertise.trim_end_matches('/'));
     }
 
@@ -645,7 +649,7 @@ async fn selftest(o: SelftestOpts) -> anyhow::Result<()> {
     }
     let plc = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let plc_url = format!("http://{}", plc.local_addr()?);
-    tokio::spawn(axum::serve(plc, serve::plc_router(layout.clone())).into_future());
+    tokio::spawn(axum::serve(plc, serve::plc_router(layout.clone(), None)).into_future());
 
     let mut wire_bad = 0u64;
     for h in 0..hosts {

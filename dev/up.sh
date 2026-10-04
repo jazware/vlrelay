@@ -3,7 +3,7 @@
 # PDS in docker, plus $DEV_PDS native vlpds upstreams, each memory-capped.
 # Idempotent: a running piece is left alone.
 #
-# Env: DEV_PDS (2: vlpds upstreams, at most 3), VLPDS_BIN (skip building vlpds),
+# Env: DEV_PDS (2: vlpds upstreams, at most 3), DEV_STATE (dev/state), VLPDS_BIN (skip building vlpds),
 # VLPDS_MEM_MB (2048: each vlpds's cap), DEV_PDS_HOST (127.0.0.1: the vlpds
 # upstreams' public hostname; tests/compat sets localhost, the only name with a
 # port that indigo's relay accepts), DEV_NO_DOCKER=1 (vlpds only, no PLC:
@@ -12,7 +12,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 crate="$(cd "$here/.." && pwd)"
 . "$here/ports.sh"
-state="$here/state"
+state="${DEV_STATE:-$here/state}"
 mkdir -p "$state"
 
 n=${DEV_PDS:-2}

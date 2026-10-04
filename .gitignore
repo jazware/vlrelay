@@ -6,6 +6,7 @@ ui/dist/
 !src/bin/
 # dev/up.sh: pids, logs, accounts
 dev/state/
+dev/state-*/
 testdata/live/
 testdata/hunt/
 # tests/compat: cloned indigo/jetstream, node_modules, run output

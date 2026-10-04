@@ -91,6 +91,10 @@ e2e-cluster *args:
 compat *args:
     tests/compat/run.sh {{args}}
 
+# Chaos: the cluster under faults (kill -9, zombies, bucket latency/errors, partitions, upstream and consumer faults), invariants checked after (tests/chaos/chaos.sh, docs/chaos.md; `just chaos list`)
+chaos scenario *args:
+    tests/chaos/chaos.sh {{scenario}} {{args}}
+
 # ---- benchbox (scripts/benchbox.sh) --------------------------------------------
 
 # Ship the working tree (tracked + uncommitted) to benchbox:~/vlrelay-dev

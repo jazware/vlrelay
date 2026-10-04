@@ -4,7 +4,7 @@
 # dev/state (its accounts only exist in the stopped servers).
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-state="$here/state"
+state="${DEV_STATE:-$here/state}"
 for pidf in "$state"/*.pid; do
   [ -f "$pidf" ] || continue
   pid=$(cat "$pidf")

@@ -122,6 +122,18 @@ impl HostState {
         }
     }
 
+    /// The restart fault: an empty ring and the sequence back at 0, and
+    /// every socket closed, so subscribers come back with a future cursor.
+    fn restart(&self) {
+        {
+            let mut ring = self.ring.lock();
+            ring.items.clear();
+            ring.bytes = 0;
+            ring.seq = 0;
+        }
+        self.kill.send_modify(|k| *k += 1);
+    }
+
     fn disconnect_all(&self, down: Duration) {
         *self.down_until.lock() = Some(Instant::now() + down);
         self.kill.send_modify(|k| *k += 1);
@@ -147,6 +159,7 @@ struct Emit {
     stall_end: Option<Instant>,
     next_disconnect: Option<Instant>,
     next_replay: Option<Instant>,
+    next_restart: Option<Instant>,
 }
 
 /// One emitter thread for `hosts`. `rates` are events/s per host.
@@ -173,6 +186,7 @@ pub fn run_emitter(
                 stall_end: None,
                 next_disconnect: f.disconnect.and_then(|(every, _)| at(every)),
                 next_replay: f.replay.and_then(|(every, _)| at(every)),
+                next_restart: f.restart.and_then(at),
             }
         })
         .collect();
@@ -224,6 +238,12 @@ pub fn run_emitter(
                 if now_i >= t {
                     e.host.replay(n);
                     e.next_replay = Some(t + Duration::from_secs_f64(every));
+                }
+            }
+            if let (Some(every), Some(t)) = (f.restart, e.next_restart) {
+                if now_i >= t {
+                    e.host.restart();
+                    e.next_restart = Some(t + Duration::from_secs_f64(every));
                 }
             }
             // Ornstein-Uhlenbeck on log(rate multiplier)
@@ -474,19 +494,35 @@ fn scopeguard(h: &HostState) -> SubGuard<'_> {
     SubGuard(h)
 }
 
-/// `GET /{did}`: the document any fleet DID resolves to.
-pub fn plc_router(layout: Layout) -> Router {
+/// `GET /{did}`: the document any fleet DID resolves to. A DID that isn't
+/// the fleet's goes to `fallback` (another PLC directory) when there is
+/// one, so a relay with one `--plc-url` can carry the fleet beside real PDSes.
+pub fn plc_router(layout: Layout, fallback: Option<String>) -> Router {
+    let client = reqwest::Client::new();
     Router::new()
         .route(
             "/{did}",
-            get(|State(l): State<Layout>, Path(did): Path<String>| async move {
-                match l.parse_did(&did) {
-                    Some((g, i)) => Json(l.doc(g, i)).into_response(),
-                    None => (StatusCode::NOT_FOUND, Json(json!({"message": format!("DID not registered: {did}")})))
-                        .into_response(),
-                }
-            }),
+            get(
+                |State((l, fallback, client)): State<(Layout, Option<String>, reqwest::Client)>,
+                 Path(did): Path<String>| async move {
+                    if let Some((g, i)) = l.parse_did(&did) {
+                        return Json(l.doc(g, i)).into_response();
+                    }
+                    if let Some(f) = fallback {
+                        return match client.get(format!("{}/{did}", f.trim_end_matches('/'))).send().await {
+                            Ok(r) => {
+                                let code = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+                                (code, [("content-type", "application/json")], r.bytes().await.unwrap_or_default())
+                                    .into_response()
+                            }
+                            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"message": e.to_string()}))).into_response(),
+                        };
+                    }
+                    (StatusCode::NOT_FOUND, Json(json!({"message": format!("DID not registered: {did}")})))
+                        .into_response()
+                },
+            ),
         )
         .route("/_health", get(|| async { Json(json!({"version": "fakepds-plc"})) }))
-        .with_state(layout)
+        .with_state((layout, fallback, client))
 }

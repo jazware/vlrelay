@@ -118,6 +118,8 @@ enum Msg {
         src: usize,
         what: String,
     },
+    /// The upstream restarted its sequence (FutureCursor): its seqs start over.
+    Restarted { src: usize },
 }
 
 fn subscribe_url(s: &str) -> String {
@@ -281,6 +283,13 @@ async fn subscribe(side: Side, src: usize, base: String, tx: mpsc::UnboundedSend
                             }
                         }
                         Ok(None) => {}
+                        // a host whose sequence restarted: everything it has
+                        // now is new, so replay all of it
+                        Err(e) if side == Side::Up && e.starts_with("error frame: FutureCursor") => {
+                            cursor = Some(0);
+                            let _ = tx.send(Msg::Restarted { src });
+                            break;
+                        }
                         Err(e) => {
                             let _ = tx.send(Msg::Other { side, src, what: e });
                         }
@@ -338,6 +347,8 @@ struct Waiting {
     kind: Kind,
     /// The event's position in its DID's upstream stream (Up side only).
     pos: u64,
+    /// (upstream index, seq) of the upstream copy.
+    from: (usize, i64),
 }
 
 #[derive(Default)]
@@ -438,6 +449,9 @@ async fn main() -> anyhow::Result<()> {
     let mut lat_kind: HashMap<Kind, Histogram<u64>> = HashMap::new();
     let mut last_seq: HashMap<(bool, usize), i64> = HashMap::new();
     let mut seq_regressions = 0u64;
+    let mut upstream_replays = 0u64;
+    let mut upstream_restarts = 0u64;
+    let mut missing_events: Vec<serde_json::Value> = Vec::new();
     let mut duplicates = 0u64;
     let mut out_of_order = 0u64;
     let mut rev_regressions = 0u64;
@@ -489,6 +503,12 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("e2e_check: {}: {what}", name(side, src));
                 continue;
             }
+            Msg::Restarted { src } => {
+                eprintln!("e2e_check: {}: sequence restarted", name(Side::Up, src));
+                last_seq.remove(&(true, src));
+                upstream_restarts += 1;
+                continue;
+            }
             Msg::Other { side, src, what } => {
                 bad_frames += 1;
                 note(
@@ -511,6 +531,14 @@ async fn main() -> anyhow::Result<()> {
         };
         if seq > 0 {
             let k = (side == Side::Up, src);
+            if side == Side::Up
+                && last_seq.get(&k).is_some_and(|&prev| seq <= prev)
+            {
+                // the upstream sent these again (a replay fault): they're
+                // not new events, and the relay shouldn't carry them twice
+                upstream_replays += 1;
+                continue;
+            }
             if let Some(&prev) = last_seq.get(&k)
                 && seq <= prev
             {
@@ -639,6 +667,7 @@ async fn main() -> anyhow::Result<()> {
                         at,
                         kind,
                         pos,
+                        from: (src, seq),
                     },
                 );
             }
@@ -654,6 +683,11 @@ async fn main() -> anyhow::Result<()> {
             Side::Up if w.at >= warm_end && w.at <= collect_end => {
                 c.missing += 1;
                 note("missing", format!("{did} {key}"), args.show);
+                if missing_events.len() < 10_000 {
+                    missing_events.push(serde_json::json!({
+                        "upstream": args.upstreams[w.from.0], "seq": w.from.1, "did": did, "key": key,
+                    }));
+                }
             }
             Side::Relay if w.at >= warm_end => {
                 c.extra += 1;
@@ -743,7 +777,8 @@ async fn main() -> anyhow::Result<()> {
             "seq_regressions": seq_regressions, "bad_frames": bad_frames, "relay_first": relay_first, "out_of_scope": out_of_scope,
             "latency_ms": {"p50": ms(lat.value_at_quantile(0.5)), "p90": ms(lat.value_at_quantile(0.9)),
                            "p99": ms(lat.value_at_quantile(0.99)), "max": ms(lat.max()), "n": lat.len()},
-            "examples": examples,
+            "examples": examples, "upstream_replays": upstream_replays, "upstream_restarts": upstream_restarts,
+            "missing_events": missing_events,
         });
         std::fs::write(path, serde_json::to_vec_pretty(&j)?)?;
     }
