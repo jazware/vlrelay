@@ -101,7 +101,8 @@ impl UpstreamConfig {
 /// checkpoints; without one the manager uses the registry's acked seq.
 pub trait CursorSource: Send + Sync + 'static {
     fn durable_cursor(&self, host: &Host) -> Option<i64>;
-    /// The host answered our cursor with FutureCursor and is being resumed live.
+    /// The host answered our cursor with FutureCursor: its sequence restarted,
+    /// and it's resumed from 0 (the new sequence's start).
     fn on_future_cursor(&self, _host: &Host) {}
 }
 

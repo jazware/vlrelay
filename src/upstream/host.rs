@@ -292,10 +292,11 @@ impl HostEntry {
         }
     }
 
-    /// A host that reset its sequence (FutureCursor) starts over.
+    /// A host that reset its sequence (FutureCursor) starts over, from the
+    /// new sequence's first event.
     pub(crate) fn reset_cursor(&self) {
-        self.acked_seq.store(NO_SEQ, Ordering::Relaxed);
-        self.received_seq.store(NO_SEQ, Ordering::Relaxed);
+        self.acked_seq.store(0, Ordering::Relaxed);
+        self.received_seq.store(0, Ordering::Relaxed);
         self.dirty.store(true, Ordering::Relaxed);
     }
 

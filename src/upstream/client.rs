@@ -54,7 +54,7 @@ enum End {
 impl HostTask {
     pub async fn run(mut self) {
         let mut attempt: u32 = 0;
-        let mut skip_cursor = false;
+        let mut restarted = false;
         let reconnects = |e: &HostEntry, cfg: &UpstreamConfig| e.limits(&cfg.limits).reconnects_per_hour;
         let mut dials = TokenBucket::windowed(reconnects(&self.entry, &self.cfg), 3_600.0, std::time::Instant::now());
         let mut dials_gen = self.entry.limits_gen();
@@ -79,9 +79,10 @@ impl HostTask {
                 }
                 continue;
             }
-            let restarted = skip_cursor;
-            let cursor = if skip_cursor { None } else { self.cursor.durable_cursor(&self.entry.host) };
-            skip_cursor = false;
+            // after a sequence restart the durable cursor is 0: the new
+            // sequence from its first event
+            let cursor = self.cursor.durable_cursor(&self.entry.host);
+            let was_restarted = std::mem::take(&mut restarted);
             // a fresh socket replays from the durable cursor: anything still
             // queued from the old one would arrive twice
             self.queue.clear();
@@ -93,13 +94,13 @@ impl HostTask {
                 Ok(Ok(ws)) => {
                     let epoch = self.entry.note_connected();
                     if let Some(f) = &self.on_connect {
-                        f(&self.entry.host, epoch, cursor, restarted);
+                        f(&self.entry.host, epoch, cursor, was_restarted);
                     }
                     self.entry.set_status(HostStatus::Active);
                     if let Some(c) = cursor {
                         self.entry.set_received_seq(c);
                     }
-                    let (end, got_frames) = self.read(ws, epoch, &mut skip_cursor).await;
+                    let (end, got_frames) = self.read(ws, epoch, cursor, &mut restarted).await;
                     if got_frames || started.elapsed() > self.cfg.backoff_max {
                         attempt = 0;
                     }
@@ -148,7 +149,7 @@ impl HostTask {
         self.entry.set_status(HostStatus::Idle);
     }
 
-    async fn read(&mut self, mut ws: Socket, epoch: u64, skip_cursor: &mut bool) -> (End, bool) {
+    async fn read(&mut self, mut ws: Socket, epoch: u64, cursor: Option<i64>, restarted: &mut bool) -> (End, bool) {
         let cfg = self.cfg.clone();
         let mut limiter =
             HostLimiter::new(&self.entry.limits(&cfg.limits), self.entry.limits_gen(), std::time::Instant::now());
@@ -225,13 +226,22 @@ impl HostTask {
                     tracing::info!(host = %self.entry.host.0, error, message, "upstream error frame");
                     match error {
                         "FutureCursor" => {
-                            // the host's sequence restarted below ours (a reset
-                            // or restored PDS): resume live and let the DID
-                            // owners' rev checks sort out what it re-sends
+                            // The host's sequence restarted below our cursor (a
+                            // wiped or restored PDS). Resuming live would skip
+                            // what it emitted since the restart and
+                            // desynchronize those accounts, so it replays its
+                            // new sequence from the start: commits it re-sends
+                            // are caught by rev, and the rest by the restart
+                            // dedupe (docs/chaos.md, issue 1).
                             self.entry.count_error(|c| c.future_cursor += 1);
+                            if cursor.is_some_and(|c| c <= 0) {
+                                // can't be ahead of anything: a broken host
+                                self.entry.count_error(|c| c.protocol += 1);
+                                break End::Failed;
+                            }
                             self.entry.reset_cursor();
                             self.cursor.on_future_cursor(&self.entry.host);
-                            *skip_cursor = true;
+                            *restarted = true;
                             break End::Soon;
                         }
                         "ConsumerTooSlow" => {
@@ -488,6 +498,63 @@ pub(crate) mod tests {
         m.admit(&host, super::super::Tier::Default).await.unwrap();
         let uri = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
         assert_eq!(uri, "/xrpc/com.atproto.sync.subscribeRepos");
+        m.shutdown().await.unwrap();
+    }
+
+    /// Issue 1 in docs/chaos.md: a host whose sequence restarted answers our
+    /// cursor with FutureCursor. Resuming live lost everything it emitted
+    /// since the restart; it must replay its new sequence from 0.
+    #[tokio::test]
+    async fn future_cursor_replays_the_new_sequence_from_zero() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = Host(format!("127.0.0.1:{}", l.local_addr().unwrap().port()));
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                let seen_tx = seen_tx.clone();
+                tokio::spawn(async move {
+                    let mut query = String::new();
+                    let cb =
+                        |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                         r: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                            query = req.uri().query().unwrap_or("").to_string();
+                            Ok(r)
+                        };
+                    let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(s, cb).await else { return };
+                    let _ = seen_tx.send(query.clone());
+                    if query.contains("cursor=500") {
+                        let f = vlpds::events::error_frame("FutureCursor", "cursor in the future");
+                        let _ = ws.send(Message::Binary(f.into())).await;
+                        let _ = ws.close(None).await;
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                });
+            }
+        });
+        let store = Arc::new(super::super::MemHostStore::default());
+        let mut rec = super::super::HostRecord::new(&host, super::super::Tier::Trusted);
+        rec.acked_seq = Some(500);
+        super::super::HostStore::put(&*store, vec![rec]).await.unwrap();
+        let mut cfg = UpstreamConfig::new(true);
+        cfg.endpoint = Arc::new(|h: &Host| format!("http://{}", h.0));
+        cfg.backoff_base = Duration::from_millis(10);
+        let (m, _rx) = super::super::Manager::new(cfg, store, None);
+        let connects = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let c = connects.clone();
+        m.on_connect(Arc::new(move |_: &Host, epoch, cursor, restarted| c.lock().push((epoch, cursor, restarted))));
+        m.start().await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), seen.recv()).await.unwrap().unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), seen.recv()).await.unwrap().unwrap();
+        assert_eq!((first.as_str(), second.as_str()), ("cursor=500", "cursor=0"));
+        for _ in 0..100 {
+            if connects.lock().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*connects.lock(), vec![(1, Some(500), false), (2, Some(0), true)]);
+        assert_eq!(m.host(&host).unwrap().record.acked_seq, Some(0));
         m.shutdown().await.unwrap();
     }
 }
