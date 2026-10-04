@@ -15,7 +15,7 @@
 # --host), the relay part is skipped and the checker runs against the
 # upstreams themselves instead, which still proves the network, the load and
 # the checker. Env: KEEP=1 leaves the network up (dev-down tears it down),
-# OUT (dev/state/e2e: logs and the JSON report).
+# OUT (${DEV_STATE:-dev/state}/e2e: logs and the JSON report).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 crate="$(cd "$here/../.." && pwd)"
@@ -33,7 +33,7 @@ while [ $# -gt 0 ]; do
     *) echo "e2e: unknown flag $1" >&2; exit 1 ;;
   esac
 done
-out=${OUT:-dev/state/e2e}
+out=${OUT:-${DEV_STATE:-dev/state}/e2e}
 target=${CARGO_TARGET_DIR:-target}/debug
 
 t0=$(date +%s)
@@ -54,8 +54,8 @@ trap cleanup EXIT
 
 dev/up.sh
 mkdir -p "$out"
-up_flags=$(sed 's/^/--upstream /' dev/state/hosts | tr '\n' ' ')
-"$target/devnet" seed --accounts "$accounts" $(sed 's/^/--host /' dev/state/hosts | tr '\n' ' ')
+up_flags=$(sed 's/^/--upstream /' ${DEV_STATE:-dev/state}/hosts | tr '\n' ' ')
+"$target/devnet" seed --accounts "$accounts" $(sed 's/^/--host /' ${DEV_STATE:-dev/state}/hosts | tr '\n' ' ')
 
 relay_flags=""
 store_flags="--memory"
@@ -65,10 +65,10 @@ fi
 start_relay() {
   dev/capped.sh "${RELAY_MEM_MB:-4096}" "$target/vlrelay" \
     --listen "127.0.0.1:$RELAY_PORT" $store_flags --plc-url "http://127.0.0.1:$PLC_PORT" --linger-ms 25 \
-    $(sed 's/^/--host /' dev/state/hosts | tr '\n' ' ') >>"$out/relay.log" 2>&1 &
+    $(sed 's/^/--host /' ${DEV_STATE:-dev/state}/hosts | tr '\n' ' ') >>"$out/relay.log" 2>&1 &
   relay_pid=$!
   pids+=($relay_pid)
-  echo $relay_pid >dev/state/relay.pid
+  echo $relay_pid >${DEV_STATE:-dev/state}/relay.pid
   for _ in $(seq 1 100); do
     curl -sf "http://127.0.0.1:$RELAY_PORT/xrpc/_health" >/dev/null && break
     sleep 0.2
@@ -82,7 +82,7 @@ if "$target/vlrelay" --help 2>/dev/null | grep -q -- '--listen' && "$target/vlre
   echo "e2e: relay up on :$RELAY_PORT"
 else
   echo "e2e: SKIP relay: vlrelay doesn't implement the CLI contract yet (--listen, --host); checking the upstreams against themselves"
-  relay_flags=$(sed 's/^/--relay /' dev/state/hosts | tr '\n' ' ')
+  relay_flags=$(sed 's/^/--relay /' ${DEV_STATE:-dev/state}/hosts | tr '\n' ' ')
 fi
 
 # the checker subscribes first so the load's first events are in its window

@@ -16,7 +16,7 @@
 #
 # Ports: node i (cores 1-3, edge 4, replica 5) serves on CLUSTER_PORT_BASE+i
 # (2960) and peers on CLUSTER_PORT_BASE+10+i. Env: KEEP=1, OUT
-# (dev/state/e2e-cluster), TTL_MS (3000: node lease TTL), HOST_SHARDS (16).
+# (${DEV_STATE:-dev/state}/e2e-cluster), TTL_MS (3000: node lease TTL), HOST_SHARDS (16).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 crate="$(cd "$here/../.." && pwd)"
@@ -37,7 +37,7 @@ while [ $# -gt 0 ]; do
     *) echo "e2e-cluster: unknown flag $1" >&2; exit 1 ;;
   esac
 done
-out=${OUT:-dev/state/e2e-cluster}
+out=${OUT:-${DEV_STATE:-dev/state}/e2e-cluster}
 target=${CARGO_TARGET_DIR:-target}/debug
 base=${CLUSTER_PORT_BASE:-2960}
 ttl=${TTL_MS:-3000}
@@ -63,13 +63,13 @@ trap cleanup EXIT
 
 DEV_PDS=${DEV_PDS:-3} dev/up.sh
 rm -rf "$out" && mkdir -p "$out"
-up_flags=$(sed 's/^/--upstream /' dev/state/hosts | tr '\n' ' ')
-"$target/devnet" seed --accounts "$accounts" $(sed 's/^/--host /' dev/state/hosts | tr '\n' ' ')
+up_flags=$(sed 's/^/--upstream /' ${DEV_STATE:-dev/state}/hosts | tr '\n' ' ')
+"$target/devnet" seed --accounts "$accounts" $(sed 's/^/--host /' ${DEV_STATE:-dev/state}/hosts | tr '\n' ' ')
 
 prefix="e2e-cluster-$(date +%s)-$$"
 store="--s3-endpoint http://127.0.0.1:$MINIO_PORT --s3-bucket vlrelay --s3-access-key minioadmin --s3-secret-key minioadmin --prefix $prefix"
-common="$store --plc-url http://127.0.0.1:$PLC_PORT --linger-ms 25 --dev-mode --internal-token e2e-cluster-token --peer-tls-dir dev/state/peer-tls --lease-ttl-ms $ttl --did-shards 8 --host-shards ${HOST_SHARDS:-16}"
-hosts=$(sed 's/^/--host /' dev/state/hosts | tr '\n' ' ')
+common="$store --plc-url http://127.0.0.1:$PLC_PORT --linger-ms 25 --dev-mode --internal-token e2e-cluster-token --peer-tls-dir ${DEV_STATE:-dev/state}/peer-tls --lease-ttl-ms $ttl --did-shards 8 --host-shards ${HOST_SHARDS:-16}"
+hosts=$(sed 's/^/--host /' ${DEV_STATE:-dev/state}/hosts | tr '\n' ' ')
 
 declare -a node_pid
 pub() { echo $((base + $1)); }

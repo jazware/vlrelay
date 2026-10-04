@@ -12,7 +12,9 @@
 # (dev/state-chaos-$CHAOS_BASE/run), TTL_MS (3000), HOST_SHARDS (15),
 # RELAY_MEM_MB (3072 per node), RESTART_SEC (1: supervisor delay),
 # FAKE_HOSTS (3), RETENTION_H (72), SOAK_EVERY (180: soak's fault interval),
-# VLRELAY_BIN (another relay build, e.g. one from before a fix).
+# VLRELAY_BIN (another relay build, e.g. one from before a fix), CHAOS_PROFILE
+# (dev: the cargo profile to build and run), CHAOS_NO_BUILD=1 (use what's built),
+# RELAY_EXTRA (more relay flags), CONSUMER_LAG_MB (16: consumers' lag bound).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 crate="$(cd "$here/../.." && pwd)"
@@ -54,11 +56,13 @@ fake_base=$((B + 100)) fake_plc=$((B + 99))
 fake_hosts=${FAKE_HOSTS:-3}
 
 out=${OUT:-$DEV_STATE/run}
-target=${CARGO_TARGET_DIR:-target}/debug
+# CHAOS_PROFILE=dev-release for a soak at production speed
+profile=${CHAOS_PROFILE:-dev}
+target=${CARGO_TARGET_DIR:-target}/$([ "$profile" = dev ] && echo debug || echo "$profile")
 relay_bin=${VLRELAY_BIN:-$target/vlrelay}
 ttl=${TTL_MS:-3000}
 t0=$(date +%s)
-cargo build --quiet --bin vlrelay --bin e2e_check --bin devnet --bin fakepds
+[ "${CHAOS_NO_BUILD:-}" = 1 ] || cargo build --quiet --profile "$profile" --bin vlrelay --bin e2e_check --bin devnet --bin fakepds
 echo "chaos[$scenario]: built in $(($(date +%s) - t0))s"
 
 ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
@@ -119,7 +123,9 @@ for g in $(seq 0 $((fake_hosts - 1))); do echo "http://127.0.0.1:$((fake_base + 
 prefix="chaos-$scenario-$(date +%s)-$$"
 echo "$prefix" >"$out/prefix"
 creds="--s3-bucket vlrelay --s3-access-key minioadmin --s3-secret-key minioadmin --prefix $prefix"
-common="--plc-url http://127.0.0.1:$fake_plc --linger-ms 25 --dev-mode --internal-token chaos-token --peer-tls-dir $DEV_STATE/peer-tls --lease-ttl-ms $ttl --did-shards 8 --host-shards ${HOST_SHARDS:-15} --retention ${RETENTION_H:-72}"
+common="--plc-url http://127.0.0.1:$fake_plc --linger-ms 25 --dev-mode --internal-token chaos-token --peer-tls-dir $DEV_STATE/peer-tls --lease-ttl-ms $ttl --did-shards 8 --host-shards ${HOST_SHARDS:-15} --retention ${RETENTION_H:-72} ${RELAY_EXTRA:-}"
+# slow consumers reach a 16 MiB lag bound within the 40 s storm at ~1 MB/s
+[ "$scenario" = consumers ] && common="$common --firehose-max-lag-mb ${CONSUMER_LAG_MB:-16}"
 hosts=$(sed 's/^/--host /' "$out/upstreams" | tr '\n' ' ')
 roles=(x core core core edge replica)
 
@@ -331,7 +337,7 @@ done
 touch "$out/sampled"
 sample
 for i in 1 2 3 4 5; do
-  curl -sf -m 2 "http://127.0.0.1:$(pub "$i")/metrics" | grep -E '^vlrelay_|^vlpds_cluster' >"$out/metrics-n$i.txt" || true
+  curl -sf -m 2 "http://127.0.0.1:$(pub "$i")/metrics" | grep -E '^vlrelay_|^vlpds_cluster|^vlpds_firehose_disconnects' >"$out/metrics-n$i.txt" || true
 done
 # the hosts' checkpointed cursors, for acked-but-lost
 docker compose -f dev/docker-compose.yml exec -T minio sh -c \
