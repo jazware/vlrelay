@@ -77,6 +77,9 @@ pub struct NodeConfig {
     pub dev_mode: bool,
     pub plc_url: String,
     pub linger: Duration,
+    /// Segment PUTs in flight.
+    pub log_inflight: usize,
+    pub max_segment_bytes: usize,
     pub did_shards: u32,
     pub retention: Duration,
     /// Pipeline lanes (each a task; a DID always maps to the same one).
@@ -107,6 +110,8 @@ impl NodeConfig {
             dev_mode: false,
             plc_url: plc_url.into(),
             linger: seq::DEFAULT_LINGER,
+            log_inflight: seq::DEFAULT_INFLIGHT,
+            max_segment_bytes: seq::DEFAULT_MAX_SEGMENT_BYTES,
             did_shards: 4,
             retention: seq::DEFAULT_RETENTION,
             lanes: 64,
@@ -465,6 +470,8 @@ impl Node {
 
         let mut lcfg = LogConfig::new(seq::new_log_id(&cfg.node_id));
         lcfg.linger = cfg.linger;
+        lcfg.inflight = cfg.log_inflight.max(1);
+        lcfg.max_segment_bytes = cfg.max_segment_bytes.max(64 << 10);
         let scfg = ServeConfig { retention: cfg.retention, threads: cfg.serve_threads, ..Default::default() };
         let on_fatal: seq::OnFatal = Box::new(|e: &LogError| {
             let code = if matches!(e, LogError::LeaseLapsed) { 5 } else { 3 };
@@ -709,7 +716,26 @@ impl Node {
     }
 
     async fn lane(self: Arc<Self>, mut rx: mpsc::Receiver<Job>) {
-        while let Some(job) = rx.recv().await {
+        use futures::StreamExt;
+        use futures::stream::FuturesUnordered;
+        // durable acks of this lane's appended (or forwarded) events, polled
+        // between jobs instead of a task per event
+        let mut acks: FuturesUnordered<futures::future::BoxFuture<'static, Option<(Host, i64, u64)>>> =
+            FuturesUnordered::new();
+        loop {
+            let job = tokio::select! {
+                biased;
+                Some(done) = acks.next(), if !acks.is_empty() => {
+                    if let Some((host, useq, ordinal)) = done {
+                        self.finish(&host, useq, Some(ordinal));
+                    }
+                    continue;
+                }
+                job = rx.recv() => match job {
+                    Some(j) => j,
+                    None => break,
+                },
+            };
             metrics::LANE_QUEUED.dec();
             let host = job.frame.host.clone();
             let useq = job.frame.upstream_seq;
@@ -733,13 +759,16 @@ impl Node {
                     if let Some(p) = &self.policy {
                         p.on_accepted(&host.0, &did, kind);
                     }
-                    let node = self.clone();
-                    tokio::spawn(async move {
-                        // a failed log fail-stops the process (on_fatal): no ack
-                        if let Ok(Ok(d)) = rx.await {
-                            node.finish(&host, useq, Some(d.ordinal));
+                    acks.push(
+                        async move {
+                            // a failed log fail-stops the process (on_fatal): no ack
+                            match rx.await {
+                                Ok(Ok(d)) => Some((host, useq, d.ordinal)),
+                                _ => None,
+                            }
                         }
-                    });
+                        .boxed(),
+                    );
                 }
                 Submitted::Duplicate => {
                     metrics::EVENTS_DUPLICATE.with_label_values(&["state"]).inc();
@@ -751,8 +780,19 @@ impl Node {
                 }
                 Submitted::Forwarded(rx) => {
                     let node = self.clone();
-                    tokio::spawn(async move { node.forwarded(rx, host, did, useq, kind).await });
+                    acks.push(
+                        async move {
+                            node.forwarded(rx, host, did, useq, kind).await;
+                            None
+                        }
+                        .boxed(),
+                    );
                 }
+            }
+        }
+        while let Some(done) = acks.next().await {
+            if let Some((host, useq, ordinal)) = done {
+                self.finish(&host, useq, Some(ordinal));
             }
         }
     }

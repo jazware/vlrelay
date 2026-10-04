@@ -4490,6 +4490,7 @@ dependencies = [
  "shrike",
  "slatedb",
  "thiserror 2.0.21",
+ "tikv-jemallocator",
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tower",

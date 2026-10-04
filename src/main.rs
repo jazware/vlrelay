@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use vlrelay::node::{Node, NodeConfig, admin::NodeAdmin};
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser, Debug)]
 #[command(version, about = "An atproto relay whose only durable state is an object store")]
 struct Args {
@@ -37,6 +40,12 @@ struct Args {
     /// Segment linger (PLAN.md decision 1).
     #[arg(long, default_value_t = 25)]
     linger_ms: u64,
+    /// Segment PUTs in flight at once.
+    #[arg(long, default_value_t = vlrelay::seq::DEFAULT_INFLIGHT)]
+    log_inflight: usize,
+    /// A segment seals at this size even before its linger is up.
+    #[arg(long, default_value_t = vlrelay::seq::DEFAULT_MAX_SEGMENT_BYTES >> 20)]
+    max_segment_mb: usize,
     /// An upstream to subscribe to (repeatable). `http://` means plain
     /// `ws://` (dev mode); a bare hostname means `wss://`.
     #[arg(long = "host")]
@@ -148,6 +157,8 @@ async fn run(a: Args) -> anyhow::Result<()> {
     cfg.node_id = a.node_id.clone();
     cfg.dev_mode = dev_mode;
     cfg.linger = Duration::from_millis(a.linger_ms);
+    cfg.log_inflight = a.log_inflight;
+    cfg.max_segment_bytes = a.max_segment_mb << 20;
     cfg.did_shards = a.did_shards.max(1);
     cfg.retention = Duration::from_secs(a.retention.max(1) * 3600);
     cfg.lanes = a.lanes.max(1);

@@ -65,7 +65,9 @@ use crate::types::Host;
 pub const DEFAULT_LINGER: Duration = Duration::from_millis(25);
 pub const DEFAULT_MAX_SEGMENT_BYTES: usize = 8 << 20;
 pub const DEFAULT_MAX_SEGMENT_EVENTS: usize = 65_536;
-pub const DEFAULT_INFLIGHT: usize = 4;
+/// Past ~50k events/s a segment seals on size, not linger, and its PUT takes
+/// ~100 ms on MinIO: 4 in flight capped a node at ~50k events/s (docs/perf.md).
+pub const DEFAULT_INFLIGHT: usize = 16;
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(72 * 3600);
 /// Durable batches a peer stream may fall behind by before it's dropped.
 const LIVE_BATCHES: usize = 4096;
@@ -618,7 +620,9 @@ impl Sequencer {
                         .await
                         .expect("segment compression task");
                     sealed.stored_bytes = put.len();
+                    let t = Instant::now();
                     let r = upload(&store, &log_id, sealed.ordinal, put, hedge, &stats).await;
+                    vlpds::metrics::PUT_DURATION.with_label_values(&["relay"]).observe(t.elapsed().as_secs_f64());
                     (sealed, r)
                 })));
             }
