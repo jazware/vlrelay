@@ -11,7 +11,7 @@ publish = false
 # crypto, MST, CAR and DID resolution. Factored into shared crates once the
 # relay settles which pieces it needs.
 # the public vlpds at the commit this one was exported against
-vlpds = { git = "https://github.com/jazware/vlpds", rev = "2e75d57b87d0851afdd378942aded866e79248d2" }
+vlpds = { git = "https://github.com/jazware/vlpds", rev = "f8bdca3f71ade0ab287db2d337e2e0307caaf1d1" }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws", "macros", "http2"] }
@@ -73,9 +73,10 @@ tower = { version = "0.5", features = ["util"] }
 # differential tests against a second atproto implementation, as vlpds does
 shrike = { version = "=0.7.0", default-features = false, features = ["syntax", "cbor", "crypto", "mst", "repo", "car", "sync"] }
 
+# the fork rev vlpds pins (vlpds/Cargo.toml lists its patches)
 [patch.crates-io]
-slatedb = { git = "https://github.com/jazware/slatedb", rev = "2a79077e0da057c4673137195409edfe7bb673c4" }
-slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "2a79077e0da057c4673137195409edfe7bb673c4" }
+slatedb = { git = "https://github.com/jazware/slatedb", rev = "c7b29a0673d54a8346cb8dd6f4b888e0b7dda84a" }
+slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "c7b29a0673d54a8346cb8dd6f4b888e0b7dda84a" }
 
 [profile.release]
 opt-level = 3

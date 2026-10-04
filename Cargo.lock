@@ -3591,7 +3591,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slatedb"
 version = "0.17.0"
-source = "git+https://github.com/jazware/slatedb?rev=2a79077e0da057c4673137195409edfe7bb673c4#2a79077e0da057c4673137195409edfe7bb673c4"
+source = "git+https://github.com/jazware/slatedb?rev=c7b29a0673d54a8346cb8dd6f4b888e0b7dda84a#c7b29a0673d54a8346cb8dd6f4b888e0b7dda84a"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -3637,7 +3637,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.17.0"
-source = "git+https://github.com/jazware/slatedb?rev=2a79077e0da057c4673137195409edfe7bb673c4#2a79077e0da057c4673137195409edfe7bb673c4"
+source = "git+https://github.com/jazware/slatedb?rev=c7b29a0673d54a8346cb8dd6f4b888e0b7dda84a#c7b29a0673d54a8346cb8dd6f4b888e0b7dda84a"
 dependencies = [
  "chrono",
  "log",
@@ -3652,7 +3652,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.17.0"
-source = "git+https://github.com/jazware/slatedb?rev=2a79077e0da057c4673137195409edfe7bb673c4#2a79077e0da057c4673137195409edfe7bb673c4"
+source = "git+https://github.com/jazware/slatedb?rev=c7b29a0673d54a8346cb8dd6f4b888e0b7dda84a#c7b29a0673d54a8346cb8dd6f4b888e0b7dda84a"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4395,7 +4395,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vlpds"
 version = "1.0.0"
-source = "git+https://github.com/jazware/vlpds?rev=2e75d57b87d0851afdd378942aded866e79248d2#2e75d57b87d0851afdd378942aded866e79248d2"
+source = "git+https://github.com/jazware/vlpds?rev=f8bdca3f71ade0ab287db2d337e2e0307caaf1d1#f8bdca3f71ade0ab287db2d337e2e0307caaf1d1"
 dependencies = [
  "anyhow",
  "argon2",

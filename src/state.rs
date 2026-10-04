@@ -92,15 +92,10 @@ pub trait ReplaySource: Send + Sync {
 pub const CLONE_FAMILIES: &[vlpds::partition::FamilyRange] =
     &[vlpds::state::slot_range_keys, record::host_range_keys, crate::plc_seed::seed_range_keys];
 
-/// What a live split or merge carries today: `0x01` only. Cloning the other
-/// tags too gives a child each parent L0 several times, out of order, and
-/// once its compactor takes some its writer's flush fails SlateDB's L0 ULID
-/// cutoff (`InvalidClockTick`, a node fail-stop; vlpds's ignored
-/// `family_child_flushes_through_compaction`). Seeds are a cache (a child's DIDs resolve from
-/// PLC on a miss) and a cluster's host records are in the bucket, so losing
-/// `0x02` and `0x03` costs lookups, not correctness. docs/cluster.md,
-/// "Resharding".
-pub const RESHARD_FAMILIES: &[vlpds::partition::FamilyRange] = &[vlpds::state::slot_range_keys];
+/// What a live split or merge carries: every family. The child then holds
+/// each parent L0 SST once per family, which SlateDB's L0 merge needs fork
+/// patch 5 for (vlpds's Cargo.toml). docs/cluster.md, "Resharding".
+pub const RESHARD_FAMILIES: &[vlpds::partition::FamilyRange] = CLONE_FAMILIES;
 
 pub struct StateStore<C: Chain = StubChain> {
     archive: std::sync::OnceLock<Arc<crate::archive::Archive>>,
