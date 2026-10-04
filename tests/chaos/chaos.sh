@@ -128,7 +128,7 @@ echo "$prefix" >"$out/prefix"
 creds="--s3-bucket vlrelay --s3-access-key minioadmin --s3-secret-key minioadmin --prefix $prefix"
 common="--plc-url http://127.0.0.1:$fake_plc --linger-ms 25 --dev-mode --internal-token chaos-token --peer-tls-dir $DEV_STATE/peer-tls --lease-ttl-ms $ttl --did-shards 8 --host-shards ${HOST_SHARDS:-15} --retention ${RETENTION_H:-72} ${RELAY_EXTRA:-}"
 # slow consumers reach a 16 MiB lag bound within the 40 s storm at ~1 MB/s
-[ "$scenario" = consumers ] && common="$common --firehose-max-lag-mb ${CONSUMER_LAG_MB:-16}"
+[ "$scenario" = consumers ] && common="$common --max-lag-mb ${CONSUMER_LAG_MB:-16}"
 hosts=$(sed 's/^/--host /' "$out/upstreams" | tr '\n' ' ')
 roles=(x core core core edge replica)
 

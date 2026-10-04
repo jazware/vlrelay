@@ -341,8 +341,11 @@ async fn lane(cfg: ForwardConfig, route: Arc<dyn Route>, mut rx: mpsc::Receiver<
         }
         // one batch per owner, so a slow owner's answer doesn't hold the rest
         let mut groups: Vec<(Option<Option<String>>, Vec<Item>)> = Vec::new();
+        // one lookup per DID: two of its events in different batches would
+        // be in flight at once, and could land out of order
+        let mut owners: HashMap<String, Option<Option<String>>> = HashMap::new();
         for it in batch {
-            let o = route.owner(&it.ev.did);
+            let o = owners.entry(it.ev.did.clone()).or_insert_with(|| route.owner(&it.ev.did)).clone();
             match groups.iter_mut().find(|(g, _)| *g == o) {
                 Some((_, v)) => v.push(it),
                 None => groups.push((o, vec![it])),
