@@ -85,7 +85,7 @@ struct Args {
     /// Seed DID documents from the PLC directory's /export (resumable, then
     /// follows its tail), so a cold relay doesn't resolve each account. On
     /// a cluster the lowest-named live core reads it.
-    #[arg(long, env = "VLRELAY_PLC_EXPORT")]
+    #[arg(long, env = "VLRELAY_PLC_EXPORT", value_parser = clap::builder::BoolishValueParser::new())]
     plc_export: bool,
     /// The directory --plc-export reads (default: --plc-url).
     #[arg(long, env = "VLRELAY_PLC_EXPORT_URL")]
