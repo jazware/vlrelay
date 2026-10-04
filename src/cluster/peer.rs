@@ -1,18 +1,28 @@
 //! The peer listener: node-to-node routes over mTLS (vlpds's peer
 //! transport, HTTP/2 with the log stream upgrading over HTTP/1.1). Every
 //! route also wants the internal token, as vlpds's do.
+//!
+//! The token and the cluster CA admit every member, edges included, and an
+//! edge is the most exposed of them. So each request is also bound to the
+//! node its client certificate names ([`guard`]): any member may stream a
+//! log and say hello, and everything that changes state (forwards, nudges,
+//! key invalidations, admin, archival and PLC routes) wants a core we list
+//! as leased. A fence wants its log's own node, or a leased core while that
+//! log's lease is draining, expired or gone in the bucket ([`may_fence`]).
 
 use super::ClusterNode;
 use super::forward;
 use axum::body::Bytes;
-use axum::extract::{Query, State, WebSocketUpgrade};
+use axum::extract::{Extension, Query, Request, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use vlpds::cluster::{Handoff, ShardHost};
+use vlpds::peer_tls::PeerIdentity;
 
 pub const TOKEN_HEADER: &str = "x-vlpds-internal";
 /// vlpds's path: `vlpds::remote::follow_log` streams from here.
@@ -76,6 +86,80 @@ fn authorized(n: &ClusterNode, h: &HeaderMap) -> Result<(), StatusCode> {
     Ok(())
 }
 
+/// Who may call a path, beyond the token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Access {
+    /// Any member of the cluster CA: edges follow logs, joiners greet.
+    Member,
+    /// The handler decides ([`may_fence`]).
+    Fence,
+    /// A core we list as leased.
+    Core,
+}
+
+fn access(path: &str) -> Access {
+    match path {
+        STREAM | HELLO => Access::Member,
+        FENCE => Access::Fence,
+        _ => Access::Core,
+    }
+}
+
+/// Binds every peer request, the extra routes' included, to its caller's
+/// certificate.
+async fn guard(State(n): S, req: Request, next: Next) -> Response {
+    if n.halted() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some(id) = req.extensions().get::<PeerIdentity>() else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if access(req.uri().path()) == Access::Core && !n.is_leased_core(&id.0) {
+        PEER_REFUSED.inc();
+        tracing::warn!(caller = %id.0, path = req.uri().path(), "peer route refused: the caller isn't a leased core");
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(req).await
+}
+
+static PEER_REFUSED: std::sync::LazyLock<prometheus::IntCounter> = std::sync::LazyLock::new(|| {
+    prometheus::register_int_counter!(
+        "vlrelay_peer_refused_total",
+        "Peer requests refused because the caller's certificate names no leased core (or, for a fence, no node entitled to fence that log)"
+    )
+    .unwrap()
+});
+
+/// The node a log id names: vlpds's log ids are `{node_id}.{micros}`.
+fn log_node(log_id: &str) -> Option<&str> {
+    log_id.rsplit_once('.').map(|(n, _)| n).filter(|n| !n.is_empty())
+}
+
+/// Whether `caller` may fence `log_id`: its own log (a leave whose own
+/// fence failed, its lease possibly lapsed), or a leased core fencing a log
+/// whose lease the bucket shows draining, expired or replaced. The bool in
+/// an error says the bucket couldn't be read (worth a retry).
+async fn may_fence(n: &ClusterNode, caller: &str, log_id: &str) -> Result<(), (bool, String)> {
+    let owner = log_node(log_id).ok_or_else(|| (false, "not a log id".to_string()))?;
+    if owner == caller {
+        return Ok(());
+    }
+    if !n.is_leased_core(caller) {
+        return Err((false, "the caller isn't a leased core".into()));
+    }
+    let c = n.cluster.as_ref().ok_or_else(|| (false, "not a core".to_string()))?;
+    if c.fenced_logs().contains_key(log_id) {
+        return Ok(());
+    }
+    match c.read_lease(owner).await {
+        Err(e) => Err((true, format!("reading its lease: {e:#}"))),
+        Ok(Some(l)) if l.log_id == log_id && !l.draining && !c.lease_expired(&l) => {
+            Err((false, "its lease is live".into()))
+        }
+        Ok(_) => Ok(()),
+    }
+}
+
 pub fn router(node: &Arc<ClusterNode>) -> axum::Router {
     axum::Router::new()
         .route(STREAM, get(stream))
@@ -105,7 +189,7 @@ pub fn spawn_listener_with(
         max_connections: vlpds::server::DEFAULT_MAX_CONNECTIONS,
         tls: Some(tls.server_config()),
     };
-    let r = router(node).merge(extra);
+    let r = router(node).merge(extra).layer(middleware::from_fn_with_state(node.clone(), guard));
     tokio::spawn(async move {
         if let Err(e) = vlpds::server::serve_with(listener, r, opts).await {
             tracing::error!("peer listener exited: {e:#}");
@@ -154,11 +238,25 @@ async fn nudge(State(n): S, h: HeaderMap, axum::Json(inp): axum::Json<NudgeIn>) 
     StatusCode::OK.into_response()
 }
 
-async fn fence(State(n): S, h: HeaderMap, axum::Json(inp): axum::Json<FenceIn>) -> Response {
+async fn fence(
+    State(n): S,
+    Extension(caller): Extension<PeerIdentity>,
+    h: HeaderMap,
+    axum::Json(inp): axum::Json<FenceIn>,
+) -> Response {
     if let Err(r) = authorized(&n, &h) {
         return r.into_response();
     }
     let Some(c) = &n.cluster else { return StatusCode::NOT_FOUND.into_response() };
+    if let Err((transient, why)) = may_fence(&n, &caller.0, &inp.log_id).await {
+        tracing::warn!(caller = %caller.0, log_id = %inp.log_id, "fence refused: {why}");
+        if transient {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        PEER_REFUSED.inc();
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
     n.peer_leaving(inp.log_id.clone());
     match c.fence(&inp.log_id).await {
         Ok(_) => {

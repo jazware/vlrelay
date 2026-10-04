@@ -766,3 +766,46 @@ async fn a_held_did_keeps_its_shard_open() {
     tokio::time::timeout(Duration::from_secs(5), closing).await.expect("the close finishes").unwrap();
     assert!(n.node.hold_did(&d).is_none(), "closed: nothing to hold");
 }
+
+/// An edge's certificate and the shared token get it streams and hellos
+/// only. Forwards, nudges, key invalidations and fences of a live core's
+/// log want a leased core, and a fence of one's own log is always allowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_routes_are_bound_to_the_callers_certificate() {
+    let (store, ca, applied) = (Store::memory(None), Ca::new(), Arc::new(Applied::default()));
+    let a = spawn(&store, &ca, "node-a", Role::Core, &applied).await;
+    let b = spawn(&store, &ca, "node-b", Role::Core, &applied).await;
+    let ac = a.node.cluster.clone().unwrap();
+    eventually("a lists b", Duration::from_secs(10), || ac.peers().iter().any(|l| l.node_id == "node-b")).await;
+    let a_addr = ac.own_lease().addr;
+    let a_log = ac.log_id.clone();
+    let b_log = b.node.cluster.as_ref().unwrap().log_id.clone();
+    let post = |who: &str, path: &str, body: Vec<u8>| {
+        let http = vlpds::http::PeerClient::new(1, ca.node(who));
+        let url = format!("{a_addr}{path}");
+        async move {
+            let r = http.post(url).header(peer::TOKEN_HEADER, "test-token").header("content-type", "application/json");
+            r.body(body).send().await.unwrap().status().as_u16()
+        }
+    };
+    let json = |v: serde_json::Value| serde_json::to_vec(&v).unwrap();
+    let fence = |log: &str| json(serde_json::json!({ "log_id": log }));
+    let batch = || forward::encode_batch(&[fwd(1, 1)]).to_vec();
+    for who in ["edge-1", "node-z"] {
+        assert_eq!(post(who, peer::FORWARD, batch()).await, 403, "{who} forward");
+        assert_eq!(post(who, peer::NUDGE, json(serde_json::json!({ "hosts": true }))).await, 403, "{who} nudge");
+        assert_eq!(post(who, peer::KEYS, json(serde_json::json!({ "dids": [] }))).await, 403, "{who} keys");
+        assert_eq!(post(who, peer::FENCE, fence(&a_log)).await, 403, "{who} fence");
+    }
+    let hello = json(serde_json::json!({ "node_id": "edge-1" }));
+    assert_eq!(post("edge-1", peer::HELLO, hello).await, 200);
+    // b is leased: it forwards, but may not fence a's live log
+    assert_eq!(post("node-b", peer::FORWARD, batch()).await, 200);
+    assert_eq!(post("node-b", peer::FENCE, fence(&a_log)).await, 403);
+    assert!(!vlpds::nodelog::first_free(&store, &a_log).await.unwrap().1, "a's log stays open");
+    // a node may always have its own log fenced
+    assert_eq!(post("node-b", peer::FENCE, fence(&b_log)).await, 200);
+    assert!(vlpds::nodelog::first_free(&store, &b_log).await.unwrap().1, "b's log is fenced");
+    a.node.halt();
+    b.node.halt();
+}

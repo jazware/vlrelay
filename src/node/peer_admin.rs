@@ -3,7 +3,8 @@
 //! (`admin::fleet` adds them up).
 //!
 //! Core nodes serve it on the peer listener under [`CORE_PREFIX`], behind
-//! the internal token like every peer route. Edges and replicas serve it on
+//! the internal token and, like every peer route that changes state, only
+//! to a leased core's certificate (`cluster::peer`). Edges and replicas serve it on
 //! their public listener under [`FOLLOWER_PREFIX`], behind the admin token:
 //! a replica has no peer listener at all, and a core's peer client only
 //! trusts the origins of leased cores, which an edge's isn't. Cores find

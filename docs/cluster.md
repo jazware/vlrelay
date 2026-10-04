@@ -11,7 +11,7 @@ Single-node mode (no `--cluster`/`--role`) is still the default and unchanged. A
 | `--peer-listen ADDR` | `127.0.0.1:2979` | The node-to-node mTLS listener (forwarding, log streams, nudges). Core and edge. |
 | `--advertise-url URL` | `https://{peer-listen}` | Where peers reach `--peer-listen`. |
 | `--peer-tls-dir DIR` | | `ca.crt`, `{node-id}.crt`, `{node-id}.key`, as `vlpds admin tls ca` / `issue` write them. With `--dev-mode` they're created as needed (vlpds's `dev_files`). Core and edge. |
-| `--internal-token T` | | Shared secret on every peer request. Core and edge. |
+| `--internal-token T` | | Shared secret on every peer request. Core and edge. Not enough alone: see "Peer authorization". |
 | `--lease-ttl-ms MS` | 10000 | Node lease TTL. Renewal and skew are a fifth of it each. |
 | `--did-shards N`, `--host-shards N` | 4 alone or 24 in a cluster, 64 | Only used when the bucket has no layout yet. |
 
@@ -26,6 +26,18 @@ vlrelay --role core --node-id n1 --listen :2980 --peer-listen 10.0.0.1:2979 \
 A node that gets SIGTERM leaves gracefully: it marks its lease draining and tells its peers, hands its host shards over (sockets closed, in-flight events landed, cursors checkpointed, recipients nudged), then its DID shards, fences its log and deletes its lease. If it can't fence its own log, it asks a peer to (below, "Failure handling"). Its consumers keep their sockets until the process exits and then resume on another node with their cursor. kill -9 is a crash: peers take its shards once the lease lapses, or sooner if its peer port refuses connections.
 
 Locally, `just e2e-cluster` runs three cores, an edge and a replica (docs/devloop.md, "Cluster e2e").
+
+### Peer authorization
+
+Every core and edge holds the internal token and a certificate from the cluster CA, and the CA admits any of them. An edge is the most exposed member, so neither is enough on its own to change anything. Each peer request is bound to the node its client certificate names (the `vlpds://node/<id>` URI SAN, which vlpds's peer listener hands to the router as `PeerIdentity`), and `cluster::peer::guard` checks it against the leases:
+
+| Route | Who may call it |
+|---|---|
+| log stream, hello | any member (edges follow core logs, joiners greet) |
+| forward, nudge, key invalidation, peer admin, archival reads, PLC seeding | a core whose lease we list as live (draining included: a leaving node still forwards and nudges) |
+| fence `log_id` | the node that wrote `log_id` (a leave whose own fence failed, its lease possibly lapsed), or a leased core while the bucket shows that log's lease draining, expired (by its `expires_ms`, with the skew as margin), replaced or gone |
+
+Anything else gets a 403 and counts in `vlrelay_peer_refused_total`. A core whose peers presumed it dead is refused until they list it again, which is what a zombie should get. The token is still checked on every route.
 
 ## What node.rs does with it
 

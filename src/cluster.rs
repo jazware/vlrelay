@@ -590,7 +590,13 @@ impl ClusterNode {
         Some(NodeAddr { node_id, addr })
     }
 
-    /// The token peers present on internal routes.
+    /// Whether `node_id` is a core whose lease we list as live (ourselves
+    /// included): who may call the peer routes that change state.
+    pub fn is_leased_core(&self, node_id: &str) -> bool {
+        let Some(c) = &self.cluster else { return false };
+        node_id == self.node_id || c.peers().iter().any(|l| l.node_id == node_id)
+    }
+
     /// Whether this node should read the PLC export: the live core with the
     /// lowest node id. Peers listed as draining or leaving don't count.
     pub fn plc_ingest_leader(&self) -> bool {
