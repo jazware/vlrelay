@@ -664,7 +664,9 @@ impl ClusterNode {
         std::iter::once(me)
             .chain(c.peers())
             .map(|l| Member {
-                draining: l.draining || leaving.contains_key(&l.log_id),
+                // a peer that hasn't joined (`may_join` can hold one for a
+                // whole partition) doesn't step its host shards: hand it none
+                draining: l.draining || !l.joined || leaving.contains_key(&l.log_id),
                 node_id: l.node_id,
                 log_id: l.log_id,
                 addr: l.addr,
