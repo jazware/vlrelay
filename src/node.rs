@@ -486,6 +486,10 @@ pub struct Node {
     /// (host, upstream seq) pairs already in an earlier log past the host's
     /// durable cursor: the replay after a restart drops them.
     replayed: Mutex<HashMap<Host, HashSet<i64>>>,
+    /// Per DID, the newest local append not yet durable: a duplicate of it
+    /// (a replay on a new socket) is acked only once it is. A lane handles
+    /// all of a DID's events, so no lock spans the submit and this.
+    inflight: cluster::Inflight,
     /// Per host: sockets below this epoch are fenced (`forward::Fence`).
     fences: Mutex<crate::types::FastMap<Host, Arc<AtomicU64>>>,
     lanes: Vec<mpsc::Sender<Job>>,
@@ -742,6 +746,7 @@ impl Node {
             rejects: Mutex::new(HashMap::new()),
             policy: hooks.clone(),
             replayed: Mutex::new(replayed),
+            inflight: Default::default(),
             fences: Mutex::new(Default::default()),
             lanes: lane_tx,
             ingest: ingest_handle.clone(),
@@ -896,21 +901,44 @@ impl Node {
                     if let Some(p) = &self.policy {
                         p.on_accepted(&host.0, &did, kind);
                     }
+                    let (id, done) = self.inflight.begin(&did);
+                    let node = self.clone();
                     acks.push(
                         async move {
                             let _permit = permit;
                             // a failed log fail-stops the process (on_fatal): no ack
-                            match rx.await {
+                            let r = match rx.await {
                                 Ok(Ok(d)) => Some((host, useq, epoch, d.ordinal)),
                                 _ => None,
-                            }
+                            };
+                            node.inflight.done(&did, id, done, r.is_some());
+                            r
                         }
                         .boxed(),
                     );
                 }
                 Submitted::Duplicate => {
                     metrics::EVENTS_DUPLICATE.with_label_values(&["state"]).inc();
-                    self.finish(&host, useq, epoch, None);
+                    match self.inflight.watch(&did) {
+                        None => self.finish(&host, useq, epoch, None),
+                        // the copy it duplicates may not be durable yet, and
+                        // acking past it would lose it if it never is
+                        Some(of) => {
+                            let node = self.clone();
+                            acks.push(
+                                async move {
+                                    let _permit = permit;
+                                    if cluster::durable(of, Duration::from_secs(3600)).await {
+                                        node.finish(&host, useq, epoch, None);
+                                    } else {
+                                        node.acks.fail(&host, useq, epoch);
+                                    }
+                                    None
+                                }
+                                .boxed(),
+                            );
+                        }
+                    }
                 }
                 Submitted::Rejected(r) if owner_retryable(r.reason) => {
                     tracing::warn!(host = %host.0, did, useq, reason = r.reason, "replaying from the host: {}", r.detail);

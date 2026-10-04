@@ -839,7 +839,7 @@ impl Uncommitted {
 }
 
 /// Resolves to whether an append became durable (None until it did or failed).
-type Durability = tokio::sync::watch::Receiver<Option<bool>>;
+pub(super) type Durability = tokio::sync::watch::Receiver<Option<bool>>;
 
 enum Wait {
     Appended {
@@ -880,7 +880,7 @@ impl Glue {
     }
 }
 
-async fn durable(mut rx: Durability, limit: Duration) -> bool {
+pub(super) async fn durable(mut rx: Durability, limit: Duration) -> bool {
     matches!(
         tokio::time::timeout(limit, rx.wait_for(|v| v.is_some())).await,
         Ok(Ok(v)) if *v == Some(true)
@@ -890,7 +890,7 @@ async fn durable(mut rx: Durability, limit: Duration) -> bool {
 /// Per DID, the newest event this owner appended that may not be durable
 /// yet, and a lock per stripe of DIDs held from the dedupe claim to the
 /// append's registration here.
-struct Inflight {
+pub(super) struct Inflight {
     stripes: Box<[tokio::sync::Mutex<()>]>,
     last: Mutex<HashMap<String, (u64, Durability)>>,
     next: AtomicU64,
@@ -911,7 +911,7 @@ impl Inflight {
         self.stripes[(did_key(did) % self.stripes.len() as u64) as usize].lock().await
     }
 
-    fn begin(&self, did: &str) -> (u64, tokio::sync::watch::Sender<Option<bool>>) {
+    pub(super) fn begin(&self, did: &str) -> (u64, tokio::sync::watch::Sender<Option<bool>>) {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::watch::channel(None);
         self.last.lock().insert(did.to_string(), (id, rx));
@@ -920,11 +920,11 @@ impl Inflight {
 
     /// The log commits in append order, so the newest append's outcome
     /// covers every earlier one of the DID.
-    fn watch(&self, did: &str) -> Option<Durability> {
+    pub(super) fn watch(&self, did: &str) -> Option<Durability> {
         self.last.lock().get(did).map(|(_, rx)| rx.clone())
     }
 
-    fn done(&self, did: &str, id: u64, tx: tokio::sync::watch::Sender<Option<bool>>, ok: bool) {
+    pub(super) fn done(&self, did: &str, id: u64, tx: tokio::sync::watch::Sender<Option<bool>>, ok: bool) {
         let _ = tx.send(Some(ok));
         let mut m = self.last.lock();
         if m.get(did).is_some_and(|(i, _)| *i == id) {
