@@ -138,8 +138,20 @@ fn opts(ca: &Ca, id: &str, role: Role, addr: &str) -> ClusterOptions {
 }
 
 async fn spawn(store: &Store, ca: &Ca, id: &str, role: Role, applied: &Arc<Applied>) -> TNode {
+    spawn_at(store, ca, id, role, applied, None).await
+}
+
+/// `advertise`: where peers are told to reach it (default: its listener).
+async fn spawn_at(
+    store: &Store,
+    ca: &Ca,
+    id: &str,
+    role: Role,
+    applied: &Arc<Applied>,
+    advertise: Option<String>,
+) -> TNode {
     let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = format!("https://{}", peer.local_addr().unwrap());
+    let addr = advertise.unwrap_or_else(|| format!("https://{}", peer.local_addr().unwrap()));
     let node = ClusterNode::start(opts(ca, id, role, &addr), store.clone()).await.unwrap();
     node.set_stage(Arc::new(LogStage { node: Arc::downgrade(&node), applied: applied.clone() }));
     let hosts = Arc::new(FakeHosts::default());
@@ -563,4 +575,38 @@ async fn a_failed_log_loses_the_node() {
     let _ = tokio::time::timeout(Duration::from_secs(5), n.node.forward(fwd(1, 1))).await;
     eventually("the node is lost", Duration::from_secs(10), || lost.load(Ordering::SeqCst)).await;
     assert!(n.node.halted());
+}
+
+/// A core whose advertised peer address takes connections and never
+/// answers (a blackholed port in front of it): it hands its shards to the
+/// peer that can't reach it and steps down, instead of holding them for
+/// the whole partition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_core_its_peers_cannot_reach_steps_down() {
+    let (store, ca, applied) = (Store::memory(None), Ca::new(), Arc::new(Applied::default()));
+    let a = spawn(&store, &ca, "node-a", Role::Core, &applied).await;
+    eventually("a holds every shard", Duration::from_secs(10), || {
+        a.node.cluster.as_ref().unwrap().owned().len() == a.node.layout().unwrap().shards.len()
+    })
+    .await;
+    let hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hole_addr = format!("https://{}", hole.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = hole.accept().await {
+            held.push(s);
+        }
+    });
+    let b = spawn_at(&store, &ca, "node-b", Role::Core, &applied, Some(hole_addr)).await;
+    let lost = Arc::new(AtomicBool::new(false));
+    let l = lost.clone();
+    b.node.on_lost(Box::new(move |_| l.store(true, Ordering::SeqCst)));
+    let t0 = Instant::now();
+    eventually("the unreachable core stepped down", Duration::from_secs(20), || lost.load(Ordering::SeqCst)).await;
+    let total = a.node.layout().unwrap().shards.len();
+    eventually("a holds every shard again", Duration::from_secs(10), || {
+        a.node.cluster.as_ref().unwrap().owned().len() == total
+    })
+    .await;
+    assert!(t0.elapsed() < Duration::from_secs(15), "took {:?}", t0.elapsed());
 }
