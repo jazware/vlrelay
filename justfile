@@ -1,0 +1,90 @@
+# vlrelay: dev loop, local network and e2e (docs/devloop.md)
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+target_dir := env_var_or_default("CARGO_TARGET_DIR", "target")
+bin := target_dir / "debug"
+
+default:
+    @just --list --unsorted
+
+# Type-check everything (the fastest edit loop)
+check:
+    cargo check --all-targets
+
+# Build the relay (dev profile)
+build:
+    cargo build --bin vlrelay
+
+# Unit and integration tests (nextest when installed: one process per test, parallel)
+test *args:
+    if command -v cargo-nextest >/dev/null; then cargo nextest run {{args}}; else cargo test {{args}}; fi
+
+# Re-check on every save (bacon when installed, else cargo-watch, else a polling loop)
+watch job="check":
+    scripts/watch.sh {{job}}
+
+fmt:
+    cargo fmt
+
+clippy:
+    cargo clippy --all-targets -- -D warnings
+
+# Time a cold build, a no-op build and an incremental one-module edit (scripts/buildtime.sh)
+buildtime *args:
+    scripts/buildtime.sh {{args}}
+
+# ---- local network -------------------------------------------------------
+
+# MinIO + PLC + reference PDS (docker) and DEV_PDS (2) native vlpds upstreams, all memory-capped
+dev-up:
+    dev/up.sh
+
+# Stop and delete everything dev-up started (and dev/state)
+dev-down:
+    dev/down.sh
+
+# Create N accounts round-robin across every upstream (appends to dev/state/accounts.json)
+dev-seed n="30":
+    cargo build --quiet --bin devnet
+    {{bin}}/devnet seed --accounts {{n}} $(sed 's/^/--host /' dev/state/hosts | tr '\n' ' ')
+
+# Continuous writes at RATE/s plus handle changes and deactivations (DURATION 0 = until ^C)
+dev-load rate="20" duration="0" *args:
+    cargo build --quiet --bin devnet
+    {{bin}}/devnet load --rate {{rate}} --duration {{duration}} {{args}}
+
+# The relay against the local network, under a memory cap (the e2e's contract, docs/devloop.md)
+relay *args:
+    cargo build --quiet --bin vlrelay
+    source dev/ports.sh && dev/capped.sh ${RELAY_MEM_MB:-4096} {{bin}}/vlrelay \
+        --listen 127.0.0.1:$RELAY_PORT --memory --plc-url http://127.0.0.1:$PLC_PORT --linger-ms 25 \
+        $(sed 's/^/--host /' dev/state/hosts | tr '\n' ' ') {{args}}
+
+# Compare a relay's firehose with every local upstream's (e2e_check; extra flags e.g. --duration 60)
+e2e-check relay="http://127.0.0.1:2980" *args:
+    cargo build --quiet --bin e2e_check
+    {{bin}}/e2e_check $(sed 's/^/--upstream /' dev/state/hosts | tr '\n' ' ') --relay {{relay}} {{args}}
+
+# The checker against the upstreams themselves (proves the env and the checker without a relay)
+e2e-self *args:
+    cargo build --quiet --bin e2e_check
+    {{bin}}/e2e_check $(sed 's/^/--upstream /' dev/state/hosts | tr '\n' ' ') $(sed 's/^/--relay /' dev/state/hosts | tr '\n' ' ') {{args}}
+
+# Full e2e: dev-up, seed, load, relay, checker (tests/e2e/run.sh; KEEP=1 leaves the network up)
+e2e *args:
+    tests/e2e/run.sh {{args}}
+
+# ---- benchbox (scripts/benchbox.sh) --------------------------------------------
+
+# Ship the working tree (tracked + uncommitted) to benchbox:~/vlrelay-dev
+benchbox-sync:
+    scripts/benchbox.sh sync
+
+# Sync, then build the bins (dev-release) on benchbox with a target dir kept between runs
+benchbox-build *args:
+    scripts/benchbox.sh build {{args}}
+
+# Run a bin on benchbox under a memory cap (MEM, default 8G): just benchbox-run vlrelay --help
+benchbox-run bin *args:
+    scripts/benchbox.sh run {{bin}} {{args}}

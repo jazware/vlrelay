@@ -2,3 +2,7 @@ target/
 ui/node_modules/
 ui/dist/
 *.log
+# the repo root ignores Go bin/ dirs; the dev tools live in src/bin
+!src/bin/
+# dev/up.sh: pids, logs, accounts
+dev/state/

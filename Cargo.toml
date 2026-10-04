@@ -28,6 +28,30 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 mime_guess = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# dev tools (src/bin/e2e_check.rs, src/bin/devnet.rs). Features match
+# vlpds's exactly: a different feature set would rebuild these and vlpds.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures = "0.3"
+hdrhistogram = "7"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+tokio-tungstenite = { version = "0.26", features = ["__rustls-tls"] }
+webpki-roots = "1"
+
+[[bin]]
+name = "vlrelay"
+path = "src/main.rs"
+
+# Compares a relay's firehose with its upstreams' (docs/devloop.md)
+[[bin]]
+name = "e2e_check"
+path = "src/bin/e2e_check.rs"
+
+# Seeds and loads the local network (docs/devloop.md)
+[[bin]]
+name = "devnet"
+path = "src/bin/devnet.rs"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
