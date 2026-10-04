@@ -584,11 +584,14 @@ struct Meta {
     span: SeqSpan,
 }
 
-fn decode_meta(did: &str, mut r: Bytes) -> anyhow::Result<Meta> {
+/// `frame_len`: the span must lie in the frame, or the splice into our log
+/// panics the sequencer.
+fn decode_meta(did: &str, frame_len: usize, mut r: Bytes) -> anyhow::Result<Meta> {
     anyhow::ensure!(r.remaining() >= 10, "short meta");
     let tag = r.get_u8();
     let first_sighting = r.get_u8() != 0;
     let span = SeqSpan { start: r.get_u32(), end: r.get_u32() };
+    anyhow::ensure!(span.start <= span.end && span.end as usize <= frame_len, "seq span {span:?} outside the frame");
     let cid = |r: &mut Bytes| -> anyhow::Result<Cid> {
         anyhow::ensure!(r.remaining() >= 33, "short cid");
         let codec = r.get_u8();
@@ -678,7 +681,7 @@ impl Stage {
                 out.push((i, Err(e.clone())));
                 continue;
             }
-            let m = match decode_meta(&f.did, f.meta.clone()) {
+            let m = match decode_meta(&f.did, f.frame.len(), f.meta.clone()) {
                 Ok(m) => m,
                 Err(e) => {
                     out.push((i, Ok(Outcome::Rejected(format!("bad_meta: {e:#}")))));
@@ -1842,7 +1845,8 @@ mod tests {
             CheckedKind::Account { active: true, status: None },
         ] {
             let c = mk(kind);
-            let m = decode_meta(&c.did, encode_meta(&c)).unwrap();
+            let m = decode_meta(&c.did, 9, encode_meta(&c)).unwrap();
+            assert!(decode_meta(&c.did, 8, encode_meta(&c)).is_err(), "a span past the frame's end");
             assert_eq!(m.span, c.span);
             assert!(m.first_sighting);
             match (&m.kind, &c.kind) {

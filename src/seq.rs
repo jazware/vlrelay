@@ -193,6 +193,8 @@ pub enum LogError {
     /// Stopped (shutdown or a test crash) before the batch was durable.
     #[error("node log closed")]
     Closed,
+    #[error("node log sequencer panicked: {0}")]
+    Panicked(String),
 }
 
 pub struct LogConfig {
@@ -315,6 +317,7 @@ impl NodeLog {
         let oldest_pending = Arc::new(parking_lot::Mutex::new(None));
         let log_id: Arc<str> = cfg.log_id.clone().into();
         let (live, _) = tokio::sync::broadcast::channel(LIVE_BATCHES);
+        let on_fatal = Arc::new(parking_lot::Mutex::new(on_fatal));
         let seq = Sequencer {
             store,
             log_id: log_id.clone(),
@@ -327,11 +330,26 @@ impl NodeLog {
             next_ordinal: next_ordinal.clone(),
             stats: stats.clone(),
             live: live.clone(),
-            on_fatal,
+            on_fatal: on_fatal.clone(),
             lapsed_at: None,
             oldest_pending: oldest_pending.clone(),
         };
-        let task = tokio::spawn(seq.run(rx));
+        let (dead, id) = (failed.clone(), log_id.clone());
+        let task = tokio::spawn(async move {
+            use futures::FutureExt;
+            let Err(p) = std::panic::AssertUnwindSafe(seq.run(rx)).catch_unwind().await else { return };
+            let why = p
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            let e = LogError::Panicked(why);
+            tracing::error!(log_id = %id, "node log failed: {e}");
+            dead.lock().get_or_insert(e.clone());
+            if let Some(cb) = on_fatal.lock().take() {
+                cb(&e);
+            }
+        });
         Arc::new(NodeLog {
             log_id,
             wm,
@@ -422,7 +440,9 @@ struct Sequencer {
     next_ordinal: Arc<AtomicU64>,
     stats: Arc<LogStats>,
     live: tokio::sync::broadcast::Sender<Arc<LogBatch>>,
-    on_fatal: Option<OnFatal>,
+    /// Shared with the task's supervisor, which runs it if the sequencer
+    /// panics: the log is dead then, and nothing would say so.
+    on_fatal: Arc<parking_lot::Mutex<Option<OnFatal>>>,
     /// When the lease was first seen lapsed (None while it's valid).
     lapsed_at: Option<Instant>,
     oldest_pending: Arc<parking_lot::Mutex<Option<Instant>>>,
@@ -533,7 +553,7 @@ impl Sequencer {
             tracing::error!(log_id = %self.log_id, "node log failed: {e}");
             *f = Some(e.clone());
             drop(f);
-            if let Some(cb) = self.on_fatal.take() {
+            if let Some(cb) = self.on_fatal.lock().take() {
                 cb(&e);
             }
         }
@@ -1164,6 +1184,36 @@ mod tests {
         let t = log.submit(one_event(2)).await;
         assert_eq!(t.await.unwrap_err(), LogError::LeaseLapsed, "past the grace");
         assert_eq!(log.failed(), Some(LogError::LeaseLapsed));
+    }
+
+    struct Panics;
+
+    impl EncodeWithSeq for Panics {
+        fn encode_with_seq(&self, _: i64, _: &mut Vec<u8>) {
+            panic!("bad span");
+        }
+        fn len_hint(&self) -> usize {
+            0
+        }
+    }
+
+    /// A panic in the sequencer used to end the log with nobody told: every
+    /// later append failed `Closed` and the node lived on.
+    #[tokio::test]
+    async fn a_sequencer_panic_is_fatal() {
+        let store = Store::memory(None);
+        let mut cfg = LogConfig::new("boom");
+        cfg.linger = Duration::from_millis(2);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (ftx, frx) = std::sync::mpsc::channel();
+        let log = NodeLog::start(store, cfg, tx, Some(Box::new(move |e: &LogError| ftx.send(e.clone()).unwrap())));
+        let mut ev = one_event(1);
+        ev[0].frame = Box::new(Panics);
+        assert!(log.submit(ev).await.await.is_err());
+        let e = frx.recv_timeout(Duration::from_secs(5)).expect("on_fatal ran");
+        assert!(matches!(e, LogError::Panicked(ref m) if m == "bad span"), "{e:?}");
+        assert!(matches!(log.failed(), Some(LogError::Panicked(_))));
+        assert!(log.submit(one_event(2)).await.await.is_err());
     }
 
     #[test]
