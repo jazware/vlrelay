@@ -15,9 +15,9 @@ To read along, clone both into an ignored scratch dir (`git clone --depth 50 htt
 
 One goroutine per upstream host reads frames (`cmd/relay/stream/consumer.go:L112-L327`). It decodes the header and body, drops seqs that went backwards on this connection, and hands each event to a per-host parallel scheduler keyed by DID (`cmd/relay/stream/schedulers/parallel/parallel.go`). Workers apply the host's rate limits, then run `Relay.processRepoEvent` (`cmd/relay/relay/ingest.go:L22-L49`). An event that passes goes to `DiskPersistence.Persist`, which stamps the relay seq, writes it to a local file and only then broadcasts it (`cmd/relay/stream/persist/diskpersist/diskpersist.go:L498-L612`).
 
-Every failure in a handler is logged and dropped. The slurper callbacks log `"failed handling event"`, still advance the host cursor and return nil (`cmd/relay/relay/slurper.go:L398-L437`). The scheduler only logs worker errors too (`parallel.go:L140-L142`). So indigo never retries an event, never disconnects a host for a bad event and never marks an account desynchronized. That's the most important thing to know about it.
+Every failure in a handler is logged and dropped. The slurper callbacks log `"failed handling event"`, still advance the host cursor and return nil (`cmd/relay/relay/slurper.go:L398-L437`). The scheduler only logs worker errors too (`parallel.go:L140-L142`). So indigo never retries an event, never disconnects a host for a bad event and never marks an account desynchronized. Wherever the tables below say "dropped", it means logged and skipped.
 
-Bluesky runs it with `--lenient-sync-validation` (`RELAY_LENIENT_SYNC_VALIDATION`, `cmd/relay/main.go:L139-L143`), per the January 2026 relay rollout post. So the "strict" checks below are logged and the event goes out anyway. `relay1.us-east.bsky.network` and `bsky.network` both answer with `Server: openresty` and the rainbow banner, so consumers see the relay through a rainbow splitter.
+Bluesky runs it with `--lenient-sync-validation` (`RELAY_LENIENT_SYNC_VALIDATION`, `cmd/relay/main.go:L139-L143`), per Bluesky's relay rollout post (atproto.com/blog/relay-rollout). So the "strict" checks below are logged and the event goes out anyway. `relay1.us-east.bsky.network` and `bsky.network` both answer with `Server: openresty` and the rainbow banner, so consumers see the relay through a rainbow splitter.
 
 ## What it checks, per event type
 
@@ -265,7 +265,7 @@ From the issue tracker (all open unless noted):
 - indigo#1357: `since: ""` passes through. indigo#1347: `time` isn't validated on `#account`.
 - atproto discussion 5271: `throttled` sent with `active: false` although the spec says it may be active.
 - proposals#78: no exact definition of the blocks a commit must carry. Producers include enough for inversion in any op order.
-- proposals#77: `prevData` is optional in the lexicon but needed in practice. An inversion failure means a bug (drop), a `prevData` mismatch means lost events (resync).
+- proposals#77: `prevData` is optional in the lexicon, but every current PDS sends it and relays expect it. An inversion failure means a bug (drop), a `prevData` mismatch means lost events (resync).
 - atproto#2400: PDSes skip seqs, so gaps don't mean anything.
 - atproto#4212: PDSes accept CBOR (floats, unsafe ints) that strict consumers reject.
 
@@ -309,7 +309,75 @@ shrike also has a few gaps of its own. Error frames without a `t` fail to parse 
 
 ## Measured: the production firehose
 
-TODO(refdiff results)
+`tools/refdiff` subscribes to the relay and to a few PDSes at once and matches events by (DID, kind, rev). It reports what one side saw and the other didn't, per-DID order, the PDS→relay delay as a consumer sees it, and the relay's frame mix. It only reads public streams.
+
+```bash
+cd tools/refdiff && cargo build --release
+./target/release/refdiff --relay relay1.us-east.bsky.network \
+  --pds amanita.us-east.host.bsky.network --pds eurosky.social --pds blacksky.app \
+  --secs 780 --out run.json
+```
+
+We ran it twice from benchbox on 2026-10-04, 09:10 and 09:28 UTC (a Sunday, ~2 am Pacific, so near the daily low), for 16 and 13 minutes. amanita is a Bluesky mushroom with ~213k accounts. eurosky.social (~35k accounts, in Europe) and blacksky.app (~42k accounts, its own PDS implementation) are the biggest independent hosts by account count in `listHosts`. Raw output is in `tools/refdiff/results/`.
+
+### Frame sizes and rates
+
+| | Run 1 (930 s) | Run 2 (750 s) |
+|---|---|---|
+| Relay events | 216,147 | 161,164 |
+| Events/s (p50 · p99 · max per second) | 214 · 311 · 564 | 189 · 271 · 333 |
+| MB/s | 1.14 | 1.01 |
+| Mean frame | 5,323 B | 5,283 B |
+| `#commit` share of events · of bytes | 99.56% · ~100% | 99.55% · ~100% |
+| `#commit` size p50 · p90 · p99 · p99.9 · max | 5,223 · 7,251 · 9,863 · 16,239 · 799,743 B | 5,159 · 7,279 · 9,959 · 16,479 · 763,391 B |
+| `#commit` blocks p50 · p99 | 4,851 · 9,455 B | 4,771 · 9,543 B |
+| `#commit` ops p50 · p99 · max | 1 · 2 · 100 | 1 · 3 · 100 |
+| `#sync` · `#identity` · `#account` per s | 0.3 · 0.3 · 0.4 | 0.2 · 0.3 · 0.3 |
+| `#sync` · `#identity` · `#account` size | 409 · 100 · ~111 B | 409 · 100 · ~111 B |
+| `tooBig` commits | 0 | 0 |
+| Relay seq gaps | 0 | 0 |
+
+Almost every frame is a one-op commit, and about 90% of its bytes are the CAR blocks. A record is a few hundred bytes, so most of the ~4.8 KB is the MST proof path that sync 1.1 requires. That's why frames got bigger than the ~4.5 KB the design assumed.
+
+Our indexer's ClickHouse archive puts the rate in context (`default.repo_records`, record ops per hour over the last 7 days). The average is ~350 ops/s, the busiest hour ~480/s and the quietest ~180/s. So we sampled close to the bottom of the day, and the peak is about 2.3× what we saw.
+
+For the capacity math, that means:
+
+- Plan on ~5.3 KB per event. 100k events/s is ~530 MB/s (~4.2 Gbit/s) coming in, and the same again for every full-firehose subscriber going out. That's still inside 10 GbE per node for the ingest plus a subscriber or so, but not much more.
+- Today's ~350 events/s is ~1.9 MB/s (~15 Mbit/s), and a 72 h window is ~480 GB raw. The design used 12 Mbit/s and ~390 GB.
+- At 100k/s, a 72 h window is ~137 TB raw before compression.
+- Frames up to ~800 KB are real (a 100-op commit). Size buffers for the 5 MB limit, not the average.
+
+### Time to firehose
+
+The delay is the time between our socket getting an event from the PDS and our socket getting the same event from the relay. That's the extra wait a consumer has by reading the relay instead of the PDS. Both sockets ran on the same machine, so there's no clock skew in it.
+
+| PDS (run 2) | Matched | p10 | p50 | p90 | p99 | p99.9 | max |
+|---|---|---|---|---|---|---|---|
+| amanita (mushroom) | 1,799 | 1 ms | 89 ms | 169 ms | 899 ms | 1,050 ms | 1,084 ms |
+| eurosky.social | 4,508 | -55 ms | 92 ms | 258 ms | 563 ms | 836 ms | 1,048 ms |
+| blacksky.app | 443 | 52 ms | 94 ms | 133 ms | 339 ms | 374 ms | 374 ms |
+| all three | 6,763 | | 92 ms | 223 ms | 589 ms | 1,014 ms | 1,084 ms |
+
+Run 1 agrees (n = 10,228, p50 102 ms, p90 192 ms, p99 734 ms, p99.9 2.5 s). Its percentiles leave out the ~8% of events that reached us from the relay first, so they read a bit high.
+
+Some of the deltas are negative, down to -880 ms. That's when the PDS's stream to us was slower than the PDS→relay→us path. TCP connects from benchbox take ~30 ms to the relay's edge, ~60 ms to amanita and ~160 ms to eurosky, so the paths aren't equal. The PDS streams also arrive in bursts (amanita's own commit-to-socket time has a p99 of 2.6 s). So p50 is the trustworthy number and the tails carry PDS noise. Part of indigo's p50 is built in: it writes events to disk every 100 ms (or 400 events) before broadcasting, and rainbow adds a hop.
+
+The baseline vlRelay has to beat is ~90 ms p50 and ~600 ms p99 from PDS to consumer, measured this way.
+
+### Missing, extra and out-of-order events
+
+Across both runs, 17,000 commits matched with no misses, no CID mismatches, no duplicates and no per-DID reordering. The relay stream had no seq gaps in 377k events.
+
+Three `#sync` events from eurosky never showed up at the relay. All three DIDs had just migrated to eurosky from Bluesky mushrooms (morel, scalycap and shiitake), and each `#sync` reached us a second or two after the PLC operation that moved the account (`did:plc:2x3ipl2td62fs4ubqwqoe273` at 09:14:09.66Z, for example). The likely cause is indigo resolving the DID before PLC (or its cache) had the new PDS and dropping the event as coming from the wrong host. The accounts' later commits went through, and `getRepoStatus` at the relay showed the right rev afterwards.
+
+This matters for PLAN decision 3. vlRelay will drop events from a host that the DID document doesn't name yet, so it'll hit the same race. A DID owner should hold events from a non-matching host for a few seconds and re-resolve once more before dropping them, and the `#sync` that follows a migration is the event most likely to be in that window.
+
+The two "relay-only" commits in run 2 are an artifact of how refdiff picks DIDs. They came from the account's old PDS (shiitake) before it moved to eurosky later in the run.
+
+### `#identity` handles
+
+None of the 230 `#identity` events from the relay in run 2 carried a handle. Five of the seven eurosky `#identity` events that matched had one at the PDS, and the relay stripped all five. That's the `SkipHandleVerification` quirk from [`#identity`](#identity) showing up in production.
 
 ## What vlRelay must match
 
@@ -356,6 +424,7 @@ Decided in the design doc:
 
 Proposed here, for the lead to confirm:
 
+- Events from a host the DID document doesn't name yet wait a few seconds for one more re-resolve before they're dropped, so the `#sync` right after a migration isn't lost (see [Missing, extra and out-of-order events](#missing-extra-and-out-of-order-events)).
 - `#sync` rev ordering is checked like `#commit`, so a `#sync` can't roll an account back.
 - `#info OutdatedCursor` for cursors older than the window, and `FutureCursor` (then close) for cursors past the head, per the event-stream spec.
 - The CAR root must equal `evt.commit`, and blocks are re-hashed as they're used (vlpds's CAR reader already does).
