@@ -79,9 +79,10 @@ pub fn install<C: Chain>(
     state: &Arc<StateStore<C>>,
     engine: Arc<Engine>,
     identity: Arc<IdentityCache<HttpFetch>>,
+    dev_mode: bool,
 ) -> (Arc<Archive>, Arc<PolicyGate>) {
     let gate = Arc::new(PolicyGate { engine, hooks: OnceLock::new() });
-    let a = Archive::new(gate.clone(), Arc::new(IdentityResolver(identity)));
+    let a = Archive::new(gate.clone(), Arc::new(IdentityResolver(identity)), dev_mode);
     state.set_archive(a.clone());
     a.spawn(state.clone());
     (a, gate)

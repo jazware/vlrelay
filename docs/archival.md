@@ -59,11 +59,13 @@ A repo needs a full copy when:
 - archiving is switched on for it (the sweeper's rescan after a policy change queues every active account it should mirror),
 - its chain breaks: a `prev_data_mismatch`, a commit from a desynchronized account, a #sync the mirror can't link, or a stored-tree mismatch.
 
-The DID owner queues it (`archive::fetch::Queue`). A fetch resolves the account's PDS endpoint and key from the DID document cache, reads `getLatestCommit`, then `getRepo`, and checks the CAR with vlpds's import parse (every block hashed, the complete canonical tree rebuilt and matched to the commit's `data`) and then the commit's DID, version and signature against the key. Its rev must be at or past `getLatestCommit`'s. The records and nodes become rows with vlpds's `import_rows`, the same function `importRepo` stages with.
+The DID owner queues it (`archive::fetch::Queue`). A fetch resolves the account's PDS endpoint and key from the DID document cache, keeps only the endpoint's `scheme://host[:port]` (a path or query in the document doesn't reach the request), reads `getLatestCommit`, then `getRepo`, and checks the CAR with vlpds's import parse (every block hashed, the complete canonical tree rebuilt and matched to the commit's `data`) and then the commit's DID, version and signature against the key. Its rev must be at or past `getLatestCommit`'s. The records and nodes become rows with vlpds's `import_rows`, the same function `importRepo` stages with.
 
 Live commits for the account keep being checked, sequenced and emitted while it's queued. Their frames wait in the queue entry (up to 1,024 frames or 16 MiB). The import applies the ones past the fetched rev under the DID's lock, after the account's earlier commits are written, and then goes live. A frame that doesn't chain from the fetched head, or a buffer that overflowed, queues another fetch.
 
 A desynchronized account also takes the fetched head as its chain and loses its desync mark. The head is signed by the account's key and is at least what the PDS's `getLatestCommit` says, which is the same evidence a #sync carries. So an archiving relay heals a broken chain without waiting for the PDS to emit #sync.
+
+The DID document is anyone's to write, so fetches go through vlpds's guarded client: https only, no redirects followed, and only hostnames that resolve to public addresses. `--dev-mode` allows plain http to local PDSes.
 
 Politeness: each host has a token bucket at its tier's `archivalFetchesPerHost`, and hosts take turns. The node's share of the cluster's concurrency and bytes budgets caps the rest. Failures retry 5 times with backoff (4 s, 8 s, ... 64 s). The last 32 failures show on `GET /admin/api/archive`.
 
@@ -146,7 +148,6 @@ The reference PDS writes its CAR's blocks in its own order (by the rev that wrot
 - `getRepo` with `since` sends the whole current tree with only the newer records, like vlpds. The reference sends only the blocks written since.
 - The fetch queue is in memory. A restart or a shard move drops it. The sweeper's rescan after startup queues every account that should be mirrored and isn't, so nothing is lost, but the order starts over.
 - Healing a desynchronized account from a fetched repo doesn't emit a #sync. Consumers see the account's next commit chain from a head they never saw.
-- A fetch goes to whatever endpoint the DID document names, `http://` included. Production documents name https endpoints, but nothing outside dev mode refuses plain http yet.
 - The stored-tree check catches a commit whose ops don't produce its `data` from the mirror's tree. It can't catch lost record rows whose leaf nodes are still in the node cache (nodes are content-addressed). Those show up when the leaf is rebuilt: on export, or after the cache drops it.
 - The sweeper walks every `V/` row of a shard every 10 s, and every sync record after a policy change. Fine at dev scale; at 56M accounts it wants a cursor and pacing.
 - Takedown retention counts from when the sweeper first saw the takedown, not from the takedown itself (the sync record doesn't keep a time).

@@ -84,7 +84,7 @@ impl Acct {
 async fn store(on: bool) -> (Arc<StateStore>, Arc<Archive>, Arc<MapIdentity>) {
     let id = MapIdentity::new();
     let st = open(2, id.clone(), Default::default()).await;
-    let a = Archive::new(gate(on, 0), Arc::new(NoResolver));
+    let a = Archive::new(gate(on, 0), Arc::new(NoResolver), true);
     st.set_archive(a.clone());
     (st, a, id)
 }
@@ -234,7 +234,7 @@ async fn replay_rebuilds_the_mirror() {
         id.clone(),
         Default::default(),
     ));
-    let a2 = Archive::new(gate(true, 0), Arc::new(NoResolver));
+    let a2 = Archive::new(gate(true, 0), Arc::new(NoResolver), true);
     st2.set_archive(a2.clone());
     let sid = st2.shard_id_of_slot(vlpds::slots::slot_of(&did));
     for l in vlpds::slots::Layout::uniform(2).shards {
@@ -500,7 +500,7 @@ async fn fetches_over_http_from_the_pds() {
             Ok(Resolved { endpoint: self.0.clone(), key: self.1.clone() })
         }
     }
-    let a = Archive::new(gate(true, 0), Arc::new(Fixed(endpoint, acct.repo.signer.public())));
+    let a = Archive::new(gate(true, 0), Arc::new(Fixed(endpoint, acct.repo.signer.public())), true);
     let st = open(2, id.clone(), Default::default()).await;
     st.set_archive(a.clone());
     st.archive_fetch_now(&did).await.unwrap();
@@ -508,11 +508,82 @@ async fn fetches_over_http_from_the_pds() {
     assert_eq!(a.queue.stats.records.load(Relaxed), 200);
     // a PDS that doesn't answer fails the fetch, and the queue says why
     let did2 = plc(10);
-    let a_bad = Archive::new(gate(true, 0), Arc::new(Fixed("http://127.0.0.1:1".into(), acct.repo.signer.public())));
+    let a_bad =
+        Archive::new(gate(true, 0), Arc::new(Fixed("http://127.0.0.1:1".into(), acct.repo.signer.public())), true);
     let st3 = open(1, id, Default::default()).await;
     st3.set_archive(a_bad.clone());
     assert!(st3.archive_fetch_now(&did2).await.is_err());
     assert_eq!(a_bad.queue.errors.lock().len(), 1);
+}
+
+/// A resolver that names `endpoint` as every DID's PDS.
+struct At(String, crate::verify::SigningKey);
+
+#[async_trait::async_trait]
+impl Resolver for At {
+    async fn resolve(&self, _did: &str) -> anyhow::Result<Resolved> {
+        Ok(Resolved { endpoint: self.0.clone(), key: self.1.clone() })
+    }
+}
+
+#[test]
+fn pds_origin_drops_path_and_query() {
+    for (e, want) in [
+        ("https://pds.example", "https://pds.example"),
+        ("https://pds.example/", "https://pds.example"),
+        ("https://PDS.example:8443/xrpc/evil?did=x#f", "https://pds.example:8443"),
+        ("https://pds.example:443/a", "https://pds.example"),
+        ("http://127.0.0.1:2583/path", "http://127.0.0.1:2583"),
+    ] {
+        assert_eq!(fetch::pds_origin(e).unwrap(), want, "{e}");
+    }
+    for e in ["ftp://pds.example", "pds.example", "https://user:pw@pds.example", "unix:/run/sock"] {
+        assert!(fetch::pds_origin(e).is_err(), "{e}");
+    }
+}
+
+/// A DID document can name any URL: outside dev mode a local or plain http
+/// endpoint is refused, and in either mode a redirect isn't followed.
+#[tokio::test]
+async fn archival_fetch_is_ssrf_guarded() {
+    let _cache = NODE_CACHE_USE.read().await;
+    let id = MapIdentity::new();
+    let did = plc(11);
+    id.set(&did, "pds.a", 1);
+    let acct = Acct::new(&did, 11, 5);
+    let hits = Arc::new(AtomicU64::new(0));
+    let h = hits.clone();
+    let target = axum::Router::new().fallback(move || {
+        h.fetch_add(1, Relaxed);
+        async { "{}" }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_url = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, target).await });
+    let to = target_url.clone();
+    let redirector = axum::Router::new().fallback(move || {
+        let to = to.clone();
+        async move { axum::response::Redirect::temporary(&format!("{to}/internal")) }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let redirect_url = format!("http://{}/xrpc/x?y=z", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, redirector).await });
+
+    let key = || acct.repo.signer.public();
+    for (endpoint, want) in [(target_url.clone(), "Forbidden protocol"), ("https://127.0.0.1:1".into(), "non-unicast")]
+    {
+        let strict = Archive::new(gate(true, 0), Arc::new(At(endpoint, key())), false);
+        let st = open(1, id.clone(), Default::default()).await;
+        st.set_archive(strict);
+        let e = st.archive_fetch_now(&did).await.unwrap_err();
+        assert!(format!("{e:#}").contains(want), "{e:#}");
+    }
+    let dev = Archive::new(gate(true, 0), Arc::new(At(redirect_url, key())), true);
+    let st = open(1, id, Default::default()).await;
+    st.set_archive(dev);
+    let e = st.archive_fetch_now(&did).await.unwrap_err();
+    assert!(format!("{e:#}").contains("307"), "{e:#}");
+    assert_eq!(hits.load(Relaxed), 0, "the redirect was followed");
 }
 
 #[test]

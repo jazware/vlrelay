@@ -110,10 +110,11 @@ pub enum Step {
 }
 
 impl Archive {
-    pub fn new(gate: Arc<dyn Gate>, resolver: Arc<dyn Resolver>) -> Arc<Archive> {
+    /// `dev_mode` lets bootstrap fetches reach local http PDSes.
+    pub fn new(gate: Arc<dyn Gate>, resolver: Arc<dyn Resolver>, dev_mode: bool) -> Arc<Archive> {
         Arc::new(Archive {
             gate: RwLock::new(gate),
-            queue: Queue::new(resolver),
+            queue: Queue::new(resolver, dev_mode),
             stats: Stats::default(),
             reads: ReadStats::default(),
         })

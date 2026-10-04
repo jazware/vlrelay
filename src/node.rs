@@ -560,8 +560,10 @@ impl Node {
         for s in &layout {
             state.open_shard(s.id, None).await?;
         }
-        let archive =
-            cfg.policy.as_ref().map(|p| crate::archive::wiring::install(&state, p.0.clone(), identity.clone()));
+        let archive = cfg
+            .policy
+            .as_ref()
+            .map(|p| crate::archive::wiring::install(&state, p.0.clone(), identity.clone(), cfg.dev_mode));
         // after a restart every DID misses the cache: its state record or
         // its export entry fills it, where resolving them all again at
         // --did-lookups-per-sec would take hours

@@ -137,20 +137,18 @@ pub struct Queue {
     inner: Mutex<Inner>,
     notify: tokio::sync::Notify,
     resolver: Arc<dyn Resolver>,
-    http: reqwest::Client,
+    /// The PDS endpoint comes from a DID document anyone can write, so
+    /// requests go through vlpds's guarded client: https only, no
+    /// redirects, public addresses only (dev mode allows local http).
+    http: vlpds::http::Guarded,
     pub stats: FetchStats,
     /// The last few failures, for the operator.
     pub errors: Mutex<VecDeque<(String, String)>>,
 }
 
 impl Queue {
-    pub fn new(resolver: Arc<dyn Resolver>) -> Arc<Queue> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent(concat!("vlrelay/", env!("CARGO_PKG_VERSION"), " (atproto-relay archival)"))
-            .build()
-            .expect("reqwest client");
+    pub fn new(resolver: Arc<dyn Resolver>, dev_mode: bool) -> Arc<Queue> {
+        let http = vlpds::http::guarded(dev_mode);
         Arc::new(Queue {
             inner: Mutex::new(Inner {
                 entries: HashMap::new(),
@@ -333,22 +331,26 @@ impl Queue {
         self.inner.lock().bytes_tokens -= n as f64;
     }
 
-    async fn get_latest(&self, endpoint: &str, did: &str) -> anyhow::Result<(Cid, Tid)> {
+    fn get(&self, origin: &str, method: &str, did: &str, timeout: Duration) -> anyhow::Result<reqwest::RequestBuilder> {
+        let url = format!("{origin}/xrpc/{method}");
+        let req = self.http.get(&url).map_err(|e| anyhow::anyhow!("{method}: {e}"))?;
+        Ok(req.query(&[("did", did)]).header(reqwest::header::USER_AGENT, USER_AGENT).timeout(timeout))
+    }
+
+    async fn get_latest(&self, origin: &str, did: &str) -> anyhow::Result<(Cid, Tid)> {
         #[derive(serde::Deserialize)]
         struct Latest {
             cid: String,
             rev: String,
         }
-        let url = format!("{}/xrpc/com.atproto.sync.getLatestCommit?did={did}", endpoint.trim_end_matches('/'));
-        let r = self.http.get(&url).send().await?;
+        let r = self.get(origin, "com.atproto.sync.getLatestCommit", did, Duration::from_secs(30))?.send().await?;
         anyhow::ensure!(r.status().is_success(), "getLatestCommit: {}", r.status());
         let l: Latest = r.json().await?;
         Ok((Cid::parse(&l.cid)?, Tid::parse(&l.rev).context("getLatestCommit: bad rev")?))
     }
 
-    async fn get_repo(&self, endpoint: &str, did: &str) -> anyhow::Result<Bytes> {
-        let url = format!("{}/xrpc/com.atproto.sync.getRepo?did={did}", endpoint.trim_end_matches('/'));
-        let mut r = self.http.get(&url).send().await?;
+    async fn get_repo(&self, origin: &str, did: &str) -> anyhow::Result<Bytes> {
+        let mut r = self.get(origin, "com.atproto.sync.getRepo", did, Duration::from_secs(300))?.send().await?;
         anyhow::ensure!(r.status().is_success(), "getRepo: {}", r.status());
         if r.content_length().is_some_and(|n| n as usize > MAX_REPO_BYTES) {
             anyhow::bail!("repo over {MAX_REPO_BYTES} bytes");
@@ -360,6 +362,21 @@ impl Queue {
         }
         Ok(body.into())
     }
+}
+
+const USER_AGENT: &str = concat!("vlrelay/", env!("CARGO_PKG_VERSION"), " (atproto-relay archival)");
+
+/// `scheme://host[:port]` of a DID document's PDS endpoint: a path or query
+/// in the document must not choose what the relay requests.
+pub fn pds_origin(endpoint: &str) -> anyhow::Result<String> {
+    let u = reqwest::Url::parse(endpoint.trim()).context("PDS endpoint is not a URL")?;
+    anyhow::ensure!(matches!(u.scheme(), "http" | "https"), "PDS endpoint scheme {:?}", u.scheme());
+    anyhow::ensure!(u.username().is_empty() && u.password().is_none(), "PDS endpoint has credentials");
+    let host = u.host_str().filter(|h| !h.is_empty()).context("PDS endpoint has no host")?;
+    Ok(match u.port() {
+        Some(p) => format!("{}://{host}:{p}", u.scheme()),
+        None => format!("{}://{host}", u.scheme()),
+    })
 }
 
 fn push_host(g: &mut Inner, host: &str, did: Arc<str>) {
@@ -432,8 +449,9 @@ async fn fetch_and_import<C: Chain>(a: &Archive, state: &StateStore<C>, did: &st
     let q = &a.queue;
     let t0 = Instant::now();
     let id = q.resolver.resolve(did).await?;
-    let (_, latest_rev) = q.get_latest(&id.endpoint, did).await?;
-    let body = q.get_repo(&id.endpoint, did).await?;
+    let origin = pds_origin(&id.endpoint)?;
+    let (_, latest_rev) = q.get_latest(&origin, did).await?;
+    let body = q.get_repo(&origin, did).await?;
     q.spend_bytes(body.len());
     q.stats.bytes.fetch_add(body.len() as u64, Relaxed);
     q.stats.fetch_us.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);

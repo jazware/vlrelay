@@ -187,7 +187,10 @@ impl Node {
             Arc::new(super::adapters::CacheIdentity(identity.clone())),
             state::ApplyConfig::default(),
         ));
-        let archive = cfg.policy.as_ref().map(|p| crate::archive::wiring::install(&state, p.0.clone(), identity.clone()));
+        let archive = cfg
+            .policy
+            .as_ref()
+            .map(|p| crate::archive::wiring::install(&state, p.0.clone(), identity.clone(), cfg.dev_mode));
         let seeds = Arc::new(crate::plc_seed::LocalSeeds::new(state.clone(), cfg.identity.ttl));
         identity.set_seeder(Arc::new(crate::plc_seed::peer::ClusterSeeder {
             seeds: seeds.clone(),
