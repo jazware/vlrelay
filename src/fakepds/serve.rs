@@ -515,7 +515,9 @@ pub fn plc_router(layout: Layout, fallback: Option<String>) -> Router {
                                 (code, [("content-type", "application/json")], r.bytes().await.unwrap_or_default())
                                     .into_response()
                             }
-                            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"message": e.to_string()}))).into_response(),
+                            Err(e) => {
+                                (StatusCode::BAD_GATEWAY, Json(json!({"message": e.to_string()}))).into_response()
+                            }
                         };
                     }
                     (StatusCode::NOT_FOUND, Json(json!({"message": format!("DID not registered: {did}")})))

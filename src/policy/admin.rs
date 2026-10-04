@@ -15,8 +15,7 @@ use super::store::{AuditEntry, SaveError, Stored, now_ms};
 use super::tiers::{self, Manual};
 use super::{Engine, RuleEffect};
 use crate::admin::{
-    self as wire, AdminError, AdminResult, CaseQuery, CaseUpdate, DomainRuleInput, HostAction,
-    HostActionRecord,
+    self as wire, AdminError, AdminResult, CaseQuery, CaseUpdate, DomainRuleInput, HostAction, HostActionRecord,
 };
 use crate::state::{HostRecord, HostStore, Tier};
 use std::collections::BTreeMap;
@@ -63,18 +62,14 @@ fn set_rate(t: &mut doc::Threshold, v: f64, unit_secs: f64) {
 pub fn to_wire(p: &PolicyBody) -> wire::Policy {
     let s = &p.spam;
     wire::Policy {
-        tiers: LIMIT_TIERS
-            .iter()
-            .map(|&t| (tier_name(t).to_string(), wire_tier(p.tiers.get(t).unwrap())))
-            .collect(),
+        tiers: LIMIT_TIERS.iter().map(|&t| (tier_name(t).to_string(), wire_tier(p.tiers.get(t).unwrap()))).collect(),
         default_tier: tier_name(p.crawl.initial_tier).to_string(),
         spam: wire::SpamThresholds {
             new_accounts_per_hour: rate(&s.host_new_accounts, 3_600.0).round() as u64,
             reject_ratio: p.transitions.error_ratio,
             bad_signatures_per_min: rate(&s.host_failed_validation, 60.0).round() as u64,
             account_events_per_sec: rate(&s.account_records, 1.0),
-            auto_throttle: s.host_new_accounts.action.throttles()
-                || s.host_failed_validation.action.throttles(),
+            auto_throttle: s.host_new_accounts.action.throttles() || s.host_failed_validation.action.throttles(),
         },
     }
 }
@@ -85,9 +80,7 @@ pub fn merge_wire(base: &PolicyBody, w: &wire::Policy) -> Result<PolicyBody, Str
     for (name, wl) in &w.tiers {
         let t = parse_tier(name)
             .filter(|t| LIMIT_TIERS.contains(t))
-            .ok_or_else(|| {
-                format!("tier {name:?}: the tiers are trusted, default, new and throttled")
-            })?;
+            .ok_or_else(|| format!("tier {name:?}: the tiers are trusted, default, new and throttled"))?;
         let l = p.tiers.get_mut(t).unwrap();
         l.events_per_sec = wl.events_per_sec;
         l.events_per_hour = wl.events_per_hour;
@@ -95,25 +88,14 @@ pub fn merge_wire(base: &PolicyBody, w: &wire::Policy) -> Result<PolicyBody, Str
         l.max_accounts = wl.max_accounts;
         l.new_accounts_per_hour = wl.new_accounts_per_hour;
     }
-    p.crawl.initial_tier = parse_tier(&w.default_tier)
-        .ok_or_else(|| format!("default tier {:?} is not a tier", w.default_tier))?;
+    p.crawl.initial_tier =
+        parse_tier(&w.default_tier).ok_or_else(|| format!("default tier {:?} is not a tier", w.default_tier))?;
     let s = &w.spam;
-    set_rate(
-        &mut p.spam.host_new_accounts,
-        s.new_accounts_per_hour as f64,
-        3_600.0,
-    );
-    set_rate(
-        &mut p.spam.host_failed_validation,
-        s.bad_signatures_per_min as f64,
-        60.0,
-    );
+    set_rate(&mut p.spam.host_new_accounts, s.new_accounts_per_hour as f64, 3_600.0);
+    set_rate(&mut p.spam.host_failed_validation, s.bad_signatures_per_min as f64, 60.0);
     set_rate(&mut p.spam.account_records, s.account_events_per_sec, 1.0);
     p.transitions.error_ratio = s.reject_ratio;
-    for t in [
-        &mut p.spam.host_new_accounts,
-        &mut p.spam.host_failed_validation,
-    ] {
+    for t in [&mut p.spam.host_new_accounts, &mut p.spam.host_failed_validation] {
         t.action = match (s.auto_throttle, t.action) {
             (true, SpamAction::Case) => SpamAction::ThrottleAndCase,
             (true, SpamAction::Alert) => SpamAction::Throttle,
@@ -135,25 +117,15 @@ fn wire_doc(d: &Stored<PolicyBody>) -> wire::PolicyDoc {
 }
 
 fn wire_audit(a: AuditEntry) -> wire::PolicyAudit {
-    wire::PolicyAudit {
-        version: a.version,
-        at_ms: a.at_ms,
-        by: a.by,
-        note: a.note,
-        changes: a.changes,
-    }
+    wire::PolicyAudit { version: a.version, at_ms: a.at_ms, by: a.by, note: a.note, changes: a.changes }
 }
 
 pub fn effect_to_wire(e: &RuleEffect) -> wire::RuleEffect {
     match e {
         RuleEffect::Ban => wire::RuleEffect::Ban,
         RuleEffect::Allow => wire::RuleEffect::Allow,
-        RuleEffect::Tier { tier } => wire::RuleEffect::Tier {
-            tier: tier_name(*tier).to_string(),
-        },
-        RuleEffect::Throttle { events_per_sec } => wire::RuleEffect::Throttle {
-            events_per_sec: *events_per_sec,
-        },
+        RuleEffect::Tier { tier } => wire::RuleEffect::Tier { tier: tier_name(*tier).to_string() },
+        RuleEffect::Throttle { events_per_sec } => wire::RuleEffect::Throttle { events_per_sec: *events_per_sec },
     }
 }
 
@@ -166,9 +138,7 @@ pub fn effect_from_wire(e: &wire::RuleEffect) -> AdminResult<RuleEffect> {
                 .filter(|t| LIMIT_TIERS.contains(t))
                 .ok_or_else(|| AdminError::BadRequest(format!("no tier {tier:?}")))?,
         },
-        wire::RuleEffect::Throttle { events_per_sec } => RuleEffect::Throttle {
-            events_per_sec: *events_per_sec,
-        },
+        wire::RuleEffect::Throttle { events_per_sec } => RuleEffect::Throttle { events_per_sec: *events_per_sec },
     })
 }
 
@@ -183,11 +153,7 @@ impl PolicyAdmin {
         Ok(wire_doc(&self.engine.policy()))
     }
 
-    pub async fn update_policy(
-        &self,
-        u: wire::PolicyUpdate,
-        by: &str,
-    ) -> AdminResult<wire::PolicyDoc> {
+    pub async fn update_policy(&self, u: wire::PolicyUpdate, by: &str) -> AdminResult<wire::PolicyDoc> {
         // Merge onto the version the operator edited, so fields the wire
         // type lacks come from that version too. The refresh catches this
         // node up if the edit was read from a peer that saw a newer save.
@@ -202,11 +168,7 @@ impl PolicyAdmin {
             )));
         }
         let body = merge_wire(&cur.body, &u.policy).map_err(AdminError::BadRequest)?;
-        let d = self
-            .engine
-            .save_policy(u.base_version, body, by, &u.note)
-            .await
-            .map_err(save_err)?;
+        let d = self.engine.save_policy(u.base_version, body, by, &u.note).await.map_err(save_err)?;
         Ok(wire_doc(&d))
     }
 
@@ -221,20 +183,11 @@ impl PolicyAdmin {
         note: &str,
         by: &str,
     ) -> AdminResult<Stored<PolicyBody>> {
-        self.engine
-            .save_policy(base_version, body, by, note)
-            .await
-            .map_err(save_err)
+        self.engine.save_policy(base_version, body, by, note).await.map_err(save_err)
     }
 
     pub async fn policy_audit(&self) -> AdminResult<Vec<wire::PolicyAudit>> {
-        Ok(self
-            .engine
-            .policy_audit(AUDIT_LIMIT)
-            .await?
-            .into_iter()
-            .map(wire_audit)
-            .collect())
+        Ok(self.engine.policy_audit(AUDIT_LIMIT).await?.into_iter().map(wire_audit).collect())
     }
 
     // ------------------------------------------------------------ domain rules
@@ -288,28 +241,18 @@ impl PolicyAdmin {
         }
         let (version, mut set) = self.engine.rules();
         let id = f(&mut set)?;
-        let d = self
-            .engine
-            .save_rules(version, set, by, note)
-            .await
-            .map_err(save_err)?;
+        let d = self.engine.save_rules(version, set, by, note).await.map_err(save_err)?;
         Ok((d.body, id))
     }
 
-    pub async fn create_domain_rule(
-        &self,
-        input: DomainRuleInput,
-        by: &str,
-    ) -> AdminResult<wire::DomainRule> {
+    pub async fn create_domain_rule(&self, input: DomainRuleInput, by: &str) -> AdminResult<wire::DomainRule> {
         let pattern = rules::normalize_pattern(&input.pattern).map_err(AdminError::BadRequest)?;
         let effect = effect_from_wire(&input.effect)?;
         let note = format!("create {pattern}");
         let (set, id) = self
             .edit_rules(by, &note, |set| {
                 if set.rules.iter().any(|r| r.pattern == pattern) {
-                    return Err(AdminError::Conflict(format!(
-                        "a rule for {pattern} already exists"
-                    )));
+                    return Err(AdminError::Conflict(format!("a rule for {pattern} already exists")));
                 }
                 let id = set.next_id.max(1);
                 set.next_id = id + 1;
@@ -329,21 +272,14 @@ impl PolicyAdmin {
         Ok(Self::rule_view(r, &m))
     }
 
-    pub async fn update_domain_rule(
-        &self,
-        id: u64,
-        input: DomainRuleInput,
-        by: &str,
-    ) -> AdminResult<wire::DomainRule> {
+    pub async fn update_domain_rule(&self, id: u64, input: DomainRuleInput, by: &str) -> AdminResult<wire::DomainRule> {
         let pattern = rules::normalize_pattern(&input.pattern).map_err(AdminError::BadRequest)?;
         let effect = effect_from_wire(&input.effect)?;
         let note = format!("update rule {id} ({pattern})");
         let (set, _) = self
             .edit_rules(by, &note, |set| {
                 if set.rules.iter().any(|r| r.pattern == pattern && r.id != id) {
-                    return Err(AdminError::Conflict(format!(
-                        "a rule for {pattern} already exists"
-                    )));
+                    return Err(AdminError::Conflict(format!("a rule for {pattern} already exists")));
                 }
                 let r = set
                     .rules
@@ -383,14 +319,7 @@ impl PolicyAdmin {
     // ------------------------------------------------------------ cases
 
     pub async fn cases(&self, q: CaseQuery) -> AdminResult<Vec<wire::Case>> {
-        Ok(self
-            .engine
-            .cases
-            .list(q.status)
-            .await?
-            .iter()
-            .map(|c| c.to_wire())
-            .collect())
+        Ok(self.engine.cases.list(q.status).await?.iter().map(|c| c.to_wire()).collect())
     }
 
     pub async fn case(&self, id: u64) -> AdminResult<wire::Case> {
@@ -404,11 +333,7 @@ impl PolicyAdmin {
 
     /// With its evidence, which the wire `Case` doesn't carry yet.
     pub async fn case_detail(&self, id: u64) -> AdminResult<super::cases::StoredCase> {
-        self.engine
-            .cases
-            .get_case(id)
-            .await?
-            .ok_or_else(|| AdminError::NotFound(format!("no case {id}")))
+        self.engine.cases.get_case(id).await?.ok_or_else(|| AdminError::NotFound(format!("no case {id}")))
     }
 
     pub async fn update_case(&self, id: u64, u: CaseUpdate, by: &str) -> AdminResult<wire::Case> {
@@ -425,34 +350,22 @@ impl PolicyAdmin {
     /// The tier actions. Returns the updated record, which the caller turns
     /// into a `HostRow` with its live numbers. `Reconnect` is the upstream
     /// module's and comes back as a BadRequest here.
-    pub async fn host_action(
-        &self,
-        host: &str,
-        action: HostAction,
-        by: &str,
-    ) -> AdminResult<HostRecord> {
+    pub async fn host_action(&self, host: &str, action: HostAction, by: &str) -> AdminResult<HostRecord> {
         let m = match &action {
-            HostAction::SetTier { tier } => Manual::SetTier(
-                parse_tier(tier)
-                    .ok_or_else(|| AdminError::BadRequest(format!("no tier {tier:?}")))?,
-            ),
+            HostAction::SetTier { tier } => {
+                Manual::SetTier(parse_tier(tier).ok_or_else(|| AdminError::BadRequest(format!("no tier {tier:?}")))?)
+            }
             HostAction::Throttle { events_per_sec } => Manual::Throttle(*events_per_sec),
             HostAction::Suspend { reason } => Manual::Suspend(reason.clone()),
             HostAction::Ban { reason } => Manual::Ban(reason.clone()),
             HostAction::Unban => Manual::Unban,
             HostAction::SetAccountLimit { max_accounts } => Manual::AccountLimit(*max_accounts),
             HostAction::Reconnect => {
-                return Err(AdminError::BadRequest(
-                    "reconnect is an upstream action, not a policy one".into(),
-                ));
+                return Err(AdminError::BadRequest("reconnect is an upstream action, not a policy one".into()));
             }
         };
-        let entry = serde_json::to_value(HostActionRecord {
-            at_ms: now_ms(),
-            by: by.to_string(),
-            action,
-        })
-        .map_err(anyhow::Error::from)?;
+        let entry = serde_json::to_value(HostActionRecord { at_ms: now_ms(), by: by.to_string(), action })
+            .map_err(anyhow::Error::from)?;
         let mut outcome: Option<Result<Tier, String>> = None;
         let out = &mut outcome;
         let written = self
@@ -495,11 +408,7 @@ impl PolicyAdmin {
 
     /// The operator actions recorded on a host, oldest first.
     pub fn host_actions(rec: &HostRecord) -> Vec<HostActionRecord> {
-        tiers::host_policy(rec)
-            .actions
-            .into_iter()
-            .filter_map(|v| serde_json::from_value(v).ok())
-            .collect()
+        tiers::host_policy(rec).actions.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect()
     }
 
     /// The limits in force for the dashboard's `HostDetail.limits`.

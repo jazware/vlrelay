@@ -171,7 +171,13 @@ mod tests {
     use bytes::Bytes;
 
     fn f(host: &str, seq: i64, len: usize) -> UpstreamFrame {
-        UpstreamFrame { host: Host(host.into()), upstream_seq: seq, frame: Bytes::from(vec![0u8; len]), epoch: 0, permit: None }
+        UpstreamFrame {
+            host: Host(host.into()),
+            upstream_seq: seq,
+            frame: Bytes::from(vec![0u8; len]),
+            epoch: 0,
+            permit: None,
+        }
     }
 
     #[tokio::test]

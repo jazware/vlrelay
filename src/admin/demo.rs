@@ -33,9 +33,7 @@ impl Demo {
             sim.tick(start - i * 1000);
         }
         sim.tick(start);
-        let demo = Arc::new(Demo {
-            sim: Mutex::new(sim),
-        });
+        let demo = Arc::new(Demo { sim: Mutex::new(sim) });
         let weak = Arc::downgrade(&demo);
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_secs(1));
@@ -51,10 +49,7 @@ impl Demo {
 }
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------- rng
@@ -98,9 +93,7 @@ impl Rng {
 
 fn hash(s: &str) -> u64 {
     // FNV-1a: stable across runs, which std's hasher isn't
-    s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-        (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
-    })
+    s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
 }
 
 // ---------------------------------------------------------------- model
@@ -205,19 +198,17 @@ const MUSHROOMS: [&str; 24] = [
     "suillus",
 ];
 const WORDS: [&str; 48] = [
-    "moss", "fern", "lichen", "cedar", "harbor", "signal", "static", "pixel", "kettle", "orbit",
-    "quartz", "ember", "tidal", "basalt", "copper", "willow", "hollow", "lantern", "cobalt",
-    "meadow", "falcon", "otter", "badger", "heron", "juniper", "sparrow", "nimbus", "delta",
-    "granite", "rowan", "thistle", "aurora", "cinder", "drift", "fable", "glade", "haze", "ivory",
-    "jetty", "knoll", "lumen", "marsh", "nectar", "onyx", "prairie", "quill", "raven", "sable",
+    "moss", "fern", "lichen", "cedar", "harbor", "signal", "static", "pixel", "kettle", "orbit", "quartz", "ember",
+    "tidal", "basalt", "copper", "willow", "hollow", "lantern", "cobalt", "meadow", "falcon", "otter", "badger",
+    "heron", "juniper", "sparrow", "nimbus", "delta", "granite", "rowan", "thistle", "aurora", "cinder", "drift",
+    "fable", "glade", "haze", "ivory", "jetty", "knoll", "lumen", "marsh", "nectar", "onyx", "prairie", "quill",
+    "raven", "sable",
 ];
 const NAMES: [&str; 24] = [
-    "alex", "sam", "jo", "kai", "rin", "max", "lee", "ana", "noa", "eli", "mia", "tom", "ivy",
-    "zoe", "ben", "lou", "ada", "ray", "sol", "ola", "jun", "kit", "pia", "rex",
+    "alex", "sam", "jo", "kai", "rin", "max", "lee", "ana", "noa", "eli", "mia", "tom", "ivy", "zoe", "ben", "lou",
+    "ada", "ray", "sol", "ola", "jun", "kit", "pia", "rex",
 ];
-const TLDS: [&str; 10] = [
-    "com", "dev", "social", "net", "org", "xyz", "io", "blue", "cloud", "me",
-];
+const TLDS: [&str; 10] = ["com", "dev", "social", "net", "org", "xyz", "io", "blue", "cloud", "me"];
 
 fn default_policy() -> Policy {
     let tier = |eps: f64, hour: u64, day: u64, max: u64, newh: u64| TierLimits {
@@ -229,18 +220,9 @@ fn default_policy() -> Policy {
     };
     Policy {
         tiers: BTreeMap::from([
-            (
-                "trusted".to_string(),
-                tier(5_000.0, 15_000_000, 300_000_000, 5_000_000, 50_000),
-            ),
-            (
-                "standard".to_string(),
-                tier(50.0, 150_000, 2_000_000, 100_000, 500),
-            ),
-            (
-                "probation".to_string(),
-                tier(10.0, 20_000, 200_000, 1_000, 50),
-            ),
+            ("trusted".to_string(), tier(5_000.0, 15_000_000, 300_000_000, 5_000_000, 50_000)),
+            ("standard".to_string(), tier(50.0, 150_000, 2_000_000, 100_000, 500)),
+            ("probation".to_string(), tier(10.0, 20_000, 200_000, 1_000, 50)),
         ]),
         default_tier: "probation".into(),
         spam: SpamThresholds {
@@ -267,14 +249,9 @@ impl Sim {
             let (err_base, newh) = match profile {
                 Profile::Big => (rng.range(0.0001, 0.0006), accounts as f64 * 0.0004),
                 Profile::Community => (rng.range(0.0005, 0.004), accounts as f64 * 0.001),
-                Profile::SelfHosted => (
-                    if rng.chance(0.03) {
-                        rng.range(0.01, 0.06)
-                    } else {
-                        rng.range(0.0, 0.003)
-                    },
-                    0.0,
-                ),
+                Profile::SelfHosted => {
+                    (if rng.chance(0.03) { rng.range(0.01, 0.06) } else { rng.range(0.0, 0.003) }, 0.0)
+                }
                 Profile::Buggy => (rng.range(0.25, 0.45), rng.range(0.0, 3.0)),
                 Profile::SpamAccounts => (rng.range(0.02, 0.06), rng.range(900.0, 2400.0)),
                 Profile::SpamSigs => (rng.range(0.3, 0.6), rng.range(10.0, 60.0)),
@@ -327,56 +304,24 @@ impl Sim {
             let name = match i % 4 {
                 0 => format!("pds.{w}.social"),
                 1 => format!("{w}{}.blue", rng.pick(&["sky", "town", "club", "space"])),
-                2 => format!(
-                    "pds.{w}-{}.org",
-                    rng.pick(&["collective", "coop", "commons", "guild"])
-                ),
+                2 => format!("pds.{w}-{}.org", rng.pick(&["collective", "coop", "commons", "guild"])),
                 _ => format!("bsky.{w}.{}", rng.pick(&["net", "dev", "community"])),
             };
             let accounts = (rng.range(7.5, 11.3)).exp() as u64;
             let rate = accounts as f64 * rng.range(0.0006, 0.0018);
-            let tier = if accounts > 20_000 {
-                "trusted"
-            } else {
-                "standard"
-            };
-            add(
-                &mut hosts,
-                &mut rng,
-                name,
-                tier,
-                Profile::Community,
-                rate,
-                accounts,
-            );
+            let tier = if accounts > 20_000 { "trusted" } else { "standard" };
+            add(&mut hosts, &mut rng, name, tier, Profile::Community, rate, accounts);
         }
-        for (i, name) in [
-            "pds.patchwork-proto.dev",
-            "atp.homebrew-pds.net",
-            "pds.experimental-sync.org",
-            "repo.toy-pds.xyz",
-        ]
-        .iter()
-        .enumerate()
+        for (i, name) in
+            ["pds.patchwork-proto.dev", "atp.homebrew-pds.net", "pds.experimental-sync.org", "repo.toy-pds.xyz"]
+                .iter()
+                .enumerate()
         {
             let accounts = 20 + i as u64 * 37;
-            add(
-                &mut hosts,
-                &mut rng,
-                name.to_string(),
-                "standard",
-                Profile::Buggy,
-                0.8 + i as f64 * 1.1,
-                accounts,
-            );
+            add(&mut hosts, &mut rng, name.to_string(), "standard", Profile::Buggy, 0.8 + i as f64 * 1.1, accounts);
         }
         let spam: [(&str, Profile, f64, u64); 7] = [
-            (
-                "pds-7f3a.fastvps.cloud",
-                Profile::SpamAccounts,
-                38.0,
-                14_200,
-            ),
+            ("pds-7f3a.fastvps.cloud", Profile::SpamAccounts, 38.0, 14_200),
             ("pds-91c2.fastvps.cloud", Profile::SpamAccounts, 22.0, 8_900),
             ("social-boost.click", Profile::SpamAccounts, 30.0, 11_400),
             ("free-followers.xyz", Profile::SpamSigs, 18.0, 2_300),
@@ -385,80 +330,25 @@ impl Sim {
             ("autopost.megabot.io", Profile::Flood, 31.0, 12),
         ];
         for (name, p, rate, accounts) in spam {
-            add(
-                &mut hosts,
-                &mut rng,
-                name.to_string(),
-                "probation",
-                p,
-                rate,
-                accounts,
-            );
+            add(&mut hosts, &mut rng, name.to_string(), "probation", p, rate, accounts);
         }
         while hosts.len() < 5_000 {
             let name = match rng.below(6) {
-                0 => format!(
-                    "pds.{}{}.{}",
-                    rng.pick(&NAMES),
-                    rng.pick(&WORDS),
-                    rng.pick(&TLDS)
-                ),
-                1 => format!(
-                    "{}.{}.{}",
-                    rng.pick(&WORDS),
-                    rng.pick(&NAMES),
-                    rng.pick(&TLDS)
-                ),
-                2 => format!(
-                    "bsky.{}{}.{}",
-                    rng.pick(&NAMES),
-                    rng.below(100),
-                    rng.pick(&TLDS)
-                ),
-                3 => format!(
-                    "pds.{}-{}.{}",
-                    rng.pick(&WORDS),
-                    rng.pick(&WORDS),
-                    rng.pick(&TLDS)
-                ),
-                4 => format!(
-                    "{}.pds.{}{}.{}",
-                    rng.pick(&NAMES),
-                    rng.pick(&WORDS),
-                    rng.below(10),
-                    rng.pick(&TLDS)
-                ),
-                _ => format!(
-                    "atproto.{}{}.{}",
-                    rng.pick(&WORDS),
-                    rng.pick(&NAMES),
-                    rng.pick(&TLDS)
-                ),
+                0 => format!("pds.{}{}.{}", rng.pick(&NAMES), rng.pick(&WORDS), rng.pick(&TLDS)),
+                1 => format!("{}.{}.{}", rng.pick(&WORDS), rng.pick(&NAMES), rng.pick(&TLDS)),
+                2 => format!("bsky.{}{}.{}", rng.pick(&NAMES), rng.below(100), rng.pick(&TLDS)),
+                3 => format!("pds.{}-{}.{}", rng.pick(&WORDS), rng.pick(&WORDS), rng.pick(&TLDS)),
+                4 => format!("{}.pds.{}{}.{}", rng.pick(&NAMES), rng.pick(&WORDS), rng.below(10), rng.pick(&TLDS)),
+                _ => format!("atproto.{}{}.{}", rng.pick(&WORDS), rng.pick(&NAMES), rng.pick(&TLDS)),
             };
             if hosts.iter().any(|h| h.name == name) {
                 continue;
             }
             // most self-hosted PDSes hold one or two accounts
-            let accounts = if rng.chance(0.7) {
-                1 + rng.below(3) as u64
-            } else {
-                rng.range(1.0, 7.0).exp() as u64
-            };
+            let accounts = if rng.chance(0.7) { 1 + rng.below(3) as u64 } else { rng.range(1.0, 7.0).exp() as u64 };
             let rate = accounts as f64 * rng.range(0.0002, 0.004) * rng.jitter(0.8);
-            let tier = if rng.chance(0.3) {
-                "probation"
-            } else {
-                "standard"
-            };
-            add(
-                &mut hosts,
-                &mut rng,
-                name,
-                tier,
-                Profile::SelfHosted,
-                rate,
-                accounts,
-            );
+            let tier = if rng.chance(0.3) { "probation" } else { "standard" };
+            add(&mut hosts, &mut rng, name, tier, Profile::SelfHosted, rate, accounts);
         }
         // the long tail's connection churn
         for h in hosts.iter_mut().skip(80) {
@@ -481,9 +371,7 @@ impl Sim {
         }
 
         let assign = |n: usize, skew: usize| -> Vec<Option<String>> {
-            (0..n)
-                .map(|i| Some(NODES[(i * 7 + i / skew) % NODES.len()].to_string()))
-                .collect()
+            (0..n).map(|i| Some(NODES[(i * 7 + i / skew) % NODES.len()].to_string())).collect()
         };
         let host_shards = assign(HOST_SHARDS, 9);
         let did_shards = assign(DID_SHARDS, 11);
@@ -498,12 +386,7 @@ impl Sim {
             last_seq: 24_811_204_377,
             consumers: Vec::new(),
             next_consumer: 1,
-            policy: PolicyDoc {
-                version: 0,
-                policy: policy.clone(),
-                updated_at_ms: now,
-                updated_by: "admin".into(),
-            },
+            policy: PolicyDoc { version: 0, policy: policy.clone(), updated_at_ms: now, updated_by: "admin".into() },
             audit: Vec::new(),
             rules: Vec::new(),
             next_rule: 1,
@@ -551,10 +434,7 @@ impl Sim {
             f(&mut p);
             let changes = match &prev {
                 None => vec!["created".to_string()],
-                Some(old) => diff_json(
-                    &serde_json::to_value(old).unwrap(),
-                    &serde_json::to_value(&p).unwrap(),
-                ),
+                Some(old) => diff_json(&serde_json::to_value(old).unwrap(), &serde_json::to_value(&p).unwrap()),
             };
             self.policy.version += 1;
             self.audit.push(PolicyAudit {
@@ -572,36 +452,15 @@ impl Sim {
 
     fn seed_rules(&mut self, now: i64) {
         let rules = [
-            (
-                "*.cryptoairdrop.live",
-                RuleEffect::Ban,
-                "forged commits, every subdomain is the same operator",
-                6,
-            ),
+            ("*.cryptoairdrop.live", RuleEffect::Ban, "forged commits, every subdomain is the same operator", 6),
             (
                 "*.fastvps.cloud",
-                RuleEffect::Tier {
-                    tier: "probation".into(),
-                },
+                RuleEffect::Tier { tier: "probation".into() },
                 "cheap VPS range used by account farms",
                 3,
             ),
-            (
-                "*.host.bsky.network",
-                RuleEffect::Tier {
-                    tier: "trusted".into(),
-                },
-                "Bluesky's PDS fleet",
-                30,
-            ),
-            (
-                "*.megabot.io",
-                RuleEffect::Throttle {
-                    events_per_sec: 5.0,
-                },
-                "bot platform, fine at low volume",
-                1,
-            ),
+            ("*.host.bsky.network", RuleEffect::Tier { tier: "trusted".into() }, "Bluesky's PDS fleet", 30),
+            ("*.megabot.io", RuleEffect::Throttle { events_per_sec: 5.0 }, "bot platform, fine at low volume", 1),
         ];
         for (pattern, effect, note, days) in rules {
             let id = self.next_rule;
@@ -642,16 +501,11 @@ impl Sim {
             let (ua, _) = uas[i % uas.len()];
             let backfilling = i % 13 == 5;
             let ip = if i % 5 == 0 {
-                format!(
-                    "2a01:4f8:{:x}:{:x}::1",
-                    0x1000 + self.rng.below(0xeff),
-                    self.rng.below(0xffff)
-                )
+                format!("2a01:4f8:{:x}:{:x}::1", 0x1000 + self.rng.below(0xeff), self.rng.below(0xffff))
             } else {
                 format!(
                     "{}.{}.{}.{}",
-                    self.rng
-                        .pick(&[5, 23, 34, 45, 65, 88, 104, 138, 147, 157, 172, 185, 203]),
+                    self.rng.pick(&[5, 23, 34, 45, 65, 88, 104, 138, 147, 157, 172, 185, 203]),
                     self.rng.below(255),
                     self.rng.below(255),
                     1 + self.rng.below(253)
@@ -664,11 +518,7 @@ impl Sim {
                 node: NODES[i % NODES.len()].into(),
                 connected_since_ms: now - (self.rng.range(30.0, 86_400.0 * 6.0) * 1000.0) as i64,
                 cursor: 0,
-                lag_ms: if backfilling {
-                    self.rng.range(3.6e6, 4.0e7)
-                } else {
-                    0.0
-                },
+                lag_ms: if backfilling { self.rng.range(3.6e6, 4.0e7) } else { 0.0 },
                 events_per_sec: 0.0,
                 bytes_per_sec: 0.0,
                 backfilling,
@@ -690,24 +540,12 @@ impl Sim {
             } else {
                 95 + self.rng.below(self.hosts.len() - 95)
             };
-            let did = format!(
-                "did:plc:{}",
-                (0..24)
-                    .map(|_| B32[self.rng.below(32)] as char)
-                    .collect::<String>()
-            );
+            let did = format!("did:plc:{}", (0..24).map(|_| B32[self.rng.below(32)] as char).collect::<String>());
             let host = self.hosts[hi].name.clone();
             let handle = if hi < 24 {
-                format!(
-                    "{}{}.bsky.social",
-                    self.rng.pick(&WORDS),
-                    self.rng.below(1000)
-                )
+                format!("{}{}.bsky.social", self.rng.pick(&WORDS), self.rng.below(1000))
             } else {
-                let base = host
-                    .trim_start_matches("pds.")
-                    .trim_start_matches("bsky.")
-                    .to_string();
+                let base = host.trim_start_matches("pds.").trim_start_matches("bsky.").to_string();
                 format!("{}.{base}", self.rng.pick(&NAMES))
             };
             let a = self.synth_account(did, Some(handle), hi, now);
@@ -724,41 +562,19 @@ impl Sim {
         );
     }
 
-    fn synth_account(
-        &mut self,
-        did: String,
-        handle: Option<String>,
-        hi: usize,
-        now: i64,
-    ) -> Account {
+    fn synth_account(&mut self, did: String, handle: Option<String>, hi: usize, now: i64) -> Account {
         let h = &self.hosts[hi];
-        let spam = matches!(
-            h.profile,
-            Profile::SpamAccounts | Profile::SpamSigs | Profile::Flood
-        );
+        let spam = matches!(h.profile, Profile::SpamAccounts | Profile::SpamSigs | Profile::Flood);
         let per_acct = h.base_rate / h.accounts.max(1) as f64;
         let shard = (hash(&did) % DID_SHARDS as u64) as u32;
-        let upstream = if self.rng.chance(0.02) {
-            "deactivated"
-        } else {
-            "active"
-        };
+        let upstream = if self.rng.chance(0.02) { "deactivated" } else { "active" };
         Account {
             handle,
             host: h.name.clone(),
-            status: if spam {
-                "throttled".into()
-            } else {
-                upstream.into()
-            },
+            status: if spam { "throttled".into() } else { upstream.into() },
             upstream_status: upstream.into(),
             takedown: None,
-            rev: format!(
-                "3m{}",
-                (0..11)
-                    .map(|_| (b'a' + self.rng.below(26) as u8) as char)
-                    .collect::<String>()
-            ),
+            rev: format!("3m{}", (0..11).map(|_| (b'a' + self.rng.below(26) as u8) as char).collect::<String>()),
             last_seq: self.last_seq - self.rng.below(5_000_000) as i64,
             last_event_ms: now - (self.rng.range(0.5, 3.0 * 86_400.0) * 1000.0) as i64,
             events_last_hour: (per_acct * 3600.0 * self.rng.jitter(1.0)) as u64,
@@ -811,11 +627,7 @@ impl Sim {
                 observed: obs,
                 threshold: thr,
                 auto_action: None,
-                notes: vec![CaseNote {
-                    at_ms: opened + 2_400_000,
-                    by: "admin".into(),
-                    text: note.into(),
-                }],
+                notes: vec![CaseNote { at_ms: opened + 2_400_000, by: "admin".into(), text: note.into() }],
             });
         }
     }
@@ -846,9 +658,8 @@ impl Sim {
         self.now_ms = now;
         let t = now as f64 / 1000.0;
         // a compressed "day" (20 min) so the demo visibly moves, plus a slow wander
-        let diurnal = 1.0
-            + 0.16 * (t * std::f64::consts::TAU / 1200.0).sin()
-            + 0.05 * (t * std::f64::consts::TAU / 173.0).sin();
+        let diurnal =
+            1.0 + 0.16 * (t * std::f64::consts::TAU / 1200.0).sin() + 0.05 * (t * std::f64::consts::TAU / 173.0).sin();
         if self.surge <= 0.0 && self.rng.chance(0.006) {
             self.surge = self.rng.range(0.15, 0.45);
         }
@@ -863,13 +674,8 @@ impl Sim {
             let jit = self.rng.jitter(0.12);
             let ejit = self.rng.jitter(0.35);
             let roll = self.rng.f();
-            let (coin, coin2, pick, acct, back) = (
-                self.rng.f(),
-                self.rng.f(),
-                self.rng.next(),
-                self.rng.next(),
-                self.rng.below(900) as i64,
-            );
+            let (coin, coin2, pick, acct, back) =
+                (self.rng.f(), self.rng.f(), self.rng.next(), self.rng.next(), self.rng.below(900) as i64);
             let h = &mut self.hosts[i];
             match h.status {
                 HostStatus::Backoff if h.redial_at.is_some_and(|r| r <= now) => {
@@ -877,9 +683,7 @@ impl Sim {
                     h.connected_since = Some(now);
                     h.redial_at = None;
                 }
-                HostStatus::Connected | HostStatus::Idle
-                    if h.profile == Profile::SelfHosted && roll < 0.00004 =>
-                {
+                HostStatus::Connected | HostStatus::Idle if h.profile == Profile::SelfHosted && roll < 0.00004 => {
                     h.status = HostStatus::Backoff;
                     h.connected_since = None;
                     h.redial_at = Some(now + 5_000 + (roll * 1e9) as i64 % 30_000);
@@ -890,23 +694,14 @@ impl Sim {
                 }
                 _ => {}
             }
-            let live = matches!(
-                h.status,
-                HostStatus::Connected | HostStatus::Idle | HostStatus::Throttled
-            );
+            let live = matches!(h.status, HostStatus::Connected | HostStatus::Idle | HostStatus::Throttled);
             let (rate, err) = if live {
                 let burst = match h.profile {
-                    Profile::SpamAccounts | Profile::Flood => {
-                        1.0 + 0.6 * ((t / 37.0 + i as f64).sin()).max(0.0)
-                    }
+                    Profile::SpamAccounts | Profile::Flood => 1.0 + 0.6 * ((t / 37.0 + i as f64).sin()).max(0.0),
                     _ => 1.0,
                 };
                 let want = h.base_rate * level * jit * burst;
-                let tier_cap = policy
-                    .tiers
-                    .get(&h.tier)
-                    .map(|l| l.events_per_sec)
-                    .unwrap_or(f64::INFINITY);
+                let tier_cap = policy.tiers.get(&h.tier).map(|l| l.events_per_sec).unwrap_or(f64::INFINITY);
                 let cap = h.throttle.unwrap_or(f64::INFINITY).min(tier_cap);
                 let rate = want.min(cap);
                 h.status = if want > cap * 1.001 {
@@ -922,11 +717,7 @@ impl Sim {
             };
             h.rate = rate;
             h.err = err;
-            h.lag = if live {
-                h.lag_base * jit * (1.0 + self.surge)
-            } else {
-                0.0
-            };
+            h.lag = if live { h.lag_base * jit * (1.0 + self.surge) } else { 0.0 };
             h.seq += (rate + if rate > 0.0 { 0.5 } else { 0.0 }) as i64;
             if h.series.len() == HOST_HISTORY {
                 h.series.pop_front();
@@ -939,15 +730,10 @@ impl Sim {
                 let reasons = reasons_for(h.profile);
                 let mut left = rej;
                 for (k, (reason, share)) in reasons.iter().enumerate() {
-                    let v = if k + 1 == reasons.len() {
-                        left
-                    } else {
-                        rej * share
-                    };
+                    let v = if k + 1 == reasons.len() { left } else { rej * share };
                     left -= v;
                     *rejects.entry(*reason).or_default() += v;
-                    *h.by_reason.entry(*reason).or_default() +=
-                        v.trunc() as u64 + u64::from(coin < v.fract());
+                    *h.by_reason.entry(*reason).or_default() += v.trunc() as u64 + u64::from(coin < v.fract());
                 }
                 // a sample for the detail page's recent list, not one per reject
                 if coin2 < rej.min(1.0) {
@@ -976,15 +762,13 @@ impl Sim {
         for c in self.consumers.iter_mut() {
             if c.backfilling {
                 c.events_per_sec = ev_out * self.rng.range(2.5, 4.0);
-                c.lag_ms =
-                    (c.lag_ms - 1000.0 * (c.events_per_sec / ev_out.max(1.0) - 1.0)).max(0.0);
+                c.lag_ms = (c.lag_ms - 1000.0 * (c.events_per_sec / ev_out.max(1.0) - 1.0)).max(0.0);
                 if c.lag_ms < 50.0 {
                     c.backfilling = false;
                 }
             } else {
                 c.events_per_sec = ev_out * self.rng.jitter(0.01);
-                c.lag_ms =
-                    self.rng.range(1.0, 25.0) * if self.rng.chance(0.03) { 20.0 } else { 1.0 };
+                c.lag_ms = self.rng.range(1.0, 25.0) * if self.rng.chance(0.03) { 20.0 } else { 1.0 };
             }
             c.bytes_per_sec = c.events_per_sec * EVENT_BYTES * self.rng.jitter(0.05);
             c.cursor = self.last_seq - (c.lag_ms / 1000.0 * ev_out) as i64;
@@ -1004,11 +788,7 @@ impl Sim {
                 ),
                 user_agent: self
                     .rng
-                    .pick(&[
-                        "python-websockets/13.1",
-                        "Go-http-client/1.1",
-                        "node-ws/8.18",
-                    ])
+                    .pick(&["python-websockets/13.1", "Go-http-client/1.1", "node-ws/8.18"])
                     .to_string(),
                 node: self.rng.pick(&NODES).to_string(),
                 connected_since_ms: now,
@@ -1025,11 +805,7 @@ impl Sim {
 
         let busy = ev_in / 60_000.0;
         let p50 = 31.0 + 6.0 * busy + self.rng.range(-2.0, 2.0) + 20.0 * self.surge;
-        let spike = if self.rng.chance(0.02) {
-            self.rng.range(80.0, 260.0)
-        } else {
-            0.0
-        };
+        let spike = if self.rng.chance(0.02) { self.rng.range(80.0, 260.0) } else { 0.0 };
         let p99 = p50 * self.rng.range(2.4, 3.1) + spike;
         let dur = 22.0 + 10.0 * busy + self.rng.range(-3.0, 6.0) + spike * 0.4;
         let _ = lag_acc;
@@ -1053,50 +829,19 @@ impl Sim {
     fn check_thresholds(&mut self, now: i64) {
         let spam = self.policy.policy.spam.clone();
         let tiers = self.policy.policy.tiers.clone();
-        let tier_newh = |t: &str| {
-            tiers
-                .get(t)
-                .map(|l| l.new_accounts_per_hour as f64)
-                .unwrap_or(0.0)
-        };
+        let tier_newh = |t: &str| tiers.get(t).map(|l| l.new_accounts_per_hour as f64).unwrap_or(0.0);
         let mut open = Vec::new();
         for (i, h) in self.hosts.iter().enumerate() {
-            if !matches!(
-                h.status,
-                HostStatus::Connected | HostStatus::Throttled | HostStatus::Idle
-            ) {
+            if !matches!(h.status, HostStatus::Connected | HostStatus::Throttled | HostStatus::Idle) {
                 continue;
             }
-            let sigs_per_min = h.rate
-                * h.err
-                * 60.0
-                * if h.profile == Profile::SpamSigs {
-                    0.8
-                } else {
-                    0.0
-                };
-            let top_acct = if h.profile == Profile::Flood {
-                h.rate * 0.9
-            } else {
-                h.rate / h.accounts.max(1) as f64
-            };
+            let sigs_per_min = h.rate * h.err * 60.0 * if h.profile == Profile::SpamSigs { 0.8 } else { 0.0 };
+            let top_acct = if h.profile == Profile::Flood { h.rate * 0.9 } else { h.rate / h.accounts.max(1) as f64 };
             let checks = [
                 // a tier that allows more sign-ups (trusted) raises the bar with it
-                (
-                    "new-accounts",
-                    h.new_accounts_per_hour,
-                    (spam.new_accounts_per_hour as f64).max(tier_newh(&h.tier)),
-                ),
-                (
-                    "reject-ratio",
-                    if h.rate > 0.05 { h.err } else { 0.0 },
-                    spam.reject_ratio,
-                ),
-                (
-                    "bad-signatures",
-                    sigs_per_min,
-                    spam.bad_signatures_per_min as f64,
-                ),
+                ("new-accounts", h.new_accounts_per_hour, (spam.new_accounts_per_hour as f64).max(tier_newh(&h.tier))),
+                ("reject-ratio", if h.rate > 0.05 { h.err } else { 0.0 }, spam.reject_ratio),
+                ("bad-signatures", sigs_per_min, spam.bad_signatures_per_min as f64),
                 ("account-rate", top_acct, spam.account_events_per_sec),
             ];
             for (kind, obs, thr) in checks {
@@ -1108,9 +853,7 @@ impl Sim {
         for (i, kind, obs, thr) in open {
             let name = self.hosts[i].name.clone();
             if self.cases.iter().any(|c| {
-                c.host == name
-                    && c.kind == kind
-                    && matches!(c.status, CaseStatus::Open | CaseStatus::Acknowledged)
+                c.host == name && c.kind == kind && matches!(c.status, CaseStatus::Open | CaseStatus::Acknowledged)
             }) {
                 continue;
             }
@@ -1127,24 +870,15 @@ impl Sim {
             let did = (kind == "account-rate").then(|| fake_did(&name));
             let mut auto_action = None;
             if spam.auto_throttle && severity >= Severity::High {
-                let cap = self
-                    .policy
-                    .policy
-                    .tiers
-                    .get("probation")
-                    .map(|t| t.events_per_sec)
-                    .unwrap_or(10.0);
+                let cap = self.policy.policy.tiers.get("probation").map(|t| t.events_per_sec).unwrap_or(10.0);
                 self.hosts[i].throttle = Some(cap);
                 auto_action = Some(format!("throttled to {cap} events/s"));
             }
             let id = self.next_case;
             self.next_case += 1;
             // the first batch (at startup) is backdated so the list has a spread of ages
-            let opened = if self.history.len() < 5 {
-                now - (self.rng.range(120.0, 30_000.0) * 1000.0) as i64
-            } else {
-                now
-            };
+            let opened =
+                if self.history.len() < 5 { now - (self.rng.range(120.0, 30_000.0) * 1000.0) as i64 } else { now };
             self.cases.push(Case {
                 id,
                 host: name,
@@ -1178,11 +912,7 @@ impl Sim {
             lag_ms: round2(h.lag),
             throttle: h.throttle,
             max_accounts: if h.tier == "trusted" { 10_000_000 } else { 100 },
-            rule: self
-                .rules
-                .iter()
-                .find(|r| rule_matches(&r.pattern, &h.name))
-                .map(|r| r.id),
+            rule: self.rules.iter().find(|r| rule_matches(&r.pattern, &h.name)).map(|r| r.id),
             node: self.host_shards[h.shard].clone().unwrap_or_default(),
         }
     }
@@ -1196,11 +926,7 @@ impl Sim {
 
     fn rule_view(&self, r: &DomainRule) -> DomainRule {
         DomainRule {
-            matches: self
-                .hosts
-                .iter()
-                .filter(|h| rule_matches(&r.pattern, &h.name))
-                .count() as u32,
+            matches: self.hosts.iter().filter(|h| rule_matches(&r.pattern, &h.name)).count() as u32,
             ..r.clone()
         }
     }
@@ -1218,15 +944,12 @@ impl Sim {
         if let Some(i) = self.accounts.iter().position(|a| a.did == did) {
             return Ok(i);
         }
-        let valid = did.strip_prefix("did:plc:").is_some_and(|s| {
-            s.len() == 24
-                && s.bytes()
-                    .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
-        }) || did.strip_prefix("did:web:").is_some_and(|s| !s.is_empty());
+        let valid = did
+            .strip_prefix("did:plc:")
+            .is_some_and(|s| s.len() == 24 && s.bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)))
+            || did.strip_prefix("did:web:").is_some_and(|s| !s.is_empty());
         if !valid {
-            return Err(AdminError::NotFound(format!(
-                "{did} is not a DID this relay has seen"
-            )));
+            return Err(AdminError::NotFound(format!("{did} is not a DID this relay has seen")));
         }
         // any well-formed DID resolves to a stable synthetic account
         let hi = (hash(did) % 24) as usize;
@@ -1263,34 +986,20 @@ pub fn rule_matches(pattern: &str, host: &str) -> bool {
 fn reasons_for(p: Profile) -> &'static [(RejectReason, f64)] {
     use RejectReason::*;
     match p {
-        Profile::Buggy => &[
-            (InvalidCommit, 0.45),
-            (RevOutOfOrder, 0.3),
-            (PrevDataMismatch, 0.2),
-            (Malformed, 0.05),
-        ],
+        Profile::Buggy => &[(InvalidCommit, 0.45), (RevOutOfOrder, 0.3), (PrevDataMismatch, 0.2), (Malformed, 0.05)],
         Profile::SpamSigs => &[(BadSignature, 0.8), (WrongHost, 0.15), (UnknownDid, 0.05)],
         Profile::SpamAccounts => &[(UnknownDid, 0.5), (RateLimited, 0.4), (BadSignature, 0.1)],
         Profile::Flood => &[(RateLimited, 0.85), (TooLarge, 0.15)],
-        Profile::Big => &[
-            (WrongHost, 0.55),
-            (PrevDataMismatch, 0.25),
-            (Takendown, 0.2),
-        ],
-        Profile::Community | Profile::SelfHosted => &[
-            (RevOutOfOrder, 0.3),
-            (WrongHost, 0.3),
-            (InvalidCommit, 0.2),
-            (TooLarge, 0.2),
-        ],
+        Profile::Big => &[(WrongHost, 0.55), (PrevDataMismatch, 0.25), (Takendown, 0.2)],
+        Profile::Community | Profile::SelfHosted => {
+            &[(RevOutOfOrder, 0.3), (WrongHost, 0.3), (InvalidCommit, 0.2), (TooLarge, 0.2)]
+        }
     }
 }
 
 fn reject_detail(r: RejectReason) -> &'static str {
     match r {
-        RejectReason::BadSignature => {
-            "commit signature doesn't verify against the DID document's #atproto key"
-        }
+        RejectReason::BadSignature => "commit signature doesn't verify against the DID document's #atproto key",
         RejectReason::InvalidCommit => "MST root in the CAR doesn't match the commit's data CID",
         RejectReason::RevOutOfOrder => "rev is not after the last rev the relay accepted",
         RejectReason::PrevDataMismatch => "prevData doesn't match the last accepted commit's data",
@@ -1307,11 +1016,7 @@ fn reject_detail(r: RejectReason) -> &'static str {
 fn case_summary(kind: &str, obs: f64, thr: f64) -> String {
     match kind {
         "new-accounts" => format!("{obs:.0} new accounts/h (threshold {thr:.0})"),
-        "reject-ratio" => format!(
-            "{:.0}% of frames rejected (threshold {:.0}%)",
-            obs * 100.0,
-            thr * 100.0
-        ),
+        "reject-ratio" => format!("{:.0}% of frames rejected (threshold {:.0}%)", obs * 100.0, thr * 100.0),
         "bad-signatures" => format!("{obs:.0} bad signatures/min (threshold {thr:.0})"),
         "account-rate" => format!("one account at {obs:.1} events/s (threshold {thr:.0})"),
         _ => format!("{obs:.2} over {thr:.2}"),
@@ -1322,15 +1027,11 @@ fn validate_pattern(p: &str) -> AdminResult<String> {
     let p = p.trim().to_ascii_lowercase();
     let base = p.strip_prefix("*.").unwrap_or(&p);
     let ok = base.contains('.')
-        && base.split('.').all(|l| {
-            !l.is_empty()
-                && l.len() <= 63
-                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        });
+        && base
+            .split('.')
+            .all(|l| !l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
     if !ok {
-        return Err(AdminError::BadRequest(format!(
-            "{p:?} isn't a hostname or *.domain pattern"
-        )));
+        return Err(AdminError::BadRequest(format!("{p:?} isn't a hostname or *.domain pattern")));
     }
     Ok(p)
 }
@@ -1354,10 +1055,7 @@ impl AdminSource for Demo {
         }
         let mut idx: Vec<usize> = (0..s.hosts.len()).collect();
         idx.sort_by(|a, b| s.hosts[*b].rate.total_cmp(&s.hosts[*a].rate));
-        let mut hist = History {
-            sample_secs: 1,
-            ..Default::default()
-        };
+        let mut hist = History { sample_secs: 1, ..Default::default() };
         for x in &s.history {
             hist.t.push(x.t);
             hist.events_in.push(round2(x.ev_in));
@@ -1368,21 +1066,13 @@ impl AdminSource for Demo {
             hist.ttf_p99_ms.push(round2(x.p99));
             hist.durability_lag_ms.push(round2(x.dur));
             for r in RejectReason::ALL {
-                hist.rejects
-                    .entry(r)
-                    .or_default()
-                    .push(round2(x.rejects.get(&r).copied().unwrap_or(0.0)));
+                hist.rejects.entry(r).or_default().push(round2(x.rejects.get(&r).copied().unwrap_or(0.0)));
             }
         }
         let connected = s
             .hosts
             .iter()
-            .filter(|h| {
-                matches!(
-                    h.status,
-                    HostStatus::Connected | HostStatus::Idle | HostStatus::Throttled
-                )
-            })
+            .filter(|h| matches!(h.status, HostStatus::Connected | HostStatus::Idle | HostStatus::Throttled))
             .count();
         Ok(Overview {
             time_ms: s.now_ms,
@@ -1395,19 +1085,12 @@ impl AdminSource for Demo {
             hosts_total: s.hosts.len() as u32,
             hosts_by_status: by_status,
             rejects_per_sec: round2(last.rejects.values().sum()),
-            rejects_by_reason: rejects_by_reason
-                .into_iter()
-                .map(|(k, v)| (k, round2(v)))
-                .collect(),
+            rejects_by_reason: rejects_by_reason.into_iter().map(|(k, v)| (k, round2(v))).collect(),
             time_to_firehose_p50_ms: round2(last.p50),
             time_to_firehose_p99_ms: round2(last.p99),
             log_durability_lag_ms: round2(last.dur),
             last_seq: s.last_seq,
-            open_cases: s
-                .cases
-                .iter()
-                .filter(|c| c.status == CaseStatus::Open)
-                .count() as u32,
+            open_cases: s.cases.iter().filter(|c| c.status == CaseStatus::Open).count() as u32,
             top_hosts: idx.iter().take(12).map(|&i| s.row(&s.hosts[i])).collect(),
             history: hist,
             stream_events_per_sec: round2(last.ev_in),
@@ -1417,10 +1100,7 @@ impl AdminSource for Demo {
 
     async fn hosts(&self, q: HostQuery) -> AdminResult<HostList> {
         let s = self.sim.lock();
-        let needle =
-            q.q.as_deref()
-                .map(str::to_ascii_lowercase)
-                .filter(|x| !x.is_empty());
+        let needle = q.q.as_deref().map(str::to_ascii_lowercase).filter(|x| !x.is_empty());
         let mut rows: Vec<HostRow> = s
             .hosts
             .iter()
@@ -1445,11 +1125,7 @@ impl AdminSource for Demo {
             if q.desc { o.reverse() } else { o }
         });
         let total = rows.len();
-        let rows = rows
-            .into_iter()
-            .skip(q.offset.unwrap_or(0))
-            .take(q.limit.unwrap_or(10_000))
-            .collect();
+        let rows = rows.into_iter().skip(q.offset.unwrap_or(0)).take(q.limit.unwrap_or(10_000)).collect();
         Ok(HostList { total, hosts: rows })
     }
 
@@ -1466,10 +1142,7 @@ impl AdminSource for Demo {
         if let Some(t) = h.throttle {
             limits.events_per_sec = limits.events_per_sec.min(t);
         }
-        let mut series = HostSeries {
-            sample_secs: 1,
-            ..Default::default()
-        };
+        let mut series = HostSeries { sample_secs: 1, ..Default::default() };
         for (t, e, r) in &h.series {
             series.t.push(*t);
             series.events.push(round2(*e as f64));
@@ -1486,10 +1159,7 @@ impl AdminSource for Demo {
             open_cases: s
                 .cases
                 .iter()
-                .filter(|c| {
-                    c.host == h.name
-                        && matches!(c.status, CaseStatus::Open | CaseStatus::Acknowledged)
-                })
+                .filter(|c| c.host == h.name && matches!(c.status, CaseStatus::Open | CaseStatus::Acknowledged))
                 .map(|c| c.id)
                 .collect(),
         })
@@ -1504,14 +1174,10 @@ impl AdminSource for Demo {
         {
             return Err(AdminError::BadRequest(format!("no tier {tier:?}")));
         }
-        if let HostAction::Throttle {
-            events_per_sec: Some(x),
-        } = &action
+        if let HostAction::Throttle { events_per_sec: Some(x) } = &action
             && !(x.is_finite() && *x >= 0.0)
         {
-            return Err(AdminError::BadRequest(
-                "throttle must be ≥ 0 events/s".into(),
-            ));
+            return Err(AdminError::BadRequest("throttle must be ≥ 0 events/s".into()));
         }
         let h = &mut s.hosts[i];
         match &action {
@@ -1543,11 +1209,7 @@ impl AdminSource for Demo {
                 h.redial_at = Some(now + 1_500);
             }
         }
-        h.actions.push(HostActionRecord {
-            at_ms: now,
-            by: by.into(),
-            action,
-        });
+        h.actions.push(HostActionRecord { at_ms: now, by: by.into(), action });
         let h = &s.hosts[i];
         Ok(s.row(h))
     }
@@ -1562,9 +1224,7 @@ impl AdminSource for Demo {
         let mut s = self.sim.lock();
         check_effect(&s, &rule.effect)?;
         if s.rules.iter().any(|r| r.pattern == pattern) {
-            return Err(AdminError::Conflict(format!(
-                "a rule for {pattern} already exists"
-            )));
+            return Err(AdminError::Conflict(format!("a rule for {pattern} already exists")));
         }
         let id = s.next_rule;
         s.next_rule += 1;
@@ -1582,25 +1242,14 @@ impl AdminSource for Demo {
         Ok(s.rule_view(&r))
     }
 
-    async fn update_domain_rule(
-        &self,
-        id: u64,
-        rule: DomainRuleInput,
-        _by: &str,
-    ) -> AdminResult<DomainRule> {
+    async fn update_domain_rule(&self, id: u64, rule: DomainRuleInput, _by: &str) -> AdminResult<DomainRule> {
         let pattern = validate_pattern(&rule.pattern)?;
         let mut s = self.sim.lock();
         check_effect(&s, &rule.effect)?;
         if s.rules.iter().any(|r| r.pattern == pattern && r.id != id) {
-            return Err(AdminError::Conflict(format!(
-                "a rule for {pattern} already exists"
-            )));
+            return Err(AdminError::Conflict(format!("a rule for {pattern} already exists")));
         }
-        let i = s
-            .rules
-            .iter()
-            .position(|r| r.id == id)
-            .ok_or_else(|| AdminError::NotFound(format!("no rule {id}")))?;
+        let i = s.rules.iter().position(|r| r.id == id).ok_or_else(|| AdminError::NotFound(format!("no rule {id}")))?;
         s.rules[i].pattern = pattern.clone();
         s.rules[i].effect = rule.effect.clone();
         s.rules[i].note = rule.note;
@@ -1611,11 +1260,7 @@ impl AdminSource for Demo {
 
     async fn delete_domain_rule(&self, id: u64, _by: &str) -> AdminResult<()> {
         let mut s = self.sim.lock();
-        let i = s
-            .rules
-            .iter()
-            .position(|r| r.id == id)
-            .ok_or_else(|| AdminError::NotFound(format!("no rule {id}")))?;
+        let i = s.rules.iter().position(|r| r.id == id).ok_or_else(|| AdminError::NotFound(format!("no rule {id}")))?;
         s.rules.remove(i);
         Ok(())
     }
@@ -1640,20 +1285,10 @@ impl AdminSource for Demo {
             return Err(AdminError::BadRequest("nothing changed".into()));
         }
         let now = s.now_ms;
-        s.policy = PolicyDoc {
-            version: s.policy.version + 1,
-            policy: u.policy,
-            updated_at_ms: now,
-            updated_by: by.into(),
-        };
+        s.policy =
+            PolicyDoc { version: s.policy.version + 1, policy: u.policy, updated_at_ms: now, updated_by: by.into() };
         let version = s.policy.version;
-        s.audit.push(PolicyAudit {
-            version,
-            at_ms: now,
-            by: by.into(),
-            note: u.note,
-            changes,
-        });
+        s.audit.push(PolicyAudit { version, at_ms: now, by: by.into(), note: u.note, changes });
         Ok(s.policy.clone())
     }
 
@@ -1690,14 +1325,10 @@ impl AdminSource for Demo {
             .iter()
             .enumerate()
             .map(|(i, id)| {
-                let hosts: Vec<&SimHost> = s
-                    .hosts
-                    .iter()
-                    .filter(|h| s.host_shards[h.shard].as_deref() == Some(*id))
-                    .collect();
+                let hosts: Vec<&SimHost> =
+                    s.hosts.iter().filter(|h| s.host_shards[h.shard].as_deref() == Some(*id)).collect();
                 let ev_in: f64 = hosts.iter().map(|h| h.rate).sum();
-                let consumers: Vec<&Consumer> =
-                    s.consumers.iter().filter(|c| c.node == *id).collect();
+                let consumers: Vec<&Consumer> = s.consumers.iter().filter(|c| c.node == *id).collect();
                 let ev_out: f64 = consumers.iter().map(|c| c.events_per_sec).sum();
                 NodeView {
                     id: id.to_string(),
@@ -1708,16 +1339,8 @@ impl AdminSource for Demo {
                     lease_valid: true,
                     // leases renew every ~3 s with a 10 s TTL
                     lease_expires_ms: now + 7_000 + ((now + i as i64 * 1_100) % 3_000),
-                    host_shards: s
-                        .host_shards
-                        .iter()
-                        .filter(|o| o.as_deref() == Some(*id))
-                        .count() as u32,
-                    did_shards: s
-                        .did_shards
-                        .iter()
-                        .filter(|o| o.as_deref() == Some(*id))
-                        .count() as u32,
+                    host_shards: s.host_shards.iter().filter(|o| o.as_deref() == Some(*id)).count() as u32,
+                    did_shards: s.did_shards.iter().filter(|o| o.as_deref() == Some(*id)).count() as u32,
                     hosts: hosts.len() as u32,
                     consumers: consumers.len() as u32,
                     events_in_per_sec: round2(ev_in),
@@ -1758,9 +1381,7 @@ impl AdminSource for Demo {
             .filter(|a| {
                 q.is_empty()
                     || a.did.starts_with(&q)
-                    || a.handle
-                        .as_deref()
-                        .is_some_and(|h| h.starts_with(&q) || h.contains(&q))
+                    || a.handle.as_deref().is_some_and(|h| h.starts_with(&q) || h.contains(&q))
             })
             .take(100)
             .map(|a| s.account_view(a))
@@ -1781,14 +1402,7 @@ impl AdminSource for Demo {
         let mut s = self.sim.lock();
         let i = s.find_account(did)?;
         let now = s.now_ms;
-        s.takedowns.insert(
-            did.to_string(),
-            Takedown {
-                at_ms: now,
-                by: by.into(),
-                reason,
-            },
-        );
+        s.takedowns.insert(did.to_string(), Takedown { at_ms: now, by: by.into(), reason });
         Ok(s.account_view(&s.accounts[i]))
     }
 
@@ -1801,46 +1415,25 @@ impl AdminSource for Demo {
 
     async fn cases(&self, q: CaseQuery) -> AdminResult<Vec<Case>> {
         let s = self.sim.lock();
-        let mut out: Vec<Case> = s
-            .cases
-            .iter()
-            .filter(|c| q.status.is_none_or(|st| c.status == st))
-            .cloned()
-            .collect();
-        out.sort_by(|a, b| {
-            b.severity
-                .cmp(&a.severity)
-                .then(b.opened_at_ms.cmp(&a.opened_at_ms))
-        });
+        let mut out: Vec<Case> = s.cases.iter().filter(|c| q.status.is_none_or(|st| c.status == st)).cloned().collect();
+        out.sort_by(|a, b| b.severity.cmp(&a.severity).then(b.opened_at_ms.cmp(&a.opened_at_ms)));
         Ok(out)
     }
 
     async fn case(&self, id: u64) -> AdminResult<Case> {
         let s = self.sim.lock();
-        s.cases
-            .iter()
-            .find(|c| c.id == id)
-            .cloned()
-            .ok_or_else(|| AdminError::NotFound(format!("no case {id}")))
+        s.cases.iter().find(|c| c.id == id).cloned().ok_or_else(|| AdminError::NotFound(format!("no case {id}")))
     }
 
     async fn update_case(&self, id: u64, u: CaseUpdate, by: &str) -> AdminResult<Case> {
         let mut s = self.sim.lock();
         let now = s.now_ms;
-        let c = s
-            .cases
-            .iter_mut()
-            .find(|c| c.id == id)
-            .ok_or_else(|| AdminError::NotFound(format!("no case {id}")))?;
+        let c = s.cases.iter_mut().find(|c| c.id == id).ok_or_else(|| AdminError::NotFound(format!("no case {id}")))?;
         if let Some(st) = u.status {
             c.status = st;
         }
         if !u.note.trim().is_empty() {
-            c.notes.push(CaseNote {
-                at_ms: now,
-                by: by.into(),
-                text: u.note,
-            });
+            c.notes.push(CaseNote { at_ms: now, by: by.into(), text: u.note });
         }
         c.updated_at_ms = now;
         Ok(c.clone())
@@ -1852,12 +1445,8 @@ fn check_effect(s: &Sim, e: &RuleEffect) -> AdminResult<()> {
         RuleEffect::Tier { tier } if !s.policy.policy.tiers.contains_key(tier) => {
             Err(AdminError::BadRequest(format!("no tier {tier:?}")))
         }
-        RuleEffect::Throttle { events_per_sec }
-            if !(events_per_sec.is_finite() && *events_per_sec >= 0.0) =>
-        {
-            Err(AdminError::BadRequest(
-                "throttle must be ≥ 0 events/s".into(),
-            ))
+        RuleEffect::Throttle { events_per_sec } if !(events_per_sec.is_finite() && *events_per_sec >= 0.0) => {
+            Err(AdminError::BadRequest("throttle must be ≥ 0 events/s".into()))
         }
         _ => Ok(()),
     }
@@ -1884,13 +1473,7 @@ mod tests {
         assert!(o.events_in_per_sec > 20_000.0, "{}", o.events_in_per_sec);
         assert!(o.history.t.len() >= HISTORY - 1);
         assert!(o.open_cases > 0);
-        let l = d
-            .hosts(HostQuery {
-                q: Some("fastvps".into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let l = d.hosts(HostQuery { q: Some("fastvps".into()), ..Default::default() }).await.unwrap();
         assert_eq!(l.total, 2);
         let det = d.host("pds-7f3a.fastvps.cloud").await.unwrap();
         assert_eq!(det.row.tier, "probation");
@@ -1899,31 +1482,13 @@ mod tests {
         let mut np = p.policy.clone();
         np.spam.reject_ratio = 0.3;
         let u = d
-            .update_policy(
-                PolicyUpdate {
-                    base_version: p.version,
-                    policy: np.clone(),
-                    note: "t".into(),
-                },
-                "admin",
-            )
+            .update_policy(PolicyUpdate { base_version: p.version, policy: np.clone(), note: "t".into() }, "admin")
             .await
             .unwrap();
         assert_eq!(u.version, p.version + 1);
-        let stale = d
-            .update_policy(
-                PolicyUpdate {
-                    base_version: p.version,
-                    policy: np,
-                    note: String::new(),
-                },
-                "admin",
-            )
-            .await;
+        let stale =
+            d.update_policy(PolicyUpdate { base_version: p.version, policy: np, note: String::new() }, "admin").await;
         assert!(matches!(stale, Err(AdminError::Conflict(_))));
-        assert_eq!(
-            d.policy_audit().await.unwrap()[0].changes,
-            vec!["spam.rejectRatio: 0.2 → 0.3".to_string()]
-        );
+        assert_eq!(d.policy_audit().await.unwrap()[0].changes, vec!["spam.rejectRatio: 0.2 → 0.3".to_string()]);
     }
 }

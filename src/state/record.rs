@@ -18,7 +18,7 @@
 
 use bytes::{BufMut, Bytes};
 use sha2::{Digest, Sha256};
-use vlpds::cid::{Cid, CODEC_DAG_CBOR};
+use vlpds::cid::{CODEC_DAG_CBOR, Cid};
 use vlpds::state::{SLOT_PREFIX_LEN, slot_prefix};
 use vlpds::tid::Tid;
 
@@ -342,7 +342,11 @@ impl Record {
             || self.relay_throttled
             || matches!(
                 self.upstream,
-                Upstream::Takendown | Upstream::Suspended | Upstream::Deleted | Upstream::Deactivated | Upstream::Inactive
+                Upstream::Takendown
+                    | Upstream::Suspended
+                    | Upstream::Deleted
+                    | Upstream::Deactivated
+                    | Upstream::Inactive
             )
     }
 

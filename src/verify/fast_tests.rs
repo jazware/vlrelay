@@ -31,17 +31,9 @@ fn data_of(c: &ParsedCommit) -> Cid {
 /// A create at a random key, in one of a few collections so that keys
 /// land at every height and on both sides of the existing ones.
 fn random_create(rng: &mut StdRng) -> Op {
-    const COLLECTIONS: [&str; 4] = [
-        "app.bsky.feed.like",
-        "app.bsky.feed.post",
-        "app.bsky.graph.follow",
-        "a.b.c",
-    ];
+    const COLLECTIONS: [&str; 4] = ["app.bsky.feed.like", "app.bsky.feed.post", "app.bsky.graph.follow", "a.b.c"];
     let col = COLLECTIONS[rng.gen_range(0..COLLECTIONS.len())];
-    let tid = vlpds::tid::Tid::from_parts(
-        rng.gen_range(1_600_000_000_000_000..1_800_000_000_000_000),
-        0,
-    );
+    let tid = vlpds::tid::Tid::from_parts(rng.gen_range(1_600_000_000_000_000..1_800_000_000_000_000), 0);
     Op::Put(format!("{col}/{tid}"))
 }
 
@@ -51,11 +43,7 @@ fn one_create_fast_path_matches_tree_path() {
     let mut rng = StdRng::seed_from_u64(0x5eed);
     let (mut fast_hits, mut total) = (0, 0);
     for initial in [0usize, 1, 2, 3, 5, 17, 100, 1000] {
-        let mut r = Repo::new(
-            "did:plc:fastfastfastfastfast",
-            Signer::new(Curve::K256, 3),
-            initial,
-        );
+        let mut r = Repo::new("did:plc:fastfastfastfastfast", Signer::new(Curve::K256, 3), initial);
         for _ in 0..60 {
             let op = random_create(&mut rng);
             if let Op::Put(p) = &op
@@ -69,13 +57,8 @@ fn one_create_fast_path_matches_tree_path() {
             assert_eq!(both(&c, data, &opts), Ok(()));
             let blocks: BlockMap<'_> = c.blocks.iter().map(|(k, v)| (*k, &v[..])).collect();
             let op = &c.ops[0];
-            if vlpds::mst::single_create::undo_single_create(
-                &blocks,
-                data,
-                op.path.as_bytes(),
-                op.cid.unwrap(),
-                true,
-            ) == Some(c.prev_data)
+            if vlpds::mst::single_create::undo_single_create(&blocks, data, op.path.as_bytes(), op.cid.unwrap(), true)
+                == Some(c.prev_data)
             {
                 fast_hits += 1;
             }
@@ -89,10 +72,7 @@ fn one_create_fast_path_matches_tree_path() {
             assert!(both(&m, data, &opts).is_err());
             let mut m = c.clone();
             m.ops[0].cid = Some(Cid::dag_cbor(b"another record"));
-            let lax = Options {
-                require_record_blocks: false,
-                ..Options::default()
-            };
+            let lax = Options { require_record_blocks: false, ..Options::default() };
             assert!(both(&m, data, &lax).is_err());
             for i in 0..c.blocks.len() {
                 let mut m = c.clone();
@@ -110,27 +90,17 @@ fn one_create_fast_path_matches_tree_path() {
         }
     }
     // the fast path must carry the common case, not just fall back
-    assert!(
-        fast_hits * 10 >= total * 7,
-        "fast path took {fast_hits} of {total}"
-    );
+    assert!(fast_hits * 10 >= total * 7, "fast path took {fast_hits} of {total}");
 }
 
 /// Node blocks rewritten (and re-hashed, so they pass the block check):
 /// each change must get the same verdict from both paths.
 #[test]
 fn rewritten_nodes_agree() {
-    let opts = Options {
-        require_record_blocks: false,
-        ..Options::default()
-    };
+    let opts = Options { require_record_blocks: false, ..Options::default() };
     let mut rng = StdRng::seed_from_u64(42);
     for initial in [2usize, 40, 600] {
-        let mut r = Repo::new(
-            "did:plc:rewriterewriterewrite",
-            Signer::new(Curve::K256, 5),
-            initial,
-        );
+        let mut r = Repo::new("did:plc:rewriterewriterewrite", Signer::new(Curve::K256, 5), initial);
         for _ in 0..25 {
             let c = commit_of(r.commit(&[random_create(&mut rng)]));
             let data = data_of(&c);
@@ -174,8 +144,7 @@ fn rewritten_nodes_agree() {
                                     let (wb, hb) = (was.to_bytes(), h.to_bytes());
                                     for k in 0..m.blocks.len() {
                                         let kb = m.blocks[k].1.clone();
-                                        if let Some(p) = kb.windows(wb.len()).position(|w| w == wb)
-                                        {
+                                        if let Some(p) = kb.windows(wb.len()).position(|w| w == wb) {
                                             let mut v = kb.to_vec();
                                             v[p..p + wb.len()].copy_from_slice(&hb);
                                             m.blocks[k].1 = Bytes::from(v);

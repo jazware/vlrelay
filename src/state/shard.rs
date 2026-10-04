@@ -9,10 +9,10 @@
 //! duplicate, and the event never reaches the firehose.
 
 use super::record::{self, Record};
+use crate::types::FastMap;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use slatedb::Db;
-use crate::types::FastMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use vlpds::slots::ShardId;

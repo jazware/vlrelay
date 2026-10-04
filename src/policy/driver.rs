@@ -54,11 +54,7 @@ pub struct Driver {
 }
 
 pub fn severity(t: &Trip) -> Severity {
-    let over = if t.threshold > 0.0 {
-        t.observed / t.threshold
-    } else {
-        1.0
-    };
+    let over = if t.threshold > 0.0 { t.observed / t.threshold } else { 1.0 };
     match t.action {
         _ if over >= 5.0 => Severity::Critical,
         SpamAction::ThrottleAndCase | SpamAction::Throttle => Severity::High,
@@ -77,21 +73,12 @@ pub fn summary(t: &Trip) -> String {
         Some(d) => format!("{d} on {}", t.host),
         None => t.host.clone(),
     };
-    format!(
-        "{who}: {} {:.0}{per} (threshold {:.0})",
-        t.rule.name(),
-        t.observed,
-        t.threshold
-    )
+    format!("{who}: {} {:.0}{per} (threshold {:.0})", t.rule.name(), t.observed, t.threshold)
 }
 
 impl Driver {
     pub fn new(engine: Arc<Engine>, hosts: Arc<dyn HostStore>) -> Driver {
-        Driver {
-            engine,
-            hosts,
-            seen: Default::default(),
-        }
+        Driver { engine, hosts, seen: Default::default() }
     }
 
     /// Steps one host and writes it if anything changed. The step runs on
@@ -130,12 +117,7 @@ impl Driver {
                 %reason,
                 "host tier changed"
             );
-            report.moved.push(Moved {
-                host: rec.hostname.clone(),
-                from,
-                to: ch.tier,
-                reason,
-            });
+            report.moved.push(Moved { host: rec.hostname.clone(), from, to: ch.tier, reason });
         }
         Ok(())
     }
@@ -165,10 +147,7 @@ impl Driver {
             }
             let mut auto_action = None;
             if throttles {
-                let obs = Obs {
-                    spam_trip: Some(t.rule.name().to_string()),
-                    ..Default::default()
-                };
+                let obs = Obs { spam_trip: Some(t.rule.name().to_string()), ..Default::default() };
                 let before = report.moved.len();
                 self.step_host(&t.host, &obs, now, report).await?;
                 if report.moved.len() > before {
@@ -183,10 +162,7 @@ impl Driver {
                     window_secs: t.window_secs,
                     node: self.engine.node.clone(),
                     detail: t.detail.clone(),
-                    signals: self
-                        .engine
-                        .signals
-                        .snapshot(&t.host, t.did.as_deref(), t.at_ms),
+                    signals: self.engine.signals.snapshot(&t.host, t.did.as_deref(), t.at_ms),
                 };
                 let o = CaseOpen {
                     kind: t.rule.name().to_string(),
@@ -199,9 +175,7 @@ impl Driver {
                     auto_action,
                     evidence: ev,
                 };
-                report
-                    .cases
-                    .push(self.engine.cases.open_or_update(o).await?);
+                report.cases.push(self.engine.cases.open_or_update(o).await?);
             }
         }
         Ok(())
@@ -224,11 +198,9 @@ impl Driver {
                 let prev = self.seen.lock().get(&rec.hostname).copied();
                 live.insert(rec.hostname.clone(), cur);
                 let obs = match prev {
-                    Some((e, f)) => Obs {
-                        events: cur.0.saturating_sub(e),
-                        failed: cur.1.saturating_sub(f),
-                        spam_trip: None,
-                    },
+                    Some((e, f)) => {
+                        Obs { events: cur.0.saturating_sub(e), failed: cur.1.saturating_sub(f), spam_trip: None }
+                    }
                     None => Obs::default(),
                 };
                 self.step_host(&rec.hostname, &obs, now, &mut report).await?;

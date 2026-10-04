@@ -9,32 +9,13 @@ fn finish(f: events::Frame, seq: i64) -> Bytes {
 }
 
 fn all_kinds() -> Vec<Bytes> {
-    let mut r = Repo::new(
-        "did:plc:eventseventsevents",
-        Signer::new(Curve::K256, 5),
-        50,
-    );
+    let mut r = Repo::new("did:plc:eventseventsevents", Signer::new(Curve::K256, 5), 50);
     let ops = r.mixed_ops(6);
     vec![
         r.commit(&ops),
         r.sync(),
-        finish(
-            events::identity_frame(
-                "did:plc:eventseventsevents",
-                "alice.test",
-                "2026-01-01T00:00:00Z",
-            ),
-            77,
-        ),
-        finish(
-            events::account_frame(
-                "did:web:example.com",
-                false,
-                Some("takendown"),
-                "2026-01-01T00:00:00Z",
-            ),
-            1 << 40,
-        ),
+        finish(events::identity_frame("did:plc:eventseventsevents", "alice.test", "2026-01-01T00:00:00Z"), 77),
+        finish(events::account_frame("did:web:example.com", false, Some("takendown"), "2026-01-01T00:00:00Z"), 1 << 40),
     ]
 }
 
@@ -88,19 +69,7 @@ fn route_reads_the_kinds_did_key() {
 fn seq_splice_round_trips() {
     for f in all_kinds() {
         let e = parse(f.clone(), &Limits::default()).unwrap();
-        for seq in [
-            0i64,
-            1,
-            23,
-            24,
-            255,
-            256,
-            65535,
-            65536,
-            u32::MAX as i64,
-            u32::MAX as i64 + 1,
-            i64::MAX,
-        ] {
+        for seq in [0i64, 1, 23, 24, 255, 256, 65535, 65536, u32::MAX as i64, u32::MAX as i64 + 1, i64::MAX] {
             let out = e.encode_with_seq(seq).unwrap();
             let r = route(&out, MAX_FRAME_BYTES).unwrap();
             assert_eq!(r.seq, Some(seq));
@@ -168,34 +137,10 @@ fn limits_and_syntax() {
     let ops = r.mixed_ops(30);
     let f = r.commit(&ops);
     let strict = |l: Limits| parse(f.clone(), &l).err();
-    assert_eq!(
-        strict(Limits {
-            max_frame_bytes: f.len() - 1,
-            ..Limits::default()
-        }),
-        Some(Reject::FrameTooBig)
-    );
-    assert_eq!(
-        strict(Limits {
-            max_commit_ops: 29,
-            ..Limits::default()
-        }),
-        Some(Reject::TooManyOps)
-    );
-    assert_eq!(
-        strict(Limits {
-            max_commit_blocks: 3,
-            ..Limits::default()
-        }),
-        Some(Reject::TooManyBlocks)
-    );
-    assert_eq!(
-        strict(Limits {
-            max_commit_blocks_bytes: 100,
-            ..Limits::default()
-        }),
-        Some(Reject::BlocksTooBig)
-    );
+    assert_eq!(strict(Limits { max_frame_bytes: f.len() - 1, ..Limits::default() }), Some(Reject::FrameTooBig));
+    assert_eq!(strict(Limits { max_commit_ops: 29, ..Limits::default() }), Some(Reject::TooManyOps));
+    assert_eq!(strict(Limits { max_commit_blocks: 3, ..Limits::default() }), Some(Reject::TooManyBlocks));
+    assert_eq!(strict(Limits { max_commit_blocks_bytes: 100, ..Limits::default() }), Some(Reject::BlocksTooBig));
     assert_eq!(strict(Limits::default()), None);
 
     // same-length replacements keep the frame well formed
@@ -205,23 +150,14 @@ fn limits_and_syntax() {
         v[at..at + to.len()].copy_from_slice(to);
         parse(Bytes::from(v), &Limits::default()).err()
     };
-    assert_eq!(
-        swap(b"did:plc:limits", b"did:PLC:limits"),
-        Some(Reject::BadDid)
-    );
+    assert_eq!(swap(b"did:plc:limits", b"did:PLC:limits"), Some(Reject::BadDid));
     let rev = r.rev.to_string();
     assert_eq!(swap(rev.as_bytes(), b"zzzzzzzzzzzzz"), Some(Reject::BadRev));
-    assert_eq!(
-        swap(b"app.bsky.feed.like/", b"app.bsky.feed.like!"),
-        Some(Reject::BadOp)
-    );
+    assert_eq!(swap(b"app.bsky.feed.like/", b"app.bsky.feed.like!"), Some(Reject::BadOp));
 
     // truncation anywhere is an error, never a panic
     for n in 0..f.len().min(4000) {
-        assert!(
-            route(&f[..n], MAX_FRAME_BYTES).is_err()
-                || parse(f.slice(..n), &Limits::default()).is_err()
-        );
+        assert!(route(&f[..n], MAX_FRAME_BYTES).is_err() || parse(f.slice(..n), &Limits::default()).is_err());
     }
     // trailing garbage
     let mut v = f.to_vec();
@@ -242,9 +178,6 @@ fn unsigned_commit_split() {
     u.write(&mut out);
     assert_eq!(out, unsigned);
     use sha2::Digest;
-    assert_eq!(
-        u.sha256(),
-        <[u8; 32]>::from(sha2::Sha256::digest(&unsigned))
-    );
+    assert_eq!(u.sha256(), <[u8; 32]>::from(sha2::Sha256::digest(&unsigned)));
     assert!(split_signed_commit(&unsigned).is_none());
 }

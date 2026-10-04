@@ -73,24 +73,15 @@ impl SpamRule {
     }
 
     pub fn per_account(self) -> bool {
-        matches!(
-            self,
-            SpamRule::AccountRecords
-                | SpamRule::AccountFailedValidation
-                | SpamRule::AccountIdentityChurn
-        )
+        matches!(self, SpamRule::AccountRecords | SpamRule::AccountFailedValidation | SpamRule::AccountIdentityChurn)
     }
 
     pub fn kind(self) -> SignalKind {
         match self {
             SpamRule::HostNewAccounts => SignalKind::NewAccount,
             SpamRule::AccountRecords => SignalKind::Record,
-            SpamRule::HostFailedValidation | SpamRule::AccountFailedValidation => {
-                SignalKind::FailedValidation
-            }
-            SpamRule::HostIdentityChurn | SpamRule::AccountIdentityChurn => {
-                SignalKind::IdentityChange
-            }
+            SpamRule::HostFailedValidation | SpamRule::AccountFailedValidation => SignalKind::FailedValidation,
+            SpamRule::HostIdentityChurn | SpamRule::AccountIdentityChurn => SignalKind::IdentityChange,
             SpamRule::HostOversizedCommits => SignalKind::OversizedCommit,
         }
     }
@@ -121,13 +112,7 @@ pub struct Signal<'a> {
 
 impl<'a> Signal<'a> {
     pub fn new(kind: SignalKind, host: &'a str, did: Option<&'a str>) -> Signal<'a> {
-        Signal {
-            kind,
-            host,
-            did,
-            count: 1,
-            detail: None,
-        }
+        Signal { kind, host, did, count: 1, detail: None }
     }
 }
 
@@ -289,10 +274,7 @@ impl TopK {
         if newly_tripped {
             e.tripped_window = window + 1;
         }
-        Added {
-            lower,
-            newly_tripped,
-        }
+        Added { lower, newly_tripped }
     }
 
     fn insert(&mut self, key: &str, hash: u64, host: &str, keep: f64) -> usize {
@@ -317,13 +299,7 @@ impl TopK {
         let old = &self.entries[i];
         self.index.remove(&old.hash);
         let (cur, prev) = (old.cur, old.prev);
-        self.entries[i] = Entry {
-            cur,
-            cur_err: cur,
-            prev,
-            prev_err: prev,
-            ..fresh
-        };
+        self.entries[i] = Entry { cur, cur_err: cur, prev, prev_err: prev, ..fresh };
         self.index.insert(hash, i);
         i
     }
@@ -420,9 +396,7 @@ impl Tracker {
         let per = capacity.div_ceil(SHARDS).max(1);
         Tracker {
             rule,
-            shards: (0..SHARDS)
-                .map(|_| Mutex::new(TopK::new(per, threshold.window_secs)))
-                .collect(),
+            shards: (0..SHARDS).map(|_| Mutex::new(TopK::new(per, threshold.window_secs))).collect(),
             threshold,
             hasher: Default::default(),
         }
@@ -445,34 +419,16 @@ impl Tracker {
     }
 
     pub fn add(&self, s: &Signal<'_>, now_ms: i64) -> Option<Trip> {
-        let key = if self.rule.per_account() {
-            s.did?
-        } else {
-            s.host
-        };
+        let key = if self.rule.per_account() { s.did? } else { s.host };
         let h = self.hash(key);
         let now_s = (now_ms / 1000) as u64;
-        let limit = if self.threshold.enabled() {
-            self.threshold.limit
-        } else {
-            0.0
-        };
-        let a = self.shards[(h >> 60) as usize % SHARDS].lock().add(
-            key,
-            h,
-            s.host,
-            s.count as u64,
-            s.detail,
-            limit,
-            now_s,
-        );
+        let limit = if self.threshold.enabled() { self.threshold.limit } else { 0.0 };
+        let a =
+            self.shards[(h >> 60) as usize % SHARDS].lock().add(key, h, s.host, s.count as u64, s.detail, limit, now_s);
         a.newly_tripped.then(|| Trip {
             rule: self.rule,
             host: s.host.to_string(),
-            did: s
-                .did
-                .filter(|_| self.rule.per_account())
-                .map(str::to_string),
+            did: s.did.filter(|_| self.rule.per_account()).map(str::to_string),
             observed: a.lower,
             threshold: self.threshold.limit,
             window_secs: self.threshold.window_secs,
@@ -484,18 +440,12 @@ impl Tracker {
 
     pub fn lower_bound(&self, key: &str, now_ms: i64) -> f64 {
         let h = self.hash(key);
-        self.shards[(h >> 60) as usize % SHARDS]
-            .lock()
-            .lower_bound(key, h, (now_ms / 1000) as u64)
+        self.shards[(h >> 60) as usize % SHARDS].lock().lower_bound(key, h, (now_ms / 1000) as u64)
     }
 
     pub fn top(&self, n: usize, now_ms: i64) -> Vec<(String, String, f64, f64)> {
         let now_s = (now_ms / 1000) as u64;
-        let mut all: Vec<_> = self
-            .shards
-            .iter()
-            .flat_map(|s| s.lock().top(n, now_s))
-            .collect();
+        let mut all: Vec<_> = self.shards.iter().flat_map(|s| s.lock().top(n, now_s)).collect();
         all.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
         all.truncate(n);
         all
@@ -542,18 +492,14 @@ impl Signals {
 
     pub fn record(&self, s: &Signal<'_>, now_ms: i64) -> Vec<Trip> {
         let t = self.trackers.read();
-        let trips: Vec<Trip> = t
-            .iter()
-            .filter(|tr| tr.rule.kind() == s.kind)
-            .filter_map(|tr| tr.add(s, now_ms))
-            .collect();
+        let trips: Vec<Trip> =
+            t.iter().filter(|tr| tr.rule.kind() == s.kind).filter_map(|tr| tr.add(s, now_ms)).collect();
         drop(t);
         if !trips.is_empty() {
             let mut q = self.trips.lock();
             for tr in &trips {
                 if q.len() >= TRIP_QUEUE {
-                    self.dropped_trips
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.dropped_trips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
                     q.push_back(tr.clone());
                 }
@@ -567,12 +513,7 @@ impl Signals {
     }
 
     /// Every rule's current lower bound for a host (and DID), for evidence.
-    pub fn snapshot(
-        &self,
-        host: &str,
-        did: Option<&str>,
-        now_ms: i64,
-    ) -> std::collections::BTreeMap<String, f64> {
+    pub fn snapshot(&self, host: &str, did: Option<&str>, now_ms: i64) -> std::collections::BTreeMap<String, f64> {
         let t = self.trackers.read();
         t.iter()
             .filter_map(|tr| {
@@ -585,10 +526,7 @@ impl Signals {
 
     pub fn top(&self, rule: SpamRule, n: usize, now_ms: i64) -> Vec<(String, String, f64, f64)> {
         let t = self.trackers.read();
-        t.iter()
-            .find(|tr| tr.rule == rule)
-            .map(|tr| tr.top(n, now_ms))
-            .unwrap_or_default()
+        t.iter().find(|tr| tr.rule == rule).map(|tr| tr.top(n, now_ms)).unwrap_or_default()
     }
 
     pub fn heap_bytes(&self) -> usize {
@@ -596,25 +534,14 @@ impl Signals {
     }
 
     pub fn tracked(&self, rule: SpamRule) -> usize {
-        self.trackers
-            .read()
-            .iter()
-            .find(|t| t.rule == rule)
-            .map_or(0, |t| t.len())
+        self.trackers.read().iter().find(|t| t.rule == rule).map_or(0, |t| t.len())
     }
 }
 
 fn capacity(rule: SpamRule, spam: &Spam) -> usize {
-    if rule.per_account() {
-        spam.track_accounts as usize
-    } else {
-        spam.track_hosts as usize
-    }
+    if rule.per_account() { spam.track_accounts as usize } else { spam.track_hosts as usize }
 }
 
 fn build(spam: &Spam) -> Vec<Tracker> {
-    SpamRule::ALL
-        .iter()
-        .map(|&r| Tracker::new(r, r.threshold(spam).clone(), capacity(r, spam)))
-        .collect()
+    SpamRule::ALL.iter().map(|&r| Tracker::new(r, r.threshold(spam).clone(), capacity(r, spam))).collect()
 }

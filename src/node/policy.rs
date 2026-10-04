@@ -195,8 +195,16 @@ const STATE_REASONS: &[&str] = &[
 ];
 
 /// Not the host's fault, or a follow-on of a failure already counted.
-const NOT_SIGNALS: &[&str] =
-    &["stale", "desynchronized", "inactive", "rate_limited", "new_account_deferred", "identity_unavailable", "store", "not_owner"];
+const NOT_SIGNALS: &[&str] = &[
+    "stale",
+    "desynchronized",
+    "inactive",
+    "rate_limited",
+    "new_account_deferred",
+    "identity_unavailable",
+    "store",
+    "not_owner",
+];
 
 /// An `#identity` past its host's `identityEventsPerHour`.
 pub const IDENTITY_RATE: &str = "identity_rate";
@@ -676,9 +684,10 @@ mod tests {
         let did = |h: &str, i: u32| format!("did:plc:{h}{i}");
         let admit = |h: &str, i: u32| hooks.admit_account(h, &did(h, i), Arrival::Created);
         use NewAccount::*;
-        assert_eq!([admit("capped.example", 1), admit("capped.example", 2), admit("capped.example", 3)], [
-            Admit, Admit, Throttle
-        ]);
+        assert_eq!(
+            [admit("capped.example", 1), admit("capped.example", 2), admit("capped.example", 3)],
+            [Admit, Admit, Throttle]
+        );
         assert_eq!([admit("young.example", 1), admit("young.example", 2)], [Admit, Defer]);
         // every creation is a new-account signal once, whatever the verdict
         let now = policy::store::now_ms();
@@ -697,8 +706,14 @@ mod tests {
         assert_eq!(hooks.accounts("young.example"), Some(100));
         assert_eq!(hooks.engine.signals.snapshot("young.example", None, now).get("new-accounts"), Some(&2.0));
         // a known account's first commit counts nothing unless it's a creation
-        assert_eq!(hooks.admit_account("young.example", "did:plc:known", Arrival::FirstCommit { created: false }), Admit);
-        assert_eq!(hooks.admit_account("young.example", "did:plc:known", Arrival::FirstCommit { created: true }), Defer);
+        assert_eq!(
+            hooks.admit_account("young.example", "did:plc:known", Arrival::FirstCommit { created: false }),
+            Admit
+        );
+        assert_eq!(
+            hooks.admit_account("young.example", "did:plc:known", Arrival::FirstCommit { created: true }),
+            Defer
+        );
         assert_eq!(hooks.accounts("young.example"), Some(100));
         // an hourly limit holds an hour's allowance, not one second's
         edit_policy(&hooks, |p| p.tiers.default.new_accounts_per_hour = 50).await;
@@ -785,13 +800,16 @@ mod tests {
             pds: format!("https://{host}"),
             fetches: Default::default(),
         });
-        let identity = Arc::new(IdentityCache::new(fetch.clone(), Options {
-            lookups_per_sec: 1e9,
-            burst: 1e9,
-            // short, so lookups over the cluster budget take the paced retry
-            max_budget_wait: Duration::from_millis(20),
-            ..Options::default()
-        }));
+        let identity = Arc::new(IdentityCache::new(
+            fetch.clone(),
+            Options {
+                lookups_per_sec: 1e9,
+                burst: 1e9,
+                // short, so lookups over the cluster budget take the paced retry
+                max_budget_wait: Duration::from_millis(20),
+                ..Options::default()
+            },
+        ));
         let store = Store::memory(None);
         let layout = vlpds::slots::Layout::uniform(4).shards;
         let state = Arc::new(StateStore::new(
@@ -854,7 +872,12 @@ mod tests {
                     assert!(!v.created && v.prev_data.is_some());
                     let h = Host(host.into());
                     let r = state
-                        .apply(state::Incoming { did, host: &h, now: state::now_secs(), kind: state::EventKind::Commit(v) })
+                        .apply(state::Incoming {
+                            did,
+                            host: &h,
+                            now: state::now_secs(),
+                            kind: state::EventKind::Commit(v),
+                        })
                         .await;
                     out.push(r);
                 }

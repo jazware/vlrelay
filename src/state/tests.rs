@@ -98,7 +98,13 @@ async fn db_record(st: &StateStore, did: &str) -> Option<Record> {
 
 #[test]
 fn did_keys_round_trip() {
-    for did in [plc(1), plc(2), "did:web:example.com".into(), "did:plc:short".into(), "did:plc:ABCDEFGHIJKLMNOPQRSTUVWX".into()] {
+    for did in [
+        plc(1),
+        plc(2),
+        "did:web:example.com".into(),
+        "did:plc:short".into(),
+        "did:plc:ABCDEFGHIJKLMNOPQRSTUVWX".into(),
+    ] {
         let k = record::did_key(&did);
         assert_eq!(record::did_from_key(&k).as_deref(), Some(did.as_str()), "{did}");
     }
@@ -239,13 +245,8 @@ async fn new_did_from_wrong_host_tries_fresh_and_creates_nothing() {
 }
 
 async fn account(st: &StateStore, did: &str, h: &Host, active: bool, status: Option<&str>) -> Result<Applied, Reject> {
-    st.apply(Incoming {
-        did,
-        host: h,
-        now: NOW,
-        kind: EventKind::Account { active, status: status.map(String::from) },
-    })
-    .await
+    st.apply(Incoming { did, host: h, now: NOW, kind: EventKind::Account { active, status: status.map(String::from) } })
+        .await
 }
 
 #[tokio::test]
@@ -282,7 +283,10 @@ async fn inactive_accounts_drop_commits() {
     // a relay takedown outlives upstream "active"
     assert_eq!(st.set_relay_takedown(&did, true).await.unwrap(), Some(AccountStatus::Takendown));
     account(&st, &did, &h, true, None).await.unwrap();
-    assert!(matches!(commit(&st, &did, &h, claim(&did, 4), NOW).await, Err(Reject::Inactive(AccountStatus::Takendown))));
+    assert!(matches!(
+        commit(&st, &did, &h, claim(&did, 4), NOW).await,
+        Err(Reject::Inactive(AccountStatus::Takendown))
+    ));
     st.set_relay_takedown(&did, false).await.unwrap();
     commit(&st, &did, &h, claim(&did, 4), NOW).await.unwrap();
 }
@@ -311,7 +315,12 @@ async fn broken_chain_desyncs_until_sync() {
     // #sync resets the chain
     let c = claim(&did, 4);
     let a = st
-        .apply(Incoming { did: &did, host: &h, now: NOW, kind: EventKind::Sync { rev: c.rev, commit: c.commit, data: c.data } })
+        .apply(Incoming {
+            did: &did,
+            host: &h,
+            now: NOW,
+            kind: EventKind::Sync { rev: c.rev, commit: c.commit, data: c.data },
+        })
         .await
         .unwrap();
     let Applied::Append(acc) = a else { panic!() };
@@ -421,7 +430,12 @@ struct VecSource(Vec<(u64, Vec<StateDelta>)>);
 
 #[async_trait::async_trait]
 impl ReplaySource for VecSource {
-    async fn tail(&self, _log: &str, _shard: ShardId, after: Option<u64>) -> anyhow::Result<Vec<(u64, Vec<StateDelta>)>> {
+    async fn tail(
+        &self,
+        _log: &str,
+        _shard: ShardId,
+        after: Option<u64>,
+    ) -> anyhow::Result<Vec<(u64, Vec<StateDelta>)>> {
         Ok(self.0.iter().filter(|(o, _)| after.is_none_or(|a| *o > a)).cloned().collect())
     }
 }
@@ -449,7 +463,8 @@ async fn replay_rebuilds_state_idempotently() {
     let store = st.store.clone();
     let id0 = st.shards()[0].id;
     st.close_shard(id0).await.unwrap();
-    let st2 = Arc::new(StateStore::new(store, Layout::uniform(1).shards, StubChain, id.clone(), ApplyConfig::default()));
+    let st2 =
+        Arc::new(StateStore::new(store, Layout::uniform(1).shards, StubChain, id.clone(), ApplyConfig::default()));
     st2.open_shard(id0, None).await.unwrap();
     let src = VecSource(log.clone());
     assert_eq!(st2.recover(id0, "node-a", &src, NOW).await.unwrap(), 10 * 3 + 1);
@@ -726,14 +741,17 @@ async fn only_a_repos_first_commit_is_a_creation() {
         commit(&st, d, &h, claim(d, n), NOW).await.unwrap();
     }
     use Arrival::*;
-    assert_eq!(*gate.0.lock(), vec![
-        (dids[0].clone(), FirstSeen),
-        (dids[1].clone(), Created),
-        (dids[2].clone(), FirstSeen),
-        (dids[2].clone(), FirstCommit { created: true }),
-        (dids[3].clone(), FirstSeen),
-        (dids[3].clone(), FirstCommit { created: false }),
-    ]);
+    assert_eq!(
+        *gate.0.lock(),
+        vec![
+            (dids[0].clone(), FirstSeen),
+            (dids[1].clone(), Created),
+            (dids[2].clone(), FirstSeen),
+            (dids[2].clone(), FirstCommit { created: true }),
+            (dids[3].clone(), FirstSeen),
+            (dids[3].clone(), FirstCommit { created: false }),
+        ]
+    );
 }
 
 /// No lookup budget left for the host: fresh fetches its events ask for

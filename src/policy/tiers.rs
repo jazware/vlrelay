@@ -52,20 +52,14 @@ pub const ACTIONS_KEPT: usize = 20;
 const EXTRA_KEY: &str = "policy";
 
 pub fn host_policy(rec: &HostRecord) -> HostPolicy {
-    rec.extra
-        .get(EXTRA_KEY)
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default()
+    rec.extra.get(EXTRA_KEY).and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default()
 }
 
 pub fn set_host_policy(rec: &mut HostRecord, p: &HostPolicy) {
     if *p == HostPolicy::default() {
         rec.extra.remove(EXTRA_KEY);
     } else {
-        rec.extra.insert(
-            EXTRA_KEY.into(),
-            serde_json::to_value(p).expect("serializable"),
-        );
+        rec.extra.insert(EXTRA_KEY.into(), serde_json::to_value(p).expect("serializable"));
     }
 }
 
@@ -97,31 +91,16 @@ pub fn error_trip(obs: &Obs, p: &PolicyBody) -> Option<String> {
     }
     let ratio = obs.failed as f64 / total as f64;
     (ratio >= t.error_ratio).then(|| {
-        format!(
-            "{:.0}% of {total} frames failed checks (budget {:.0}%)",
-            ratio * 100.0,
-            t.error_ratio * 100.0
-        )
+        format!("{:.0}% of {total} frames failed checks (budget {:.0}%)", ratio * 100.0, t.error_ratio * 100.0)
     })
 }
 
 /// One host, one step. None: nothing to write.
-pub fn step(
-    tier: Tier,
-    first_seen: u32,
-    st: &HostPolicy,
-    obs: &Obs,
-    p: &PolicyBody,
-    now: u32,
-) -> Option<Change> {
+pub fn step(tier: Tier, first_seen: u32, st: &HostPolicy, obs: &Obs, p: &PolicyBody, now: u32) -> Option<Change> {
     if matches!(tier, Tier::Suspended | Tier::Banned) {
         return None;
     }
-    let trip = obs
-        .spam_trip
-        .as_ref()
-        .map(|r| format!("spam threshold {r}"))
-        .or_else(|| error_trip(obs, p));
+    let trip = obs.spam_trip.as_ref().map(|r| format!("spam threshold {r}")).or_else(|| error_trip(obs, p));
     if let Some(why) = trip {
         let mut s = st.clone();
         s.last_trip = Some(now);
@@ -131,23 +110,12 @@ pub fn step(
             s.restore_tier = Some(tier);
             s.throttled_at = Some(now);
             s.reason = Some(format!("auto-throttled from {}: {why}", tier_name(tier)));
-            return Some(Change {
-                tier: Tier::Throttled,
-                reason: s.reason.clone(),
-                state: s,
-            });
+            return Some(Change { tier: Tier::Throttled, reason: s.reason.clone(), state: s });
         }
         // Already throttled (the quiet period restarts) or exempt.
-        return Some(Change {
-            tier,
-            state: s,
-            reason: None,
-        });
+        return Some(Change { tier, state: s, reason: None });
     }
-    let quiet_for = |secs: u64| {
-        st.last_trip
-            .is_none_or(|t| now.saturating_sub(t) as u64 >= secs)
-    };
+    let quiet_for = |secs: u64| st.last_trip.is_none_or(|t| now.saturating_sub(t) as u64 >= secs);
     if tier == Tier::Throttled {
         if let Some(back) = st.restore_tier
             && quiet_for(p.transitions.recover_after_secs as u64)
@@ -160,11 +128,7 @@ pub fn step(
                 tier_name(back),
                 p.transitions.recover_after_secs
             ));
-            return Some(Change {
-                tier: back,
-                reason: s.reason.clone(),
-                state: s,
-            });
+            return Some(Change { tier: back, reason: s.reason.clone(), state: s });
         }
         return None;
     }
@@ -172,15 +136,8 @@ pub fn step(
         let days = p.transitions.promote_after_days as u64 * 86_400;
         if now.saturating_sub(first_seen) as u64 >= days && quiet_for(days) {
             let mut s = st.clone();
-            s.reason = Some(format!(
-                "promoted to default after {} clean days",
-                p.transitions.promote_after_days
-            ));
-            return Some(Change {
-                tier: Tier::Default,
-                reason: s.reason.clone(),
-                state: s,
-            });
+            s.reason = Some(format!("promoted to default after {} clean days", p.transitions.promote_after_days));
+            return Some(Change { tier: Tier::Default, reason: s.reason.clone(), state: s });
         }
     }
     None
@@ -224,11 +181,7 @@ pub fn apply_manual(rec: &mut HostRecord, m: &Manual, now: u32) -> Result<(), St
         }
         Manual::AccountLimit(n) => s.max_accounts = *n,
         Manual::Suspend(why) | Manual::Ban(why) => {
-            let to = if matches!(m, Manual::Ban(_)) {
-                Tier::Banned
-            } else {
-                Tier::Suspended
-            };
+            let to = if matches!(m, Manual::Ban(_)) { Tier::Banned } else { Tier::Suspended };
             if !matches!(rec.tier, Tier::Suspended | Tier::Banned) {
                 s.restore_tier = Some(match (rec.tier, s.restore_tier) {
                     (Tier::Throttled, Some(r)) => r,
@@ -240,18 +193,11 @@ pub fn apply_manual(rec: &mut HostRecord, m: &Manual, now: u32) -> Result<(), St
         }
         Manual::Unban => {
             if !matches!(rec.tier, Tier::Suspended | Tier::Banned) {
-                return Err(format!(
-                    "{} is {}, not suspended or banned",
-                    rec.hostname,
-                    tier_name(rec.tier)
-                ));
+                return Err(format!("{} is {}, not suspended or banned", rec.hostname, tier_name(rec.tier)));
             }
             rec.tier = s.restore_tier.take().unwrap_or(Tier::Default);
             s.throttled_at = None;
-            s.reason = Some(format!(
-                "restored to {} by an operator",
-                tier_name(rec.tier)
-            ));
+            s.reason = Some(format!("restored to {} by an operator", tier_name(rec.tier)));
         }
     }
     set_host_policy(rec, &s);

@@ -141,7 +141,9 @@ async fn get_latest_commit(State(src): State<Src>, Query(p): Params) -> XResult 
     let did = did_param(&p)?;
     let rec = src.repo(did).await.map_err(store_err)?.ok_or_else(|| repo_not_found(did))?;
     match rec.status() {
-        AccountStatus::Takendown => return Err(XrpcError::bad("RepoTakendown", format!("repo has been taken down: {did}"))),
+        AccountStatus::Takendown => {
+            return Err(XrpcError::bad("RepoTakendown", format!("repo has been taken down: {did}")));
+        }
         AccountStatus::Suspended => return Err(XrpcError::bad("RepoSuspended", format!("repo is suspended: {did}"))),
         AccountStatus::Deactivated => {
             return Err(XrpcError::bad("RepoDeactivated", format!("repo has been deactivated: {did}")));
@@ -189,7 +191,7 @@ async fn get_host_status(State(src): State<Src>, Query(p): Params) -> XResult {
 mod tests {
     use super::*;
     use crate::state::tests::{MapIdentity, claim, open, plc};
-    use crate::state::{ApplyConfig, Applied, EventKind, HostRecord, Incoming, Tier};
+    use crate::state::{Applied, ApplyConfig, EventKind, HostRecord, Incoming, Tier};
     use crate::types::Host;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};

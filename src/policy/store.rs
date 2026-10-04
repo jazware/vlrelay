@@ -10,9 +10,7 @@
 //! it can only grow. The stored object repeats its own audit entry, and the
 //! next save writes it if the first attempt was lost to a crash.
 
-use object_store::{
-    GetOptions, ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion, path::Path,
-};
+use object_store::{GetOptions, ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion, path::Path};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
 use vlpds::store::Store;
@@ -61,9 +59,7 @@ pub struct AuditEntry {
 pub enum SaveError {
     #[error("invalid: {}", .0.join("; "))]
     Invalid(Vec<String>),
-    #[error(
-        "changed since version {expected} (now version {current}): reload and reapply your edit"
-    )]
+    #[error("changed since version {expected} (now version {current}): reload and reapply your edit")]
     Conflict { expected: u64, current: u64 },
     #[error("nothing changed")]
     NoChange,
@@ -92,49 +88,31 @@ pub struct Versioned {
     audit: String,
 }
 
-pub(crate) async fn bounded<T>(
-    f: impl Future<Output = object_store::Result<T>>,
-) -> object_store::Result<T> {
+pub(crate) async fn bounded<T>(f: impl Future<Output = object_store::Result<T>>) -> object_store::Result<T> {
     match tokio::time::timeout(CALL_DEADLINE, f).await {
         Ok(r) => r,
-        Err(_) => Err(object_store::Error::Generic {
-            store: "policy",
-            source: "object store call timed out".into(),
-        }),
+        Err(_) => Err(object_store::Error::Generic { store: "policy", source: "object store call timed out".into() }),
     }
 }
 
 pub(crate) fn is_conflict(e: &object_store::Error) -> bool {
-    matches!(
-        e,
-        object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. }
-    )
+    matches!(e, object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. })
 }
 
 pub(crate) fn if_match(etag: Option<String>) -> PutMode {
     match etag {
-        Some(e) => PutMode::Update(UpdateVersion {
-            e_tag: Some(e),
-            version: None,
-        }),
+        Some(e) => PutMode::Update(UpdateVersion { e_tag: Some(e), version: None }),
         None => PutMode::Create,
     }
 }
 
 pub(crate) fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 /// `{prefix}/{rel}`.
 pub(crate) fn path(store: &Store, rel: &str) -> Path {
-    if store.prefix.is_empty() {
-        Path::from(rel)
-    } else {
-        Path::from(format!("{}/{rel}", store.prefix))
-    }
+    if store.prefix.is_empty() { Path::from(rel) } else { Path::from(format!("{}/{rel}", store.prefix)) }
 }
 
 /// GET with an optional If-None-Match. None when absent.
@@ -144,16 +122,7 @@ pub(crate) async fn get(
     etag: Option<String>,
 ) -> object_store::Result<Option<(bytes::Bytes, Option<String>)>> {
     let got = bounded(async {
-        let r = store
-            .raw
-            .get_opts(
-                p,
-                GetOptions {
-                    if_none_match: etag,
-                    ..Default::default()
-                },
-            )
-            .await?;
+        let r = store.raw.get_opts(p, GetOptions { if_none_match: etag, ..Default::default() }).await?;
         let e = r.meta.e_tag.clone();
         Ok((r.bytes().await?, e))
     })
@@ -165,21 +134,8 @@ pub(crate) async fn get(
     }
 }
 
-pub(crate) async fn put(
-    store: &Store,
-    p: &Path,
-    body: Vec<u8>,
-    mode: PutMode,
-) -> object_store::Result<Option<String>> {
-    let r = bounded(store.raw.put_opts(
-        p,
-        PutPayload::from(body),
-        PutOptions {
-            mode,
-            ..Default::default()
-        },
-    ))
-    .await?;
+pub(crate) async fn put(store: &Store, p: &Path, body: Vec<u8>, mode: PutMode) -> object_store::Result<Option<String>> {
+    let r = bounded(store.raw.put_opts(p, PutPayload::from(body), PutOptions { mode, ..Default::default() })).await?;
     Ok(r.e_tag)
 }
 
@@ -198,10 +154,7 @@ impl Versioned {
         Path::from(format!("{}/{version:020}.json", self.audit))
     }
 
-    pub async fn fetch<T: DeserializeOwned>(
-        &self,
-        etag: Option<String>,
-    ) -> object_store::Result<Fetched<T>> {
+    pub async fn fetch<T: DeserializeOwned>(&self, etag: Option<String>) -> object_store::Result<Fetched<T>> {
         let got = match get(&self.store, &self.path, etag).await {
             Ok(g) => g,
             Err(object_store::Error::NotModified { .. }) => return Ok(Fetched::NotModified),
@@ -213,9 +166,7 @@ impl Versioned {
         Ok(match serde_json::from_slice::<Stored<T>>(&bytes) {
             Ok(doc) => Fetched::Got { doc, etag },
             Err(e) => Fetched::Invalid {
-                version: serde_json::from_slice::<serde_json::Value>(&bytes)
-                    .ok()
-                    .and_then(|v| v["version"].as_u64()),
+                version: serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| v["version"].as_u64()),
                 message: e.to_string(),
                 etag,
             },
@@ -234,9 +185,7 @@ impl Versioned {
     ) -> Result<Stored<T>, SaveError> {
         validate(&body).map_err(SaveError::Invalid)?;
         if note.chars().count() > 280 {
-            return Err(SaveError::Invalid(vec![
-                "note: longer than 280 characters".into(),
-            ]));
+            return Err(SaveError::Invalid(vec!["note: longer than 280 characters".into()]));
         }
         let st = |e: object_store::Error| SaveError::Store(e.to_string());
         let cur = get(&self.store, &self.path, None).await.map_err(st)?;
@@ -251,23 +200,17 @@ impl Versioned {
             }
         };
         if cur_version != base_version {
-            return Err(SaveError::Conflict {
-                expected: base_version,
-                current: cur_version,
-            });
+            return Err(SaveError::Conflict { expected: base_version, current: cur_version });
         }
-        if let Some(prev) = cur_raw
-            .as_ref()
-            .and_then(|v| serde_json::from_value::<Stored<serde_json::Value>>(v.clone()).ok())
+        if let Some(prev) =
+            cur_raw.as_ref().and_then(|v| serde_json::from_value::<Stored<serde_json::Value>>(v.clone()).ok())
         {
             self.write_audit(&prev).await;
         }
         // The first save is diffed against the defaults every node ran on.
         let old_body = match &cur_raw {
             Some(v) => v["body"].clone(),
-            None => {
-                serde_json::to_value(T::default()).map_err(|e| SaveError::Store(e.to_string()))?
-            }
+            None => serde_json::to_value(T::default()).map_err(|e| SaveError::Store(e.to_string()))?,
         };
         let new_body = serde_json::to_value(&body).map_err(|e| SaveError::Store(e.to_string()))?;
         let changes = crate::admin::diff_json(&old_body, &new_body);
@@ -286,10 +229,7 @@ impl Versioned {
         match put(&self.store, &self.path, bytes, if_match(etag)).await {
             Ok(_) => {}
             Err(e) if is_conflict(&e) || matches!(e, object_store::Error::NotFound { .. }) => {
-                return Err(SaveError::Conflict {
-                    expected: base_version,
-                    current: base_version + 1,
-                });
+                return Err(SaveError::Conflict { expected: base_version, current: base_version + 1 });
             }
             Err(e) => return Err(st(e)),
         }
@@ -317,21 +257,11 @@ impl Versioned {
             changes: d.changes.clone(),
         };
         let body = serde_json::to_vec(&e).expect("serializable");
-        match put(
-            &self.store,
-            &self.audit_path(d.version),
-            body,
-            PutMode::Create,
-        )
-        .await
-        {
+        match put(&self.store, &self.audit_path(d.version), body, PutMode::Create).await {
             Ok(_) => {}
             Err(e) if is_conflict(&e) => {}
             Err(e) => {
-                tracing::warn!(
-                    version = d.version,
-                    "audit entry not written (the next save retries): {e}"
-                )
+                tracing::warn!(version = d.version, "audit entry not written (the next save retries): {e}")
             }
         }
     }

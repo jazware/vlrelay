@@ -65,14 +65,10 @@ pub fn validate(rs: &RuleSet) -> Result<(), Vec<String>> {
             errs.push(format!("rule {}: id isn't below nextId", r.id));
         }
         match &r.effect {
-            RuleEffect::Tier { tier } if matches!(tier, Tier::Suspended | Tier::Banned) => errs
-                .push(format!(
-                    "rule {}: use a ban rule instead of tier {tier:?}",
-                    r.id
-                )),
-            RuleEffect::Throttle { events_per_sec }
-                if !(events_per_sec.is_finite() && *events_per_sec >= 0.0) =>
-            {
+            RuleEffect::Tier { tier } if matches!(tier, Tier::Suspended | Tier::Banned) => {
+                errs.push(format!("rule {}: use a ban rule instead of tier {tier:?}", r.id))
+            }
+            RuleEffect::Throttle { events_per_sec } if !(events_per_sec.is_finite() && *events_per_sec >= 0.0) => {
                 errs.push(format!("rule {}: throttle must be ≥ 0 events/s", r.id))
             }
             _ => {}
@@ -156,11 +152,7 @@ pub fn parse_hostname(input: &str) -> Result<ParsedHost, HostnameError> {
             other => return Err(HostnameError::Scheme(other.to_string())),
         },
     };
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default().to_ascii_lowercase();
     let (name, port) = match authority.rsplit_once(':') {
         Some((n, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (n, Some(p)),
         Some(_) => return Err(HostnameError::Syntax(authority.clone())),
@@ -180,10 +172,7 @@ pub fn parse_hostname(input: &str) -> Result<ParsedHost, HostnameError> {
     if !valid_labels(name) {
         return Err(HostnameError::Syntax(name.to_string()));
     }
-    Ok(ParsedHost {
-        hostname: name.to_string(),
-        insecure,
-    })
+    Ok(ParsedHost { hostname: name.to_string(), insecure })
 }
 
 /// Rules indexed by name, so a lookup costs one hash probe per label of the
@@ -197,11 +186,7 @@ pub struct Compiled {
 
 impl Compiled {
     pub fn new(set: RuleSet) -> Compiled {
-        let mut c = Compiled {
-            exact: HashMap::new(),
-            wildcard: HashMap::new(),
-            set,
-        };
+        let mut c = Compiled { exact: HashMap::new(), wildcard: HashMap::new(), set };
         for (i, r) in c.set.rules.iter().enumerate() {
             match r.pattern.strip_prefix("*.") {
                 Some(base) => c.wildcard.insert(base.to_string(), i),

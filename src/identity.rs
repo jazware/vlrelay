@@ -44,17 +44,11 @@ impl Identity {
         let handle = doc
             .get("alsoKnownAs")
             .and_then(J::as_array)
-            .and_then(|a| {
-                a.iter()
-                    .filter_map(J::as_str)
-                    .find_map(|s| s.strip_prefix("at://"))
-            })
+            .and_then(|a| a.iter().filter_map(J::as_str).find_map(|s| s.strip_prefix("at://")))
             .map(String::from);
         Ok(Identity {
             did: did.to_string(),
-            signing_key: mb
-                .as_deref()
-                .and_then(|m| SigningKey::from_multibase(m).ok()),
+            signing_key: mb.as_deref().and_then(|m| SigningKey::from_multibase(m).ok()),
             signing_key_multibase: mb,
             pds_host: pds.as_deref().and_then(normalize_host),
             pds,
@@ -71,11 +65,7 @@ impl Identity {
 /// trailing dot, and the port only when it isn't the scheme's default.
 pub fn normalize_host(s: &str) -> Option<Host> {
     let s = s.trim();
-    let url = if s.contains("://") {
-        reqwest::Url::parse(s)
-    } else {
-        reqwest::Url::parse(&format!("https://{s}"))
-    };
+    let url = if s.contains("://") { reqwest::Url::parse(s) } else { reqwest::Url::parse(&format!("https://{s}")) };
     let url = url.ok()?;
     if !matches!(url.scheme(), "http" | "https") {
         return None;
@@ -132,10 +122,7 @@ pub struct HttpFetch {
 
 impl HttpFetch {
     pub fn new(plc_url: &str, allow_insecure: bool) -> HttpFetch {
-        HttpFetch {
-            plc_url: plc_url.trim_end_matches('/').to_string(),
-            allow_insecure,
-        }
+        HttpFetch { plc_url: plc_url.trim_end_matches('/').to_string(), allow_insecure }
     }
 
     fn request(&self, did: &str) -> Result<reqwest::RequestBuilder, LookupError> {
@@ -151,20 +138,12 @@ impl HttpFetch {
             return Err(LookupError::BadDid);
         }
         let host = rest.replace("%3A", ":").replace("%3a", ":");
-        if !host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b':')
-        {
+        if !host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b':') {
             return Err(LookupError::BadDid);
         }
         let plain = host.split(':').next() == Some("localhost");
-        let url = format!(
-            "{}://{host}/.well-known/did.json",
-            if plain { "http" } else { "https" }
-        );
-        vlpds::http::guarded(self.allow_insecure)
-            .get(&url)
-            .map_err(LookupError::Failed)
+        let url = format!("{}://{host}/.well-known/did.json", if plain { "http" } else { "https" });
+        vlpds::http::guarded(self.allow_insecure).get(&url).map_err(LookupError::Failed)
     }
 }
 
@@ -194,12 +173,9 @@ impl Fetch for HttpFetch {
                 }
                 buf.extend_from_slice(&chunk);
             }
-            serde_json::from_slice(&buf)
-                .map_err(|e| LookupError::Failed(format!("invalid JSON: {e}")))
+            serde_json::from_slice(&buf).map_err(|e| LookupError::Failed(format!("invalid JSON: {e}")))
         };
-        tokio::time::timeout(FETCH_TIMEOUT, fut)
-            .await
-            .map_err(|_| LookupError::Failed("timed out".into()))?
+        tokio::time::timeout(FETCH_TIMEOUT, fut).await.map_err(|_| LookupError::Failed("timed out".into()))?
     }
 }
 
@@ -296,10 +272,7 @@ impl<F: Fetch> IdentityCache<F> {
     pub fn new(fetcher: F, opts: Options) -> IdentityCache<F> {
         IdentityCache {
             fetcher,
-            budget: Mutex::new(Bucket {
-                tokens: opts.burst,
-                at: Instant::now(),
-            }),
+            budget: Mutex::new(Bucket { tokens: opts.burst, at: Instant::now() }),
             opts,
             entries: Default::default(),
             swept: Mutex::new(Instant::now()),
@@ -350,21 +323,13 @@ impl<F: Fetch> IdentityCache<F> {
     pub fn cached(&self, did: &str) -> Option<Outcome> {
         let e = self.entries.lock();
         let e = e.get(did)?;
-        let ttl = if e.v.is_ok() {
-            self.opts.ttl
-        } else {
-            self.opts.negative_ttl
-        };
+        let ttl = if e.v.is_ok() { self.opts.ttl } else { self.opts.negative_ttl };
         (e.at.elapsed() < ttl).then(|| e.v.clone())
     }
 
     pub async fn resolve(&self, did: &str) -> Outcome {
         if let Some(v) = self.cached(did) {
-            let c = if v.is_ok() {
-                &self.stats.hits
-            } else {
-                &self.stats.negative_hits
-            };
+            let c = if v.is_ok() { &self.stats.hits } else { &self.stats.negative_hits };
             c.fetch_add(1, Ordering::Relaxed);
             return v;
         }
@@ -383,11 +348,7 @@ impl<F: Fetch> IdentityCache<F> {
     /// lane and, through it, its host's socket, where failing would drop it.
     pub async fn lookup_paced(&self, did: &str, fresh: bool) -> Outcome {
         loop {
-            let r = if fresh {
-                self.refresh(did).await
-            } else {
-                self.resolve(did).await
-            };
+            let r = if fresh { self.refresh(did).await } else { self.resolve(did).await };
             match r {
                 Err(LookupError::OverBudget) => tokio::time::sleep(OVER_BUDGET_RETRY).await,
                 r => return r,
@@ -507,9 +468,8 @@ impl<F: Fetch> IdentityCache<F> {
         let wait = {
             let mut b = self.budget.lock();
             let now = Instant::now();
-            b.tokens = (b.tokens
-                + now.duration_since(b.at).as_secs_f64() * self.opts.lookups_per_sec)
-                .min(self.opts.burst);
+            b.tokens =
+                (b.tokens + now.duration_since(b.at).as_secs_f64() * self.opts.lookups_per_sec).min(self.opts.burst);
             b.at = now;
             let wait = if b.tokens >= 1.0 {
                 Duration::ZERO

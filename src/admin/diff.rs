@@ -16,11 +16,7 @@ fn walk(path: &str, a: &Value, b: &Value, out: &mut Vec<String>) {
             keys.sort();
             keys.dedup();
             for k in keys {
-                let p = if path.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{path}.{k}")
-                };
+                let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
                 match (x.get(k), y.get(k)) {
                     (Some(av), Some(bv)) => walk(&p, av, bv, out),
                     (Some(av), None) => out.push(format!("{p}: {} → —", short(av))),
@@ -36,11 +32,7 @@ fn walk(path: &str, a: &Value, b: &Value, out: &mut Vec<String>) {
 
 fn short(v: &Value) -> String {
     let s = v.to_string();
-    if s.chars().count() > 80 {
-        format!("{}…", s.chars().take(80).collect::<String>())
-    } else {
-        s
-    }
+    if s.chars().count() > 80 { format!("{}…", s.chars().take(80).collect::<String>()) } else { s }
 }
 
 #[cfg(test)]
@@ -52,13 +44,7 @@ mod tests {
     fn leaves() {
         let a = json!({"tiers": {"a": {"x": 1, "y": 2}}, "d": "a"});
         let b = json!({"tiers": {"a": {"x": 3, "y": 2}, "b": {"x": 1}}, "d": "a"});
-        assert_eq!(
-            diff_json(&a, &b),
-            vec![
-                "tiers.a.x: 1 → 3".to_string(),
-                "tiers.b: — → {\"x\":1}".to_string()
-            ]
-        );
+        assert_eq!(diff_json(&a, &b), vec!["tiers.a.x: 1 → 3".to_string(), "tiers.b: — → {\"x\":1}".to_string()]);
         assert!(diff_json(&a, &a).is_empty());
     }
 }

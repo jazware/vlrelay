@@ -11,8 +11,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use shrike::sync::RawSyncEvent;
 use shrike::sync::invert::{
-    check_op_cids, decode_commit_car, decode_sync_commit, find_duplicate_path,
-    invert_decoded_commit,
+    check_op_cids, decode_commit_car, decode_sync_commit, find_duplicate_path, invert_decoded_commit,
 };
 
 fn shrike_verdict(frame: &[u8], did_key: &str) -> Result<(), String> {
@@ -32,8 +31,7 @@ fn shrike_verdict(frame: &[u8], did_key: &str) -> Result<(), String> {
             d.inner.verify(key.as_ref()).map_err(|e| e.to_string())?;
             check_op_cids(&raw, d.inner.data, &d.store).map_err(|e| e.to_string())?;
             if let Some(pd) = raw.prev_data {
-                let inv =
-                    invert_decoded_commit(&raw, &d.inner, &d.store).map_err(|e| e.to_string())?;
+                let inv = invert_decoded_commit(&raw, &d.inner, &d.store).map_err(|e| e.to_string())?;
                 if inv != pd {
                     return Err("inversion mismatch".into());
                 }
@@ -41,8 +39,7 @@ fn shrike_verdict(frame: &[u8], did_key: &str) -> Result<(), String> {
             Ok(())
         }
         RawSyncEvent::Sync(raw) => {
-            let c =
-                decode_sync_commit(&raw.did, &raw.rev, &raw.blocks).map_err(|e| e.to_string())?;
+            let c = decode_sync_commit(&raw.did, &raw.rev, &raw.blocks).map_err(|e| e.to_string())?;
             if c.did != raw.did || c.rev.to_string() != raw.rev || c.version != 3 {
                 return Err("field mismatch".into());
             }
@@ -55,10 +52,7 @@ fn shrike_verdict(frame: &[u8], did_key: &str) -> Result<(), String> {
 /// Shrike doesn't require record blocks (it counts them), so neither do we here.
 fn our_verdict(frame: &Bytes, did_key: &str) -> Result<(), String> {
     let key = SigningKey::from_did_key(did_key).map_err(|e| e.to_string())?;
-    let opts = Options {
-        require_record_blocks: false,
-        ..Options::default()
-    };
+    let opts = Options { require_record_blocks: false, ..Options::default() };
     match parse(frame.clone(), &Limits::default()).map_err(|e| e.reason().to_string())? {
         Event::Commit(c) => verify_commit_with(&c, &key, &opts).map(drop),
         Event::Sync(s) => verify_sync_with(&s, &key, &opts).map(drop),
@@ -180,17 +174,10 @@ fn compare(name: &str, frame: &Bytes, did_key: &str, diffs: &mut Vec<String>) ->
 fn synthetic_commits_and_mutations_agree() {
     let mut diffs = Vec::new();
     let (mut accepted, mut rejected) = (0, 0);
-    for (curve, seed, initial) in [
-        (Curve::K256, 1, 0usize),
-        (Curve::K256, 2, 40),
-        (Curve::P256, 3, 300),
-        (Curve::K256, 4, 2000),
-    ] {
-        let mut r = Repo::new(
-            "did:plc:diffdiffdiffdiffdiff",
-            Signer::new(curve, seed),
-            initial,
-        );
+    for (curve, seed, initial) in
+        [(Curve::K256, 1, 0usize), (Curve::K256, 2, 40), (Curve::P256, 3, 300), (Curve::K256, 4, 2000)]
+    {
+        let mut r = Repo::new("did:plc:diffdiffdiffdiffdiff", Signer::new(curve, seed), initial);
         let dk = format!("did:key:{}", r.signer.multibase());
         for round in 0..8 {
             let ops = if round == 7 && initial > 0 {
@@ -200,12 +187,7 @@ fn synthetic_commits_and_mutations_agree() {
             };
             let c = commit_of(&r.commit(&ops));
             for (name, f) in mutations(&c) {
-                if compare(
-                    &format!("{curve:?}/{initial}/{round}/{name}"),
-                    &f,
-                    &dk,
-                    &mut diffs,
-                ) {
+                if compare(&format!("{curve:?}/{initial}/{round}/{name}"), &f, &dk, &mut diffs) {
                     accepted += 1;
                 } else {
                     rejected += 1;
@@ -220,36 +202,19 @@ fn synthetic_commits_and_mutations_agree() {
         unexplained.is_empty(),
         "{} disagreements:\n{}",
         unexplained.len(),
-        unexplained
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
+        unexplained.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n")
     );
-    assert!(
-        accepted > 30 && rejected > 300,
-        "accepted {accepted}, rejected {rejected}"
-    );
+    assert!(accepted > 30 && rejected > 300, "accepted {accepted}, rejected {rejected}");
 }
 
 #[test]
 fn real_commits_and_mutations_agree() {
     let keys: HashMap<String, String> = {
-        let p = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/testdata/firehose_commit_keys.json"
-        );
+        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/firehose_commit_keys.json");
         let j: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
-        j.as_object()
-            .unwrap()
-            .iter()
-            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
-            .collect()
+        j.as_object().unwrap().iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()
     };
-    let dir = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../vlpds/testdata/shrike/firehose_commits"
-    );
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../vlpds/testdata/shrike/firehose_commits");
     let mut diffs = Vec::new();
     for e in std::fs::read_dir(dir).unwrap() {
         let p = e.unwrap().path();
@@ -262,22 +227,13 @@ fn real_commits_and_mutations_agree() {
             compare(&format!("{}: {name}", p.display()), &m, dk, &mut diffs);
         }
     }
-    assert!(
-        diffs.is_empty(),
-        "{} disagreements:\n{}",
-        diffs.len(),
-        diffs.join("\n")
-    );
+    assert!(diffs.is_empty(), "{} disagreements:\n{}", diffs.len(), diffs.join("\n"));
 }
 
 #[test]
 fn random_byte_flips_agree() {
     let mut rng = StdRng::seed_from_u64(0x5eed);
-    let mut r = Repo::new(
-        "did:plc:flipflipflipflipflip",
-        Signer::new(Curve::K256, 9),
-        100,
-    );
+    let mut r = Repo::new("did:plc:flipflipflipflipflip", Signer::new(Curve::K256, 9), 100);
     let dk = format!("did:key:{}", r.signer.multibase());
     let mut diffs = Vec::new();
     let mut n = 0;
@@ -300,11 +256,7 @@ fn random_byte_flips_agree() {
         unexplained.is_empty(),
         "{} of {n} flips disagree:\n{}",
         unexplained.len(),
-        unexplained
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
+        unexplained.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n")
     );
 }
 
@@ -316,8 +268,7 @@ fn random_byte_flips_agree() {
 /// don't ship (vlpds's `shrike_update_inversion_overfetch_pinned`).
 fn known_split(d: &str) -> bool {
     let shrike_only = d.contains("ours Ok(())")
-        && (d.contains("tooBig")
-            || (d.contains("inversion failed") && d.contains("block not found")));
+        && (d.contains("tooBig") || (d.contains("inversion failed") && d.contains("block not found")));
     shrike_only
         || d.contains("ours Err(\"bad_frame\")")
         || d.contains("ours Err(\"bad_header\")")
@@ -334,10 +285,9 @@ fn known_split(d: &str) -> bool {
 #[test]
 fn live_frames_agree() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/live");
-    let (Ok(frames), Ok(keys)) = (
-        std::fs::read(format!("{dir}/frames.bin")),
-        std::fs::read(format!("{dir}/keys.json")),
-    ) else {
+    let (Ok(frames), Ok(keys)) =
+        (std::fs::read(format!("{dir}/frames.bin")), std::fs::read(format!("{dir}/keys.json")))
+    else {
         eprintln!("no live frames in {dir}; skipping");
         return;
     };
@@ -368,14 +318,7 @@ fn live_frames_agree() {
         unexplained.is_empty(),
         "{} disagreements:\n{}",
         unexplained.len(),
-        unexplained
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
+        unexplained.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n")
     );
-    eprintln!(
-        "{n} live commits, {ok} accepted by both; {} known splits",
-        diffs.len()
-    );
+    eprintln!("{n} live commits, {ok} accepted by both; {} known splits", diffs.len());
 }

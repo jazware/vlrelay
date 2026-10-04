@@ -42,12 +42,8 @@ impl HostStore for MemHosts {
     }
     async fn list_hosts(&self, cursor: Option<&str>, limit: usize) -> anyhow::Result<HostPage> {
         let m = self.0.lock();
-        let hosts: Vec<HostRecord> = m
-            .values()
-            .filter(|r| cursor.is_none_or(|c| r.hostname.as_str() > c))
-            .take(limit)
-            .cloned()
-            .collect();
+        let hosts: Vec<HostRecord> =
+            m.values().filter(|r| cursor.is_none_or(|c| r.hostname.as_str() > c)).take(limit).cloned().collect();
         let cursor = (hosts.len() == limit).then(|| hosts.last().unwrap().hostname.clone());
         Ok(HostPage { hosts, cursor })
     }
@@ -77,28 +73,16 @@ fn new_hosts_are_promoted_after_clean_days() {
     assert_eq!(ch.tier, Tier::Default);
     assert!(ch.reason.unwrap().contains("7 clean days"));
     // a trip on day 5 holds promotion until day 12
-    let tripped = HostPolicy {
-        last_trip: Some(5 * DAY),
-        ..Default::default()
-    };
+    let tripped = HostPolicy { last_trip: Some(5 * DAY), ..Default::default() };
     assert_eq!(step(Tier::New, 0, &tripped, &quiet, &p, 8 * DAY), None);
-    assert_eq!(
-        step(Tier::New, 0, &tripped, &quiet, &p, 12 * DAY)
-            .unwrap()
-            .tier,
-        Tier::Default
-    );
+    assert_eq!(step(Tier::New, 0, &tripped, &quiet, &p, 12 * DAY).unwrap().tier, Tier::Default);
 }
 
 #[test]
 fn error_budget_throttles_and_quiet_recovers() {
     let p = p();
     let now = 100 * DAY;
-    let bad = Obs {
-        events: 100,
-        failed: 150,
-        spam_trip: None,
-    };
+    let bad = Obs { events: 100, failed: 150, spam_trip: None };
     let ch = step(Tier::Default, 0, &HostPolicy::default(), &bad, &p, now).unwrap();
     assert_eq!(ch.tier, Tier::Throttled);
     assert_eq!(ch.state.restore_tier, Some(Tier::Default));
@@ -107,25 +91,12 @@ fn error_budget_throttles_and_quiet_recovers() {
 
     // still bad while throttled: no tier change, quiet period restarts
     let again = step(Tier::Throttled, 0, &ch.state, &bad, &p, now + 600).unwrap();
-    assert_eq!(
-        (again.tier, again.reason.as_deref()),
-        (Tier::Throttled, None)
-    );
+    assert_eq!((again.tier, again.reason.as_deref()), (Tier::Throttled, None));
     assert_eq!(again.state.last_trip, Some(now + 600));
 
     let quiet = Obs::default();
     let rs = p.transitions.recover_after_secs;
-    assert_eq!(
-        step(
-            Tier::Throttled,
-            0,
-            &again.state,
-            &quiet,
-            &p,
-            now + 600 + rs - 1
-        ),
-        None
-    );
+    assert_eq!(step(Tier::Throttled, 0, &again.state, &quiet, &p, now + 600 + rs - 1), None);
     let back = step(Tier::Throttled, 0, &again.state, &quiet, &p, now + 600 + rs).unwrap();
     assert_eq!(back.tier, Tier::Default);
     assert_eq!(back.state.restore_tier, None);
@@ -136,20 +107,10 @@ fn error_budget_throttles_and_quiet_recovers() {
 fn small_hosts_and_exempt_tiers_are_not_auto_throttled() {
     let p = p();
     // under errorMinEvents: one bad commit from a tiny PDS
-    let tiny = Obs {
-        events: 1,
-        failed: 5,
-        spam_trip: None,
-    };
-    assert_eq!(
-        step(Tier::New, 0, &HostPolicy::default(), &tiny, &p, DAY),
-        None
-    );
+    let tiny = Obs { events: 1, failed: 5, spam_trip: None };
+    assert_eq!(step(Tier::New, 0, &HostPolicy::default(), &tiny, &p, DAY), None);
     // trusted records the trip but stays
-    let spam = Obs {
-        spam_trip: Some("new-accounts".into()),
-        ..Default::default()
-    };
+    let spam = Obs { spam_trip: Some("new-accounts".into()), ..Default::default() };
     let ch = step(Tier::Trusted, 0, &HostPolicy::default(), &spam, &p, DAY).unwrap();
     assert_eq!(ch.tier, Tier::Trusted);
     assert_eq!(ch.state.last_trip, Some(DAY));
@@ -160,10 +121,7 @@ fn small_hosts_and_exempt_tiers_are_not_auto_throttled() {
     // suspended and banned never move on their own
     for t in [Tier::Suspended, Tier::Banned] {
         assert_eq!(step(t, 0, &HostPolicy::default(), &spam, &p, DAY), None);
-        assert_eq!(
-            step(t, 0, &HostPolicy::default(), &Obs::default(), &p, 30 * DAY),
-            None
-        );
+        assert_eq!(step(t, 0, &HostPolicy::default(), &Obs::default(), &p, 30 * DAY), None);
     }
 }
 
@@ -180,18 +138,9 @@ fn operator_tiers_are_final_and_unban_restores() {
 
     // auto-throttled, then banned, then unbanned: back to the original tier
     let mut r = rec("pds.example.com", Tier::New, 0);
-    let ch = step(
-        r.tier,
-        0,
-        &HostPolicy::default(),
-        &Obs {
-            spam_trip: Some("x".into()),
-            ..Default::default()
-        },
-        &p,
-        DAY,
-    )
-    .unwrap();
+    let ch =
+        step(r.tier, 0, &HostPolicy::default(), &Obs { spam_trip: Some("x".into()), ..Default::default() }, &p, DAY)
+            .unwrap();
     r.tier = ch.tier;
     tiers::set_host_policy(&mut r, &ch.state);
     tiers::apply_manual(&mut r, &Manual::Ban("spam".into()), DAY).unwrap();
@@ -220,10 +169,7 @@ async fn concurrent_policy_edits_conflict() {
     assert_eq!(d.version, 1);
     // b edited version 0 too
     match b.save_policy(0, pb.clone(), "bob", "").await {
-        Err(SaveError::Conflict {
-            expected: 0,
-            current: 1,
-        }) => {}
+        Err(SaveError::Conflict { expected: 0, current: 1 }) => {}
         other => panic!("{other:?}"),
     }
     // at once, from eight writers on version 1: exactly one wins
@@ -232,9 +178,7 @@ async fn concurrent_policy_edits_conflict() {
         let e = engine(&store, &format!("n{i}"));
         let mut body = p();
         body.cluster.new_hosts_per_day = 100 + i;
-        tasks.push(tokio::spawn(async move {
-            e.save_policy(1, body, "x", "").await
-        }));
+        tasks.push(tokio::spawn(async move { e.save_policy(1, body, "x", "").await }));
     }
     let mut ok = 0;
     for t in tasks {
@@ -251,18 +195,9 @@ async fn concurrent_policy_edits_conflict() {
     // invalid bodies never reach the store
     let mut bad = p();
     bad.tiers.default.events_per_sec = 0.0;
-    assert!(matches!(
-        a.save_policy(2, bad, "x", "").await,
-        Err(SaveError::Invalid(_))
-    ));
-    assert!(matches!(
-        a.save_policy(2, p(), "x", "").await.map(|d| d.version),
-        Ok(3)
-    ));
-    assert!(matches!(
-        a.save_policy(3, p(), "x", "").await,
-        Err(SaveError::NoChange)
-    ));
+    assert!(matches!(a.save_policy(2, bad, "x", "").await, Err(SaveError::Invalid(_))));
+    assert!(matches!(a.save_policy(2, p(), "x", "").await.map(|d| d.version), Ok(3)));
+    assert!(matches!(a.save_policy(3, p(), "x", "").await, Err(SaveError::NoChange)));
 }
 
 #[tokio::test]
@@ -271,30 +206,21 @@ async fn audit_log_lists_every_changed_leaf() {
     let e = engine(&store, "a");
     let mut body = p();
     body.tiers.default.events_per_sec = 80.0;
-    e.save_policy(0, body.clone(), "alice", "raise default")
-        .await
-        .unwrap();
+    e.save_policy(0, body.clone(), "alice", "raise default").await.unwrap();
     body.crawl.trusted_domains.push("*.example.net".into());
     body.spam.host_new_accounts.action = SpamAction::Case;
     e.save_policy(1, body.clone(), "bob", "").await.unwrap();
 
     let audit = e.policy_audit(10).await.unwrap();
-    assert_eq!(
-        audit.iter().map(|a| a.version).collect::<Vec<_>>(),
-        vec![2, 1]
-    );
+    assert_eq!(audit.iter().map(|a| a.version).collect::<Vec<_>>(), vec![2, 1]);
     assert_eq!(audit[1].by, "alice");
     assert_eq!(audit[1].note, "raise default");
     // the first save diffs against the defaults
-    assert_eq!(
-        audit[1].changes,
-        vec!["tiers.default.eventsPerSec: 51.0 → 80.0".to_string()]
-    );
+    assert_eq!(audit[1].changes, vec!["tiers.default.eventsPerSec: 51.0 → 80.0".to_string()]);
     assert_eq!(
         audit[0].changes,
         vec![
-            "crawl.trustedDomains: [\"*.host.bsky.network\"] → [\"*.host.bsky.network\",\"*.example.net\"]"
-                .to_string(),
+            "crawl.trustedDomains: [\"*.host.bsky.network\"] → [\"*.host.bsky.network\",\"*.example.net\"]".to_string(),
             "spam.hostNewAccounts.action: \"throttle-and-case\" → \"case\"".to_string(),
         ],
         "{:?}",
@@ -308,10 +234,7 @@ async fn audit_log_lists_every_changed_leaf() {
     body.consumers.connections_per_ip = 4;
     e.save_policy(2, body, "carol", "").await.unwrap();
     let audit = e.policy_audit(10).await.unwrap();
-    assert_eq!(
-        audit.iter().map(|a| a.version).collect::<Vec<_>>(),
-        vec![3, 2, 1]
-    );
+    assert_eq!(audit.iter().map(|a| a.version).collect::<Vec<_>>(), vec![3, 2, 1]);
     assert_eq!(audit[1].by, "bob");
 
     // rules keep their own log
@@ -329,12 +252,7 @@ async fn audit_log_lists_every_changed_leaf() {
         .unwrap();
     admin.delete_domain_rule(1, "erin").await.unwrap();
     let ra = admin.domain_rules_audit().await.unwrap();
-    assert_eq!(
-        ra.iter()
-            .map(|a| (a.version, a.by.as_str()))
-            .collect::<Vec<_>>(),
-        vec![(2, "erin"), (1, "dave")]
-    );
+    assert_eq!(ra.iter().map(|a| (a.version, a.by.as_str())).collect::<Vec<_>>(), vec![(2, "erin"), (1, "dave")]);
     assert_eq!(ra[0].note, "delete rule 1");
     assert_eq!(e.policy_audit(10).await.unwrap().len(), 3);
 }
@@ -357,13 +275,7 @@ fn rule_matching_prefers_the_most_specific() {
             mk(1, "*.spam.example", RuleEffect::Ban),
             mk(2, "good.spam.example", RuleEffect::Allow),
             mk(3, "*.eu.spam.example", RuleEffect::Tier { tier: Tier::New }),
-            mk(
-                4,
-                "exact.example.org",
-                RuleEffect::Throttle {
-                    events_per_sec: 3.0,
-                },
-            ),
+            mk(4, "exact.example.org", RuleEffect::Throttle { events_per_sec: 3.0 }),
         ],
     };
     rules::validate(&set).unwrap();
@@ -372,22 +284,16 @@ fn rule_matching_prefers_the_most_specific() {
     assert_eq!(id("spam.example"), Some(1));
     assert_eq!(id("a.b.spam.example"), Some(1));
     assert_eq!(id("good.spam.example"), Some(2));
-    assert_eq!(
-        id("x.good.spam.example"),
-        Some(1),
-        "exact rules don't cover subdomains"
-    );
+    assert_eq!(id("x.good.spam.example"), Some(1), "exact rules don't cover subdomains");
     assert_eq!(id("pds.eu.spam.example"), Some(3));
     assert_eq!(id("exact.example.org"), Some(4));
     assert_eq!(id("sub.exact.example.org"), None);
     assert_eq!(id("notspam.example"), None);
     assert_eq!(id("example"), None);
 
-    assert_eq!(
-        rules::normalize_pattern(" *.Example.COM. ").unwrap(),
-        "*.example.com"
-    );
-    for bad in ["com", "*.com", "a..b", "-a.com", "*.1.2.3.4", "*.*.x.com", "", "x.com:0", "x.com:http", "*.x.com:443"] {
+    assert_eq!(rules::normalize_pattern(" *.Example.COM. ").unwrap(), "*.example.com");
+    for bad in ["com", "*.com", "a..b", "-a.com", "*.1.2.3.4", "*.*.x.com", "", "x.com:0", "x.com:http", "*.x.com:443"]
+    {
         assert!(rules::normalize_pattern(bad).is_err(), "{bad}");
     }
     // one host by address and port, as a dev network or a PDS on a port is known
@@ -401,39 +307,19 @@ fn rule_matching_prefers_the_most_specific() {
     assert_eq!(ports.lookup("127.0.0.1:30003").map(|r| r.id), Some(1));
     assert_eq!(ports.lookup("127.0.0.1:30004").map(|r| r.id), None);
     assert_eq!(ports.lookup("10.0.0.1:443").map(|r| r.id), Some(2), "a portless rule covers every port");
-    let dup = RuleSet {
-        next_id: 3,
-        rules: vec![
-            mk(1, "a.example", RuleEffect::Ban),
-            mk(2, "a.example", RuleEffect::Allow),
-        ],
-    };
+    let dup =
+        RuleSet { next_id: 3, rules: vec![mk(1, "a.example", RuleEffect::Ban), mk(2, "a.example", RuleEffect::Allow)] };
     assert!(rules::validate(&dup).is_err());
 }
 
 #[test]
 fn hostnames_parse_like_indigo() {
     let ok = |s: &str| parse_hostname(s).map(|p| (p.hostname, p.insecure));
-    assert_eq!(
-        ok("https://PDS.Example.com/xrpc?x=1"),
-        Ok(("pds.example.com".into(), false))
-    );
-    assert_eq!(
-        ok("wss://pds.example.com"),
-        Ok(("pds.example.com".into(), false))
-    );
-    assert_eq!(
-        ok("pds.example.com."),
-        Ok(("pds.example.com".into(), false))
-    );
-    assert_eq!(
-        ok("http://pds.example.com"),
-        Ok(("pds.example.com".into(), true))
-    );
-    assert_eq!(
-        ok("http://localhost:2583"),
-        Ok(("localhost:2583".into(), true))
-    );
+    assert_eq!(ok("https://PDS.Example.com/xrpc?x=1"), Ok(("pds.example.com".into(), false)));
+    assert_eq!(ok("wss://pds.example.com"), Ok(("pds.example.com".into(), false)));
+    assert_eq!(ok("pds.example.com."), Ok(("pds.example.com".into(), false)));
+    assert_eq!(ok("http://pds.example.com"), Ok(("pds.example.com".into(), true)));
+    assert_eq!(ok("http://localhost:2583"), Ok(("localhost:2583".into(), true)));
     assert!(parse_hostname("pds.example.com:8443").is_err());
     assert!(parse_hostname("ftp://pds.example.com").is_err());
     assert!(parse_hostname("10.0.0.1").is_err());
@@ -451,26 +337,12 @@ async fn for_host_and_admission_apply_rules_and_budgets() {
     for (pattern, effect) in [
         ("*.spam.example", crate::admin::RuleEffect::Ban),
         ("good.spam.example", crate::admin::RuleEffect::Allow),
-        (
-            "*.friends.example",
-            crate::admin::RuleEffect::Tier {
-                tier: "trusted".into(),
-            },
-        ),
-        (
-            "*.slow.example",
-            crate::admin::RuleEffect::Throttle {
-                events_per_sec: 2.0,
-            },
-        ),
+        ("*.friends.example", crate::admin::RuleEffect::Tier { tier: "trusted".into() }),
+        ("*.slow.example", crate::admin::RuleEffect::Throttle { events_per_sec: 2.0 }),
     ] {
         admin
             .create_domain_rule(
-                crate::admin::DomainRuleInput {
-                    pattern: pattern.into(),
-                    effect,
-                    note: String::new(),
-                },
+                crate::admin::DomainRuleInput { pattern: pattern.into(), effect, note: String::new() },
                 "t",
             )
             .await
@@ -483,11 +355,7 @@ async fn for_host_and_admission_apply_rules_and_budgets() {
     assert_eq!(l.tier, Tier::Trusted);
     assert_eq!(l.limits.unwrap().events_per_sec, 5_000.0);
     // auto-throttled beats a forced tier
-    assert_eq!(
-        e.for_host(&rec("a.friends.example", Tier::Throttled, 0))
-            .tier,
-        Tier::Throttled
-    );
+    assert_eq!(e.for_host(&rec("a.friends.example", Tier::Throttled, 0)).tier, Tier::Throttled);
     let l = e.for_host(&rec("x.slow.example", Tier::Default, 0));
     assert_eq!(l.limits.unwrap().events_per_sec, 2.0);
     let mut r = rec("plain.example", Tier::Default, 0);
@@ -507,56 +375,21 @@ async fn for_host_and_admission_apply_rules_and_budgets() {
         let e = e.clone();
         async move { e.admit_host(&AdmitRequest { hostname: h, by_admin, existing: None, dry_run: false }).await }
     };
-    assert!(matches!(
-        admit("https://x.spam.example", false).await,
-        Admit::Reject(RejectHost::Banned { .. })
-    ));
-    assert!(matches!(
-        admit("pds.example.com:99", false).await,
-        Admit::Reject(RejectHost::BadHostname(_))
-    ));
-    assert!(matches!(
-        admit("http://pds.example.com", false).await,
-        Admit::Reject(RejectHost::BadHostname(_))
-    ));
-    assert!(matches!(
-        admit("localhost", false).await,
-        Admit::Reject(RejectHost::Localhost)
-    ));
+    assert!(matches!(admit("https://x.spam.example", false).await, Admit::Reject(RejectHost::Banned { .. })));
+    assert!(matches!(admit("pds.example.com:99", false).await, Admit::Reject(RejectHost::BadHostname(_))));
+    assert!(matches!(admit("http://pds.example.com", false).await, Admit::Reject(RejectHost::BadHostname(_))));
+    assert!(matches!(admit("localhost", false).await, Admit::Reject(RejectHost::Localhost)));
     // trusted domain: starts trusted and, like allow rules, skips the daily budget
     assert_eq!(
         admit("morel.us-east.host.bsky.network", false).await,
-        Admit::Admit {
-            host: Host("morel.us-east.host.bsky.network".into()),
-            tier: Tier::Trusted,
-            counted: false
-        }
+        Admit::Admit { host: Host("morel.us-east.host.bsky.network".into()), tier: Tier::Trusted, counted: false }
     );
     // allow rules and admins skip the daily budget
-    assert!(matches!(
-        admit("good.spam.example", false).await,
-        Admit::Admit { counted: false, .. }
-    ));
-    assert!(matches!(
-        admit("one.example", false).await,
-        Admit::Admit {
-            tier: Tier::New,
-            counted: true,
-            ..
-        }
-    ));
-    assert!(matches!(
-        admit("two.example", false).await,
-        Admit::Admit { counted: true, .. }
-    ));
-    assert_eq!(
-        admit("three.example", false).await,
-        Admit::Reject(RejectHost::DailyLimit { limit: 2 })
-    );
-    assert!(matches!(
-        admit("three.example", true).await,
-        Admit::Admit { counted: false, .. }
-    ));
+    assert!(matches!(admit("good.spam.example", false).await, Admit::Admit { counted: false, .. }));
+    assert!(matches!(admit("one.example", false).await, Admit::Admit { tier: Tier::New, counted: true, .. }));
+    assert!(matches!(admit("two.example", false).await, Admit::Admit { counted: true, .. }));
+    assert_eq!(admit("three.example", false).await, Admit::Reject(RejectHost::DailyLimit { limit: 2 }));
+    assert!(matches!(admit("three.example", true).await, Admit::Admit { counted: false, .. }));
     // a peer sees the same count
     assert_eq!(engine(&store, "b").new_hosts_today().await.unwrap(), 2);
     // known hosts aren't new, banned ones stay out
@@ -569,14 +402,7 @@ async fn for_host_and_admission_apply_rules_and_budgets() {
             dry_run: false,
         })
         .await;
-    assert!(matches!(
-        r,
-        Admit::Admit {
-            counted: false,
-            tier: Tier::Default,
-            ..
-        }
-    ));
+    assert!(matches!(r, Admit::Admit { counted: false, tier: Tier::Default, .. }));
     let banned = rec("three.example", Tier::Banned, 0);
     let r = e
         .admit_host(&AdmitRequest {
@@ -592,14 +418,8 @@ async fn for_host_and_admission_apply_rules_and_budgets() {
     let mut body = e.policy().body;
     body.crawl.allowlist_only = true;
     e.save_policy(1, body, "t", "").await.unwrap();
-    assert_eq!(
-        admit("four.example", false).await,
-        Admit::Reject(RejectHost::NotAllowed)
-    );
-    assert!(matches!(
-        admit("good.spam.example", false).await,
-        Admit::Admit { .. }
-    ));
+    assert_eq!(admit("four.example", false).await, Admit::Reject(RejectHost::NotAllowed));
+    assert!(matches!(admit("good.spam.example", false).await, Admit::Admit { .. }));
 }
 
 // ---------------------------------------------------------------- budgets
@@ -669,29 +489,21 @@ async fn peers_hot_reload_policy_and_rules() {
         .raw
         .put(
             &store::path(&store, POLICY_PATH),
-            PutPayload::from(r#"{"version":9,"updatedAtMs":0,"updatedBy":"x","body":{"tiers":{"new":{"eventsPerSec":-1}}}}"#),
+            PutPayload::from(
+                r#"{"version":9,"updatedAtMs":0,"updatedBy":"x","body":{"tiers":{"new":{"eventsPerSec":-1}}}}"#,
+            ),
         )
         .await
         .unwrap();
     assert!(!b.refresh().await.unwrap());
     assert_eq!(b.policy().version, 1);
-    assert!(
-        b.last_error
-            .lock()
-            .as_deref()
-            .unwrap()
-            .contains("eventsPerSec")
-    );
+    assert!(b.last_error.lock().as_deref().unwrap().contains("eventsPerSec"));
     // and the API can still replace it (version 9 seen)
     let d = a.save_policy(9, p(), "t", "fix").await.unwrap();
     assert_eq!(d.version, 10);
     assert!(b.refresh().await.unwrap());
     assert!(b.last_error.lock().is_none());
-    assert_eq!(
-        b.for_host(&r).tier,
-        Tier::Banned,
-        "rules untouched by a policy load"
-    );
+    assert_eq!(b.for_host(&r).tier, Tier::Banned, "rules untouched by a policy load");
 }
 
 // ---------------------------------------------------------------- signals
@@ -709,17 +521,11 @@ fn topk_stays_bounded_with_10k_hosts() {
         for i in 0..10_000u32 {
             if round < 3 && (i + round) % 3 == 0 {
                 let h = format!("pds{i}.example.com");
-                trips.extend(s.record(
-                    &Signal::new(SignalKind::NewAccount, &h, None),
-                    t0 + round as i64,
-                ));
+                trips.extend(s.record(&Signal::new(SignalKind::NewAccount, &h, None), t0 + round as i64));
             }
         }
         for h in &heavy {
-            trips.extend(s.record(
-                &Signal::new(SignalKind::NewAccount, h, None),
-                t0 + round as i64,
-            ));
+            trips.extend(s.record(&Signal::new(SignalKind::NewAccount, h, None), t0 + round as i64));
         }
     }
     let tracked = s.tracked(SpamRule::HostNewAccounts);
@@ -730,11 +536,7 @@ fn topk_stays_bounded_with_10k_hosts() {
     let mut tripped: Vec<_> = trips.iter().map(|t| t.host.clone()).collect();
     tripped.sort();
     assert_eq!(tripped, heavy, "each farm trips once, no small host does");
-    assert!(
-        trips
-            .iter()
-            .all(|t| t.observed >= 300.0 && t.rule == SpamRule::HostNewAccounts)
-    );
+    assert!(trips.iter().all(|t| t.observed >= 300.0 && t.rule == SpamRule::HostNewAccounts));
     let top = s.top(SpamRule::HostNewAccounts, 5, t0 + 400);
     assert!(top.iter().all(|(k, ..)| heavy.contains(k)), "{top:?}");
 
@@ -783,10 +585,7 @@ fn signals_window_slides() {
     assert!(rec(500, t0 + 100_000).is_empty());
     assert_eq!(rec(500, t0 + 125_000).len(), 1);
     // records without a DID don't count for per-account rules
-    assert!(
-        s.record(&Signal::new(SignalKind::Record, "pds.example", None), t0)
-            .is_empty()
-    );
+    assert!(s.record(&Signal::new(SignalKind::Record, "pds.example", None), t0).is_empty());
 }
 
 // ---------------------------------------------------------------- cases
@@ -817,64 +616,23 @@ fn open(host: &str, observed: f64, at_ms: i64) -> CaseOpen {
 async fn cases_are_deduplicated_per_key() {
     let store = Store::memory(None);
     let (a, b) = (engine(&store, "a"), engine(&store, "b"));
-    assert_eq!(
-        a.cases
-            .open_or_update(open("farm.example", 310.0, 1))
-            .await
-            .unwrap(),
-        Opened::Created(1)
-    );
-    assert_eq!(
-        b.cases
-            .open_or_update(open("farm.example", 900.0, 2))
-            .await
-            .unwrap(),
-        Opened::Updated(1)
-    );
-    assert_eq!(
-        a.cases
-            .open_or_update(open("other.example", 400.0, 3))
-            .await
-            .unwrap(),
-        Opened::Created(2)
-    );
+    assert_eq!(a.cases.open_or_update(open("farm.example", 310.0, 1)).await.unwrap(), Opened::Created(1));
+    assert_eq!(b.cases.open_or_update(open("farm.example", 900.0, 2)).await.unwrap(), Opened::Updated(1));
+    assert_eq!(a.cases.open_or_update(open("other.example", 400.0, 3)).await.unwrap(), Opened::Created(2));
     let c = a.cases.get_case(1).await.unwrap().unwrap();
     assert_eq!((c.trips, c.evidence.len(), c.observed), (2, 2, 900.0));
     assert_eq!(a.cases.list(Some(CaseStatus::Open)).await.unwrap().len(), 2);
 
     // acknowledged still dedupes; resolved frees the key
-    a.cases
-        .update(1, Some(CaseStatus::Acknowledged), "looking", "op")
-        .await
-        .unwrap();
-    assert_eq!(
-        a.cases
-            .open_or_update(open("farm.example", 320.0, 4))
-            .await
-            .unwrap(),
-        Opened::Updated(1)
-    );
-    let c = a
-        .cases
-        .update(1, Some(CaseStatus::Resolved), "banned the domain", "op")
-        .await
-        .unwrap()
-        .unwrap();
+    a.cases.update(1, Some(CaseStatus::Acknowledged), "looking", "op").await.unwrap();
+    assert_eq!(a.cases.open_or_update(open("farm.example", 320.0, 4)).await.unwrap(), Opened::Updated(1));
+    let c = a.cases.update(1, Some(CaseStatus::Resolved), "banned the domain", "op").await.unwrap().unwrap();
     assert_eq!(c.notes.len(), 2);
-    assert_eq!(
-        b.cases
-            .open_or_update(open("farm.example", 330.0, 5))
-            .await
-            .unwrap(),
-        Opened::Created(3)
-    );
+    assert_eq!(b.cases.open_or_update(open("farm.example", 330.0, 5)).await.unwrap(), Opened::Created(3));
 
     // the evidence list is capped
     for i in 0..30 {
-        a.cases
-            .open_or_update(open("farm.example", 300.0 + i as f64, 10 + i))
-            .await
-            .unwrap();
+        a.cases.open_or_update(open("farm.example", 300.0 + i as f64, 10 + i)).await.unwrap();
     }
     let c = a.cases.get_case(3).await.unwrap().unwrap();
     assert_eq!((c.trips, c.evidence.len()), (31, cases::EVIDENCE_KEPT));
@@ -884,11 +642,7 @@ async fn cases_are_deduplicated_per_key() {
     let mut tasks = Vec::new();
     for i in 0..6 {
         let e = engine(&store, &format!("n{i}"));
-        tasks.push(tokio::spawn(async move {
-            e.cases
-                .open_or_update(open("race.example", 301.0, 100))
-                .await
-        }));
+        tasks.push(tokio::spawn(async move { e.cases.open_or_update(open("race.example", 301.0, 100)).await }));
     }
     let mut created = 0;
     for t in tasks {
@@ -897,14 +651,7 @@ async fn cases_are_deduplicated_per_key() {
         }
     }
     assert_eq!(created, 1);
-    let race: Vec<_> = a
-        .cases
-        .list(None)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|c| c.host == "race.example")
-        .collect();
+    let race: Vec<_> = a.cases.list(None).await.unwrap().into_iter().filter(|c| c.host == "race.example").collect();
     assert_eq!(race.len(), 1);
     assert_eq!(race[0].trips, 6);
 }
@@ -917,26 +664,14 @@ async fn driver_throttles_opens_cases_and_sweeps() {
     let e = engine(&store, "a");
     let hosts = Arc::new(MemHosts::default());
     let now = crate::state::now_secs();
-    hosts
-        .put_host(&rec("farm.example", Tier::New, now - 3_600))
-        .await
-        .unwrap();
-    hosts
-        .put_host(&rec("buggy.example", Tier::Default, now - 30 * DAY))
-        .await
-        .unwrap();
-    hosts
-        .put_host(&rec("old.example", Tier::New, now - 30 * DAY))
-        .await
-        .unwrap();
+    hosts.put_host(&rec("farm.example", Tier::New, now - 3_600)).await.unwrap();
+    hosts.put_host(&rec("buggy.example", Tier::Default, now - 30 * DAY)).await.unwrap();
+    hosts.put_host(&rec("old.example", Tier::New, now - 30 * DAY)).await.unwrap();
     let d = Driver::new(e.clone(), hosts.clone());
 
     let at = store::now_ms();
     for _ in 0..300 {
-        e.record_signal_at(
-            Signal::new(SignalKind::NewAccount, "farm.example", None),
-            at,
-        );
+        e.record_signal_at(Signal::new(SignalKind::NewAccount, "farm.example", None), at);
     }
     let r = d.process_trips().await.unwrap();
     assert_eq!(r.moved.len(), 1);
@@ -952,22 +687,12 @@ async fn driver_throttles_opens_cases_and_sweeps() {
     let r = d.sweep_at(now).await.unwrap();
     assert_eq!(r.scanned, 3);
     assert_eq!(
-        r.moved
-            .iter()
-            .map(|m| (m.host.as_str(), m.to))
-            .collect::<Vec<_>>(),
+        r.moved.iter().map(|m| (m.host.as_str(), m.to)).collect::<Vec<_>>(),
         vec![("old.example", Tier::Default)]
     );
     // a bad interval on buggy.example
     hosts
-        .add_counts(&[(
-            "buggy.example".into(),
-            HostCounts {
-                events: 100,
-                failed_checks: 400,
-                ..Default::default()
-            },
-        )])
+        .add_counts(&[("buggy.example".into(), HostCounts { events: 100, failed_checks: 400, ..Default::default() })])
         .await
         .unwrap();
     let r = d.sweep_at(now + 30).await.unwrap();
@@ -977,13 +702,7 @@ async fn driver_throttles_opens_cases_and_sweeps() {
     let r = d.sweep_at(now + 30 + 3_600).await.unwrap();
     let mut back: Vec<_> = r.moved.iter().map(|m| (m.host.clone(), m.to)).collect();
     back.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(
-        back,
-        vec![
-            ("buggy.example".into(), Tier::Default),
-            ("farm.example".into(), Tier::New)
-        ]
-    );
+    assert_eq!(back, vec![("buggy.example".into(), Tier::Default), ("farm.example".into(), Tier::New)]);
 }
 
 #[tokio::test]
@@ -991,10 +710,7 @@ async fn policy_admin_maps_the_wire_types() {
     let store = Store::memory(None);
     let e = engine(&store, "a");
     let hosts = Arc::new(MemHosts::default());
-    hosts
-        .put_host(&rec("pds.example.com", Tier::Default, 0))
-        .await
-        .unwrap();
+    hosts.put_host(&rec("pds.example.com", Tier::Default, 0)).await.unwrap();
     let a = PolicyAdmin::new(e.clone(), hosts.clone());
 
     // a wire edit changes its fields and keeps the rest
@@ -1010,11 +726,7 @@ async fn policy_admin_maps_the_wire_types() {
     doc.policy.tiers.get_mut("default").unwrap().events_per_sec = 75.0;
     doc.policy.spam.auto_throttle = false;
     doc.policy.spam.bad_signatures_per_min = 30;
-    let u = crate::admin::PolicyUpdate {
-        base_version: 1,
-        policy: doc.policy.clone(),
-        note: "x".into(),
-    };
+    let u = crate::admin::PolicyUpdate { base_version: 1, policy: doc.policy.clone(), note: "x".into() };
     let d = a.update_policy(u.clone(), "op").await.unwrap();
     assert_eq!(d.version, 2);
     let full = e.policy().body;
@@ -1022,63 +734,27 @@ async fn policy_admin_maps_the_wire_types() {
     assert_eq!(full.consumers.connections_per_ip, 3);
     assert_eq!(full.spam.host_new_accounts.action, SpamAction::Case);
     assert_eq!(full.spam.host_failed_validation.limit, 30.0);
-    assert_eq!(
-        to_wire(&merge_wire(&full, &doc.policy).unwrap()),
-        doc.policy
-    );
+    assert_eq!(to_wire(&merge_wire(&full, &doc.policy).unwrap()), doc.policy);
     // stale base
-    assert!(matches!(
-        a.update_policy(u, "op").await,
-        Err(crate::admin::AdminError::Conflict(_))
-    ));
+    assert!(matches!(a.update_policy(u, "op").await, Err(crate::admin::AdminError::Conflict(_))));
     let audit = a.policy_audit().await.unwrap();
     assert!(
-        audit[0]
-            .changes
-            .contains(&"tiers.default.eventsPerSec: 51.0 → 75.0".to_string()),
+        audit[0].changes.contains(&"tiers.default.eventsPerSec: 51.0 → 75.0".to_string()),
         "{:?}",
         audit[0].changes
     );
 
     // host actions go through the HostStore and are recorded on the host
-    let r = a
-        .host_action(
-            "pds.example.com",
-            HostAction::Ban {
-                reason: "spam".into(),
-            },
-            "op",
-        )
-        .await
-        .unwrap();
+    let r = a.host_action("pds.example.com", HostAction::Ban { reason: "spam".into() }, "op").await.unwrap();
     assert_eq!(r.tier, Tier::Banned);
-    let r = a
-        .host_action("pds.example.com", HostAction::Unban, "op")
-        .await
-        .unwrap();
+    let r = a.host_action("pds.example.com", HostAction::Unban, "op").await.unwrap();
     assert_eq!(r.tier, Tier::Default);
-    a.host_action(
-        "pds.example.com",
-        HostAction::SetTier {
-            tier: "trusted".into(),
-        },
-        "op",
-    )
-    .await
-    .unwrap();
+    a.host_action("pds.example.com", HostAction::SetTier { tier: "trusted".into() }, "op").await.unwrap();
     let r = hosts.get_host("pds.example.com").await.unwrap().unwrap();
     assert_eq!(r.tier, Tier::Trusted);
     assert_eq!(PolicyAdmin::host_actions(&r).len(), 3);
-    assert!(
-        a.host_action("pds.example.com", HostAction::Reconnect, "op")
-            .await
-            .is_err()
-    );
-    assert!(
-        a.host_action("nope.example", HostAction::Unban, "op")
-            .await
-            .is_err()
-    );
+    assert!(a.host_action("pds.example.com", HostAction::Reconnect, "op").await.is_err());
+    assert!(a.host_action("nope.example", HostAction::Unban, "op").await.is_err());
 
     // rules: CRUD with match counts
     let rule = a
@@ -1121,36 +797,16 @@ async fn policy_admin_maps_the_wire_types() {
     assert_eq!(a.domain_rules().await.unwrap().len(), 1);
     a.delete_domain_rule(1, "op").await.unwrap();
     assert!(a.domain_rules().await.unwrap().is_empty());
-    assert!(matches!(
-        a.delete_domain_rule(1, "op").await,
-        Err(crate::admin::AdminError::NotFound(_))
-    ));
+    assert!(matches!(a.delete_domain_rule(1, "op").await, Err(crate::admin::AdminError::NotFound(_))));
 
     // cases through the wire types
-    e.cases
-        .open_or_update(open("farm.example", 400.0, 1))
-        .await
-        .unwrap();
+    e.cases.open_or_update(open("farm.example", 400.0, 1)).await.unwrap();
     assert_eq!(a.cases(Default::default()).await.unwrap().len(), 1);
     let c = a
-        .update_case(
-            1,
-            crate::admin::CaseUpdate {
-                status: Some(CaseStatus::Dismissed),
-                note: "fine".into(),
-            },
-            "op",
-        )
+        .update_case(1, crate::admin::CaseUpdate { status: Some(CaseStatus::Dismissed), note: "fine".into() }, "op")
         .await
         .unwrap();
     assert_eq!(c.status, CaseStatus::Dismissed);
-    assert!(
-        a.cases(crate::admin::CaseQuery {
-            status: Some(CaseStatus::Open)
-        })
-        .await
-        .unwrap()
-        .is_empty()
-    );
+    assert!(a.cases(crate::admin::CaseQuery { status: Some(CaseStatus::Open) }).await.unwrap().is_empty());
     assert_eq!(a.case_detail(1).await.unwrap().evidence.len(), 1);
 }

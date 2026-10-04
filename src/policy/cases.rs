@@ -102,12 +102,7 @@ pub struct CaseOpen {
 
 impl CaseOpen {
     pub fn key(&self) -> String {
-        format!(
-            "{}|{}|{}",
-            self.kind,
-            self.host,
-            self.did.as_deref().unwrap_or("")
-        )
+        format!("{}|{}|{}", self.kind, self.host, self.did.as_deref().unwrap_or(""))
     }
 }
 
@@ -136,10 +131,7 @@ pub struct CaseStore {
 
 impl CaseStore {
     pub fn new(store: Store) -> CaseStore {
-        CaseStore {
-            store,
-            cache: Default::default(),
-        }
+        CaseStore { store, cache: Default::default() }
     }
 
     fn case_path(&self, id: u64) -> Path {
@@ -265,18 +257,10 @@ impl CaseStore {
         let metas: Vec<_> = bounded(self.store.raw.list(Some(&prefix)).try_collect()).await?;
         let mut out = Vec::with_capacity(metas.len());
         for m in metas {
-            let id = m
-                .location
-                .filename()
-                .and_then(|f| f.strip_suffix(".json"))
-                .and_then(|f| f.parse::<u64>().ok());
+            let id = m.location.filename().and_then(|f| f.strip_suffix(".json")).and_then(|f| f.parse::<u64>().ok());
             let Some(id) = id else { continue };
-            let cached = self
-                .cache
-                .lock()
-                .get(&id)
-                .filter(|(e, _)| e.is_some() && *e == m.e_tag)
-                .map(|(_, c)| c.clone());
+            let cached =
+                self.cache.lock().get(&id).filter(|(e, _)| e.is_some() && *e == m.e_tag).map(|(_, c)| c.clone());
             let c = match cached {
                 Some(c) => c,
                 None => match self.read(id).await? {
@@ -288,11 +272,7 @@ impl CaseStore {
                 out.push(c);
             }
         }
-        out.sort_by(|a, b| {
-            b.severity
-                .cmp(&a.severity)
-                .then(b.opened_at_ms.cmp(&a.opened_at_ms))
-        });
+        out.sort_by(|a, b| b.severity.cmp(&a.severity).then(b.opened_at_ms.cmp(&a.opened_at_ms)));
         Ok(out)
     }
 
@@ -313,11 +293,7 @@ impl CaseStore {
                 c.status = s;
             }
             if !note.trim().is_empty() {
-                c.notes.push(CaseNote {
-                    at_ms: now,
-                    by: by.to_string(),
-                    text: note.trim().to_string(),
-                });
+                c.notes.push(CaseNote { at_ms: now, by: by.to_string(), text: note.trim().to_string() });
             }
             c.updated_at_ms = now;
             match self.write(&c, if_match(etag)).await {

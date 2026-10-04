@@ -122,14 +122,7 @@ pub fn route(frame: &[u8], max_frame_bytes: usize) -> Result<Routing<'_>, Reject
     let mut i = 0;
     let (op, t) = walk_header(frame, &mut i)?;
     let kind = Kind::from_tag(op, t);
-    let mut r = Routing {
-        kind,
-        did: None,
-        seq: None,
-        seq_span: None,
-        rev: None,
-        time: None,
-    };
+    let mut r = Routing { kind, did: None, seq: None, seq_span: None, rev: None, time: None };
     let (major, n) = head(frame, &mut i).ok_or(Reject::BadFrame)?;
     if major != 5 {
         return Err(Reject::BadFrame);
@@ -150,10 +143,7 @@ pub fn route(frame: &[u8], max_frame_bytes: usize) -> Result<Routing<'_>, Reject
                     return Err(Reject::BadSeq);
                 }
                 r.seq = Some(v as i64);
-                r.seq_span = Some(SeqSpan {
-                    start: at as u32,
-                    end: i as u32,
-                });
+                r.seq_span = Some(SeqSpan { start: at as u32, end: i as u32 });
             }
             b"rev" => r.rev = Some(text_str(frame, &mut i)?),
             b"time" => r.time = Some(text_str(frame, &mut i)?),
@@ -377,8 +367,7 @@ impl Event {
 
     /// The frame to emit at `relay_seq`.
     pub fn encode_with_seq(&self, relay_seq: i64) -> Option<Bytes> {
-        self.frame_and_seq()
-            .map(|(f, s)| encode_with_seq(f, s, relay_seq))
+        self.frame_and_seq().map(|(f, s)| encode_with_seq(f, s, relay_seq))
     }
 }
 
@@ -424,13 +413,7 @@ pub fn parse(frame: Bytes, limits: &Limits) -> Result<Event, Reject> {
             let blobs = match body.get("blobs") {
                 Some(ValueRef::Array(a)) => a
                     .iter()
-                    .map(|v| {
-                        if let ValueRef::Link(c) = v {
-                            Ok(*c)
-                        } else {
-                            Err(Reject::BadField("blobs"))
-                        }
-                    })
+                    .map(|v| if let ValueRef::Link(c) = v { Ok(*c) } else { Err(Reject::BadField("blobs")) })
                     .collect::<Result<_, _>>()?,
                 None | Some(ValueRef::Null) => Vec::new(),
                 _ => return Err(Reject::BadField("blobs")),
@@ -469,48 +452,22 @@ pub fn parse(frame: Bytes, limits: &Limits) -> Result<Event, Reject> {
                 return Err(Reject::BlocksTooBig);
             }
             let (car_roots, blocks) = read_car(&frame, car, limits.max_commit_blocks)?;
-            Ok(Event::Sync(ParsedSync {
-                seq,
-                seq_span,
-                did,
-                rev,
-                time,
-                car_roots,
-                blocks,
-                frame,
-            }))
+            Ok(Event::Sync(ParsedSync { seq, seq_span, did, rev, time, car_roots, blocks, frame }))
         }
         Kind::Identity => {
             let (seq, seq_span) = seq()?;
             let did = f.did("did")?.to_string();
             let time = f.text("time")?.to_string();
             let handle = f.opt_text("handle")?.map(String::from);
-            Ok(Event::Identity(ParsedIdentity {
-                seq,
-                seq_span,
-                did,
-                time,
-                handle,
-                frame,
-            }))
+            Ok(Event::Identity(ParsedIdentity { seq, seq_span, did, time, handle, frame }))
         }
         Kind::Account => {
             let (seq, seq_span) = seq()?;
             let did = f.did("did")?.to_string();
             let time = f.text("time")?.to_string();
-            let active = f
-                .opt_bool("active")?
-                .ok_or(Reject::MissingField("active"))?;
+            let active = f.opt_bool("active")?.ok_or(Reject::MissingField("active"))?;
             let status = f.opt_text("status")?.map(String::from);
-            Ok(Event::Account(ParsedAccount {
-                seq,
-                seq_span,
-                did,
-                time,
-                active,
-                status,
-                frame,
-            }))
+            Ok(Event::Account(ParsedAccount { seq, seq_span, did, time, active, status, frame }))
         }
         Kind::Info => Ok(Event::Info(Info {
             name: f.text("name")?.to_string(),
@@ -547,12 +504,7 @@ fn parse_op(o: &ValueRef<'_>) -> Result<RepoOp, Reject> {
         Action::Delete if cid.is_some() => return Err(Reject::BadOp),
         _ => {}
     }
-    Ok(RepoOp {
-        action,
-        path: path.to_string(),
-        cid,
-        prev,
-    })
+    Ok(RepoOp { action, path: path.to_string(), cid, prev })
 }
 
 /// The CAR's roots and blocks, blocks as slices of `frame` (`car` borrows it).
@@ -566,10 +518,7 @@ fn read_car(frame: &Bytes, car: &[u8], max_blocks: usize) -> Result<Car, Reject>
     if roots.is_empty() {
         return Err(Reject::BadCar);
     }
-    let blocks = raw
-        .into_iter()
-        .map(|(c, b)| (c, frame.slice_ref(b)))
-        .collect();
+    let blocks = raw.into_iter().map(|(c, b)| (c, frame.slice_ref(b))).collect();
     Ok((roots, blocks))
 }
 
@@ -658,11 +607,7 @@ pub fn split_signed_commit<'a>(block: &'a [u8]) -> Option<(UnsignedCommit<'a>, &
             let sig = block.get(i..i.checked_add(len as usize)?)?;
             i += sig.len();
             return Some((
-                UnsignedCommit {
-                    head: 0xa0 | (n as u8 - 1),
-                    before: &block[body_start..k_start],
-                    after: &block[i..],
-                },
+                UnsignedCommit { head: 0xa0 | (n as u8 - 1), before: &block[body_start..k_start], after: &block[i..] },
                 sig,
             ));
         }

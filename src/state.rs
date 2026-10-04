@@ -17,8 +17,8 @@ pub mod record;
 pub mod shard;
 
 pub use apply::{
-    AccountGate, Accepted, ApplyConfig, Arrival, NewAccount, Applied, Chain, ChainError, ChangeKind, CommitClaim, EventKind, Identity, IdentityError,
-    IdentitySource, Incoming, Reject, StateDelta, StubChain,
+    Accepted, AccountGate, Applied, ApplyConfig, Arrival, Chain, ChainError, ChangeKind, CommitClaim, EventKind,
+    Identity, IdentityError, IdentitySource, Incoming, NewAccount, Reject, StateDelta, StubChain,
 };
 pub use host::{Conn, HostCounts, HostPage, HostRecord, HostStore, HostUpdate, Tier};
 pub use record::{AccountStatus, ChainState, HostKey, Record, SigningKey, Upstream};
@@ -63,7 +63,12 @@ pub struct RepoPage {
 /// implements it over a node log's segments.
 #[async_trait::async_trait]
 pub trait ReplaySource: Send + Sync {
-    async fn tail(&self, log_id: &str, shard: ShardId, after: Option<u64>) -> anyhow::Result<Vec<(u64, Vec<StateDelta>)>>;
+    async fn tail(
+        &self,
+        log_id: &str,
+        shard: ShardId,
+        after: Option<u64>,
+    ) -> anyhow::Result<Vec<(u64, Vec<StateDelta>)>>;
 
     /// The same entries' (DID, frame) of the shard, for archival mode's
     /// mirrors. Sources that don't carry frames give none.
@@ -209,7 +214,13 @@ impl<C: Chain> StateStore<C> {
 
     /// Replays `log_id`'s tail past `shard`'s applied marker, then
     /// checkpoints, so the shard's SlateDB holds everything the log does.
-    pub async fn recover(&self, shard: ShardId, log_id: &str, src: &dyn ReplaySource, now: u32) -> anyhow::Result<usize> {
+    pub async fn recover(
+        &self,
+        shard: ShardId,
+        log_id: &str,
+        src: &dyn ReplaySource,
+        now: u32,
+    ) -> anyhow::Result<usize> {
         let s = self.shard(shard).ok_or(StoreError::NotOwner(shard))?;
         let after = s.applied_marker(log_id).await?;
         let mut n = 0;

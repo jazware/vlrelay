@@ -86,11 +86,7 @@ struct Acct {
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(64)
-        .build()
-        .unwrap()
+    reqwest::Client::builder().timeout(Duration::from_secs(30)).pool_max_idle_per_host(64).build().unwrap()
 }
 
 #[derive(Debug)]
@@ -102,13 +98,7 @@ struct XErr {
 
 impl std::fmt::Display for XErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} {}: {}",
-            self.status,
-            self.error,
-            self.body.chars().take(300).collect::<String>()
-        )
+        write!(f, "{} {}: {}", self.status, self.error, self.body.chars().take(300).collect::<String>())
     }
 }
 
@@ -127,34 +117,18 @@ async fn xrpc(
     if let Some(t) = token {
         rq = rq.bearer_auth(t);
     }
-    let r = rq.send().await.map_err(|e| XErr {
-        status: 0,
-        error: "Transport".into(),
-        body: e.to_string(),
-    })?;
+    let r = rq.send().await.map_err(|e| XErr { status: 0, error: "Transport".into(), body: e.to_string() })?;
     let status = r.status().as_u16();
     let text = r.text().await.unwrap_or_default();
     if !(200..300).contains(&status) {
-        let error = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v["error"].as_str().map(str::to_string));
-        return Err(XErr {
-            status,
-            error: error.unwrap_or_default(),
-            body: text,
-        });
+        let error = serde_json::from_str::<Value>(&text).ok().and_then(|v| v["error"].as_str().map(str::to_string));
+        return Err(XErr { status, error: error.unwrap_or_default(), body: text });
     }
-    Ok(if text.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_str(&text).unwrap_or(Value::Null)
-    })
+    Ok(if text.is_empty() { Value::Null } else { serde_json::from_str(&text).unwrap_or(Value::Null) })
 }
 
 fn now() -> String {
-    chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string()
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 fn post(text: String) -> Value {
@@ -179,13 +153,7 @@ fn save_accounts(path: &str, accts: &[Acct]) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn seed(
-    args: &Args,
-    hosts: &[String],
-    n: usize,
-    records: usize,
-    concurrency: usize,
-) -> anyhow::Result<()> {
+async fn seed(args: &Args, hosts: &[String], n: usize, records: usize, concurrency: usize) -> anyhow::Result<()> {
     use futures::StreamExt;
     let c = client();
     let mut domains = Vec::new();
@@ -193,9 +161,8 @@ async fn seed(
         let d = xrpc(&c, h, "com.atproto.server.describeServer", None, None)
             .await
             .map_err(|e| anyhow::anyhow!("{h}: {e}"))?;
-        let dom = d["availableUserDomains"][0]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("{h}: no availableUserDomains"))?;
+        let dom =
+            d["availableUserDomains"][0].as_str().ok_or_else(|| anyhow::anyhow!("{h}: no availableUserDomains"))?;
         domains.push(dom.to_string());
     }
     // a run tag keeps handles unique across seeds of a long-lived network
@@ -304,11 +271,7 @@ impl Load {
                     .entry(format!(
                         "{op}: {} {}",
                         err.status,
-                        if err.error.is_empty() {
-                            &err.body
-                        } else {
-                            &err.error
-                        }
+                        if err.error.is_empty() { &err.body } else { &err.error }
                     ))
                     .or_default() += 1;
             }
@@ -365,8 +328,7 @@ impl Load {
         let Some(i) = self.pick_active() else { return };
         let did = self.accts[i].acct.lock().did.clone();
         let roll = rand::thread_rng().gen_range(0..100);
-        let create =
-            |coll: &str, rec: Value| json!({"repo": did, "collection": coll, "record": rec});
+        let create = |coll: &str, rec: Value| json!({"repo": did, "collection": coll, "record": rec});
         let subject = || {
             let p = self.posts.lock();
             let k = rand::thread_rng().gen_range(0..p.len().max(1));
@@ -385,29 +347,21 @@ impl Load {
             ),
             35..60 => {
                 let Some((uri, cid)) = subject() else { return };
-                let rec = json!({"$type": "app.bsky.feed.like", "subject": {"uri": uri, "cid": cid}, "createdAt": now()});
+                let rec =
+                    json!({"$type": "app.bsky.feed.like", "subject": {"uri": uri, "cid": cid}, "createdAt": now()});
                 (
                     "like",
-                    self.call(
-                        i,
-                        "com.atproto.repo.createRecord",
-                        create("app.bsky.feed.like", rec),
-                    )
-                    .await,
+                    self.call(i, "com.atproto.repo.createRecord", create("app.bsky.feed.like", rec)).await,
                     "app.bsky.feed.like",
                 )
             }
             60..68 => {
                 let Some((uri, cid)) = subject() else { return };
-                let rec = json!({"$type": "app.bsky.feed.repost", "subject": {"uri": uri, "cid": cid}, "createdAt": now()});
+                let rec =
+                    json!({"$type": "app.bsky.feed.repost", "subject": {"uri": uri, "cid": cid}, "createdAt": now()});
                 (
                     "repost",
-                    self.call(
-                        i,
-                        "com.atproto.repo.createRecord",
-                        create("app.bsky.feed.repost", rec),
-                    )
-                    .await,
+                    self.call(i, "com.atproto.repo.createRecord", create("app.bsky.feed.repost", rec)).await,
                     "app.bsky.feed.repost",
                 )
             }
@@ -417,12 +371,7 @@ impl Load {
                 let rec = json!({"$type": "app.bsky.graph.follow", "subject": target, "createdAt": now()});
                 (
                     "follow",
-                    self.call(
-                        i,
-                        "com.atproto.repo.createRecord",
-                        create("app.bsky.graph.follow", rec),
-                    )
-                    .await,
+                    self.call(i, "com.atproto.repo.createRecord", create("app.bsky.graph.follow", rec)).await,
                     "app.bsky.graph.follow",
                 )
             }
@@ -437,24 +386,22 @@ impl Load {
                     }
                 };
                 let Some((coll, rkey)) = victim else { return };
-                let op = if coll == "app.bsky.graph.follow" {
-                    "unfollow"
-                } else {
-                    "delete"
-                };
+                let op = if coll == "app.bsky.graph.follow" { "unfollow" } else { "delete" };
                 let r = self
-                    .call(
-                        i,
-                        "com.atproto.repo.deleteRecord",
-                        json!({"repo": did, "collection": coll, "rkey": rkey}),
-                    )
+                    .call(i, "com.atproto.repo.deleteRecord", json!({"repo": did, "collection": coll, "rkey": rkey}))
                     .await;
                 self.record(op, &r);
                 return;
             }
             _ => {
                 let rec = json!({"$type": "app.bsky.actor.profile", "displayName": format!("dev edit {n}"), "description": format!("edited at {}", now())});
-                let r = self.call(i, "com.atproto.repo.putRecord", json!({"repo": did, "collection": "app.bsky.actor.profile", "rkey": "self", "record": rec})).await;
+                let r = self
+                    .call(
+                        i,
+                        "com.atproto.repo.putRecord",
+                        json!({"repo": did, "collection": "app.bsky.actor.profile", "rkey": "self", "record": rec}),
+                    )
+                    .await;
                 self.record("profile", &r);
                 return;
             }
@@ -486,13 +433,7 @@ impl Load {
             (a.base.clone(), a.domain.clone())
         };
         let handle = format!("{base}h{k}{domain}");
-        let r = self
-            .call(
-                i,
-                "com.atproto.identity.updateHandle",
-                json!({"handle": handle}),
-            )
-            .await;
+        let r = self.call(i, "com.atproto.identity.updateHandle", json!({"handle": handle})).await;
         if r.is_ok() {
             self.accts[i].acct.lock().handle = handle;
         }
@@ -502,14 +443,10 @@ impl Load {
     async fn deactivate_cycle(&self, hold: Duration) {
         let Some(i) = self.pick_active() else { return };
         self.accts[i].inactive.store(true, Ordering::Release);
-        let r = self
-            .call(i, "com.atproto.server.deactivateAccount", json!({}))
-            .await;
+        let r = self.call(i, "com.atproto.server.deactivateAccount", json!({})).await;
         self.record("deactivate", &r);
         tokio::time::sleep(hold).await;
-        let r = self
-            .call(i, "com.atproto.server.activateAccount", json!({}))
-            .await;
+        let r = self.call(i, "com.atproto.server.activateAccount", json!({})).await;
         self.record("activate", &r);
         if r.is_ok() {
             self.accts[i].inactive.store(false, Ordering::Release);
@@ -529,11 +466,7 @@ async fn load(
     report_secs: u64,
 ) -> anyhow::Result<()> {
     let accts = load_accounts(&args.accounts_file)?;
-    anyhow::ensure!(
-        !accts.is_empty(),
-        "no accounts in {}: run `just dev-seed` first",
-        args.accounts_file
-    );
+    anyhow::ensure!(!accts.is_empty(), "no accounts in {}: run `just dev-seed` first", args.accounts_file);
     let l = Arc::new(Load {
         c: client(),
         accts: accts
@@ -557,17 +490,13 @@ async fn load(
             l.accts[i].inactive.store(true, Ordering::Release);
             continue;
         }
-        let _ = l
-            .call(i, "com.atproto.server.activateAccount", json!({}))
-            .await;
+        let _ = l.call(i, "com.atproto.server.activateAccount", json!({})).await;
         let (host, did) = {
             let a = l.accts[i].acct.lock();
             (a.host.clone(), a.did.clone())
         };
         // a like needs a subject: seed the ring from each account's own posts
-        let url = format!(
-            "com.atproto.repo.listRecords?repo={did}&collection=app.bsky.feed.post&limit=5"
-        );
+        let url = format!("com.atproto.repo.listRecords?repo={did}&collection=app.bsky.feed.post&limit=5");
         if let Ok(v) = xrpc(&l.c, &host, &url, None, None).await {
             for r in v["records"].as_array().into_iter().flatten() {
                 if let (Some(u), Some(c)) = (r["uri"].as_str(), r["cid"].as_str()) {
@@ -604,10 +533,7 @@ async fn load(
             loop {
                 t.tick().await;
                 let l = l.clone();
-                tokio::spawn(async move {
-                    l.deactivate_cycle(Duration::from_secs(deactivated_for))
-                        .await
-                });
+                tokio::spawn(async move { l.deactivate_cycle(Duration::from_secs(deactivated_for)).await });
             }
         });
     }
@@ -622,13 +548,7 @@ async fn load(
                 let s = l.stats.lock().clone();
                 let line: Vec<String> = s
                     .iter()
-                    .map(|(k, (ok, err))| {
-                        if *err > 0 {
-                            format!("{k} {ok}/{err}err")
-                        } else {
-                            format!("{k} {ok}")
-                        }
-                    })
+                    .map(|(k, (ok, err))| if *err > 0 { format!("{k} {ok}/{err}err") } else { format!("{k} {ok}") })
                     .collect();
                 eprintln!(
                     "devnet load: t={:.0}s {} dropped {}",
@@ -668,17 +588,11 @@ async fn load(
             }
         }
     }
-    let _ = tokio::time::timeout(
-        Duration::from_secs(10),
-        inflight.acquire_many(max_inflight as u32),
-    )
-    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), inflight.acquire_many(max_inflight as u32)).await;
     // leave no account deactivated
     for i in 0..l.accts.len() {
         if l.accts[i].inactive.load(Ordering::Acquire) {
-            let r = l
-                .call(i, "com.atproto.server.activateAccount", json!({}))
-                .await;
+            let r = l.call(i, "com.atproto.server.activateAccount", json!({})).await;
             l.record("activate", &r);
         }
     }
@@ -702,21 +616,10 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
     match &args.cmd {
-        Cmd::Seed {
-            hosts,
-            accounts,
-            records,
-            concurrency,
-        } => seed(&args, hosts, *accounts, *records, *concurrency).await,
-        Cmd::Load {
-            rate,
-            duration,
-            identity_every,
-            deactivate_every,
-            deactivated_for,
-            max_inflight,
-            report_secs,
-        } => {
+        Cmd::Seed { hosts, accounts, records, concurrency } => {
+            seed(&args, hosts, *accounts, *records, *concurrency).await
+        }
+        Cmd::Load { rate, duration, identity_every, deactivate_every, deactivated_for, max_inflight, report_secs } => {
             load(
                 &args,
                 *rate,

@@ -70,7 +70,13 @@ fn pct(v: &mut [Duration], p: f64) -> Duration {
 
 /// Applies commit `round` for DIDs [lo, hi) of `ids`, committing tickets
 /// every `batch` applies the way the log finalizer would per segment.
-async fn run(st: Arc<StateStore>, ids: Arc<Vec<String>>, workers: usize, round: u64, batch: usize) -> (usize, Duration) {
+async fn run(
+    st: Arc<StateStore>,
+    ids: Arc<Vec<String>>,
+    workers: usize,
+    round: u64,
+    batch: usize,
+) -> (usize, Duration) {
     let t = Instant::now();
     let mut tasks = Vec::new();
     for w in 0..workers {
@@ -81,7 +87,10 @@ async fn run(st: Arc<StateStore>, ids: Arc<Vec<String>>, workers: usize, round: 
             for i in (w..ids.len()).step_by(workers) {
                 let d = &ids[i];
                 let h = Host(pds_of(d));
-                match st.apply(Incoming { did: d, host: &h, now: 1_800_000_000, kind: EventKind::Commit(claim(d, round)) }).await {
+                match st
+                    .apply(Incoming { did: d, host: &h, now: 1_800_000_000, kind: EventKind::Commit(claim(d, round)) })
+                    .await
+                {
                     Ok(Applied::Append(a)) => tickets.push(a.ticket),
                     r => panic!("{d}: {r:?}"),
                 }
@@ -159,7 +168,10 @@ async fn bulk() {
     }
     println!("flush: {:.2}s", t.elapsed().as_secs_f64());
     let bytes: u64 = st.shards().iter().map(|s| s.sst_bytes()).sum();
-    println!("bucket after update (two versions until compaction): {bytes} SST bytes = {:.1} bytes/DID", bytes as f64 / n as f64);
+    println!(
+        "bucket after update (two versions until compaction): {bytes} SST bytes = {:.1} bytes/DID",
+        bytes as f64 / n as f64
+    );
     let raw: usize = ids.iter().take(10_000).map(|d| record::did_key(d).len()).sum::<usize>()
         + futures_rec_len(&st, &ids[..10_000.min(n)]).await;
     println!("raw key+value: {:.1} bytes/DID (first 10k)", raw as f64 / 10_000.min(n) as f64);
@@ -200,7 +212,12 @@ async fn bulk() {
     let sample: Arc<Vec<String>> = Arc::new(ids.iter().take(n.min(200_000)).cloned().collect());
     let (k, el) = run(st.clone(), sample, workers, 3, batch).await;
     let rate = k as f64 / el.as_secs_f64();
-    println!("cold update: {k} in {:.2}s = {:.0}/s node, {:.0}/s per shard", el.as_secs_f64(), rate, rate / shards as f64);
+    println!(
+        "cold update: {k} in {:.2}s = {:.0}/s node, {:.0}/s per shard",
+        el.as_secs_f64(),
+        rate,
+        rate / shards as f64
+    );
     for s in &layout {
         st.close_shard(s.id).await.unwrap();
     }

@@ -37,23 +37,14 @@ pub(crate) fn sig_offset(block: &[u8]) -> usize {
 }
 
 fn commit_block(c: &ParsedCommit) -> Vec<u8> {
-    c.blocks
-        .iter()
-        .find(|(cid, _)| *cid == c.commit)
-        .unwrap()
-        .1
-        .to_vec()
+    c.blocks.iter().find(|(cid, _)| *cid == c.commit).unwrap().1.to_vec()
 }
 
 #[test]
 fn synthetic_histories_verify_and_chain() {
     for curve in [Curve::K256, Curve::P256] {
         for initial in [0usize, 1, 10, 300] {
-            let mut r = Repo::new(
-                "did:plc:synthsynthsynthsynth",
-                Signer::new(curve, initial as u64),
-                initial,
-            );
+            let mut r = Repo::new("did:plc:synthsynthsynthsynth", Signer::new(curve, initial as u64), initial);
             let key = r.signer.public();
             let mut state: Option<ChainState> = None;
             for round in 0..40 {
@@ -77,24 +68,14 @@ fn synthetic_histories_verify_and_chain() {
 
 #[test]
 fn deletes_and_updates_only() {
-    let mut r = Repo::new(
-        "did:plc:deleteupdatedelete",
-        Signer::new(Curve::K256, 7),
-        200,
-    );
+    let mut r = Repo::new("did:plc:deleteupdatedelete", Signer::new(Curve::K256, 7), 200);
     let key = r.signer.public();
     let keys: Vec<String> = r.live.keys().take(60).cloned().collect();
     for chunk in keys.chunks(6) {
         let ops: Vec<Op> = chunk
             .iter()
             .enumerate()
-            .map(|(i, k)| {
-                if i % 2 == 0 {
-                    Op::Delete(k.clone())
-                } else {
-                    Op::Put(k.clone())
-                }
-            })
+            .map(|(i, k)| if i % 2 == 0 { Op::Delete(k.clone()) } else { Op::Put(k.clone()) })
             .collect();
         let c = commit_of(r.commit(&ops));
         verify_commit(&c, &key).expect("verify");
@@ -134,11 +115,7 @@ fn flipped_signature_bytes_reject() {
             let mut b = block.clone();
             b[sig_at + i] ^= 1 << (i % 8);
             set_commit_block(&mut m, b);
-            assert_eq!(
-                verify_commit(&m, &key),
-                Err(Reject::BadSignature),
-                "{curve:?} byte {i}"
-            );
+            assert_eq!(verify_commit(&m, &key), Err(Reject::BadSignature), "{curve:?} byte {i}");
         }
         // the signed content, too
         let mut m = c.clone();
@@ -146,20 +123,14 @@ fn flipped_signature_bytes_reject() {
         let at = b.windows(3).position(|w| w == b"rev").unwrap() + 4;
         b[at + 12] = if b[at + 12] == b'2' { b'3' } else { b'2' };
         set_commit_block(&mut m, b);
-        assert!(matches!(
-            verify_commit(&m, &key),
-            Err(Reject::CommitRevMismatch | Reject::BadSignature)
-        ));
+        assert!(matches!(verify_commit(&m, &key), Err(Reject::CommitRevMismatch | Reject::BadSignature)));
     }
 }
 
 #[test]
 fn wrong_key_rejects() {
     let (c, _) = sample(Curve::K256);
-    for other in [
-        Signer::new(Curve::K256, 1).public(),
-        Signer::new(Curve::P256, 1).public(),
-    ] {
+    for other in [Signer::new(Curve::K256, 1).public(), Signer::new(Curve::P256, 1).public()] {
         assert_eq!(verify_commit(&c, &other), Err(Reject::BadSignature));
     }
 }
@@ -172,22 +143,14 @@ fn high_s_rejects() {
         let at = sig_offset(&block) + 32;
         // s -> n - s: still a valid signature, but high-S
         let n: [u8; 32] = match curve {
-            Curve::K256 => {
-                hex32("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
-            }
-            Curve::P256 => {
-                hex32("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
-            }
+            Curve::K256 => hex32("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"),
+            Curve::P256 => hex32("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"),
         };
         let s: [u8; 32] = block[at..at + 32].try_into().unwrap();
         block[at..at + 32].copy_from_slice(&sub_be(&n, &s));
         let mut m = c.clone();
         set_commit_block(&mut m, block);
-        assert_eq!(
-            verify_commit(&m, &key),
-            Err(Reject::BadSignature),
-            "{curve:?}"
-        );
+        assert_eq!(verify_commit(&m, &key), Err(Reject::BadSignature), "{curve:?}");
     }
 }
 
@@ -226,11 +189,7 @@ fn every_dropped_block_rejects() {
             } else {
                 Reject::MissingMstBlocks
             };
-            assert_eq!(
-                verify_commit(&m, &key),
-                Err(want),
-                "{curve:?} dropping block {i} ({cid})"
-            );
+            assert_eq!(verify_commit(&m, &key), Err(want), "{curve:?} dropping block {i} ({cid})");
         }
     }
 }
@@ -244,32 +203,17 @@ fn proof_mutations_reject() {
     m.prev_data = Some(other);
     assert_eq!(verify_commit(&m, &key), Err(Reject::InversionMismatch));
 
-    let i = c
-        .ops
-        .iter()
-        .position(|o| o.action == Action::Create)
-        .unwrap();
+    let i = c.ops.iter().position(|o| o.action == Action::Create).unwrap();
     let mut m = c.clone();
     m.ops[i].cid = Some(other);
     assert_eq!(
-        verify_commit_with(
-            &m,
-            &key,
-            &Options {
-                require_record_blocks: false,
-                ..Options::default()
-            }
-        ),
+        verify_commit_with(&m, &key, &Options { require_record_blocks: false, ..Options::default() }),
         Err(Reject::OpMismatch)
     );
 
     let mut m = c.clone();
     m.ops.remove(i);
-    assert_eq!(
-        verify_commit(&m, &key),
-        Err(Reject::InversionMismatch),
-        "an op left out"
-    );
+    assert_eq!(verify_commit(&m, &key), Err(Reject::InversionMismatch), "an op left out");
 
     let mut m = c.clone();
     let dup = m.ops[i].clone();
@@ -318,19 +262,9 @@ fn proof_mutations_reject() {
 
     let mut m = c.clone();
     m.prev_data = None;
-    assert!(
-        verify_commit(&m, &key).is_ok(),
-        "sync 1.0 shape passes by default"
-    );
+    assert!(verify_commit(&m, &key).is_ok(), "sync 1.0 shape passes by default");
     assert_eq!(
-        verify_commit_with(
-            &m,
-            &key,
-            &Options {
-                require_prev_data: true,
-                ..Options::default()
-            }
-        ),
+        verify_commit_with(&m, &key, &Options { require_prev_data: true, ..Options::default() }),
         Err(Reject::MissingPrevData)
     );
 }
@@ -359,10 +293,7 @@ fn sync_mutations_reject() {
     m.did = "did:plc:notthesameaccount".into();
     assert_eq!(verify_sync(&m, &key), Err(Reject::CommitDidMismatch));
 
-    assert_eq!(
-        verify_sync(&s, &Signer::new(Curve::P256, 4).public()),
-        Err(Reject::BadSignature)
-    );
+    assert_eq!(verify_sync(&s, &Signer::new(Curve::P256, 4).public()), Err(Reject::BadSignature));
 }
 
 #[test]
@@ -371,11 +302,7 @@ fn chain_rules() {
     let d1 = Cid::dag_cbor(b"d1");
     let c2 = Cid::dag_cbor(b"c2");
     let d2 = Cid::dag_cbor(b"d2");
-    let st = ChainState {
-        rev: Tid(100),
-        data: d1,
-        commit: c1,
-    };
+    let st = ChainState { rev: Tid(100), data: d1, commit: c1 };
     let v = |kind, rev, commit, data, prev_data| Verified {
         kind,
         did: "did:plc:x".into(),
@@ -389,77 +316,40 @@ fn chain_rules() {
 
     assert_eq!(
         check_chain(None, &v(Commit, 5, c2, d2, Some(d1))),
-        Ok(ChainState {
-            rev: Tid(5),
-            data: d2,
-            commit: c2
-        })
+        Ok(ChainState { rev: Tid(5), data: d2, commit: c2 })
     );
     assert_eq!(
         check_chain(Some(&st), &v(Commit, 101, c2, d2, Some(d1))),
-        Ok(ChainState {
-            rev: Tid(101),
-            data: d2,
-            commit: c2
-        })
+        Ok(ChainState { rev: Tid(101), data: d2, commit: c2 })
     );
-    assert_eq!(
-        check_chain(Some(&st), &v(Commit, 99, c2, d2, Some(d1))),
-        Err(ChainError::RevNotForward)
-    );
-    assert_eq!(
-        check_chain(Some(&st), &v(Commit, 100, c2, d2, Some(d1))),
-        Err(ChainError::RevNotForward)
-    );
-    assert_eq!(
-        check_chain(Some(&st), &v(Commit, 100, c1, d1, Some(d1))),
-        Err(ChainError::Duplicate)
-    );
+    assert_eq!(check_chain(Some(&st), &v(Commit, 99, c2, d2, Some(d1))), Err(ChainError::RevNotForward));
+    assert_eq!(check_chain(Some(&st), &v(Commit, 100, c2, d2, Some(d1))), Err(ChainError::RevNotForward));
+    assert_eq!(check_chain(Some(&st), &v(Commit, 100, c1, d1, Some(d1))), Err(ChainError::Duplicate));
     assert_eq!(
         check_chain(Some(&st), &v(Commit, 101, c2, d2, Some(d2))),
-        Err(ChainError::PrevDataMismatch {
-            expected: d1,
-            got: d2
-        })
+        Err(ChainError::PrevDataMismatch { expected: d1, got: d2 })
     );
-    assert!(
-        check_chain(Some(&st), &v(Commit, 101, c2, d2, None)).is_ok(),
-        "sync 1.0 commit"
-    );
+    assert!(check_chain(Some(&st), &v(Commit, 101, c2, d2, None)).is_ok(), "sync 1.0 commit");
     // #sync resets regardless of data, but not backwards
     assert_eq!(
         check_chain(Some(&st), &v(Sync, 101, c2, d2, None)),
-        Ok(ChainState {
-            rev: Tid(101),
-            data: d2,
-            commit: c2
-        })
+        Ok(ChainState { rev: Tid(101), data: d2, commit: c2 })
     );
-    assert_eq!(
-        check_chain(Some(&st), &v(Sync, 50, c2, d2, None)),
-        Err(ChainError::RevNotForward)
-    );
+    assert_eq!(check_chain(Some(&st), &v(Sync, 50, c2, d2, None)), Err(ChainError::RevNotForward));
 
     assert_eq!(ChainState::from_bytes(&st.to_bytes()), Some(st));
 }
 
 #[test]
 fn rev_going_backwards_on_real_chain() {
-    let mut r = Repo::new(
-        "did:plc:backwardsbackwards",
-        Signer::new(Curve::K256, 11),
-        30,
-    );
+    let mut r = Repo::new("did:plc:backwardsbackwards", Signer::new(Curve::K256, 11), 30);
     let key = r.signer.public();
     let ops = r.mixed_ops(3);
     let a = verify_commit(&commit_of(r.commit(&ops)), &key).unwrap();
     let ops = r.mixed_ops(3);
     let b = verify_commit(&commit_of(r.commit(&ops)), &key).unwrap();
     let after_b = check_chain(Some(&check_chain(None, &a).unwrap()), &b).unwrap();
-    assert_eq!(
-        check_chain(Some(&after_b), &a),
-        Err(ChainError::RevNotForward)
-    );
+    assert_eq!(check_chain(Some(&after_b), &a), Err(ChainError::RevNotForward));
 }
 
 #[test]
@@ -472,28 +362,15 @@ fn multikeys() {
         SigningKey::from_did_key("did:key:zDnaembgSGUhZULN2Caob4HLJPaxBh92N7rtH21TErzqf8HQo"),
         Ok(SigningKey::P256(_))
     ));
-    for bad in [
-        "",
-        "z",
-        "zQ3sh",
-        "did:key:abc",
-        "mABC",
-        "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
-    ] {
-        assert!(
-            SigningKey::from_multibase(bad).is_err() && SigningKey::from_did_key(bad).is_err(),
-            "{bad}"
-        );
+    for bad in ["", "z", "zQ3sh", "did:key:abc", "mABC", "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"] {
+        assert!(SigningKey::from_multibase(bad).is_err() && SigningKey::from_did_key(bad).is_err(), "{bad}");
     }
 }
 
 // real bsky.network #commits (sync 1.0 era: no prevData)
 
 fn fixture_frames() -> Vec<(String, Bytes)> {
-    let dir = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../vlpds/testdata/shrike/firehose_commits"
-    );
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../vlpds/testdata/shrike/firehose_commits");
     let mut out = Vec::new();
     for e in std::fs::read_dir(dir).expect("fixtures") {
         let p = e.unwrap().path();
@@ -506,10 +383,7 @@ fn fixture_frames() -> Vec<(String, Bytes)> {
 
 pub(crate) fn frame_from_json(t: &str, body: &serde_json::Value) -> Bytes {
     use vlpds::cbor::Value;
-    let header = Value::Map(vec![
-        ("t".into(), Value::Text(t.into())),
-        ("op".into(), Value::Int(1)),
-    ]);
+    let header = Value::Map(vec![("t".into(), Value::Text(t.into())), ("op".into(), Value::Int(1))]);
     // Value::from_json sorts keys canonically; null blobs are an older PDS's
     let mut body = body.clone();
     if body["blobs"].is_null() {
@@ -521,21 +395,13 @@ pub(crate) fn frame_from_json(t: &str, body: &serde_json::Value) -> Bytes {
 }
 
 pub(crate) fn fixture_keys() -> HashMap<String, SigningKey> {
-    let p = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/testdata/firehose_commit_keys.json"
-    );
+    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/firehose_commit_keys.json");
     let j: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
     j.as_object()
         .unwrap()
         .iter()
         .filter(|(k, _)| k.starts_with("did:"))
-        .map(|(k, v)| {
-            (
-                k.clone(),
-                SigningKey::from_did_key(v.as_str().unwrap()).unwrap(),
-            )
-        })
+        .map(|(k, v)| (k.clone(), SigningKey::from_did_key(v.as_str().unwrap()).unwrap()))
         .collect()
 }
 
@@ -552,27 +418,15 @@ fn real_firehose_commits_verify() {
         let at = sig_offset(&b);
         b[at + 5] ^= 0x10;
         set_commit_block(&mut m, b);
-        assert_eq!(
-            verify_commit(&m, &keys[&c.repo]),
-            Err(Reject::BadSignature),
-            "{name}"
-        );
+        assert_eq!(verify_commit(&m, &keys[&c.repo]), Err(Reject::BadSignature), "{name}");
         // sync 1.0 CARs may carry blocks no check needs (the differential
         // test holds the rest to shrike's verdict); these must be there
         let data = verify_commit(&c, &keys[&c.repo]).unwrap().data;
-        let needed: Vec<Cid> = c
-            .ops
-            .iter()
-            .filter_map(|o| o.cid)
-            .chain([c.commit, data])
-            .collect();
+        let needed: Vec<Cid> = c.ops.iter().filter_map(|o| o.cid).chain([c.commit, data]).collect();
         for cid in needed {
             let mut m = c.clone();
             m.blocks.retain(|(x, _)| *x != cid);
-            assert!(
-                verify_commit(&m, &keys[&c.repo]).is_err(),
-                "{name}: dropped {cid}"
-            );
+            assert!(verify_commit(&m, &keys[&c.repo]).is_err(), "{name}: dropped {cid}");
         }
     }
 }
@@ -583,24 +437,16 @@ fn real_firehose_commits_verify() {
 /// as a chain break (`prev_data_mismatch`).
 #[test]
 fn delete_then_create_on_one_path() {
-    let b = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/testdata/regress/eurosky_delete_create.bin"
-    ))
-    .unwrap();
+    let b = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/regress/eurosky_delete_create.bin")).unwrap();
     let (n, rest) = b.split_at(4);
     let n = u32::from_le_bytes(n.try_into().unwrap()) as usize;
     let (first, rest) = rest.split_at(n);
     let next = &rest[4..];
-    let key =
-        SigningKey::from_multibase("zQ3shgYv5ut5siX3dhNU82fg225BqaPD2XyXVNKE3isgn76HG").unwrap();
+    let key = SigningKey::from_multibase("zQ3shgYv5ut5siX3dhNU82fg225BqaPD2XyXVNKE3isgn76HG").unwrap();
     let c = commit_of(Bytes::copy_from_slice(first));
     assert_eq!(c.ops.len(), 2);
     assert_eq!(c.ops[0].path, c.ops[1].path);
-    assert_eq!(
-        (c.ops[0].action, c.ops[1].action),
-        (Action::Delete, Action::Create)
-    );
+    assert_eq!((c.ops[0].action, c.ops[1].action), (Action::Delete, Action::Create));
     assert!(c.ops[1].prev.is_some());
     let v = verify_commit(&c, &key).expect("delete + create verifies");
     let state = check_chain(None, &v).unwrap();
@@ -613,10 +459,7 @@ fn delete_then_create_on_one_path() {
     assert_eq!(verify_commit(&m, &key), Err(Reject::InversionMismatch));
     let mut m = c.clone();
     m.ops.remove(0);
-    assert!(
-        verify_commit(&m, &key).is_ok(),
-        "a create with prev acts as an update"
-    );
+    assert!(verify_commit(&m, &key).is_ok(), "a create with prev acts as an update");
     m.ops[0].prev = None;
     assert_eq!(verify_commit(&m, &key), Err(Reject::InversionMismatch));
     // ops that contradict each other on one path

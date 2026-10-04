@@ -106,10 +106,7 @@ impl Default for Tiers {
         Tiers {
             trusted: TierLimits::trusted(),
             default: TierLimits::untrusted(1000),
-            new: TierLimits {
-                new_accounts_per_hour: 25,
-                ..TierLimits::untrusted(1000)
-            },
+            new: TierLimits { new_accounts_per_hour: 25, ..TierLimits::untrusted(1000) },
             throttled: TierLimits::throttled(),
         }
     }
@@ -181,12 +178,7 @@ pub struct Transitions {
 
 impl Default for Transitions {
     fn default() -> Self {
-        Transitions {
-            promote_after_days: 7,
-            recover_after_secs: 3_600,
-            error_ratio: 0.5,
-            error_min_events: 200,
-        }
+        Transitions { promote_after_days: 7, recover_after_secs: 3_600, error_ratio: 0.5, error_min_events: 200 }
     }
 }
 
@@ -248,11 +240,7 @@ pub struct Spam {
 
 impl Default for Spam {
     fn default() -> Self {
-        let t = |limit: f64, window_secs: u32, action| Threshold {
-            limit,
-            window_secs,
-            action,
-        };
+        let t = |limit: f64, window_secs: u32, action| Threshold { limit, window_secs, action };
         Spam {
             host_new_accounts: t(300.0, 3_600, SpamAction::ThrottleAndCase),
             account_records: t(600.0, 60, SpamAction::Case),
@@ -410,9 +398,7 @@ pub fn validate(p: &PolicyBody) -> Result<(), Vec<String>> {
             errs.push(format!("tiers.{n}.eventsPerSec must be > 0"));
         }
         if l.events_per_hour != 0 && (l.events_per_hour as f64) < l.events_per_sec {
-            errs.push(format!(
-                "tiers.{n}.eventsPerHour is below one second's worth"
-            ));
+            errs.push(format!("tiers.{n}.eventsPerHour is below one second's worth"));
         }
         if !(l.archival_fetches_per_host.is_finite() && l.archival_fetches_per_host > 0.0) {
             errs.push(format!("tiers.{n}.archivalFetchesPerHost must be > 0"));
@@ -463,10 +449,7 @@ pub fn validate(p: &PolicyBody) -> Result<(), Vec<String>> {
     if p.archive.mode == ArchiveMode::Hosts && p.archive.hosts.is_empty() {
         errs.push("archive.hosts is empty with mode hosts".into());
     }
-    if matches!(
-        p.crawl.initial_tier,
-        Tier::Throttled | Tier::Suspended | Tier::Banned
-    ) {
+    if matches!(p.crawl.initial_tier, Tier::Throttled | Tier::Suspended | Tier::Banned) {
         errs.push("crawl.initialTier must be trusted, default or new".into());
     }
     for d in &p.crawl.trusted_domains {

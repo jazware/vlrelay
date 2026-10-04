@@ -225,7 +225,9 @@ pub fn parse_fault(spec: &str, host_base: u32, hosts: u32, out: &mut [HostFaults
             "disconnect" => f.disconnect = Some((get("every", 30.0), get("down", 5.0))),
             "replay" => f.replay = Some((get("every", 20.0), get("count", 100.0) as usize)),
             "restart" => f.restart = Some(get("every", 60.0)),
-            _ => anyhow::bail!("unknown fault kind {kind} (badsig, gap, foreign, spam, stall, disconnect, replay, restart)"),
+            _ => anyhow::bail!(
+                "unknown fault kind {kind} (badsig, gap, foreign, spam, stall, disconnect, replay, restart)"
+            ),
         }
     }
     Ok(())

@@ -858,11 +858,7 @@ impl IntoResponse for AdminError {
                 (StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError")
             }
         };
-        (
-            status,
-            Json(serde_json::json!({ "error": error, "message": self.to_string() })),
-        )
-            .into_response()
+        (status, Json(serde_json::json!({ "error": error, "message": self.to_string() }))).into_response()
     }
 }
 
@@ -875,9 +871,19 @@ pub type AdminResult<T> = Result<T, AdminError>;
 #[serde(rename_all = "camelCase", tag = "op")]
 pub enum ReshardReq {
     /// `at`: the first slot of the right half (default: the midpoint).
-    Split { shard: u32, at: Option<u32>, #[serde(default)] wait: bool },
+    Split {
+        shard: u32,
+        at: Option<u32>,
+        #[serde(default)]
+        wait: bool,
+    },
     /// `left` holds the lower slots.
-    Merge { left: u32, right: u32, #[serde(default)] wait: bool },
+    Merge {
+        left: u32,
+        right: u32,
+        #[serde(default)]
+        wait: bool,
+    },
     Abort,
 }
 
@@ -911,15 +917,10 @@ pub trait AdminSource: Send + Sync + 'static {
         rule: DomainRuleInput,
         by: &str,
     ) -> impl Future<Output = AdminResult<DomainRule>> + Send;
-    fn delete_domain_rule(&self, id: u64, by: &str)
-    -> impl Future<Output = AdminResult<()>> + Send;
+    fn delete_domain_rule(&self, id: u64, by: &str) -> impl Future<Output = AdminResult<()>> + Send;
 
     fn policy(&self) -> impl Future<Output = AdminResult<PolicyDoc>> + Send;
-    fn update_policy(
-        &self,
-        update: PolicyUpdate,
-        by: &str,
-    ) -> impl Future<Output = AdminResult<PolicyDoc>> + Send;
+    fn update_policy(&self, update: PolicyUpdate, by: &str) -> impl Future<Output = AdminResult<PolicyDoc>> + Send;
     fn policy_audit(&self) -> impl Future<Output = AdminResult<Vec<PolicyAudit>>> + Send;
     fn full_policy(&self) -> impl Future<Output = AdminResult<FullPolicyDoc>> + Send {
         async { Err(AdminError::NotFound("this relay has no full policy document".into())) }
@@ -938,12 +939,7 @@ pub trait AdminSource: Send + Sync + 'static {
     fn consumers(&self) -> impl Future<Output = AdminResult<Vec<Consumer>>> + Send;
     fn kick_consumer(&self, id: u64, by: &str) -> impl Future<Output = AdminResult<()>> + Send;
     /// A consumer of `node` (ids are per node); None is this node.
-    fn kick_consumer_on(
-        &self,
-        node: Option<&str>,
-        id: u64,
-        by: &str,
-    ) -> impl Future<Output = AdminResult<()>> + Send {
+    fn kick_consumer_on(&self, node: Option<&str>, id: u64, by: &str) -> impl Future<Output = AdminResult<()>> + Send {
         let other = node.map(str::to_string);
         async move {
             match other {
@@ -977,12 +973,7 @@ pub trait AdminSource: Send + Sync + 'static {
 
     fn accounts(&self, q: AccountQuery) -> impl Future<Output = AdminResult<Vec<Account>>> + Send;
     fn account(&self, did: &str) -> impl Future<Output = AdminResult<Account>> + Send;
-    fn takedown(
-        &self,
-        did: &str,
-        reason: String,
-        by: &str,
-    ) -> impl Future<Output = AdminResult<Account>> + Send;
+    fn takedown(&self, did: &str, reason: String, by: &str) -> impl Future<Output = AdminResult<Account>> + Send;
     fn untakedown(&self, did: &str, by: &str) -> impl Future<Output = AdminResult<Account>> + Send;
 
     fn cases(&self, q: CaseQuery) -> impl Future<Output = AdminResult<Vec<Case>>> + Send;
@@ -993,12 +984,7 @@ pub trait AdminSource: Send + Sync + 'static {
             Ok(CaseDetail { case, trips: 1, evidence: Vec::new() })
         }
     }
-    fn update_case(
-        &self,
-        id: u64,
-        update: CaseUpdate,
-        by: &str,
-    ) -> impl Future<Output = AdminResult<Case>> + Send;
+    fn update_case(&self, id: u64, update: CaseUpdate, by: &str) -> impl Future<Output = AdminResult<Case>> + Send;
 }
 
 // ---------------------------------------------------------------- router
@@ -1011,32 +997,17 @@ struct Ctx<S> {
 /// `/admin/api/...`, behind `Authorization: Basic admin:<token>` (the same
 /// scheme as vlpds's console, so the UI's token handling carries over).
 pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
-    let ctx = Arc::new(Ctx {
-        src,
-        token: admin_token,
-    });
+    let ctx = Arc::new(Ctx { src, token: admin_token });
     Router::new()
         .route("/admin/api/overview", get(overview::<S>))
         .route("/admin/api/hosts", get(hosts::<S>))
         .route("/admin/api/hosts/{host}", get(host::<S>))
         .route("/admin/api/hosts/{host}/action", post(host_action::<S>))
-        .route(
-            "/admin/api/domain-rules",
-            get(rules::<S>).post(create_rule::<S>),
-        )
-        .route(
-            "/admin/api/domain-rules/{id}",
-            axum::routing::put(update_rule::<S>).delete(delete_rule::<S>),
-        )
-        .route(
-            "/admin/api/policy",
-            get(policy::<S>).put(update_policy::<S>),
-        )
+        .route("/admin/api/domain-rules", get(rules::<S>).post(create_rule::<S>))
+        .route("/admin/api/domain-rules/{id}", axum::routing::put(update_rule::<S>).delete(delete_rule::<S>))
+        .route("/admin/api/policy", get(policy::<S>).put(update_policy::<S>))
         .route("/admin/api/policy/audit", get(policy_audit::<S>))
-        .route(
-            "/admin/api/policy/full",
-            get(full_policy::<S>).put(update_full_policy::<S>),
-        )
+        .route("/admin/api/policy/full", get(full_policy::<S>).put(update_full_policy::<S>))
         .route("/admin/api/domain-rules/audit", get(rules_audit::<S>))
         .route("/admin/api/consumers", get(consumers::<S>))
         .route("/admin/api/consumers/{id}/kick", post(kick::<S>))
@@ -1050,25 +1021,15 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
         .route("/admin/api/accounts", get(accounts::<S>))
         .route("/admin/api/accounts/{did}", get(account::<S>))
         .route("/admin/api/accounts/{did}/takedown", post(takedown::<S>))
-        .route(
-            "/admin/api/accounts/{did}/untakedown",
-            post(untakedown::<S>),
-        )
+        .route("/admin/api/accounts/{did}/untakedown", post(untakedown::<S>))
         .route("/admin/api/cases", get(cases::<S>))
-        .route(
-            "/admin/api/cases/{id}",
-            get(case::<S>).post(update_case::<S>),
-        )
+        .route("/admin/api/cases/{id}", get(case::<S>).post(update_case::<S>))
         .route("/admin/api/cases/{id}/evidence", get(case_detail::<S>))
         .route_layer(middleware::from_fn_with_state(ctx.clone(), auth::<S>))
         .with_state(ctx)
 }
 
-async fn auth<S: AdminSource>(
-    State(ctx): State<Arc<Ctx<S>>>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn auth<S: AdminSource>(State(ctx): State<Arc<Ctx<S>>>, req: Request, next: Next) -> Response {
     let ok = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -1083,10 +1044,7 @@ async fn auth<S: AdminSource>(
             .into_response();
     }
     let mut res = next.run(req).await;
-    res.headers_mut().insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("no-store"),
-    );
+    res.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
     res
 }
 
@@ -1099,16 +1057,10 @@ type Ax<S> = State<Arc<Ctx<S>>>;
 async fn overview<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Overview>> {
     Ok(Json(c.src.overview().await?))
 }
-async fn hosts<S: AdminSource>(
-    State(c): Ax<S>,
-    Query(q): Query<HostQuery>,
-) -> AdminResult<Json<HostList>> {
+async fn hosts<S: AdminSource>(State(c): Ax<S>, Query(q): Query<HostQuery>) -> AdminResult<Json<HostList>> {
     Ok(Json(c.src.hosts(q).await?))
 }
-async fn host<S: AdminSource>(
-    State(c): Ax<S>,
-    Path(h): Path<String>,
-) -> AdminResult<Json<HostDetail>> {
+async fn host<S: AdminSource>(State(c): Ax<S>, Path(h): Path<String>) -> AdminResult<Json<HostDetail>> {
     Ok(Json(c.src.host(&h).await?))
 }
 async fn host_action<S: AdminSource>(
@@ -1121,10 +1073,7 @@ async fn host_action<S: AdminSource>(
 async fn rules<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Vec<DomainRule>>> {
     Ok(Json(c.src.domain_rules().await?))
 }
-async fn create_rule<S: AdminSource>(
-    State(c): Ax<S>,
-    Json(r): Json<DomainRuleInput>,
-) -> AdminResult<Json<DomainRule>> {
+async fn create_rule<S: AdminSource>(State(c): Ax<S>, Json(r): Json<DomainRuleInput>) -> AdminResult<Json<DomainRule>> {
     Ok(Json(c.src.create_domain_rule(r, BY).await?))
 }
 async fn update_rule<S: AdminSource>(
@@ -1134,20 +1083,14 @@ async fn update_rule<S: AdminSource>(
 ) -> AdminResult<Json<DomainRule>> {
     Ok(Json(c.src.update_domain_rule(id, r, BY).await?))
 }
-async fn delete_rule<S: AdminSource>(
-    State(c): Ax<S>,
-    Path(id): Path<u64>,
-) -> AdminResult<StatusCode> {
+async fn delete_rule<S: AdminSource>(State(c): Ax<S>, Path(id): Path<u64>) -> AdminResult<StatusCode> {
     c.src.delete_domain_rule(id, BY).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn policy<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<PolicyDoc>> {
     Ok(Json(c.src.policy().await?))
 }
-async fn update_policy<S: AdminSource>(
-    State(c): Ax<S>,
-    Json(u): Json<PolicyUpdate>,
-) -> AdminResult<Json<PolicyDoc>> {
+async fn update_policy<S: AdminSource>(State(c): Ax<S>, Json(u): Json<PolicyUpdate>) -> AdminResult<Json<PolicyDoc>> {
     validate_policy(&u.policy).map_err(AdminError::BadRequest)?;
     Ok(Json(c.src.update_policy(u, BY).await?))
 }
@@ -1166,10 +1109,7 @@ async fn update_full_policy<S: AdminSource>(
 async fn rules_audit<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Vec<PolicyAudit>>> {
     Ok(Json(c.src.domain_rules_audit().await?))
 }
-async fn case_detail<S: AdminSource>(
-    State(c): Ax<S>,
-    Path(id): Path<u64>,
-) -> AdminResult<Json<CaseDetail>> {
+async fn case_detail<S: AdminSource>(State(c): Ax<S>, Path(id): Path<u64>) -> AdminResult<Json<CaseDetail>> {
     Ok(Json(c.src.case_detail(id).await?))
 }
 async fn consumers<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Vec<Consumer>>> {
@@ -1202,23 +1142,14 @@ async fn cluster<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<ClusterVie
 async fn shard_layout<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<serde_json::Value>> {
     Ok(Json(c.src.shard_layout().await?))
 }
-async fn reshard<S: AdminSource>(
-    State(c): Ax<S>,
-    Json(req): Json<ReshardReq>,
-) -> AdminResult<Json<serde_json::Value>> {
+async fn reshard<S: AdminSource>(State(c): Ax<S>, Json(req): Json<ReshardReq>) -> AdminResult<Json<serde_json::Value>> {
     tracing::info!(target: "vlrelay::audit", ?req, by = BY, "reshard");
     Ok(Json(c.src.reshard(req).await?))
 }
-async fn accounts<S: AdminSource>(
-    State(c): Ax<S>,
-    Query(q): Query<AccountQuery>,
-) -> AdminResult<Json<Vec<Account>>> {
+async fn accounts<S: AdminSource>(State(c): Ax<S>, Query(q): Query<AccountQuery>) -> AdminResult<Json<Vec<Account>>> {
     Ok(Json(c.src.accounts(q).await?))
 }
-async fn account<S: AdminSource>(
-    State(c): Ax<S>,
-    Path(did): Path<String>,
-) -> AdminResult<Json<Account>> {
+async fn account<S: AdminSource>(State(c): Ax<S>, Path(did): Path<String>) -> AdminResult<Json<Account>> {
     Ok(Json(c.src.account(&did).await?))
 }
 async fn takedown<S: AdminSource>(
@@ -1231,16 +1162,10 @@ async fn takedown<S: AdminSource>(
     }
     Ok(Json(c.src.takedown(&did, b.reason, BY).await?))
 }
-async fn untakedown<S: AdminSource>(
-    State(c): Ax<S>,
-    Path(did): Path<String>,
-) -> AdminResult<Json<Account>> {
+async fn untakedown<S: AdminSource>(State(c): Ax<S>, Path(did): Path<String>) -> AdminResult<Json<Account>> {
     Ok(Json(c.src.untakedown(&did, BY).await?))
 }
-async fn cases<S: AdminSource>(
-    State(c): Ax<S>,
-    Query(q): Query<CaseQuery>,
-) -> AdminResult<Json<Vec<Case>>> {
+async fn cases<S: AdminSource>(State(c): Ax<S>, Query(q): Query<CaseQuery>) -> AdminResult<Json<Vec<Case>>> {
     Ok(Json(c.src.cases(q).await?))
 }
 async fn case<S: AdminSource>(State(c): Ax<S>, Path(id): Path<u64>) -> AdminResult<Json<Case>> {
@@ -1264,20 +1189,14 @@ pub fn validate_policy(p: &Policy) -> Result<(), String> {
         return Err(format!("default tier {:?} is not defined", p.default_tier));
     }
     for (name, t) in &p.tiers {
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        {
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
             return Err(format!("tier name {name:?}: use a-z, 0-9 and -"));
         }
         if !(t.events_per_sec.is_finite() && t.events_per_sec > 0.0) {
             return Err(format!("tiers.{name}.eventsPerSec must be > 0"));
         }
         if (t.events_per_hour as f64) < t.events_per_sec {
-            return Err(format!(
-                "tiers.{name}.eventsPerHour is below one second's worth"
-            ));
+            return Err(format!("tiers.{name}.eventsPerHour is below one second's worth"));
         }
         if t.events_per_day < t.events_per_hour {
             return Err(format!("tiers.{name}.eventsPerDay is below eventsPerHour"));

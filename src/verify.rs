@@ -153,24 +153,16 @@ impl SigningKey {
     /// `publicKeyMultibase` of a Multikey verification method: `z` + base58btc
     /// of the multicodec-prefixed compressed point.
     pub fn from_multibase(mb: &str) -> Result<SigningKey, KeyError> {
-        let b58 = mb
-            .strip_prefix('z')
-            .ok_or(KeyError("not base58btc multibase"))?;
-        let raw = bs58::decode(b58)
-            .into_vec()
-            .map_err(|_| KeyError("bad base58"))?;
+        let b58 = mb.strip_prefix('z').ok_or(KeyError("not base58btc multibase"))?;
+        let raw = bs58::decode(b58).into_vec().map_err(|_| KeyError("bad base58"))?;
         match raw.as_slice() {
-            [0xe7, 0x01, key @ ..] if key.len() == 33 => secp256k1::PublicKey::from_slice(key)
-                .map(SigningKey::K256)
-                .map_err(|_| KeyError("bad secp256k1 point")),
+            [0xe7, 0x01, key @ ..] if key.len() == 33 => {
+                secp256k1::PublicKey::from_slice(key).map(SigningKey::K256).map_err(|_| KeyError("bad secp256k1 point"))
+            }
             [0x80, 0x24, key @ ..] if key.len() == 33 => {
-                let pk = p256::PublicKey::from_sec1_bytes(key)
-                    .map_err(|_| KeyError("bad P-256 point"))?;
+                let pk = p256::PublicKey::from_sec1_bytes(key).map_err(|_| KeyError("bad P-256 point"))?;
                 let pt = p256::elliptic_curve::sec1::ToEncodedPoint::to_encoded_point(&pk, false);
-                let b: [u8; 65] = pt
-                    .as_bytes()
-                    .try_into()
-                    .map_err(|_| KeyError("bad P-256 point"))?;
+                let b: [u8; 65] = pt.as_bytes().try_into().map_err(|_| KeyError("bad P-256 point"))?;
                 Ok(SigningKey::P256(Box::new(b)))
             }
             _ => Err(KeyError("not a compressed secp256k1 or P-256 multikey")),
@@ -178,10 +170,7 @@ impl SigningKey {
     }
 
     pub fn from_did_key(k: &str) -> Result<SigningKey, KeyError> {
-        Self::from_multibase(
-            k.strip_prefix("did:key:")
-                .ok_or(KeyError("not a did:key"))?,
-        )
+        Self::from_multibase(k.strip_prefix("did:key:").ok_or(KeyError("not a did:key"))?)
     }
 
     pub fn curve(&self) -> &'static str {
@@ -203,20 +192,15 @@ impl SigningKey {
                     return false;
                 };
                 // libsecp256k1 rejects high-S itself, as atproto requires
-                secp256k1::SECP256K1
-                    .verify_ecdsa(&secp256k1::Message::from_digest(*digest), &s, pk)
-                    .is_ok()
+                secp256k1::SECP256K1.verify_ecdsa(&secp256k1::Message::from_digest(*digest), &s, pk).is_ok()
             }
             SigningKey::P256(pt) => {
                 if !p256_low_s(sig64) {
                     return false;
                 }
-                ring::signature::UnparsedPublicKey::new(
-                    &ring::signature::ECDSA_P256_SHA256_FIXED,
-                    &pt[..],
-                )
-                .verify(msg, sig64)
-                .is_ok()
+                ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, &pt[..])
+                    .verify(msg, sig64)
+                    .is_ok()
             }
         }
     }
@@ -225,9 +209,8 @@ impl SigningKey {
 /// s <= n/2 (big-endian compare against the P-256 order's half).
 fn p256_low_s(sig: &[u8; 64]) -> bool {
     const HALF_N: [u8; 32] = [
-        0x7f, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xde, 0x73, 0x7d, 0x56, 0xd3, 0x8b, 0xcf, 0x42, 0x79, 0xdc, 0xe5, 0x61, 0x7e, 0x31,
-        0x92, 0xa8,
+        0x7f, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xde, 0x73,
+        0x7d, 0x56, 0xd3, 0x8b, 0xcf, 0x42, 0x79, 0xdc, 0xe5, 0x61, 0x7e, 0x31, 0x92, 0xa8,
     ];
     sig[32..] <= HALF_N[..]
 }
@@ -303,13 +286,7 @@ fn decode_commit(block: &[u8]) -> Result<CommitObj<'_>, Reject> {
         None | Some(ValueRef::Null) => None,
         _ => return Err(Reject::BadCommit),
     };
-    Ok(CommitObj {
-        did: text("did")?,
-        version,
-        data,
-        rev: text("rev")?,
-        prev,
-    })
+    Ok(CommitObj { did: text("did")?, version, data, rev: text("rev")?, prev })
 }
 
 thread_local! {
@@ -318,12 +295,7 @@ thread_local! {
 
 /// The commit block's fields against the event, then its signature.
 #[doc(hidden)]
-pub fn check_commit_block<'a>(
-    block: &'a [u8],
-    did: &str,
-    rev: Tid,
-    key: &SigningKey,
-) -> Result<CommitObj<'a>, Reject> {
+pub fn check_commit_block<'a>(block: &'a [u8], did: &str, rev: Tid, key: &SigningKey) -> Result<CommitObj<'a>, Reject> {
     let c = decode_commit(block)?;
     if c.version != 3 {
         return Err(Reject::BadCommitVersion);
@@ -351,10 +323,7 @@ pub fn check_commit_block<'a>(
 }
 
 fn check_future_rev(rev: Tid, opts: &Options) -> Result<(), Reject> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
     if rev.micros() > now.saturating_add(opts.future_rev_tolerance.as_micros() as u64) {
         return Err(Reject::FutureRev);
     }
@@ -391,11 +360,7 @@ pub fn verify_commit(c: &ParsedCommit, key: &SigningKey) -> Result<Verified, Rej
     verify_commit_with(c, key, &Options::default())
 }
 
-pub fn verify_commit_with(
-    c: &ParsedCommit,
-    key: &SigningKey,
-    opts: &Options,
-) -> Result<Verified, Reject> {
+pub fn verify_commit_with(c: &ParsedCommit, key: &SigningKey, opts: &Options) -> Result<Verified, Reject> {
     check_future_rev(c.rev, opts)?;
     if c.car_roots.first() != Some(&c.commit) {
         return Err(Reject::CarRootMismatch);
@@ -414,26 +379,15 @@ pub fn verify_commit_with(
         commit: c.commit,
         data: obj.data,
         prev_data: c.prev_data,
-        created: c.since.is_none()
-            && c.prev_data
-                .is_none_or(|p| p == *vlpds::recent_writes::EMPTY_ROOT),
+        created: c.since.is_none() && c.prev_data.is_none_or(|p| p == *vlpds::recent_writes::EMPTY_ROOT),
     })
 }
 
 /// The ops against the new tree, then (with prevData) the inductive proof.
 #[doc(hidden)]
-pub fn check_ops(
-    c: &ParsedCommit,
-    data: Cid,
-    blocks: &BlockMap<'_>,
-    opts: &Options,
-) -> Result<(), Reject> {
+pub fn check_ops(c: &ParsedCommit, data: Cid, blocks: &BlockMap<'_>, opts: &Options) -> Result<(), Reject> {
     let net = net_ops(&c.ops)?;
-    if opts.require_record_blocks
-        && c.ops
-            .iter()
-            .any(|o| o.cid.is_some_and(|cid| !blocks.contains_key(&cid)))
-    {
+    if opts.require_record_blocks && c.ops.iter().any(|o| o.cid.is_some_and(|cid| !blocks.contains_key(&cid))) {
         return Err(Reject::MissingRecordBlock);
     }
     // an empty commit (rev bump) may leave the root out of its CAR
@@ -488,13 +442,7 @@ struct NetOp<'a> {
 /// contradict each other.
 fn net_ops(ops: &[RepoOp]) -> Result<Vec<NetOp<'_>>, Reject> {
     fn start(o: &RepoOp, i: usize) -> NetOp<'_> {
-        NetOp {
-            path: o.path.as_str(),
-            before: o.prev,
-            needs_before: o.action != Action::Create,
-            after: o.cid,
-            last: i,
-        }
+        NetOp { path: o.path.as_str(), before: o.prev, needs_before: o.action != Action::Create, after: o.cid, last: i }
     }
     if ops.len() == 1 {
         return Ok(vec![start(&ops[0], 0)]);
@@ -509,9 +457,7 @@ fn net_ops(ops: &[RepoOp]) -> Result<Vec<NetOp<'_>>, Reject> {
                 // a create's prev, if set, is the record before the commit
                 let fits = match o.action {
                     Action::Create => n.after.is_none(),
-                    Action::Update | Action::Delete => {
-                        n.after.is_some() && o.prev.is_none_or(|p| Some(p) == n.after)
-                    }
+                    Action::Update | Action::Delete => n.after.is_some() && o.prev.is_none_or(|p| Some(p) == n.after),
                 };
                 if !fits {
                     return Err(Reject::DuplicatePath);
@@ -536,15 +482,8 @@ pub(crate) fn set_fast_path(on: bool) {
     FAST_PATH.set(on);
 }
 
-fn check_ops_tree(
-    c: &ParsedCommit,
-    data: Cid,
-    blocks: &BlockMap<'_>,
-    net: &[NetOp<'_>],
-) -> Result<(), Reject> {
-    let mut tree = Tree::load_from_blocks(blocks, data)
-        .map_err(mst_err)?
-        .without_rollback();
+fn check_ops_tree(c: &ParsedCommit, data: Cid, blocks: &BlockMap<'_>, net: &[NetOp<'_>]) -> Result<(), Reject> {
+    let mut tree = Tree::load_from_blocks(blocks, data).map_err(mst_err)?.without_rollback();
     for n in net {
         if tree.get(n.path.as_bytes()).map_err(mst_err)? != n.after {
             return Err(Reject::OpMismatch);
@@ -571,18 +510,10 @@ pub fn verify_sync(s: &ParsedSync, key: &SigningKey) -> Result<Verified, Reject>
     verify_sync_with(s, key, &Options::default())
 }
 
-pub fn verify_sync_with(
-    s: &ParsedSync,
-    key: &SigningKey,
-    opts: &Options,
-) -> Result<Verified, Reject> {
+pub fn verify_sync_with(s: &ParsedSync, key: &SigningKey, opts: &Options) -> Result<Verified, Reject> {
     check_future_rev(s.rev, opts)?;
     let commit = *s.car_roots.first().ok_or(Reject::BadCar)?;
-    let (_, block) = s
-        .blocks
-        .iter()
-        .find(|(c, _)| *c == commit)
-        .ok_or(Reject::MissingCommitBlock)?;
+    let (_, block) = s.blocks.iter().find(|(c, _)| *c == commit).ok_or(Reject::MissingCommitBlock)?;
     if !vlpds::car::block_matches(&commit, block) {
         return Err(Reject::BlockHashMismatch);
     }
@@ -657,11 +588,7 @@ impl ChainError {
 /// A first sighting is accepted as is. A commit without prevData (sync 1.0)
 /// only has to move the rev forward.
 pub fn check_chain(prev: Option<&ChainState>, v: &Verified) -> Result<ChainState, ChainError> {
-    let next = ChainState {
-        rev: v.rev,
-        data: v.data,
-        commit: v.commit,
-    };
+    let next = ChainState { rev: v.rev, data: v.data, commit: v.commit };
     let Some(p) = prev else { return Ok(next) };
     if v.rev <= p.rev {
         return Err(if v.rev == p.rev && v.commit == p.commit {
@@ -673,10 +600,7 @@ pub fn check_chain(prev: Option<&ChainState>, v: &Verified) -> Result<ChainState
     if let (VerifiedKind::Commit, Some(got)) = (v.kind, v.prev_data)
         && got != p.data
     {
-        return Err(ChainError::PrevDataMismatch {
-            expected: p.data,
-            got,
-        });
+        return Err(ChainError::PrevDataMismatch { expected: p.data, got });
     }
     Ok(next)
 }

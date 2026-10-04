@@ -59,7 +59,10 @@ impl Acct {
             self.blocks.insert(*cid, b.to_vec());
         }
         let data = self.repo.tree.root_cid().unwrap();
-        (frame, CommitClaim { rev: self.repo.rev, commit: self.repo.commit, data, prev_data: Some(before), since: None })
+        (
+            frame,
+            CommitClaim { rev: self.repo.rev, commit: self.repo.commit, data, prev_data: Some(before), since: None },
+        )
     }
 
     /// The whole repo as a getRepo CAR (commit, nodes, records).

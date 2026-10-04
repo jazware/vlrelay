@@ -8,11 +8,7 @@ use vlrelay::admin::{self, UiFiles, demo::Demo};
 #[derive(Parser)]
 #[command(about = "vlRelay operator dashboard on simulated data")]
 struct Args {
-    #[arg(
-        long,
-        default_value = "127.0.0.1:2790",
-        env = "VLRELAY_ADMIN_DEMO_LISTEN"
-    )]
+    #[arg(long, default_value = "127.0.0.1:2790", env = "VLRELAY_ADMIN_DEMO_LISTEN")]
     listen: SocketAddr,
     /// A built `ui/dist` (default: this source tree's, if built).
     #[arg(long)]
@@ -27,9 +23,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let args = Args::parse();
     let ui = Arc::new(UiFiles::load(args.ui_dir.as_deref())?);

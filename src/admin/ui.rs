@@ -34,10 +34,7 @@ impl UiFiles {
                 let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/dist");
                 if !dev.join("index.html").is_file() {
                     tracing::warn!(dir = %dev.display(), "no built dashboard: serving a placeholder");
-                    return Ok(UiFiles {
-                        files: HashMap::new(),
-                        index: Bytes::from_static(PLACEHOLDER.as_bytes()),
-                    });
+                    return Ok(UiFiles { files: HashMap::new(), index: Bytes::from_static(PLACEHOLDER.as_bytes()) });
                 }
                 dev
             }
@@ -53,11 +50,7 @@ impl UiFiles {
     }
 }
 
-fn walk(
-    root: &Path,
-    dir: &Path,
-    out: &mut HashMap<String, (Bytes, HeaderValue)>,
-) -> anyhow::Result<()> {
+fn walk(root: &Path, dir: &Path, out: &mut HashMap<String, (Bytes, HeaderValue)>) -> anyhow::Result<()> {
     for e in std::fs::read_dir(dir)? {
         let path = e?.path();
         if path.is_dir() {
@@ -70,13 +63,7 @@ fn walk(
                 .collect::<Vec<_>>()
                 .join("/");
             let mime = mime_guess::from_path(&path).first_or_octet_stream();
-            out.insert(
-                rel,
-                (
-                    std::fs::read(&path)?.into(),
-                    HeaderValue::from_str(mime.as_ref())?,
-                ),
-            );
+            out.insert(rel, (std::fs::read(&path)?.into(), HeaderValue::from_str(mime.as_ref())?));
         }
     }
     Ok(())
@@ -105,44 +92,25 @@ async fn shell(State(ui): State<Arc<UiFiles>>, uri: axum::http::Uri) -> Response
     }
     (
         [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/html; charset=utf-8"),
-            ),
+            (header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")),
             (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                HeaderValue::from_static(CSP),
-            ),
-            (
-                header::X_CONTENT_TYPE_OPTIONS,
-                HeaderValue::from_static("nosniff"),
-            ),
+            (header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP)),
+            (header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
         ],
         ui.index.clone(),
     )
         .into_response()
 }
 
-async fn asset(
-    State(ui): State<Arc<UiFiles>>,
-    uri: axum::http::Uri,
-    _p: Option<AxPath<String>>,
-) -> Response {
+async fn asset(State(ui): State<Arc<UiFiles>>, uri: axum::http::Uri, _p: Option<AxPath<String>>) -> Response {
     let key = uri.path().trim_start_matches('/');
     match ui.files.get(key) {
         Some((data, mime)) => {
             // hashed names under assets/ never change content
-            let cache = if key.starts_with("assets/") {
-                "public, max-age=31536000, immutable"
-            } else {
-                "public, max-age=3600"
-            };
+            let cache =
+                if key.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "public, max-age=3600" };
             (
-                [
-                    (header::CONTENT_TYPE, mime.clone()),
-                    (header::CACHE_CONTROL, HeaderValue::from_static(cache)),
-                ],
+                [(header::CONTENT_TYPE, mime.clone()), (header::CACHE_CONTROL, HeaderValue::from_static(cache))],
                 data.clone(),
             )
                 .into_response()

@@ -29,9 +29,7 @@ impl Signer {
         let sk: [u8; 32] = Sha256::digest(seed.to_be_bytes()).into();
         match curve {
             Curve::K256 => Signer::K256(vlpds::crypto::Keypair::from_bytes(&sk).expect("k256 key")),
-            Curve::P256 => {
-                Signer::P256(p256::ecdsa::SigningKey::from_bytes(&sk.into()).expect("p256 key"))
-            }
+            Curve::P256 => Signer::P256(p256::ecdsa::SigningKey::from_bytes(&sk.into()).expect("p256 key")),
         }
     }
 
@@ -53,9 +51,7 @@ impl Signer {
         };
         match self {
             Signer::K256(k) => b.extend_from_slice(&k.public_key_sec1()),
-            Signer::P256(k) => {
-                b.extend_from_slice(k.verifying_key().to_encoded_point(true).as_bytes())
-            }
+            Signer::P256(k) => b.extend_from_slice(k.verifying_key().to_encoded_point(true).as_bytes()),
         }
         format!("z{}", bs58::encode(b).into_string())
     }
@@ -68,15 +64,9 @@ impl Signer {
 pub fn record(path: &str, n: u64) -> Vec<u8> {
     let coll = path.split('/').next().unwrap_or("");
     Value::Map(vec![
-        (
-            "text".into(),
-            Value::Text(format!("synthetic record {n} at {path}")),
-        ),
+        ("text".into(), Value::Text(format!("synthetic record {n} at {path}"))),
         ("$type".into(), Value::Text(coll.into())),
-        (
-            "createdAt".into(),
-            Value::Text("2026-01-01T00:00:00.000Z".into()),
-        ),
+        ("createdAt".into(), Value::Text("2026-01-01T00:00:00.000Z".into())),
     ])
     .to_cbor()
 }
@@ -105,10 +95,7 @@ impl Repo {
         let mut tree = Tree::new();
         let mut live = BTreeMap::new();
         for i in 0..initial {
-            let p = format!(
-                "app.bsky.feed.post/{}",
-                Tid::from_parts(1_700_000_000_000_000 + i as u64 * 7919, 0)
-            );
+            let p = format!("app.bsky.feed.post/{}", Tid::from_parts(1_700_000_000_000_000 + i as u64 * 7919, 0));
             let c = Cid::dag_cbor(&record(&p, i as u64));
             tree.insert_no_proof(p.as_bytes(), c).expect("insert");
             live.insert(p, c);
@@ -133,9 +120,7 @@ impl Repo {
 
     fn sign(&mut self, data: Cid) {
         let rev = self.rev.to_string();
-        let sig = self
-            .signer
-            .sign(&encode_commit(&self.did, &rev, &data, None));
+        let sig = self.signer.sign(&encode_commit(&self.did, &rev, &data, None));
         self.commit_block = encode_commit(&self.did, &rev, &data, Some(&sig));
         self.commit = Cid::dag_cbor(&self.commit_block);
     }
@@ -146,10 +131,7 @@ impl Repo {
 
     pub fn new_path(&mut self) -> String {
         self.n += 1;
-        format!(
-            "app.bsky.feed.like/{}",
-            Tid::from_parts(1_750_000_000_000_000 + self.n * 104_729, 1)
-        )
+        format!("app.bsky.feed.like/{}", Tid::from_parts(1_750_000_000_000_000 + self.n * 104_729, 1))
     }
 
     /// A random-ish mix: mostly creates, some updates and deletes of live keys.
@@ -158,22 +140,12 @@ impl Repo {
         let keys: Vec<String> = self.live.keys().cloned().collect();
         for i in 0..n {
             self.n += 1;
-            let pick = keys
-                .get((self.n as usize * 2_654_435_761) % keys.len().max(1))
-                .cloned();
+            let pick = keys.get((self.n as usize * 2_654_435_761) % keys.len().max(1)).cloned();
             match (i % 5, pick) {
-                (3, Some(k))
-                    if !ops
-                        .iter()
-                        .any(|o: &Op| matches!(o, Op::Put(p) | Op::Delete(p) if *p == k)) =>
-                {
+                (3, Some(k)) if !ops.iter().any(|o: &Op| matches!(o, Op::Put(p) | Op::Delete(p) if *p == k)) => {
                     ops.push(Op::Put(k))
                 }
-                (4, Some(k))
-                    if !ops
-                        .iter()
-                        .any(|o: &Op| matches!(o, Op::Put(p) | Op::Delete(p) if *p == k)) =>
-                {
+                (4, Some(k)) if !ops.iter().any(|o: &Op| matches!(o, Op::Put(p) | Op::Delete(p) if *p == k)) => {
                     ops.push(Op::Delete(k))
                 }
                 _ => ops.push(Op::Put(self.new_path())),
@@ -196,12 +168,7 @@ impl Repo {
                     let prev = self.tree.insert(p.as_bytes(), c).expect("insert");
                     self.live.insert(p.clone(), c);
                     records.push((c, rec));
-                    fops.push((
-                        p.clone(),
-                        if prev.is_some() { "update" } else { "create" },
-                        Some(c),
-                        prev,
-                    ));
+                    fops.push((p.clone(), if prev.is_some() { "update" } else { "create" }, Some(c), prev));
                 }
                 Op::Delete(p) => {
                     let prev = self.tree.remove(p.as_bytes()).expect("remove");
@@ -212,10 +179,7 @@ impl Repo {
         }
         let mut nodes = Vec::new();
         let data = self.tree.write_diff_blocks(&mut nodes).expect("diff");
-        self.rev = Tid::from_parts(
-            self.rev.micros().max(vlpds::tid::now_micros() - 30_000_000) + 1,
-            0,
-        );
+        self.rev = Tid::from_parts(self.rev.micros().max(vlpds::tid::now_micros() - 30_000_000) + 1, 0);
         self.sign(data);
         let mut car = Vec::new();
         vlpds::car::write_header(&mut car, &self.commit);
@@ -254,12 +218,7 @@ impl Repo {
         let mut car = Vec::new();
         vlpds::car::write_header(&mut car, &self.commit);
         vlpds::car::write_block(&mut car, &self.commit, &self.commit_block);
-        let f = sync_frame(
-            &self.did,
-            &self.rev.to_string(),
-            &car,
-            "2026-01-01T00:00:00.000Z",
-        );
+        let f = sync_frame(&self.did, &self.rev.to_string(), &car, "2026-01-01T00:00:00.000Z");
         self.seq += 1;
         let mut out = Vec::new();
         f.finish(self.seq, &mut out);

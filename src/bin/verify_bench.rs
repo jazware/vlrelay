@@ -29,10 +29,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Capture {
-        #[arg(
-            long,
-            default_value = "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos"
-        )]
+        #[arg(long, default_value = "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos")]
         url: String,
         #[arg(long, default_value_t = 1000)]
         n: usize,
@@ -109,10 +106,7 @@ fn read_frames(p: &PathBuf) -> anyhow::Result<Vec<Bytes>> {
 
 /// DID -> multibase key ("" when the DID has none / didn't resolve).
 fn read_keys(p: &PathBuf) -> BTreeMap<String, String> {
-    std::fs::read(p)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    std::fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
 #[tokio::main]
@@ -121,36 +115,15 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     match Cli::parse().cmd {
         Cmd::Capture { url, n, out } => capture(&url, n, &out).await,
-        Cmd::Verify {
-            frames,
-            keys,
-            plc,
-            rate,
-        } => verify_all(&frames, &keys, &plc, rate).await,
-        Cmd::Bench {
-            frames,
-            keys,
-            passes,
-        } => {
+        Cmd::Verify { frames, keys, plc, rate } => verify_all(&frames, &keys, &plc, rate).await,
+        Cmd::Bench { frames, keys, passes } => {
             bench(&frames, &keys, passes);
             Ok(())
         }
-        Cmd::Hunt {
-            hosts,
-            back,
-            cursor,
-            out,
-            keys,
-            plc,
-            rate,
-            secs,
-        } => hunt(hosts, back, cursor, &out, &keys, &plc, rate, secs).await,
-        Cmd::Profile {
-            frames,
-            keys,
-            stage,
-            secs,
-        } => {
+        Cmd::Hunt { hosts, back, cursor, out, keys, plc, rate, secs } => {
+            hunt(hosts, back, cursor, &out, &keys, &plc, rate, secs).await
+        }
+        Cmd::Profile { frames, keys, stage, secs } => {
             profile(&frames, &keys, &stage, secs);
             Ok(())
         }
@@ -180,20 +153,11 @@ async fn capture(url: &str, n: usize, out: &PathBuf) -> anyhow::Result<()> {
         std::fs::create_dir_all(d)?;
     }
     std::fs::write(out, &buf)?;
-    println!(
-        "captured {got} frames ({} bytes) in {:?}",
-        buf.len(),
-        t0.elapsed()
-    );
+    println!("captured {got} frames ({} bytes) in {:?}", buf.len(), t0.elapsed());
     Ok(())
 }
 
-async fn verify_all(
-    frames: &PathBuf,
-    keys_path: &PathBuf,
-    plc: &str,
-    rate: f64,
-) -> anyhow::Result<()> {
+async fn verify_all(frames: &PathBuf, keys_path: &PathBuf, plc: &str, rate: f64) -> anyhow::Result<()> {
     let frames = read_frames(frames)?;
     let mut keys = read_keys(keys_path);
     let ids = IdentityCache::new(
@@ -215,10 +179,7 @@ async fn verify_all(
         let e = match event::parse(f.clone(), &limits) {
             Ok(e) => e,
             Err(r) => {
-                rejects
-                    .entry(format!("parse:{}", r.reason()))
-                    .or_default()
-                    .push(format!("{r}"));
+                rejects.entry(format!("parse:{}", r.reason())).or_default().push(format!("{r}"));
                 continue;
             }
         };
@@ -240,10 +201,7 @@ async fn verify_all(
             keys.insert(did.clone(), mb);
         }
         let Ok(key) = SigningKey::from_multibase(&keys[&did]) else {
-            rejects
-                .entry("no_key".into())
-                .or_default()
-                .push(did.clone());
+            rejects.entry("no_key".into()).or_default().push(did.clone());
             continue;
         };
         *curves.entry(key.curve()).or_default() += 1;
@@ -264,10 +222,7 @@ async fn verify_all(
                     Event::Sync(s) => s.seq,
                     _ => 0,
                 };
-                rejects
-                    .entry(r.reason().to_string())
-                    .or_default()
-                    .push(format!("{did} seq={seq}"))
+                rejects.entry(r.reason().to_string()).or_default().push(format!("{did} seq={seq}"))
             }
         }
     }
@@ -279,10 +234,7 @@ async fn verify_all(
     println!(
         "commits+syncs verified ok: {ok}; commits with prevData: {with_prev_data}; ops {ops_total}; key curves {curves:?}"
     );
-    println!(
-        "plc fetches {}",
-        ids.stats.fetches.load(std::sync::atomic::Ordering::Relaxed)
-    );
+    println!("plc fetches {}", ids.stats.fetches.load(std::sync::atomic::Ordering::Relaxed));
     for (r, v) in &rejects {
         println!("reject {r}: {} (e.g. {:?})", v.len(), &v[..v.len().min(3)]);
     }
@@ -340,10 +292,7 @@ async fn hunt(
                     Some(c) => c,
                     None => head_seq(&host).await? - back,
                 };
-                let url = format!(
-                    "wss://{host}/xrpc/com.atproto.sync.subscribeRepos?cursor={}",
-                    cursor.max(0)
-                );
+                let url = format!("wss://{host}/xrpc/com.atproto.sync.subscribeRepos?cursor={}", cursor.max(0));
                 eprintln!("{host}: from seq {cursor}");
                 let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
                 while let Some(m) = ws.next().await {
@@ -402,11 +351,7 @@ async fn hunt(
                                     if let verify::ChainError::PrevDataMismatch { .. } = c {
                                         chains.insert(
                                             did,
-                                            verify::ChainState {
-                                                rev: v.rev,
-                                                data: v.data,
-                                                commit: v.commit,
-                                            },
+                                            verify::ChainState { rev: v.rev, data: v.data, commit: v.commit },
                                         );
                                     }
                                     Some(format!("chain:{}", c.reason()))
@@ -419,10 +364,7 @@ async fn hunt(
             Ok(_) => None,
         };
         if let Some(r) = reason {
-            let seq = event::route(&f, limits.max_frame_bytes)
-                .ok()
-                .and_then(|r| r.seq)
-                .unwrap_or(-1);
+            let seq = event::route(&f, limits.max_frame_bytes).ok().and_then(|r| r.seq).unwrap_or(-1);
             println!("{host} seq={seq} {r}");
             *counts.entry(r).or_default() += 1;
             saved.extend_from_slice(&(f.len() as u32).to_le_bytes());
@@ -481,9 +423,7 @@ fn profile(frames: &PathBuf, keys_path: &PathBuf, stage: &str, secs: u64) {
         .iter()
         .map(|(c, k)| {
             let m = verify::block_map(&c.blocks).unwrap();
-            let data = verify::check_commit_block(m[&c.commit], &c.repo, c.rev, k)
-                .unwrap()
-                .data;
+            let data = verify::check_commit_block(m[&c.commit], &c.repo, c.rev, k).unwrap().data;
             (c, k, m, data)
         })
         .collect();
@@ -493,12 +433,7 @@ fn profile(frames: &PathBuf, keys_path: &PathBuf, stage: &str, secs: u64) {
         for (c, k, m, data) in &staged {
             match stage {
                 "mst" => drop(black_box(verify::check_ops(c, *data, m, &opts))),
-                "sig" => drop(black_box(verify::check_commit_block(
-                    m[&c.commit],
-                    &c.repo,
-                    c.rev,
-                    k,
-                ))),
+                "sig" => drop(black_box(verify::check_commit_block(m[&c.commit], &c.repo, c.rev, k))),
                 "hashes" => drop(black_box(verify::block_map(&c.blocks))),
                 _ => {
                     if let Ok(Event::Commit(p)) = event::parse(c.frame.clone(), &limits) {
@@ -509,10 +444,7 @@ fn profile(frames: &PathBuf, keys_path: &PathBuf, stage: &str, secs: u64) {
             n += 1;
         }
     }
-    println!(
-        "{stage}: {n} iterations, {:.2} µs each",
-        t0.elapsed().as_secs_f64() * 1e6 / n as f64
-    );
+    println!("{stage}: {n} iterations, {:.2} µs each", t0.elapsed().as_secs_f64() * 1e6 / n as f64);
 }
 
 fn bench(frames: &PathBuf, keys_path: &PathBuf, passes: usize) {
@@ -525,10 +457,8 @@ fn bench(frames: &PathBuf, keys_path: &PathBuf, passes: usize) {
         frames.len(),
         commits.len(),
         bytes / commits.len().max(1),
-        commits.iter().map(|(c, _)| c.ops.len()).sum::<usize>() as f64
-            / commits.len().max(1) as f64,
-        commits.iter().map(|(c, _)| c.blocks.len()).sum::<usize>() as f64
-            / commits.len().max(1) as f64,
+        commits.iter().map(|(c, _)| c.ops.len()).sum::<usize>() as f64 / commits.len().max(1) as f64,
+        commits.iter().map(|(c, _)| c.blocks.len()).sum::<usize>() as f64 / commits.len().max(1) as f64,
     );
     let mut rows: Vec<(&str, f64)> = Vec::new();
     rows.push((
@@ -561,9 +491,7 @@ fn bench(frames: &PathBuf, keys_path: &PathBuf, passes: usize) {
         .iter()
         .map(|(c, k)| {
             let m = verify::block_map(&c.blocks).unwrap();
-            let data = verify::check_commit_block(m[&c.commit], &c.repo, c.rev, k)
-                .unwrap()
-                .data;
+            let data = verify::check_commit_block(m[&c.commit], &c.repo, c.rev, k).unwrap().data;
             (c, k, m, data)
         })
         .collect();
@@ -616,24 +544,10 @@ fn bench(frames: &PathBuf, keys_path: &PathBuf, passes: usize) {
             .collect();
         let blocks: Vec<(Vec<u8>, String, vlpds::tid::Tid)> = sc
             .iter()
-            .map(|c| {
-                (
-                    c.blocks
-                        .iter()
-                        .find(|(x, _)| *x == c.commit)
-                        .unwrap()
-                        .1
-                        .to_vec(),
-                    c.repo.clone(),
-                    c.rev,
-                )
-            })
+            .map(|c| (c.blocks.iter().find(|(x, _)| *x == c.commit).unwrap().1.to_vec(), c.repo.clone(), c.rev))
             .collect();
-        let label = if curve == Curve::K256 {
-            "signature only, k256 (libsecp256k1)"
-        } else {
-            "signature only, P-256 (ring)"
-        };
+        let label =
+            if curve == Curve::K256 { "signature only, k256 (libsecp256k1)" } else { "signature only, P-256 (ring)" };
         rows.push((
             label,
             time(&blocks, passes, |(b, did, rev)| {
@@ -642,9 +556,7 @@ fn bench(frames: &PathBuf, keys_path: &PathBuf, passes: usize) {
         ));
         if curve == Curve::P256 {
             let vk = match &key {
-                SigningKey::P256(pt) => {
-                    p256::ecdsa::VerifyingKey::from_sec1_bytes(&pt[..]).unwrap()
-                }
+                SigningKey::P256(pt) => p256::ecdsa::VerifyingKey::from_sec1_bytes(&pt[..]).unwrap(),
                 _ => unreachable!(),
             };
             rows.push((

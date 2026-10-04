@@ -142,11 +142,7 @@ impl Engine {
         let policy = Stored::<PolicyBody>::initial();
         Arc::new(Engine {
             signals: signals::Signals::new(&policy.body.spam),
-            snap: RwLock::new(Arc::new(Snapshot {
-                policy,
-                rules: rules::Compiled::default(),
-                rules_version: 0,
-            })),
+            snap: RwLock::new(Arc::new(Snapshot { policy, rules: rules::Compiled::default(), rules_version: 0 })),
             policy_obj: Versioned::new(store.clone(), POLICY_PATH, POLICY_AUDIT),
             rules_obj: Versioned::new(store.clone(), RULES_PATH, RULES_AUDIT),
             new_hosts: budget::DailyCounter::new(store.clone(), NEW_HOSTS_PATH),
@@ -190,16 +186,9 @@ impl Engine {
         }
         let (rules, rules_version) = match rules {
             Some(r) => (rules::Compiled::new(r.body), r.version),
-            None => (
-                rules::Compiled::new(cur.rules.set.clone()),
-                cur.rules_version,
-            ),
+            None => (rules::Compiled::new(cur.rules.set.clone()), cur.rules_version),
         };
-        *w = Arc::new(Snapshot {
-            policy,
-            rules,
-            rules_version,
-        });
+        *w = Arc::new(Snapshot { policy, rules, rules_version });
     }
 
     /// Re-reads both objects (conditional on the last ETags) and installs
@@ -222,11 +211,7 @@ impl Engine {
                     }
                 }
             }
-            Fetched::Invalid {
-                version,
-                message,
-                etag,
-            } => {
+            Fetched::Invalid { version, message, etag } => {
                 self.seen.lock().0 = etag;
                 errors.push(format!("policy v{version:?}: {message}"));
                 None
@@ -245,11 +230,7 @@ impl Engine {
                     }
                 }
             }
-            Fetched::Invalid {
-                version,
-                message,
-                etag,
-            } => {
+            Fetched::Invalid { version, message, etag } => {
                 self.seen.lock().1 = etag;
                 errors.push(format!("rules v{version:?}: {message}"));
                 None
@@ -307,10 +288,7 @@ impl Engine {
         note: &str,
     ) -> Result<Stored<PolicyBody>, SaveError> {
         let _io = self.io.lock().await;
-        let doc = self
-            .policy_obj
-            .save(base_version, body, by, note, doc::validate)
-            .await?;
+        let doc = self.policy_obj.save(base_version, body, by, note, doc::validate).await?;
         self.install(Some(doc.clone()), None);
         Ok(doc)
     }
@@ -323,10 +301,7 @@ impl Engine {
         note: &str,
     ) -> Result<Stored<RuleSet>, SaveError> {
         let _io = self.io.lock().await;
-        let doc = self
-            .rules_obj
-            .save(base_version, set, by, note, rules::validate)
-            .await?;
+        let doc = self.rules_obj.save(base_version, set, by, note, rules::validate).await?;
         self.install(None, Some(doc.clone()));
         Ok(doc)
     }
@@ -399,9 +374,7 @@ impl Engine {
             Err(e) => return Admit::Reject(RejectHost::BadHostname(e.to_string())),
         };
         if parsed.insecure && !crawl.allow_insecure && !req.by_admin {
-            return Admit::Reject(RejectHost::BadHostname(
-                rules::HostnameError::Insecure.to_string(),
-            ));
+            return Admit::Reject(RejectHost::BadHostname(rules::HostnameError::Insecure.to_string()));
         }
         let hostname = parsed.hostname;
         if hostname.starts_with("localhost") && !req.by_admin {
@@ -418,21 +391,11 @@ impl Engine {
         }
         if let Some(rec) = req.existing {
             if matches!(rec.tier, Tier::Banned | Tier::Suspended) && !req.by_admin {
-                return Admit::Reject(RejectHost::Banned {
-                    hostname,
-                    why: doc::tier_name(rec.tier).into(),
-                });
+                return Admit::Reject(RejectHost::Banned { hostname, why: doc::tier_name(rec.tier).into() });
             }
-            return Admit::Admit {
-                host: Host(hostname),
-                tier: rec.tier,
-                counted: false,
-            };
+            return Admit::Admit { host: Host(hostname), tier: rec.tier, counted: false };
         }
-        let trusted = crawl
-            .trusted_domains
-            .iter()
-            .any(|d| rules::pattern_matches(d, &hostname));
+        let trusted = crawl.trusted_domains.iter().any(|d| rules::pattern_matches(d, &hostname));
         let allowed = trusted || matches!(rule.map(|r| &r.effect), Some(RuleEffect::Allow));
         if crawl.allowlist_only && !allowed && !req.by_admin {
             return Admit::Reject(RejectHost::NotAllowed);
@@ -460,11 +423,7 @@ impl Engine {
                 Err(e) => return Admit::Reject(RejectHost::Store(e.to_string())),
             }
         }
-        Admit::Admit {
-            host: Host(hostname),
-            tier,
-            counted,
-        }
+        Admit::Admit { host: Host(hostname), tier, counted }
     }
 
     /// New hosts admitted today, cluster-wide.
@@ -475,11 +434,7 @@ impl Engine {
     /// This node's share of a cluster budget: the budget ÷ live nodes for
     /// the fast kinds, the whole daily budget for new hosts.
     pub fn budget(&self, kind: BudgetKind) -> f64 {
-        budget::share(
-            &self.snapshot().policy.body.cluster,
-            kind,
-            self.live.live_nodes(),
-        )
+        budget::share(&self.snapshot().policy.body.cluster, kind, self.live.live_nodes())
     }
 
     /// Takes `n` from this node's share of a fast budget. False: over it,
@@ -492,9 +447,9 @@ impl Engine {
             BudgetKind::PlcLookupsPerSec => self.plc.try_take(share, n, now),
             BudgetKind::NewAccountsPerMin => self.new_accounts.try_take(share / 60.0, n, now),
             // the archive's fetch queue spends these itself
-            BudgetKind::NewHostsPerDay | BudgetKind::ArchivalFetchConcurrency | BudgetKind::ArchivalFetchBytesPerSec => {
-                true
-            }
+            BudgetKind::NewHostsPerDay
+            | BudgetKind::ArchivalFetchConcurrency
+            | BudgetKind::ArchivalFetchBytesPerSec => true,
         }
     }
 

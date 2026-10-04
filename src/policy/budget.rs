@@ -108,20 +108,13 @@ pub struct DailyCounter {
 
 impl DailyCounter {
     pub fn new(store: Store, rel: &str) -> DailyCounter {
-        DailyCounter {
-            path: path(&store, rel),
-            store,
-            io: Default::default(),
-        }
+        DailyCounter { path: path(&store, rel), store, io: Default::default() }
     }
 
     pub async fn read(&self, now_ms: i64) -> anyhow::Result<u32> {
         let day = (now_ms / 86_400_000) as u32;
         Ok(match get(&self.store, &self.path, None).await? {
-            Some((b, _)) => serde_json::from_slice::<DayCount>(&b)
-                .ok()
-                .filter(|c| c.day == day)
-                .map_or(0, |c| c.used),
+            Some((b, _)) => serde_json::from_slice::<DayCount>(&b).ok().filter(|c| c.day == day).map_or(0, |c| c.used),
             None => 0,
         })
     }
@@ -132,20 +125,14 @@ impl DailyCounter {
         for _ in 0..CAS_RETRIES {
             let (cur, etag) = match get(&self.store, &self.path, None).await? {
                 // unreadable: overwritten by this spend
-                Some((b, e)) => (
-                    serde_json::from_slice::<DayCount>(&b).unwrap_or_default(),
-                    e,
-                ),
+                Some((b, e)) => (serde_json::from_slice::<DayCount>(&b).unwrap_or_default(), e),
                 None => (DayCount::default(), None),
             };
             let used = if cur.day == day { cur.used } else { 0 };
             if used >= limit {
                 return Ok(Spend::Exhausted(used));
             }
-            let next = DayCount {
-                day,
-                used: used + 1,
-            };
+            let next = DayCount { day, used: used + 1 };
             let body = serde_json::to_vec(&next)?;
             match put(&self.store, &self.path, body, if_match(etag)).await {
                 Ok(_) => return Ok(Spend::Spent(next.used)),
