@@ -87,6 +87,7 @@ struct Ev {
     ops: u16,
     blocks: u32,
     too_big: bool,
+    has_handle: bool,
 }
 
 enum Msg {
@@ -188,6 +189,7 @@ fn parse_frame(side: usize, frame: &[u8], recv_us: i64) -> Result<(Ev, Option<St
         ops: 0,
         blocks: 0,
         too_big: false,
+        has_handle: false,
     };
     if matches!(kind, Kind::Error | Kind::Info | Kind::Other) {
         return Ok((ev, None));
@@ -212,6 +214,7 @@ fn parse_frame(side: usize, frame: &[u8], recv_us: i64) -> Result<(Ev, Option<St
     if let Some(Value::Array(a)) = map_get(body, "ops") {
         ev.ops = a.len().min(u16::MAX as usize) as u16;
     }
+    ev.has_handle = text(body, "handle").is_some();
     if let Some(Value::Bool(b)) = map_get(body, "tooBig") {
         ev.too_big = *b;
     }
@@ -281,6 +284,44 @@ fn pct(h: &Histogram<u64>) -> serde_json::Value {
         "p99": h.value_at_quantile(0.99), "p999": h.value_at_quantile(0.999), "max": h.max(),
         "mean": h.mean().round(),
     })
+}
+
+/// Latencies can be negative: the relay's edge may be closer to us than the
+/// PDS is, so these are exact percentiles over signed values.
+struct Signed(Vec<i64>);
+
+impl Signed {
+    fn q(&self, q: f64) -> i64 {
+        if self.0.is_empty() {
+            return 0;
+        }
+        self.0[((self.0.len() - 1) as f64 * q).round() as usize]
+    }
+    fn line(&mut self) -> String {
+        self.0.sort_unstable();
+        let neg = self.0.iter().filter(|v| **v < 0).count();
+        format!(
+            "n={:<7} p50 {:>9} p90 {:>9} p99 {:>9} p99.9 {:>9} max {:>9} min {:>9} ({} negative)",
+            self.0.len(),
+            sms(self.q(0.5)),
+            sms(self.q(0.9)),
+            sms(self.q(0.99)),
+            sms(self.q(0.999)),
+            sms(self.q(1.0)),
+            sms(self.q(0.0)),
+            neg
+        )
+    }
+    fn json(&mut self) -> serde_json::Value {
+        self.0.sort_unstable();
+        json!({"n": self.0.len(), "min": self.q(0.0), "p10": self.q(0.1), "p50": self.q(0.5), "p90": self.q(0.9),
+            "p99": self.q(0.99), "p999": self.q(0.999), "max": self.q(1.0),
+            "negative": self.0.iter().filter(|v| **v < 0).count()})
+    }
+}
+
+fn sms(us: i64) -> String {
+    format!("{:.1} ms", us as f64 / 1000.0)
 }
 
 fn ms(us: u64) -> String {
@@ -388,8 +429,10 @@ fn analyze(
     let (mut seq_gaps, mut seq_missing, mut seq_backwards) = (0u64, 0u64, 0u64);
     let mut last_seq = 0i64;
     let mut relay_age_h = hist();
+    let mut identity_with_handle = 0u64;
     for &i in &relay {
         let e = &evs[i];
+        identity_with_handle += (e.kind == Kind::Identity && e.has_handle) as u64;
         let k = e.kind.idx();
         size_h[k].record(e.size.max(1) as u64).ok();
         bytes_by_kind[k] += e.size as u64;
@@ -476,6 +519,7 @@ fn analyze(
             too_big
         );
     }
+    println!("  #identity carrying a handle: {identity_with_handle} of {}", size_h[Kind::Identity.idx()].len());
     println!("  relay seq: {seq_gaps} gaps ({seq_missing} seqs skipped), {seq_backwards} backwards");
     if !relay_age_h.is_empty() {
         println!(
@@ -499,20 +543,21 @@ fn analyze(
     }
     let mut matched: HashSet<usize> = HashSet::new();
     let mut hosts = Vec::new();
-    let mut all_lat = hist();
+    let mut all_lat = Signed(Vec::new());
     let mut did_side: HashMap<u64, usize> = HashMap::new();
     for side in 1..names.len() {
         let pds: Vec<usize> = (0..evs.len()).filter(|i| evs[*i].side == side).collect();
         for &i in &pds {
             did_side.insert(evs[i].did, side);
         }
-        let mut lat_h: HashMap<Kind, Histogram<u64>> = HashMap::new();
-        let mut negative = 0u64;
+        let mut lat_h: HashMap<Kind, Signed> = HashMap::new();
         let mut missing: HashMap<Kind, Vec<usize>> = HashMap::new();
         let mut cid_mismatch = 0u64;
         let mut dup_at_relay = 0u64;
         let mut in_window = 0u64;
         let mut pds_age_h = hist();
+        // #identity events matched at the relay: (PDS sent a handle, relay kept it)
+        let (mut id_handle_pds, mut id_handle_kept) = (0u64, 0u64);
         // did -> (pds seq, relay seq) of matched events, for order checks
         let mut pairs: HashMap<u64, Vec<(i64, i64)>> = HashMap::new();
         for &i in &pds {
@@ -540,18 +585,18 @@ fn analyze(
                 Some(j) => {
                     matched.insert(j);
                     let r = &evs[j];
+                    if e.kind == Kind::Identity && e.has_handle {
+                        id_handle_pds += 1;
+                        id_handle_kept += r.has_handle as u64;
+                    }
                     if e.kind == Kind::Commit && r.cid != e.cid {
                         cid_mismatch += 1;
                     }
                     pairs.entry(e.did).or_default().push((e.seq, r.seq));
                     if counted {
                         let d = r.recv_us - e.recv_us;
-                        if d < 0 {
-                            negative += 1;
-                        } else {
-                            lat_h.entry(e.kind).or_insert_with(hist).record(d.max(1) as u64).ok();
-                            all_lat.record(d.max(1) as u64).ok();
-                        }
+                        lat_h.entry(e.kind).or_insert_with(|| Signed(Vec::new())).0.push(d);
+                        all_lat.0.push(d);
                     }
                 }
                 None if counted => missing.entry(e.kind).or_default().push(i),
@@ -579,18 +624,9 @@ fn analyze(
         );
         let mut lat_json = serde_json::Map::new();
         for k in [Kind::Commit, Kind::Sync, Kind::Identity, Kind::Account] {
-            if let Some(h) = lat_h.get(&k) {
-                println!(
-                    "  {:10} PDS→relay n={:<7} p50 {:>9} p90 {:>9} p99 {:>9} p99.9 {:>9} max {:>9}",
-                    k.name(),
-                    h.len(),
-                    ms(h.value_at_quantile(0.5)),
-                    ms(h.value_at_quantile(0.9)),
-                    ms(h.value_at_quantile(0.99)),
-                    ms(h.value_at_quantile(0.999)),
-                    ms(h.max())
-                );
-                lat_json.insert(k.name().into(), pct(h));
+            if let Some(h) = lat_h.get_mut(&k) {
+                println!("  {:10} PDS→relay {}", k.name(), h.line());
+                lat_json.insert(k.name().into(), h.json());
             }
         }
         let mut missing_json = serde_json::Map::new();
@@ -603,19 +639,21 @@ fn analyze(
             println!("  missing at relay: {} {}  e.g. {:?}", v.len(), k.name(), &ex[..ex.len().min(3)]);
             missing_json.insert(k.name().into(), json!({"count": v.len(), "examples": ex}));
         }
-        println!("  matched with negative latency: {negative}; commit cid mismatches: {cid_mismatch}; relay duplicates: {dup_at_relay}");
+        println!("  commit cid mismatches: {cid_mismatch}; relay duplicates: {dup_at_relay}");
+        println!("  #identity with a handle at the PDS: {id_handle_pds}, still carrying it at the relay: {id_handle_kept}");
         println!("  per-DID order: {order_dids} DIDs with relay order != PDS order ({order_pairs} inverted adjacent pairs)");
         hosts.push(json!({
             "host": host,
             "events_in_window": in_window,
             "latency_us": lat_json,
-            "negative_latency": negative,
             "missing_at_relay": missing_json,
             "commit_cid_mismatch": cid_mismatch,
             "relay_duplicates": dup_at_relay,
             "order_inverted_dids": order_dids,
             "order_inverted_pairs": order_pairs,
             "pds_age_us": pct(&pds_age_h),
+            "identity_handle_at_pds": id_handle_pds,
+            "identity_handle_kept_by_relay": id_handle_kept,
         }));
     }
 
@@ -634,6 +672,9 @@ fn analyze(
         }
     }
     let mut relay_only_json = Vec::new();
+    if relay_only.is_empty() {
+        println!("relay-only events for watched DIDs: 0");
+    }
     for ((side, k), v) in &relay_only {
         let ex: Vec<String> = v
             .iter()
@@ -643,15 +684,7 @@ fn analyze(
         println!("relay-only for {} DIDs: {} {}  e.g. {:?}", names[*side], v.len(), k.name(), &ex[..ex.len().min(3)]);
         relay_only_json.push(json!({"host": names[*side], "kind": k.name(), "count": v.len(), "examples": ex}));
     }
-    println!(
-        "\nall hosts PDS→relay: n={} p50 {} p90 {} p99 {} p99.9 {} max {}",
-        all_lat.len(),
-        ms(all_lat.value_at_quantile(0.5)),
-        ms(all_lat.value_at_quantile(0.9)),
-        ms(all_lat.value_at_quantile(0.99)),
-        ms(all_lat.value_at_quantile(0.999)),
-        ms(all_lat.max())
-    );
+    println!("\nall hosts PDS→relay: {}", all_lat.line());
     println!("disconnects: {}", disconnects.len());
     json!({
         "relay": names[0],
@@ -667,12 +700,13 @@ fn analyze(
             "commit_ops": pct(&ops_h),
             "commit_blocks_bytes": pct(&blocks_h),
             "too_big": too_big,
+            "identity_with_handle": identity_with_handle,
             "seq_gaps": seq_gaps, "seq_missing": seq_missing, "seq_backwards": seq_backwards,
             "recv_minus_time_us": pct(&relay_age_h),
         },
         "hosts": hosts,
         "relay_only": relay_only_json,
-        "latency_all_us": pct(&all_lat),
+        "latency_all_us": all_lat.json(),
         "disconnects": disconnects.iter().map(|(s, at, why)| json!({"host": names[*s], "t_s": (at - t0) / 1_000_000, "why": why})).collect::<Vec<_>>(),
     })
 }
