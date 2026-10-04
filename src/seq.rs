@@ -1113,6 +1113,41 @@ mod tests {
         assert!(d.seqs.is_empty());
     }
 
+    fn one_event(upstream_seq: i64) -> Vec<Event> {
+        let f = vlpds::events::sync_frame("did:plc:x", "3jzfcijpj2z2a", &[1u8; 32], "2026-10-04T00:00:00Z");
+        let mut raw = Vec::new();
+        f.finish(upstream_seq, &mut raw);
+        vec![Event {
+            meta: EventMeta { did: "did:plc:x".into(), host: Host("pds.test".into()), upstream_seq, shard: 0 },
+            frame: Box::new(SeqSplice::parse(Bytes::from(raw)).unwrap()),
+            delta: None,
+        }]
+    }
+
+    /// A lapsed lease holds the log within `lapse_grace` (the batch is acked
+    /// once the lease is back) and fails it past the grace.
+    #[tokio::test]
+    async fn a_lapsed_lease_holds_the_log_within_its_grace() {
+        let store = Store::memory(None);
+        let valid = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let v = valid.clone();
+        let mut cfg = LogConfig::new("lapse");
+        cfg.linger = Duration::from_millis(2);
+        cfg.lease_ok = Some(Arc::new(move || v.load(Ordering::SeqCst)));
+        cfg.lapse_grace = Duration::from_millis(300);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let log = NodeLog::start(store.clone(), cfg, tx, None);
+        let t = log.submit(one_event(1)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(nodelog::first_free(&store, "lapse").await.unwrap().0, 0, "nothing sealed while lapsed");
+        valid.store(true, Ordering::SeqCst);
+        assert!(t.await.is_ok(), "acked once the lease is back");
+        valid.store(false, Ordering::SeqCst);
+        let t = log.submit(one_event(2)).await;
+        assert_eq!(t.await.unwrap_err(), LogError::LeaseLapsed, "past the grace");
+        assert_eq!(log.failed(), Some(LogError::LeaseLapsed));
+    }
+
     #[test]
     fn meta_round_trips() {
         let m = EventMeta { did: "did:plc:x".into(), host: Host("pds.example.com".into()), upstream_seq: 99, shard: 7 };
