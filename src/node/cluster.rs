@@ -147,6 +147,10 @@ pub struct Glue {
     committed: AtomicU64,
     /// `committed` as the previous checkpoint tick read it.
     committed_prev: AtomicU64,
+    /// `committed` is the highest of every committer's, and committers are
+    /// per shard (modulo), so it can pass another shard's appends that are
+    /// durable but not yet committed: each shard's marker is capped here.
+    uncommitted: Uncommitted,
     hostck: HostCks,
     dedupe: DedupeStore,
     markers: Mutex<HashMap<ShardId, u64>>,
@@ -233,6 +237,7 @@ impl Node {
             local: local.clone(),
             committed: AtomicU64::new(0),
             committed_prev: AtomicU64::new(0),
+            uncommitted: Uncommitted::default(),
             hostck: HostCks::new(store.clone()),
             dedupe: DedupeStore::new(store.clone(), log.log_id.to_string()),
             markers: Mutex::new(HashMap::new()),
@@ -402,11 +407,7 @@ impl Glue {
     /// The applied marker for our log may go up to what's committed, but
     /// never past an entry the dedupe set still needs.
     fn marker(&self, shard: ShardId, committed: u64) -> Option<u64> {
-        let mut m = committed.checked_sub(1);
-        if let Some(o) = self.recent.min_ordinal(shard.0) {
-            m = m.and_then(|m| o.checked_sub(1).map(|o| m.min(o)));
-        }
-        m
+        marker(committed, [self.recent.min_ordinal(shard.0), self.uncommitted.min(shard.0)])
     }
 
     /// Writes the shard's inherited dedupe entries (those our marker doesn't
@@ -705,7 +706,11 @@ impl Stage {
                 first_sighting: m.first_sighting,
                 fence: None,
             };
+            let floor = g.uncommitted.begin(shard, &g.log.next_ordinal);
             let r = g.local.submit(c).await;
+            if !matches!(r, Submitted::Appended(_)) {
+                g.uncommitted.end(shard, floor);
+            }
             let unclaim = || {
                 if dedupe {
                     g.recent.release(&f.host, f.upstream_seq, &f.did);
@@ -717,6 +722,8 @@ impl Stage {
                     waits.push(Wait::Appended {
                         i,
                         rx,
+                        shard,
+                        floor,
                         host: f.host,
                         useq: f.upstream_seq,
                         dedupe,
@@ -748,9 +755,9 @@ impl Stage {
         }
         let mut changed_keys = Vec::new();
         for w in waits {
-            let (i, rx, host, useq, dedupe, identity, did, id, done) = match w {
-                Wait::Appended { i, rx, host, useq, dedupe, identity, did, id, done } => {
-                    (i, rx, host, useq, dedupe, identity, did, id, done)
+            let (i, rx, shard, floor, host, useq, dedupe, identity, did, id, done) = match w {
+                Wait::Appended { i, rx, shard, floor, host, useq, dedupe, identity, did, id, done } => {
+                    (i, rx, shard, floor, host, useq, dedupe, identity, did, id, done)
                 }
                 Wait::Duplicate { i, of } => {
                     out.push((i, g.duplicate(of).await));
@@ -772,6 +779,7 @@ impl Stage {
                 Ok(Err(e)) => Err(StageError::Unavailable(format!("log: {e}"))),
                 Err(_) => Err(StageError::Unavailable("log closed".into())),
             };
+            g.uncommitted.end(shard, floor);
             if r.is_err() && dedupe {
                 g.recent.release(&host, useq, &did);
             }
@@ -786,6 +794,50 @@ impl Stage {
     }
 }
 
+/// A shard's applied marker for our log: below what's committed and below
+/// every ordinal some shard-local bound still needs.
+fn marker(committed: u64, bounds: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    let mut m = committed.checked_sub(1);
+    for o in bounds.into_iter().flatten() {
+        m = m.and_then(|m| o.checked_sub(1).map(|o| m.min(o)));
+    }
+    m
+}
+
+/// Per DID shard, a lower bound on the ordinal of each of our appends whose
+/// state isn't committed yet.
+#[derive(Default)]
+struct Uncommitted(Mutex<HashMap<u32, BTreeMap<u64, usize>>>);
+
+impl Uncommitted {
+    /// Before the append is submitted, so its ordinal is at least the
+    /// returned floor.
+    fn begin(&self, shard: u32, next_ordinal: &AtomicU64) -> u64 {
+        let mut m = self.0.lock();
+        let floor = next_ordinal.load(Ordering::Acquire);
+        *m.entry(shard).or_default().entry(floor).or_default() += 1;
+        floor
+    }
+
+    fn end(&self, shard: u32, floor: u64) {
+        let mut m = self.0.lock();
+        let Some(s) = m.get_mut(&shard) else { return };
+        if let Some(n) = s.get_mut(&floor) {
+            *n -= 1;
+            if *n == 0 {
+                s.remove(&floor);
+            }
+        }
+        if s.is_empty() {
+            m.remove(&shard);
+        }
+    }
+
+    fn min(&self, shard: u32) -> Option<u64> {
+        self.0.lock().get(&shard).and_then(|s| s.keys().next().copied())
+    }
+}
+
 /// Resolves to whether an append became durable (None until it did or failed).
 type Durability = tokio::sync::watch::Receiver<Option<bool>>;
 
@@ -793,6 +845,8 @@ enum Wait {
     Appended {
         i: usize,
         rx: super::DurableRx,
+        shard: u32,
+        floor: u64,
         host: Host,
         useq: i64,
         dedupe: bool,
@@ -1698,6 +1752,24 @@ impl crate::sync_api::SyncSource for ClusterSync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Another committer committed ordinal 20 while shard 1's append at
+    /// ordinal 10 or later waits on its own: shard 1's marker stays below
+    /// it, the other shards' move to what's committed.
+    #[test]
+    fn a_marker_stays_below_its_shards_uncommitted_appends() {
+        let u = Uncommitted::default();
+        let next = AtomicU64::new(10);
+        let f = u.begin(1, &next);
+        next.store(21, Ordering::Release);
+        let committed = 21;
+        assert_eq!(marker(committed, [None, u.min(1)]), Some(9));
+        assert_eq!(marker(committed, [None, u.min(2)]), Some(20));
+        assert_eq!(marker(committed, [Some(5), u.min(2)]), Some(4));
+        u.end(1, f);
+        assert_eq!(marker(committed, [None, u.min(1)]), Some(20));
+        assert!(u.0.lock().is_empty());
+    }
 
     #[test]
     fn meta_round_trips() {
