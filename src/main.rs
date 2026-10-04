@@ -40,6 +40,10 @@ struct Args {
     s3_secret_key: Option<String>,
     #[arg(long, default_value = "auto", env = "VLRELAY_S3_REGION")]
     s3_region: String,
+    /// Send PUT bodies as SigV4 UNSIGNED-PAYLOAD instead of hashing each
+    /// one (default: on for an https endpoint, where TLS covers the body).
+    #[arg(long, env = "VLRELAY_S3_UNSIGNED_PAYLOAD")]
+    s3_unsigned_payload: Option<bool>,
     /// Key prefix in the bucket: one relay per prefix.
     #[arg(long, default_value = "vlrelay", env = "VLRELAY_PREFIX")]
     prefix: String,
@@ -186,7 +190,8 @@ async fn run(a: Args) -> anyhow::Result<()> {
             secret_key: need(&a.s3_secret_key, "--s3-secret-key")?,
             region: a.s3_region.clone(),
         };
-        vlpds::store::Store::s3(&cfg, &a.prefix, None, 256)?
+        let unsigned = a.s3_unsigned_payload.unwrap_or(cfg.endpoint.starts_with("https://"));
+        vlpds::store::Store::s3_with(&cfg, &a.prefix, None, 256, unsigned)?
     };
 
     let mut cfg = NodeConfig::new(&a.plc_url);
