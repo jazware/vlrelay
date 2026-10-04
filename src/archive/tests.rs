@@ -586,6 +586,33 @@ async fn archival_fetch_is_ssrf_guarded() {
     assert_eq!(hits.load(Relaxed), 0, "the redirect was followed");
 }
 
+/// getLatestCommit answers a CID and a rev: a PDS that streams more is cut
+/// off at 64 KiB instead of being buffered whole.
+#[tokio::test]
+async fn get_latest_commit_body_is_capped() {
+    let _cache = NODE_CACHE_USE.read().await;
+    let id = MapIdentity::new();
+    let did = plc(12);
+    id.set(&did, "pds.a", 1);
+    let acct = Acct::new(&did, 12, 5);
+    let huge = format!("{{\"cid\": \"x\", \"rev\": \"y\", \"pad\": \"{}\"}}", "a".repeat(1 << 20));
+    let pds = axum::Router::new().route(
+        "/xrpc/com.atproto.sync.getLatestCommit",
+        axum::routing::get(move || {
+            let huge = huge.clone();
+            async move { huge }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, pds).await });
+    let a = Archive::new(gate(true, 0), Arc::new(At(endpoint, acct.repo.signer.public())), true);
+    let st = open(1, id, Default::default()).await;
+    st.set_archive(a);
+    let e = st.archive_fetch_now(&did).await.unwrap_err();
+    assert!(format!("{e:#}").contains("over 65536 bytes"), "{e:#}");
+}
+
 #[test]
 fn meta_round_trips() {
     for m in [

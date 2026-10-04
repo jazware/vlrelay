@@ -3,9 +3,12 @@
 //! imported under a fresh generation.
 //!
 //! Politeness lives here. Each host has a token bucket at its tier's
-//! `archivalFetchesPerHost`, and the node's share of the cluster's
-//! `archivalFetchConcurrency` and `archivalFetchBytesPerSec` caps the rest.
-//! Hosts take turns, so one big PDS's backlog doesn't hold up the others.
+//! `archivalFetchesPerHost` and at most [`PER_HOST_RUNNING`] fetches in
+//! flight, and the node's share of the cluster's `archivalFetchConcurrency`
+//! and `archivalFetchBytesPerSec` caps the rest. Hosts take turns, so one
+//! big PDS's backlog doesn't hold up the others, and a PDS that trickles its
+//! responses can't hold every slot: a read idle for [`IDLE`], or a `getRepo`
+//! slower than [`MIN_BYTES_PER_SEC`] after [`SLOW_GRACE`], fails the fetch.
 //!
 //! While a repo is queued or being fetched, its live commits keep being
 //! checked, sequenced and emitted, and their frames wait in the queue entry.
@@ -91,6 +94,13 @@ const MAX_TRIES: u32 = 5;
 const BUFFER_FRAMES: usize = 1024;
 const BUFFER_BYTES: usize = 16 << 20;
 const ROWS_PER_BATCH: usize = 4096;
+/// Fetches in flight to one host.
+pub const PER_HOST_RUNNING: usize = 2;
+/// `getLatestCommit` answers a CID and a rev.
+const MAX_LATEST_BYTES: usize = 64 << 10;
+pub const IDLE: Duration = Duration::from_secs(30);
+pub const MIN_BYTES_PER_SEC: f64 = 32.0 * 1024.0;
+pub const SLOW_GRACE: Duration = Duration::from_secs(30);
 
 struct Entry {
     host: String,
@@ -111,6 +121,8 @@ struct HostQ {
 struct Inner {
     entries: HashMap<Arc<str>, Entry>,
     hosts: HashMap<String, HostQ>,
+    /// Fetches in flight per host.
+    running_at: HashMap<String, usize>,
     /// Hosts with queued repos, in turn order.
     turn: VecDeque<String>,
     running: usize,
@@ -153,6 +165,7 @@ impl Queue {
             inner: Mutex::new(Inner {
                 entries: HashMap::new(),
                 hosts: HashMap::new(),
+                running_at: HashMap::new(),
                 turn: VecDeque::new(),
                 running: 0,
                 bytes_tokens: 0.0,
@@ -231,8 +244,10 @@ impl Queue {
     /// The import went live: later frames go to the mirror directly.
     fn finish(&self, did: &str) {
         let mut g = self.inner.lock();
-        if g.entries.remove(did).is_some_and(|e| e.running) {
-            g.running -= 1;
+        if let Some(e) = g.entries.remove(did)
+            && e.running
+        {
+            stopped(&mut g, &e.host);
         }
     }
 
@@ -242,7 +257,8 @@ impl Queue {
         let Some(e) = g.entries.get_mut(did) else { return };
         if e.running {
             e.running = false;
-            g.running -= 1;
+            let host = e.host.clone();
+            stopped(&mut g, &host);
         }
         let e = g.entries.get_mut(did).expect("present");
         e.tries += 1;
@@ -281,6 +297,10 @@ impl Queue {
         let mut wait = idle;
         for _ in 0..g.turn.len() {
             let Some(host) = g.turn.pop_front() else { break };
+            if g.running_at.get(&host).is_some_and(|n| *n >= PER_HOST_RUNNING) {
+                g.turn.push_back(host);
+                continue;
+            }
             let rate = gate.limits(&host).per_host_per_sec.max(0.001);
             let Inner { hosts, entries, .. } = &mut *g;
             let Some(q) = hosts.get_mut(&host) else { continue };
@@ -310,6 +330,7 @@ impl Queue {
                         g.hosts.remove(&host);
                     }
                     g.running += 1;
+                    *g.running_at.entry(host).or_default() += 1;
                     g.entries.get_mut(&d).expect("present").running = true;
                     return Ok(d);
                 }
@@ -343,9 +364,14 @@ impl Queue {
             cid: String,
             rev: String,
         }
-        let r = self.get(origin, "com.atproto.sync.getLatestCommit", did, Duration::from_secs(30))?.send().await?;
+        let mut r = self.get(origin, "com.atproto.sync.getLatestCommit", did, Duration::from_secs(30))?.send().await?;
         anyhow::ensure!(r.status().is_success(), "getLatestCommit: {}", r.status());
-        let l: Latest = r.json().await?;
+        let mut body = Vec::new();
+        while let Some(c) = idle(r.chunk()).await? {
+            anyhow::ensure!(body.len() + c.len() <= MAX_LATEST_BYTES, "getLatestCommit: over {MAX_LATEST_BYTES} bytes");
+            body.extend_from_slice(&c);
+        }
+        let l: Latest = serde_json::from_slice(&body).context("getLatestCommit")?;
         Ok((Cid::parse(&l.cid)?, Tid::parse(&l.rev).context("getLatestCommit: bad rev")?))
     }
 
@@ -356,9 +382,15 @@ impl Queue {
             anyhow::bail!("repo over {MAX_REPO_BYTES} bytes");
         }
         let mut body = Vec::new();
-        while let Some(c) = r.chunk().await? {
+        let t0 = Instant::now();
+        while let Some(c) = idle(r.chunk()).await? {
             body.extend_from_slice(&c);
             anyhow::ensure!(body.len() <= MAX_REPO_BYTES, "repo over {MAX_REPO_BYTES} bytes");
+            let secs = t0.elapsed();
+            anyhow::ensure!(
+                secs < SLOW_GRACE || body.len() as f64 >= MIN_BYTES_PER_SEC * secs.as_secs_f64(),
+                "getRepo: under {MIN_BYTES_PER_SEC} bytes/s after {secs:?}"
+            );
         }
         Ok(body.into())
     }
@@ -377,6 +409,20 @@ pub fn pds_origin(endpoint: &str) -> anyhow::Result<String> {
         Some(p) => format!("{}://{host}:{p}", u.scheme()),
         None => format!("{}://{host}", u.scheme()),
     })
+}
+
+fn stopped(g: &mut Inner, host: &str) {
+    g.running -= 1;
+    if let Some(n) = g.running_at.get_mut(host) {
+        *n -= 1;
+        if *n == 0 {
+            g.running_at.remove(host);
+        }
+    }
+}
+
+async fn idle<T>(f: impl std::future::Future<Output = reqwest::Result<T>>) -> anyhow::Result<T> {
+    Ok(tokio::time::timeout(IDLE, f).await.map_err(|_| anyhow::anyhow!("no data for {IDLE:?}"))??)
 }
 
 fn push_host(g: &mut Inner, host: &str, did: Arc<str>) {
@@ -639,5 +685,41 @@ impl<C: Chain> StateStore<C> {
             a.queue.failed(did, e);
         }
         r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Never;
+
+    #[async_trait::async_trait]
+    impl Resolver for Never {
+        async fn resolve(&self, _did: &str) -> anyhow::Result<Resolved> {
+            anyhow::bail!("unused")
+        }
+    }
+
+    /// One host's backlog gets PER_HOST_RUNNING fetches in flight however
+    /// fast its bucket refills, and the other hosts the rest.
+    #[test]
+    fn fetches_in_flight_per_host_are_capped() {
+        let q = Queue::new(Arc::new(Never), false);
+        let limits = FetchLimits { per_host_per_sec: 1e6, concurrency: 8, bytes_per_sec: 1e12 };
+        let gate = super::super::StaticGate { on: true, limits, retention_secs: 0 };
+        for i in 0..6 {
+            q.enqueue(&format!("did:plc:big{i}"), "big.example", Why::New);
+        }
+        q.enqueue("did:plc:small", "small.example", Why::New);
+        let mut got = Vec::new();
+        while let Ok(d) = q.next(&gate) {
+            got.push(d.to_string());
+        }
+        assert_eq!(got.iter().filter(|d| d.contains("big")).count(), PER_HOST_RUNNING);
+        assert!(got.iter().any(|d| d == "did:plc:small"));
+        q.finish(&got[0]);
+        assert!(q.next(&gate).unwrap().contains("big"));
+        assert!(q.next(&gate).is_err());
     }
 }

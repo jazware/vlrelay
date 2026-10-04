@@ -67,7 +67,7 @@ A desynchronized account also takes the fetched head as its chain and loses its 
 
 The DID document is anyone's to write, so fetches go through vlpds's guarded client: https only, no redirects followed, and only hostnames that resolve to public addresses. `--dev-mode` allows plain http to local PDSes.
 
-Politeness: each host has a token bucket at its tier's `archivalFetchesPerHost`, and hosts take turns. The node's share of the cluster's concurrency and bytes budgets caps the rest. Failures retry 5 times with backoff (4 s, 8 s, ... 64 s). The last 32 failures show on `GET /admin/api/archive`.
+Politeness: each host has a token bucket at its tier's `archivalFetchesPerHost` and at most 2 fetches in flight, and hosts take turns. `getLatestCommit` is read up to 64 KiB. A read idle for 30 s fails the fetch, and so does a `getRepo` under 32 KiB/s after its first 30 s, so a PDS that trickles can't hold the node's fetch slots. The node's share of the cluster's concurrency and bytes budgets caps the rest. Failures retry 5 times with backoff (4 s, 8 s, ... 64 s). The last 32 failures show on `GET /admin/api/archive`.
 
 ## Deletes and takedowns
 
