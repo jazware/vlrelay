@@ -432,6 +432,10 @@ async fn committer(
     }
 }
 
+/// How long the host stage retries a DID lookup that fails for a reason
+/// other than the DID not existing.
+const IDENTITY_PATIENCE: Duration = Duration::from_secs(30);
+
 static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
 
 struct Job {
@@ -989,6 +993,10 @@ impl Node {
     }
 
     async fn lookup(&self, did: &str, fresh: bool) -> Result<Arc<Identity>, Rejection> {
+        // A rejection is acked, and a lost commit desynchronizes its
+        // account: PLC trouble is waited out (holding this lane, and so the
+        // host's reads through the in-flight caps) for longer than a blip.
+        let t0 = Instant::now();
         let mut tries = 0u32;
         loop {
             match self.identity.lookup_paced(did, fresh).await {
@@ -996,12 +1004,12 @@ impl Node {
                 Err(e @ (LookupError::NotFound | LookupError::BadDid)) => {
                     return Err(Rejection { reason: "unknown_did", detail: e.to_string() });
                 }
-                Err(e) if tries >= 2 => {
+                Err(e) if t0.elapsed() >= IDENTITY_PATIENCE => {
                     return Err(Rejection { reason: "identity_unavailable", detail: e.to_string() });
                 }
                 Err(_) => {
                     tries += 1;
-                    tokio::time::sleep(Duration::from_millis(100 << (2 * tries))).await;
+                    tokio::time::sleep(Duration::from_millis(100u64 << (2 * tries.min(4)))).await;
                 }
             }
         }
