@@ -8,3 +8,6 @@ ui/dist/
 dev/state/
 testdata/live/
 testdata/hunt/
+# tests/compat: cloned indigo/jetstream, node_modules, run output
+tests/compat/scratch/
+tests/compat/ts/node_modules/

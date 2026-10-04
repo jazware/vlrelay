@@ -4,7 +4,9 @@
 # Idempotent: a running piece is left alone.
 #
 # Env: DEV_PDS (2: vlpds upstreams, at most 3), VLPDS_BIN (skip building vlpds),
-# VLPDS_MEM_MB (2048: each vlpds's cap), DEV_NO_DOCKER=1 (vlpds only, no PLC:
+# VLPDS_MEM_MB (2048: each vlpds's cap), DEV_PDS_HOST (127.0.0.1: the vlpds
+# upstreams' public hostname; tests/compat sets localhost, the only name with a
+# port that indigo's relay accepts), DEV_NO_DOCKER=1 (vlpds only, no PLC:
 # accounts then need a PLC elsewhere, so mostly for debugging).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -14,6 +16,7 @@ state="$here/state"
 mkdir -p "$state"
 
 n=${DEV_PDS:-2}
+pds_host=${DEV_PDS_HOST:-127.0.0.1}
 [ "$n" -ge 1 ] && [ "$n" -le 3 ] || { echo "dev-up: DEV_PDS must be 1-3" >&2; exit 1; }
 mem=${VLPDS_MEM_MB:-2048}
 # small rings and caches: a dev upstream carries a few hundred events/s, and
@@ -51,7 +54,7 @@ for i in $(seq 1 "$n"); do
   fi
   # --crawlers '': vlpds defaults to telling bsky.network about itself
   nohup "$here/capped.sh" "$mem" "$bin" --memory --dev-mode --no-rate-limits \
-    --listen "127.0.0.1:$port" --public-url "http://127.0.0.1:$port" \
+    --listen "127.0.0.1:$port" --public-url "http://$pds_host:$port" \
     --handle-domain "pds$i.test" --service-did "did:web:pds$i.test" \
     --plc-url "http://127.0.0.1:$PLC_PORT" --plc-mode directory --plc-rotation-key "${keys[$((i - 1))]}" \
     --crawlers '' --memory-budget-mb "$mem" $small \
@@ -68,7 +71,7 @@ for i in $(seq 1 "$n"); do
 done
 
 hosts=()
-for i in $(seq 1 "$n"); do hosts+=("http://127.0.0.1:$((PDS_BASE_PORT + i - 1))"); done
+for i in $(seq 1 "$n"); do hosts+=("http://$pds_host:$((PDS_BASE_PORT + i - 1))"); done
 [ "${DEV_NO_DOCKER:-}" = 1 ] || hosts+=("http://localhost:$REF_PDS_PORT")
 printf '%s\n' "${hosts[@]}" >"$state/hosts"
 echo "dev-up: ready in $(($(date +%s) - t0))s"

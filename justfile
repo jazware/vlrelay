@@ -83,6 +83,10 @@ e2e-policy *args:
 e2e-cluster *args:
     tests/e2e/cluster.sh {{args}}
 
+# Ecosystem compat: vlRelay beside indigo's relay with goat, indigo's consumer, @atproto/sync and Jetstream on both (docs/compat.md)
+compat *args:
+    tests/compat/run.sh {{args}}
+
 # ---- benchbox (scripts/benchbox.sh) --------------------------------------------
 
 # Ship the working tree (tracked + uncommitted) to benchbox:~/vlrelay-dev

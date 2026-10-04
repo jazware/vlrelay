@@ -1,0 +1,11 @@
+{
+  "name": "vlrelay-compat-ts",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@atproto/identity": "^0.5.16",
+    "@atproto/lexicon": "^0.7.16",
+    "@atproto/sync": "^0.4.13",
+    "@atproto/xrpc-server": "^0.13.4"
+  }
+}
