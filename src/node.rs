@@ -36,6 +36,10 @@
 //! its durable cursor. Events the log already holds beyond a host's cursor
 //! come again; commits and syncs are caught as duplicates by their rev, and
 //! the rest by the (host, upstream seq) pairs read out of the log tail.
+//!
+//! A cluster node (`Node::start_cluster`, [`cluster`]) is this pipeline
+//! with the DID owner behind the cluster's forwarder, DID shards opened and
+//! closed as they move, and the restart dedupe on the DID owner.
 
 pub mod acks;
 pub mod adapters;

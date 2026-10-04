@@ -14,9 +14,9 @@
 # cores 1-3 each list all three cores (`--relay a,b,c`): a socket to a dead
 # node moves to the next one with its cursor. --no-ha just runs steady state.
 #
-# Ports: core i serves on CLUSTER_PORT_BASE+i (2960) and peers on
-# CLUSTER_PORT_BASE+10+i; the edge and the replica take +3 and +4. Env: KEEP=1,
-# OUT (dev/state/e2e-cluster), TTL_MS (3000: node lease TTL).
+# Ports: node i (cores 1-3, edge 4, replica 5) serves on CLUSTER_PORT_BASE+i
+# (2960) and peers on CLUSTER_PORT_BASE+10+i. Env: KEEP=1, OUT
+# (dev/state/e2e-cluster), TTL_MS (3000: node lease TTL), HOST_SHARDS (16).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 crate="$(cd "$here/../.." && pwd)"

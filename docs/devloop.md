@@ -138,6 +138,33 @@ In the restart run, the relay was back serving 1 s after the kill. It replayed 1
 
 Time per event in each stage, from `vlrelay_stage_busy_us_total` over the 400/s run (dev build, so upper bounds): strict parse 10 µs, verify (hashes, signature, MST inversion) 46 µs, apply (the DID owner's state step) 20 µs.
 
+## Cluster e2e
+
+```
+just e2e-cluster [--duration 90] [--rate 50] [--accounts 30] [--no-ha]
+                 [--kill-at 20] [--restart-at 35] [--term-at 50] [--return-at 60]
+```
+
+`tests/e2e/cluster.sh` brings the network up with 4 upstreams (`DEV_PDS=3`), starts three core relays on one fresh MinIO prefix with peer mTLS (`--dev-mode` issues the certificates into `dev/state/peer-tls`), then an edge and a replica. It runs five checkers, one per relay stream, each with the same upstreams:
+
+- one per core, with `--relay a,b,c` listing all three cores in a different order. A socket that closes or can't connect moves to the next server with its cursor, so the consumers of a dead node reconnect elsewhere, as real ones would.
+- one on the edge and one on the replica.
+
+Each checker must report 0 missing, extra, reordered and duplicated events on its own. They also write every relay event (`--seq-out`) and every latency (`--lat-out`), and `tests/e2e/cluster_report.py` checks that all five streams carry the same events at the same relay seqs, then reports steady-state latency, the pause after each HA action, and when the survivors' logs show the shards moving.
+
+The HA schedule (seconds into the load): kill -9 the core with the most upstream sockets at `--kill-at`, start it again at `--restart-at`, SIGTERM the busiest of the other two at `--term-at`, start it again at `--return-at`. `--no-ha` runs steady state only.
+
+Ports: node i (cores 1-3, the edge 4, the replica 5) serves on `CLUSTER_PORT_BASE`+i (base 2960, so :2961-:2965) and listens for peers on +10+i. Every port in `dev/ports.sh` can be moved by env, and `COMPOSE_PROJECT_NAME` separates the docker half, so a cluster run can sit beside another worktree's e2e:
+
+```
+COMPOSE_PROJECT_NAME=vlrelay-cluster PLC_PORT=3182 REF_PDS_PORT=3105 PDS_BASE_PORT=3106 \
+  MINIO_PORT=3190 MINIO_CONSOLE_PORT=3191 CLUSTER_PORT_BASE=3160 HOST_SHARDS=15 just e2e-cluster
+```
+
+Which node owns which upstream follows from the hostnames' hashes, so the ports pick the split. With the ports above and 15 host shards the 4 upstreams land 2/1/1. With the defaults and 16 host shards they all land on one node. Env: `TTL_MS` (3000, the lease TTL), `HOST_SHARDS` (16), `KEEP=1`, `OUT` (`dev/state/e2e-cluster`, copied to `$TMPDIR/vlrelay-e2e-cluster-last`).
+
+Results (Mac, dev build, the ports above, `--duration 80`, about 110 s end to end): 4,173 events on every stream, 0 missing, extra, reordered or duplicated on all five, the same seqs on all five. Steady-state p50 33 ms on the cores (29.6 ms for one node on the same network and load) and ~308 ms on the edge and the replica. kill -9 paused events up to 1.6-1.8 s, a planned handoff up to 0.66-0.89 s, and a rejoin's rebalance up to 0.2-1.2 s. docs/cluster.md has the breakdown.
+
 ### Against real PDSes
 
 `scripts/prodcmp.sh [SECONDS]` runs vlRelay locally (`--memory`, 127.0.0.1) against the same three PDSes the reference work used (amanita, eurosky.social, blacksky.app), with plain `--host` and no requestCrawl. It runs two checkers over the same window, one against vlRelay and one against `wss://bsky.network`, so both latencies are measured under the same conditions.

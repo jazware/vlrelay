@@ -703,9 +703,12 @@ impl Recent {
 
 /// The hosts' checkpointed cursors (`hostck/`, every host shard), re-read
 /// only where an object changed.
+/// An object as read, with its ETag.
+type Tagged<T> = (Option<String>, T);
+
 struct HostCks {
     store: Store,
-    docs: Mutex<HashMap<String, (Option<String>, BTreeMap<String, i64>)>>,
+    docs: Mutex<HashMap<String, Tagged<BTreeMap<String, i64>>>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -918,7 +921,7 @@ impl HostHandler for Upstreams {
 pub struct BucketHosts {
     store: Store,
     layout: Arc<Layout>,
-    docs: Mutex<HashMap<ShardId, (Option<String>, Arc<HostDoc>)>>,
+    docs: Mutex<HashMap<ShardId, Tagged<Arc<HostDoc>>>>,
     /// One `update_host` at a time on this node: its closure runs once, so
     /// a CAS conflict can only be retried when the host's own record didn't
     /// change under it.
