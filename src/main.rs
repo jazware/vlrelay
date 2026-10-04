@@ -82,6 +82,20 @@ struct Args {
     /// DID document fetches per second, all DIDs together.
     #[arg(long, default_value_t = 50.0)]
     did_lookups_per_sec: f64,
+    /// Seed DID documents from the PLC directory's /export (resumable, then
+    /// follows its tail), so a cold relay doesn't resolve each account. On
+    /// a cluster the lowest-named live core reads it.
+    #[arg(long, env = "VLRELAY_PLC_EXPORT")]
+    plc_export: bool,
+    /// The directory --plc-export reads (default: --plc-url).
+    #[arg(long, env = "VLRELAY_PLC_EXPORT_URL")]
+    plc_export_url: Option<String>,
+    /// /export requests per second, all streams together.
+    #[arg(long, default_value_t = 2.0)]
+    plc_export_rate: f64,
+    /// Time windows of the export read side by side on a fresh start.
+    #[arg(long, default_value_t = 4)]
+    plc_export_streams: usize,
     /// Node id: the node log's id prefix, and the cluster member name.
     #[arg(long, default_value = "relay", env = "VLRELAY_NODE_ID")]
     node_id: String,
@@ -184,6 +198,13 @@ async fn run(a: Args) -> anyhow::Result<()> {
         // every DID in a dev network is new, and PLC is local
         cfg.identity.lookups_per_sec = cfg.identity.lookups_per_sec.max(1000.0);
         cfg.identity.burst = cfg.identity.burst.max(1000.0);
+    }
+    if a.plc_export {
+        let mut pc = vlrelay::plc_seed::ingest::Config::new(a.plc_export_url.as_deref().unwrap_or(&a.plc_url));
+        anyhow::ensure!(a.plc_export_rate > 0.0, "--plc-export-rate must be above 0");
+        pc.rate = a.plc_export_rate;
+        pc.streams = a.plc_export_streams.max(1);
+        cfg.plc_export = Some(pc);
     }
     let setup = match role {
         Some(role) => Some(cluster_setup(&a, role, dev_mode, cores)?),

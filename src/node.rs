@@ -100,6 +100,8 @@ pub struct NodeConfig {
     pub policy: Option<policy::PolicyEngine>,
     /// The tier a `--host` upstream starts at the first time it's seen.
     pub cli_host_tier: Tier,
+    /// Seeds DID documents from the PLC directory's export (`plc_seed`).
+    pub plc_export: Option<crate::plc_seed::ingest::Config>,
 }
 
 impl NodeConfig {
@@ -123,6 +125,7 @@ impl NodeConfig {
             upstream_limits: upstream::Limits::default(),
             policy: None,
             cli_host_tier: Tier::Trusted,
+            plc_export: None,
         }
     }
 }
@@ -428,6 +431,9 @@ pub struct Node {
     pub recovery: Mutex<RecoveryReport>,
     /// A core cluster node's cluster half (docs/cluster.md).
     pub cluster: Option<Arc<cluster::Glue>>,
+    /// The PLC export reader, when `--plc-export` is on (on a cluster, every
+    /// core has one and the lowest-named live core runs it).
+    pub plc_ingest: std::sync::OnceLock<Arc<crate::plc_seed::ingest::Ingester>>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -487,6 +493,15 @@ impl Node {
             state.open_shard(s.id, None).await?;
         }
         let archive = cfg.policy.as_ref().map(|p| crate::archive::wiring::install(&state, p.0.clone(), identity.clone()));
+        // after a restart every DID misses the cache: its state record or
+        // its export entry fills it, where resolving them all again at
+        // --did-lookups-per-sec would take hours
+        let seeds = Arc::new(crate::plc_seed::LocalSeeds::new(state.clone(), cfg.identity.ttl));
+        identity.set_seeder(Arc::new(crate::plc_seed::SingleNode(seeds.clone())));
+        let plc_ingest = cfg.plc_export.as_ref().map(|pc| {
+            let sink = Arc::new(crate::plc_seed::LocalSink { seeds, cache: identity.clone() });
+            crate::plc_seed::ingest::Ingester::new(pc.clone(), store.clone(), sink)
+        });
 
         let mut lcfg = LogConfig::new(seq::new_log_id(&cfg.node_id));
         lcfg.linger = cfg.linger;
@@ -590,6 +605,10 @@ impl Node {
             None,
             rx,
         )?;
+        if let Some(ing) = plc_ingest {
+            let _ = node.plc_ingest.set(ing.clone());
+            tokio::spawn(ing.supervise(Arc::new(|| true)));
+        }
         manager.start().await?;
         for h in manager.hosts() {
             tracing::info!(host = %h.record.hostname, acked = ?h.record.acked_seq, tier = h.record.tier.as_str(), "upstream resumes");
@@ -663,6 +682,7 @@ impl Node {
             started_ms: upstream::host::now_ms() as i64,
             recovery: Mutex::new(report),
             cluster,
+            plc_ingest: Default::default(),
         });
         for rx in lane_rx {
             ingest_handle.spawn(node.clone().lane(rx));
@@ -898,9 +918,6 @@ impl Node {
     }
 
     async fn lookup(&self, did: &str, fresh: bool) -> Result<Arc<Identity>, Rejection> {
-        if !fresh && self.identity.cached(did).is_none() {
-            self.seed_identity(did).await;
-        }
         let mut tries = 0u32;
         loop {
             match self.identity.lookup_paced(did, fresh).await {
@@ -917,32 +934,6 @@ impl Node {
                 }
             }
         }
-    }
-
-    /// Fills the DID document cache from the DID's state record, when this
-    /// node holds it and the key there was resolved within the cache's TTL.
-    /// After a restart every DID misses the cache, and resolving them all
-    /// again at `--did-lookups-per-sec` would take hours. A key that fails
-    /// a signature is refreshed as usual. The record has no handle, so the
-    /// entry has none until the next `#identity` or refresh.
-    async fn seed_identity(&self, did: &str) {
-        let Ok(Some(rec)) = self.state.get(did).await else { return };
-        let fresh_for = self.cfg.identity.ttl.as_secs() as u32;
-        if rec.fetched_at == 0 || state::now_secs().saturating_sub(rec.fetched_at) >= fresh_for {
-            return;
-        }
-        let (Some(key), Some(pds)) = (rec.key.as_ref(), rec.pds) else { return };
-        let Some(pds_host) = self.state.host_name(pds) else { return };
-        let mb = format!("z{}", bs58::encode(&key.0).into_string());
-        let Ok(k) = SigningKey::from_multibase(&mb) else { return };
-        self.identity.insert(Identity {
-            did: did.to_string(),
-            signing_key: Some(k),
-            signing_key_multibase: Some(mb),
-            pds: Some(format!("https://{pds_host}")),
-            pds_host: Some(Host(pds_host.to_string())),
-            handle: None,
-        });
     }
 
     fn reject(&self, host: &Host, did: &str, useq: i64, r: Rejection) {

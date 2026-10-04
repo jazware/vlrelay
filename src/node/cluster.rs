@@ -174,6 +174,17 @@ impl Node {
             state::ApplyConfig::default(),
         ));
         let archive = cfg.policy.as_ref().map(|p| crate::archive::wiring::install(&state, p.0.clone(), identity.clone()));
+        let seeds = Arc::new(crate::plc_seed::LocalSeeds::new(state.clone(), cfg.identity.ttl));
+        identity.set_seeder(Arc::new(crate::plc_seed::peer::ClusterSeeder {
+            seeds: seeds.clone(),
+            cluster: Arc::downgrade(&cluster),
+        }));
+        let seed_owner = Arc::new(crate::plc_seed::peer::Owner {
+            seeds,
+            cache: identity.clone(),
+            cluster: Arc::downgrade(&cluster),
+            token: cluster.internal_token().to_string(),
+        });
         let host_layout = cluster.hosts.as_ref().expect("a core node has host shards").layout();
         let hosts = Arc::new(BucketHosts::new(store.clone(), host_layout));
 
@@ -247,8 +258,16 @@ impl Node {
         crate::cluster::peer::spawn_listener_with(
             &cluster,
             peer,
-            crate::archive::wiring::peer_reads(node.state.clone(), cluster.internal_token().to_string()),
+            crate::archive::wiring::peer_reads(node.state.clone(), cluster.internal_token().to_string())
+                .merge(crate::plc_seed::peer::router(seed_owner.clone())),
         )?;
+        if let Some(pc) = &node.cfg.plc_export {
+            let sink = Arc::new(crate::plc_seed::peer::ForwardSink::new(seed_owner));
+            let ing = crate::plc_seed::ingest::Ingester::new(pc.clone(), node.store.clone(), sink);
+            let _ = node.plc_ingest.set(ing.clone());
+            let c = Arc::downgrade(&cluster);
+            tokio::spawn(ing.supervise(Arc::new(move || c.upgrade().is_some_and(|c| c.plc_ingest_leader()))));
+        }
         cluster.serve.spawn_retention(log.log_id.to_string());
         cluster.run();
 

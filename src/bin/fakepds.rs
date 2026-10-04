@@ -10,6 +10,10 @@
 
 #[path = "../fakepds/check.rs"]
 mod check;
+// its test hooks (rotations) are the lib tests'
+#[allow(dead_code)]
+#[path = "../fakepds/export.rs"]
+mod export;
 #[path = "../fakepds/fleet.rs"]
 mod fleet;
 #[path = "../fakepds/generate.rs"]
@@ -79,6 +83,14 @@ struct RunArgs {
     /// Another PLC directory for DIDs that aren't the fleet's.
     #[arg(long)]
     plc_fallback: Option<String>,
+    /// Hosts of the whole fleet the PLC's `/export` lists (default: this
+    /// process's, host-base + hosts), each with --dids accounts.
+    #[arg(long)]
+    plc_hosts: Option<u32>,
+    /// Ops per second the export's tail appends after startup: a random
+    /// account re-announces its current key.
+    #[arg(long, default_value_t = 0.0)]
+    plc_tail_rate: f64,
     /// Events/s for this process, split over its hosts.
     #[arg(long, default_value_t = 10000.0)]
     rate: f64,
@@ -265,7 +277,26 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
     if let Some(p) = a.plc_port {
         let addr = format!("{}:{p}", a.bind);
         let lis = tokio::net::TcpListener::bind(&addr).await.map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
-        tokio::spawn(axum::serve(lis, serve::plc_router(layout.clone(), a.plc_fallback.clone())).into_future());
+        let hosts = a.plc_hosts.unwrap_or(a.host_base + a.hosts);
+        // genesis ops a millisecond apart, the last one a minute ago
+        let plc = export::FakePlc::new(layout.clone(), hosts, a.dids, export::now_ms() - 60_000, 1);
+        tokio::spawn(axum::serve(lis, plc.router(a.plc_fallback.clone())).into_future());
+        if a.plc_tail_rate > 0.0 && hosts > 0 && a.dids > 0 {
+            let (rate, dids) = (a.plc_tail_rate, a.dids);
+            let plc = plc.clone();
+            tokio::spawn(async move {
+                use rand::Rng;
+                let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / rate));
+                loop {
+                    tick.tick().await;
+                    let (g, i) = {
+                        let mut r = rand::thread_rng();
+                        (r.gen_range(0..hosts), r.gen_range(0..dids))
+                    };
+                    plc.append(g, i, plc.current(g, i), export::now_ms());
+                }
+            });
+        }
         println!("PLC {}:{p}", a.fleet.advertise.trim_end_matches('/'));
     }
 

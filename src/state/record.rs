@@ -76,7 +76,7 @@ pub fn did_from_key(key: &[u8]) -> Option<String> {
     }
 }
 
-fn plc_bytes(did: &str) -> Option<[u8; 15]> {
+pub(crate) fn plc_bytes(did: &str) -> Option<[u8; 15]> {
     let id = did.strip_prefix(PLC_PREFIX)?.as_bytes();
     if id.len() != 24 {
         return None;

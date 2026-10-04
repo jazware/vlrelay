@@ -7,6 +7,7 @@ pub mod cluster;
 pub mod event;
 pub mod identity;
 pub mod node;
+pub mod plc_seed;
 pub mod policy;
 pub mod seq;
 pub mod serve;

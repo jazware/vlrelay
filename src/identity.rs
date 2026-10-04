@@ -6,7 +6,8 @@
 //! hosts are anyone's), and failures are cached briefly so a burst of events
 //! from a broken DID costs one fetch. `#identity` events force a refresh.
 //! This is a bounded hot cache; the durable copy of an account's key and host
-//! lives in the DID owner's state.
+//! lives in the DID owner's state. A miss asks the [`Seeder`] (the state
+//! record or the PLC export's entry, `crate::plc_seed`) before it fetches.
 
 use crate::types::Host;
 use crate::verify::SigningKey;
@@ -249,6 +250,8 @@ pub struct Stats {
     pub fetches: AtomicU64,
     pub joined: AtomicU64,
     pub over_budget: AtomicU64,
+    /// Misses the seeder filled, with no fetch.
+    pub seeded: AtomicU64,
 }
 
 pub struct IdentityCache<F: Fetch = HttpFetch> {
@@ -260,11 +263,18 @@ pub struct IdentityCache<F: Fetch = HttpFetch> {
     budget: Mutex<Bucket>,
     /// The cluster's share of PLC lookups for this node, on top of `budget`.
     gate: parking_lot::RwLock<Option<BudgetGate>>,
+    seeder: parking_lot::RwLock<Option<Arc<dyn Seeder>>>,
     pub stats: Stats,
 }
 
 /// Takes one lookup from an outside budget; false when it's spent.
 pub type BudgetGate = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// A document the relay already holds, offered on a cache miss in place of
+/// a fetch. None: fetch it. Not asked on a forced refresh.
+pub trait Seeder: Send + Sync {
+    fn seed<'a>(&'a self, did: &'a str) -> futures::future::BoxFuture<'a, Option<Identity>>;
+}
 
 impl<F: Fetch> IdentityCache<F> {
     pub fn new(fetcher: F, opts: Options) -> IdentityCache<F> {
@@ -278,12 +288,17 @@ impl<F: Fetch> IdentityCache<F> {
             entries: Default::default(),
             inflight: Default::default(),
             gate: Default::default(),
+            seeder: Default::default(),
             stats: Stats::default(),
         }
     }
 
     pub fn set_budget_gate(&self, gate: BudgetGate) {
         *self.gate.write() = Some(gate);
+    }
+
+    pub fn set_seeder(&self, s: Arc<dyn Seeder>) {
+        *self.seeder.write() = Some(s);
     }
 
     /// Cached documents whose handle is `q`, or starts with it when `q`
@@ -409,6 +424,15 @@ impl<F: Fetch> IdentityCache<F> {
         };
         let out = cell
             .get_or_init(|| async {
+                let seeder = if force { None } else { self.seeder.read().clone() };
+                if let Some(s) = seeder
+                    && let Some(id) = s.seed(did).await
+                {
+                    self.stats.seeded.fetch_add(1, Ordering::Relaxed);
+                    let r: Outcome = Ok(Arc::new(id));
+                    self.store(did, r.clone());
+                    return r;
+                }
                 let r = self.fetch_now(did).await;
                 if !matches!(r, Err(LookupError::OverBudget)) {
                     self.store(did, r.clone());

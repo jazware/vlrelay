@@ -21,6 +21,16 @@ SECTIONS = [
         ["host", "crawl", "host-tier", "plc-url", "dev-mode", "did-lookups-per-sec"],
     ),
     (
+        "PLC export seeding",
+        "A cold relay would resolve each of ~56M accounts once at the PLC lookup budget (about 31 h at 500/s). "
+        "With `--plc-export` it reads the directory's `/export` instead and keeps each did:plc's key and PDS "
+        "in its DID shard, so a cache miss costs no lookup. The cursors checkpoint to "
+        "`plc/export-checkpoint.json` in the bucket, so a restart resumes; once caught up it follows the "
+        "export's tail. A signature that fails against a seeded key, and every `#identity`, still resolve "
+        "from PLC ([Policy](../policy.md#plc-export-seeding)).",
+        ["plc-export", "plc-export-url", "plc-export-rate", "plc-export-streams"],
+    ),
+    (
         "Log",
         "Time to firehose is about linger plus one segment PUT. Above ~50k events/s segments seal on size "
         "before the linger is up ([Performance](../perf.md)).",

@@ -473,6 +473,20 @@ impl ClusterNode {
     }
 
     /// The token peers present on internal routes.
+    /// Whether this node should read the PLC export: the live core with the
+    /// lowest node id. Peers listed as draining or leaving don't count.
+    pub fn plc_ingest_leader(&self) -> bool {
+        if self.cluster.is_none() || self.halted() || self.stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let members = self.members();
+        let me = members.iter().find(|m| m.node_id == self.node_id);
+        if me.is_none_or(|m| m.draining) {
+            return false;
+        }
+        members.iter().filter(|m| !m.draining).all(|m| m.node_id >= self.node_id)
+    }
+
     pub fn internal_token(&self) -> &str {
         &self.opts.internal_token
     }
