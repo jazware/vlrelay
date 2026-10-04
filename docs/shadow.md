@@ -9,14 +9,13 @@ The short version:
 
 - On the six Bluesky PDSes, vlRelay matched production event for event: 0 commits missing in
   each of the seven windows where the checker counted misses per host, and in all nine windows 0
-  reordered, 0 duplicates, 0 rev or seq regressions. Its time to firehose
-  was p50 40-50 ms against production's ~100 ms, except while other benches on benchbox slowed MinIO
+  reordered, 0 duplicates, 0 rev or seq regressions. Its time to firehose was p50 40-50 ms against production's ~100 ms, except while other benches on benchbox slowed MinIO
   (p50 up to ~120 ms).
 - The default policy throttled three of the four independent PDSes within ten minutes (tngl.sh is
   too quiet to trip it), and vlRelay dropped most of their traffic for the rest of the single-node
-  run. A fresh relay counts every account it
-  hasn't seen as a new account. That's the biggest problem the run found, and it's a policy bug,
-  not a pipeline one ([Bugs](#bugs)).
+  run. That relay counted every account it hadn't seen as a new account. It was the biggest
+  problem the run found, and it was in the policy, not the pipeline. Each piece is fixed or has an
+  operator path now ([Bugs](#bugs)).
 - With those hosts trusted (the cluster phase), vlRelay matched production on all ten hosts. It
   carried every `#identity` handle production strips, and it dropped the same eurosky `#sync`
   events production drops, for a reason the reference notes had wrong.
@@ -113,7 +112,7 @@ the 14:39 window on (when the checker started keeping per-upstream numbers):
   times in the previous window, so the checker saw their PDS copies before the window opened.
 - The **p99 of 9.65 s** and the maxima of 6-12 minutes are those delayed events too.
 - The **`inactive` rejects** are the throttled accounts' commits. The dashboard showed them as
-  "taken down" (fixed, [Bugs](#bugs)).
+  "taken down" ([Bugs](#bugs), fixed).
 - The **`commit_rev_mismatch`** rejects are eurosky's post-migration `#sync` (below).
 
 ### Three cores, every host trusted
@@ -220,10 +219,10 @@ segment holds 3 events. That's the linger doing its job, and it's the cost floor
 | MinIO | 181 MB | 726 MB of 4 GB | levelled off |
 
 The RSS growth after the ring filled is the one thing to watch. The identity cache accounts for
-some of it: entries expire after an hour but are only dropped when the cache is full
-(`IdentityCache::store`), so on the whole network it would hold ~1M documents before it cleaned
-anything. At a few hundred bytes to a KB an entry that's ~0.3-1 GB, inside the 8 GB cap but worth a
-byte bound. At ~390 new documents a minute here that's well under 1 MB of the ~3.5 MB a
+some of it: entries expired after an hour but were only dropped when the cache was full
+(`IdentityCache::store`), so on the whole network it would have held ~1M documents before it
+cleaned anything. It sweeps expired entries every minute now, so it holds the DIDs seen within the
+hour. At ~390 new documents a minute here that's well under 1 MB of the ~3.5 MB a
 minute, and the rest we couldn't attribute without a heap profile. It looked linear for the hour
 we saw (and ~2.5 MB a minute per core in the cluster's last window), so a longer run with jemalloc's stats or `heaptrack` is the next step.
 
@@ -231,16 +230,14 @@ we saw (and ~2.5 MB a minute per core in the cluster's last window), so a longer
 
 ## Bugs
 
-Fixed here, with a regression test:
+Each bug found, and where it stands on the branch now. The run itself was on 06a5737d.
 
 1. **The dashboard called every inactive account's reject "taken down".** `reject_class` mapped
    the state step's `inactive` (deactivated, suspended, throttled, deleted or taken down) to
-   `Takendown`, so the overview showed 3-5 takedowns a second on a relay that had none. It's its
-   own class now, "inactive account" (`0f8ac33d`).
+   `Takendown`, so the overview showed 3-5 takedowns a second on a relay that had none. Fixed: it's
+   its own class, "inactive account", with a regression test.
 
-For the lead (bigger, and in the account-gate and policy workstreams' code):
-
-2. **A fresh relay throttles every big host it doesn't trust.** The account gate treats the first
+2. **A fresh relay throttles every big host it doesn't trust.** The account gate treated the first
    event from a DID as a new account. On a relay that has just started, or has just added a host,
    that's every active account. On default-tier hosts:
    - `maxAccounts` (100) throttled 3,508 real, long-lived accounts within 90 minutes. A
@@ -253,30 +250,42 @@ For the lead (bigger, and in the account-gate and policy workstreams' code):
      the single node and 7 on the cluster (all six mushrooms and eurosky), every one a false
      positive.
 
-   indigo has the same 100-account cap, which is why bsky.network raises it per host. But it has
-   no spam rule on top. A new repo's first commit has no `prevData`, while an account the relay
-   just hasn't seen before sends a commit with one. Counting only the first kind toward the spam
-   thresholds, and seeding a known host's accounts from `listRepos` before applying the cap, would
-   fix both.
+   The spam rule and the new-account rates are fixed on the branch: they count only newly created
+   repos (no `since`, no `prevData`). The cap is unchanged on purpose: it's indigo's, and indigo
+   has the same first-wave problem, which bsky.network handles by raising each big host's limit.
+   vlRelay now has the same per-host override (`set-account-limit`), a warning on host detail for a
+   host at its cap with a one-click raise to 1,000,000, and the accounts column marked on the Hosts
+   list. [Policy](policy.md#big-independent-pdses-and-the-account-cap) has the operator notes.
+   Accounts throttled before a raise still stay throttled until an untakedown, where indigo
+   releases them.
 
-3. **A throttled host falls behind without limit.** The tier's hourly bucket blocks the reader,
-   which is right for a spammer but turns into an ever-growing backlog for a host that's
-   legitimately above the rate. eurosky was ~50 minutes behind when it cut vlRelay off with
-   `ConsumerTooSlow`, and after that the events between the reconnect cursor and the PDS's own
-   window are gone. The dashboard's "lag" column for those hosts said 0.
+3. **A throttled host falls behind without limit, and nothing showed it.** The tier's hourly
+   bucket blocks the reader, which is right for a spammer but turns into an ever-growing backlog
+   for a host that's legitimately above the rate. eurosky was ~50 minutes behind when it cut
+   vlRelay off with `ConsumerTooSlow`, and after that the events between the reconnect cursor and
+   the PDS's own window are gone. The dashboard's lag column said 0. Each host's lag is now
+   measured from its events' `time` (Hosts, host detail, `vlrelay_host_read_lag_max_seconds`,
+   `vlrelay_hosts_lagging`), and a reader more than 10 minutes behind opens a `read-lag` case. What
+   else the relay could do, and why it doesn't, is in
+   [Policy](policy.md#when-a-throttled-host-falls-behind).
 
-4. **Cluster views on the dashboard are per node.** On n1, the hosts other cores read showed as
+4. **Cluster views on the dashboard were per node.** On n1, the hosts other cores read showed as
    `idle` with node `n1`, the Consumers page listed only n1's sockets, and the Cluster page showed
    0 events/s, 0 B and 0 cores for n2 and n3 ([screenshot](assets/dashboard-real-hosts-cluster.jpg)).
+   Fixed on the branch: the dashboard aggregates hosts, consumers and cluster numbers across nodes.
 
-5. **4 DID shards over 3 cores went 2/2/0.** n3 owned no DID shards, so everything it read was
-   forwarded. With the default of 4 shards, any odd-sized cluster leaves one core state-less.
+5. **4 DID shards over 3 cores went 2/2/0.** Each core takes at most `ceil(shards / cores)`, so n3
+   owned no DID shards and forwarded everything it read. Fixed: a cluster defaults to 24 DID shards
+   (4 still on one node), which splits evenly over 2, 3, 4, 6 and 8 cores and leaves none empty at
+   5 ([Deploy](operations/deploy.md#a-cluster)).
 
 6. **The merger dropped a late event at join.** n2 and n3 each logged `firehose merger: dropped
-   late events below the emitted watermark late=1` a second after they started.Nothing was subscribed to n2 or n3 yet, and the
-   node comparison later found the three streams identical, so we couldn't tell whether a
-   consumer would have missed it. A core joining under live traffic is worth an e2e check with a
-   consumer already attached.
+   late events below the emitted watermark late=1` a second after they started. Nothing was
+   subscribed to them yet, and the node comparison later found the three streams identical. Since
+   then a joining core holds its merge below its start floor until it follows its peers. A
+   `just e2e-cluster` on the current branch (kill -9, restart, SIGTERM and rejoin under load, five
+   checkers attached throughout) logged no such drop on any node and passed with every stream
+   identical.
 
 Not a vlRelay bug: eurosky's migration `#sync` ([above](#sync-identity-and-account-events-against-production)).
 
