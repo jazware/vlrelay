@@ -4,8 +4,12 @@
 //!
 //! Order per DID is what matters (the DID owner checks each commit against
 //! the one before), so events go through lanes keyed by the DID's slot. A
-//! lane has one batch in flight, which is the in-flight limit, and a batch's
-//! failed events are retried, in order, before the lane takes anything new.
+//! lane has up to `ForwardConfig::batches` batches in flight, no DID in two
+//! of them at once: an event whose DID is in flight waits, in order, until
+//! that batch resolves (its failed events retried in order first). So one
+//! slow owner holds back only its own DIDs, not every DID sharing a lane
+//! with them (one slow bucket path on one core stalled every node's
+//! forwards, docs/chaos.md).
 //! A batch splits by owner: the part for this node calls the stage directly
 //! (no network), the rest goes over peer mTLS as one HTTP/2 POST per owner.
 //!
@@ -74,6 +78,8 @@ pub enum ForwardError {
 pub struct ForwardConfig {
     /// Lanes (one batch in flight each).
     pub lanes: usize,
+    /// Batches in flight per lane.
+    pub batches: usize,
     pub max_batch: usize,
     /// A lane holding fewer than `max_batch` events waits this long for more.
     pub window: Duration,
@@ -87,6 +93,7 @@ impl Default for ForwardConfig {
     fn default() -> Self {
         ForwardConfig {
             lanes: 64,
+            batches: 4,
             max_batch: 512,
             window: Duration::from_millis(1),
             lane_queue: 4096,
@@ -148,16 +155,96 @@ impl Forwarder {
 }
 
 async fn lane(cfg: ForwardConfig, route: Arc<dyn Route>, mut rx: mpsc::Receiver<Item>) {
-    while let Some(first) = rx.recv().await {
-        let mut batch = vec![first];
-        let deadline = tokio::time::Instant::now() + cfg.window;
-        while batch.len() < cfg.max_batch {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(it)) => batch.push(it),
-                Ok(None) | Err(_) => break,
+    use futures::StreamExt;
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let mut inflight = futures::stream::FuturesUnordered::new();
+    // DID -> its events in flight
+    let mut busy: HashMap<String, usize> = HashMap::new();
+    // waiting on a DID in flight (or behind an earlier held event of theirs)
+    let mut held: VecDeque<Item> = VecDeque::new();
+    let mut open = true;
+    loop {
+        // what's held and free to go, in order
+        let mut batch = Vec::new();
+        if !held.is_empty() && inflight.len() < cfg.batches.max(1) {
+            let mut blocked: HashSet<String> = HashSet::new();
+            let mut keep = VecDeque::new();
+            for it in held.drain(..) {
+                if batch.len() < cfg.max_batch && !busy.contains_key(&it.ev.did) && !blocked.contains(&it.ev.did) {
+                    batch.push(it);
+                } else {
+                    blocked.insert(it.ev.did.clone());
+                    keep.push_back(it);
+                }
+            }
+            held = keep;
+        }
+        if batch.is_empty() {
+            let can_take = open && inflight.len() < cfg.batches.max(1) && held.len() < cfg.lane_queue.max(1);
+            if !can_take && inflight.is_empty() {
+                return;
+            }
+            tokio::select! {
+                Some(dids) = inflight.next(), if !inflight.is_empty() => {
+                    for d in dids {
+                        release(&mut busy, d);
+                    }
+                    continue;
+                }
+                first = rx.recv(), if can_take => {
+                    let Some(first) = first else {
+                        open = false;
+                        continue;
+                    };
+                    let mut taken = vec![first];
+                    let deadline = tokio::time::Instant::now() + cfg.window;
+                    while taken.len() < cfg.max_batch {
+                        match tokio::time::timeout_at(deadline, rx.recv()).await {
+                            Ok(Some(it)) => taken.push(it),
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                    let mut blocked: HashSet<String> = held.iter().map(|i| i.ev.did.clone()).collect();
+                    for it in taken {
+                        if busy.contains_key(&it.ev.did) || blocked.contains(&it.ev.did) {
+                            blocked.insert(it.ev.did.clone());
+                            held.push_back(it);
+                        } else {
+                            batch.push(it);
+                        }
+                    }
+                }
             }
         }
-        run_batch(&cfg, &*route, batch).await;
+        // one batch per owner, so a slow owner's answer doesn't hold the rest
+        let mut groups: Vec<(Option<Option<String>>, Vec<Item>)> = Vec::new();
+        for it in batch {
+            let o = route.owner(&it.ev.did);
+            match groups.iter_mut().find(|(g, _)| *g == o) {
+                Some((_, v)) => v.push(it),
+                None => groups.push((o, vec![it])),
+            }
+        }
+        for (_, batch) in groups {
+            let dids: Vec<String> = batch.iter().map(|i| i.ev.did.clone()).collect();
+            for d in &dids {
+                *busy.entry(d.clone()).or_default() += 1;
+            }
+            let (cfg, route) = (cfg.clone(), route.clone());
+            inflight.push(async move {
+                run_batch(&cfg, &*route, batch).await;
+                dids
+            });
+        }
+    }
+}
+
+fn release(busy: &mut std::collections::HashMap<String, usize>, did: String) {
+    if let std::collections::hash_map::Entry::Occupied(mut e) = busy.entry(did) {
+        *e.get_mut() -= 1;
+        if *e.get() == 0 {
+            e.remove();
+        }
     }
 }
 
@@ -498,6 +585,54 @@ mod tests {
         *r.owner.lock() = None;
         assert!(matches!(w.await.unwrap(), Ok(Outcome::Appended(1))));
         assert!(t0.elapsed() < Duration::from_secs(2), "took {:?}", t0.elapsed());
+    }
+
+    /// One owner answers in 300 ms (its bucket path is slow), the other at
+    /// once, all in one lane.
+    struct Slow {
+        applied: Mutex<Vec<(String, i64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Route for Slow {
+        fn owner(&self, did: &str) -> Option<Option<String>> {
+            Some(did.starts_with("did:slow").then(|| "https://slow".to_string()))
+        }
+        async fn local(&self, batch: Vec<Forwarded>) -> Vec<StageResult> {
+            self.applied.lock().extend(batch.iter().map(|e| (e.did.clone(), e.upstream_seq)));
+            batch.iter().map(|e| Ok(Outcome::Appended(e.upstream_seq))).collect()
+        }
+        async fn remote(&self, _addr: &str, batch: Vec<Forwarded>) -> anyhow::Result<Vec<StageResult>> {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok(self.local(batch).await)
+        }
+    }
+
+    /// The slow owner holds back only its own DIDs, each still in order.
+    #[tokio::test]
+    async fn a_slow_owner_holds_back_only_its_dids() {
+        let r = Arc::new(Slow { applied: Mutex::new(Vec::new()) });
+        let f = Forwarder::start(ForwardConfig { lanes: 1, ..Default::default() }, r.clone());
+        let t0 = Instant::now();
+        let mut slow = Vec::new();
+        let mut fast = Vec::new();
+        for i in 0..10 {
+            slow.push(f.submit(ev("did:slow", i)).await);
+            fast.push(f.submit(ev("did:fast", i)).await);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for w in fast {
+            assert!(matches!(w.await.unwrap(), Ok(Outcome::Appended(_))));
+        }
+        assert!(t0.elapsed() < Duration::from_millis(250), "fast DIDs waited on the slow owner: {:?}", t0.elapsed());
+        for w in slow {
+            assert!(matches!(w.await.unwrap(), Ok(Outcome::Appended(_))));
+        }
+        let applied = r.applied.lock().clone();
+        for did in ["did:slow", "did:fast"] {
+            let got: Vec<i64> = applied.iter().filter(|x| x.0 == did).map(|x| x.1).collect();
+            assert_eq!(got, (0..10).collect::<Vec<_>>(), "{did}");
+        }
     }
 
     #[tokio::test]
