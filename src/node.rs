@@ -222,18 +222,37 @@ struct PendingCommit {
 pub struct LocalOwner {
     pub state: Arc<State>,
     pub log: Arc<NodeLog>,
-    commits: mpsc::UnboundedSender<PendingCommit>,
-    /// When the oldest durable-but-uncommitted batch became durable (µs since
-    /// `epoch`, 0 = none): a checkpoint must not pass an uncommitted entry.
-    pub committing_since_us: Arc<AtomicU64>,
+    /// One committer per DID shard (by shard id, modulo): one task couldn't
+    /// commit much past 90k events/s, and shards commit independently. A
+    /// DID's events all go to one committer, in the order they were applied.
+    commits: Vec<mpsc::UnboundedSender<PendingCommit>>,
+    /// Per committer: when its current batch became durable (µs since
+    /// `epoch`, 0 = none).
+    committing: Vec<Arc<AtomicU64>>,
 }
 
 impl LocalOwner {
-    pub fn start(state: Arc<State>, log: Arc<NodeLog>, ttf: Arc<Ttf>) -> Arc<LocalOwner> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let since = Arc::new(AtomicU64::new(0));
-        tokio::spawn(committer(state.clone(), rx, ttf, since.clone()));
-        Arc::new(LocalOwner { state, log, commits: tx, committing_since_us: since })
+    pub fn start(state: Arc<State>, log: Arc<NodeLog>, ttf: Arc<Ttf>, committers: usize) -> Arc<LocalOwner> {
+        let mut commits = Vec::new();
+        let mut committing = Vec::new();
+        for _ in 0..committers.max(1) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let since = Arc::new(AtomicU64::new(0));
+            tokio::spawn(committer(state.clone(), rx, ttf.clone(), since.clone()));
+            commits.push(tx);
+            committing.push(since);
+        }
+        Arc::new(LocalOwner { state, log, commits, committing })
+    }
+
+    fn commit(&self, shard: u32, p: PendingCommit) {
+        let _ = self.commits[shard as usize % self.commits.len()].send(p);
+    }
+
+    /// When the oldest durable-but-uncommitted batch became durable (µs since
+    /// `epoch`, 0 = none): a checkpoint must not pass an uncommitted entry.
+    pub fn committing_since_us(&self) -> u64 {
+        self.committing.iter().map(|c| c.load(Ordering::Acquire)).filter(|&t| t != 0).min().unwrap_or(0)
     }
 
     /// Appends a frame the relay made itself (a takedown's `#account`),
@@ -241,7 +260,7 @@ impl LocalOwner {
     pub async fn append_own(&self, meta: EventMeta, frame: vlpds::events::Frame) -> Result<Durable, LogError> {
         let t = self.log.submit(vec![seq::Event { meta, frame: Box::new(frame), delta: None }]).await;
         let (tx, rx) = oneshot::channel();
-        let _ = self.commits.send(PendingCommit { durable: t, ticket: None, tx, received: Instant::now() });
+        self.commit(0, PendingCommit { durable: t, ticket: None, tx, received: Instant::now() });
         rx.await.unwrap_or(Err(LogError::Closed))
     }
 }
@@ -302,7 +321,7 @@ impl DidOwner for LocalOwner {
                 };
                 let durable = self.log.submit(vec![ev]).await;
                 let (tx, rx) = oneshot::channel();
-                let _ = self.commits.send(PendingCommit { durable, ticket: Some(a.ticket), tx, received: c.received });
+                self.commit(a.ticket.shard.0, PendingCommit { durable, ticket: Some(a.ticket), tx, received: c.received });
                 Submitted::Appended(rx)
             }
             // A #sync may restate the head the last #commit left (a
@@ -314,7 +333,7 @@ impl DidOwner for LocalOwner {
                 let ev = seq::Event { meta, frame: Box::new(Spliced { frame: c.frame, span: c.span }), delta: None };
                 let durable = self.log.submit(vec![ev]).await;
                 let (tx, rx) = oneshot::channel();
-                let _ = self.commits.send(PendingCommit { durable, ticket: None, tx, received: c.received });
+                self.commit(shard.0, PendingCommit { durable, ticket: None, tx, received: c.received });
                 Submitted::Appended(rx)
             }
             Ok(Applied::Duplicate) => Submitted::Duplicate,
@@ -363,9 +382,10 @@ async fn committer(
                 ttf.durable_batch(batch.iter().filter_map(|(r, _, _, received)| {
                     r.as_ref().ok().map(|d| (d.seqs.as_slice(), *received))
                 }));
+                let now = Instant::now();
                 for (r, _, tx, received) in batch {
                     if r.is_ok() {
-                        metrics::TIME_TO_DURABLE.observe(received.elapsed().as_secs_f64());
+                        metrics::TIME_TO_DURABLE.observe(now.saturating_duration_since(received).as_secs_f64());
                     }
                     let _ = tx.send(r);
                 }
@@ -545,7 +565,7 @@ impl Node {
         }
 
         let ttf = Arc::new(Ttf::default());
-        let local = LocalOwner::start(state.clone(), log.clone(), ttf.clone());
+        let local = LocalOwner::start(state.clone(), log.clone(), ttf.clone(), cfg.did_shards as usize);
         let owner: Arc<dyn DidOwner> = local.clone();
         let cli_tier = cfg.cli_host_tier;
         let node = Node::assemble(
@@ -662,14 +682,14 @@ impl Node {
                 Ok(r) => r,
                 Err(e) => {
                     metrics::EVENTS_IN.with_label_values(&["malformed"]).inc();
-                    self.acks.begin(&f.host, f.upstream_seq);
+                    self.acks.begin_at(&f.host, f.upstream_seq, received);
                     self.reject(&f.host, "", f.upstream_seq, Rejection::verify(e));
                     self.finish(&f.host, f.upstream_seq, None);
                     continue;
                 }
             };
             metrics::IN_BY_KIND.inc(r.kind.as_str());
-            let first = self.acks.begin(&f.host, f.upstream_seq);
+            let first = self.acks.begin_at(&f.host, f.upstream_seq, received);
             let did = match (r.kind, r.did) {
                 (Kind::Commit | Kind::Sync | Kind::Identity | Kind::Account, Some(d)) => d,
                 (k, _) => {
@@ -859,8 +879,8 @@ impl Node {
         loop {
             let t0 = Instant::now();
             let id = self.lookup(did, fresh).await?;
-            metrics::IDENTITY.wall(t0.elapsed());
             let t1 = Instant::now();
+            metrics::IDENTITY.wall(t1 - t0);
             let r = match &id.signing_key {
                 Some(k) => cpu(len, || check(k)),
                 None => Err(Reject::NoSigningKey),
@@ -874,6 +894,9 @@ impl Node {
     }
 
     async fn lookup(&self, did: &str, fresh: bool) -> Result<Arc<Identity>, Rejection> {
+        if !fresh && self.identity.cached(did).is_none() {
+            self.seed_identity(did).await;
+        }
         let mut tries = 0u32;
         loop {
             let r = if fresh { self.identity.refresh(did).await } else { self.identity.resolve(did).await };
@@ -891,6 +914,32 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// Fills the DID document cache from the DID's state record, when this
+    /// node holds it and the key there was resolved within the cache's TTL.
+    /// After a restart every DID misses the cache, and resolving them all
+    /// again at `--did-lookups-per-sec` would take hours. A key that fails
+    /// a signature is refreshed as usual. The record has no handle, so the
+    /// entry has none until the next `#identity` or refresh.
+    async fn seed_identity(&self, did: &str) {
+        let Ok(Some(rec)) = self.state.get(did).await else { return };
+        let fresh_for = self.cfg.identity.ttl.as_secs() as u32;
+        if rec.fetched_at == 0 || state::now_secs().saturating_sub(rec.fetched_at) >= fresh_for {
+            return;
+        }
+        let (Some(key), Some(pds)) = (rec.key.as_ref(), rec.pds) else { return };
+        let Some(pds_host) = self.state.host_name(pds) else { return };
+        let mb = format!("z{}", bs58::encode(&key.0).into_string());
+        let Ok(k) = SigningKey::from_multibase(&mb) else { return };
+        self.identity.insert(Identity {
+            did: did.to_string(),
+            signing_key: Some(k),
+            signing_key_multibase: Some(mb),
+            pds: Some(format!("https://{pds_host}")),
+            pds_host: Some(Host(pds_host.to_string())),
+            handle: None,
+        });
     }
 
     fn reject(&self, host: &Host, did: &str, useq: i64, r: Rejection) {
@@ -948,7 +997,7 @@ impl Node {
             tick.tick().await;
             let snap = self.acks.snapshot();
             let durable = self.log.durable_ordinal.load(Ordering::Acquire);
-            let committing = self.local.committing_since_us.load(Ordering::Acquire);
+            let committing = self.local.committing_since_us();
             let stuck_commit = committing != 0 && mono_us(*EPOCH).saturating_sub(committing) > every.as_micros() as u64;
             let mut marker = (prev_durable != u64::MAX).then_some(prev_durable);
             if let Some(m) = snap.min_ordinal_above_ack {

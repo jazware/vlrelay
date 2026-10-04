@@ -44,15 +44,23 @@ impl Tracker {
     /// Returns false when this seq is already in the pipeline or done but
     /// not yet acked: a replay after a reconnect.
     pub fn begin(&self, host: &Host, seq: i64) -> bool {
+        self.begin_at(host, seq, Instant::now())
+    }
+
+    /// [`Self::begin`] with the time the frame was read.
+    pub fn begin_at(&self, host: &Host, seq: i64, at: Instant) -> bool {
         if seq <= 0 {
             return true;
         }
         let mut m = self.hosts.lock();
-        let seqs = &mut m.entry(host.clone()).or_default().seqs;
+        if !m.contains_key(host) {
+            m.insert(host.clone(), HostAcks::default());
+        }
+        let seqs = &mut m.get_mut(host).expect("inserted above").seqs;
         let first = !seqs.contains_key(&seq);
         let e = seqs.entry(seq).or_default();
         e.pending += 1;
-        e.since.get_or_insert_with(Instant::now);
+        e.since.get_or_insert(at);
         first
     }
 

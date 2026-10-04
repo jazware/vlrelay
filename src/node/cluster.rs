@@ -194,7 +194,7 @@ impl Node {
         let cli_tier = cfg.cli_host_tier;
 
         let ttf = Arc::new(Ttf::default());
-        let local = LocalOwner::start(state.clone(), log.clone(), ttf.clone());
+        let local = LocalOwner::start(state.clone(), log.clone(), ttf.clone(), cfg.did_shards as usize);
         let glue = Arc::new(Glue {
             cluster: cluster.clone(),
             hosts: hosts.clone(),

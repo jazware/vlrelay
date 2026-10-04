@@ -653,8 +653,9 @@ impl Sequencer {
         }
         let ordinal =
             if s.frames.is_empty() && !s.heartbeat { self.durable_ordinal.load(Ordering::Acquire) } else { s.ordinal };
+        let now = Instant::now();
         for (ack, seqs, enq) in s.acks {
-            self.stats.latency_us.fetch_add(enq.elapsed().as_micros() as u64, Ordering::Relaxed);
+            self.stats.latency_us.fetch_add(now.saturating_duration_since(enq).as_micros() as u64, Ordering::Relaxed);
             let _ = ack.send(Ok(Durable { seqs, ordinal }));
         }
     }
