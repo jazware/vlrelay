@@ -376,7 +376,7 @@ impl Glue {
                 return;
             }
             match self.hostck.refresh().await {
-                Ok(c) => self.recent.prune(&c, Duration::from_secs(900)),
+                Ok(c) => self.recent.prune(&c, UNCHECKPOINTED_DEDUPE_AGE),
                 Err(e) => tracing::warn!("reading host checkpoints failed: {e:#}"),
             }
             let prev = self.committed_prev.swap(self.committed.load(Ordering::Acquire), Ordering::AcqRel);
@@ -939,7 +939,17 @@ impl Inflight {
 #[derive(Default)]
 pub struct Recent {
     m: Mutex<HashMap<Host, BTreeMap<i64, Ent>>>,
+    /// Each host's sequence generation as `hostck/` last said.
+    gens: Mutex<HashMap<Host, u64>>,
 }
+
+/// A host's checkpointed cursor and its sequence generation.
+pub type HostCk = (i64, u64);
+
+/// How long an entry of a host with no checkpoint yet is kept. A host with
+/// one keeps its entries until the checkpoint passes them, however long that
+/// takes: an expired entry lets a replay append a second copy.
+const UNCHECKPOINTED_DEDUPE_AGE: Duration = Duration::from_secs(900);
 
 #[derive(Clone, Copy)]
 struct Ent {
@@ -1012,13 +1022,28 @@ impl Recent {
         });
     }
 
-    pub fn prune(&self, cursors: &HashMap<Host, i64>, max_age: Duration) {
+    /// Drops what the hosts' checkpoints passed. A host whose sequence
+    /// restarted (a new generation) loses all of its entries first: they
+    /// belong to the old sequence, and its cursor starts over below them, so
+    /// they'd be kept until the new sequence passed them, and would drop
+    /// the new sequence's events at those seqs for the same DID. (Entries
+    /// the new sequence made before the reset was seen go with them: a
+    /// replay of one restates the same state.)
+    pub fn prune(&self, cks: &HashMap<Host, HostCk>, max_age: Duration) {
+        let restarted: std::collections::HashSet<&Host> = {
+            let mut g = self.gens.lock();
+            cks.iter()
+                .filter(|(h, (_, n))| g.insert((*h).clone(), *n).is_some_and(|seen| seen < *n))
+                .map(|(h, _)| h)
+                .collect()
+        };
         let mut m = self.m.lock();
         m.retain(|h, seqs| {
-            if let Some(c) = cursors.get(h) {
-                *seqs = seqs.split_off(&(c + 1));
+            match cks.get(h) {
+                _ if restarted.contains(h) => seqs.clear(),
+                Some((c, _)) => *seqs = seqs.split_off(&(c + 1)),
+                None => seqs.retain(|_, e| e.at.elapsed() < max_age),
             }
-            seqs.retain(|_, e| e.at.elapsed() < max_age);
             !seqs.is_empty()
         });
     }
@@ -1174,13 +1199,15 @@ type Tagged<T> = (Option<String>, T);
 
 struct HostCks {
     store: Store,
-    docs: Mutex<HashMap<String, Tagged<BTreeMap<String, i64>>>>,
+    docs: Mutex<HashMap<String, Tagged<CkDoc>>>,
 }
 
 #[derive(Deserialize, Default)]
 struct CkDoc {
     #[serde(default)]
     cursors: BTreeMap<String, i64>,
+    #[serde(default)]
+    gens: BTreeMap<String, u64>,
 }
 
 impl HostCks {
@@ -1188,7 +1215,7 @@ impl HostCks {
         HostCks { store, docs: Mutex::new(HashMap::new()) }
     }
 
-    async fn refresh(&self) -> anyhow::Result<HashMap<Host, i64>> {
+    async fn refresh(&self) -> anyhow::Result<HashMap<Host, HostCk>> {
         use futures::StreamExt;
         let prefix = Path::from(format!("{}/hostck", self.store.prefix));
         let mut listed = Vec::new();
@@ -1205,17 +1232,18 @@ impl HostCks {
             match self.store.raw.get(&Path::from(p.as_str())).await {
                 Ok(r) => {
                     let doc: CkDoc = serde_json::from_slice(&r.bytes().await?).unwrap_or_default();
-                    self.docs.lock().insert(p, (etag, doc.cursors));
+                    self.docs.lock().insert(p, (etag, doc));
                 }
                 Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => return Err(e.into()),
             }
         }
         let mut out = HashMap::new();
-        for (_, c) in self.docs.lock().values() {
-            for (h, s) in c {
-                let e = out.entry(Host(h.clone())).or_insert(*s);
-                *e = (*e).max(*s);
+        for (_, d) in self.docs.lock().values() {
+            for (h, s) in &d.cursors {
+                let ck = (*s, d.gens.get(h).copied().unwrap_or(0));
+                let e = out.entry(Host(h.clone())).or_insert(ck);
+                *e = (*e).max(ck);
             }
         }
         Ok(out)
@@ -1840,11 +1868,29 @@ mod tests {
         r.replayed(&h, 12, did_key("did:b"), 1);
         assert_eq!(r.min_ordinal(0), Some(7));
         assert_eq!(r.min_ordinal(1), None);
-        r.prune(&HashMap::from([(h.clone(), 10)]), Duration::from_secs(60));
+        r.prune(&HashMap::from([(h.clone(), (10, 0))]), Duration::from_secs(60));
         assert!(r.claim(&h, 10, "did:a", 0, 5), "past the cursor: forgotten");
         assert!(!r.claim(&h, 12, "did:b", 1, 5));
         r.release(&h, 10, "did:a");
         assert_eq!(r.len(), 1);
+    }
+
+    /// A checkpointed host's entries stay until its checkpoint passes them,
+    /// however old; a sequence restart drops the old sequence's; a host with
+    /// no checkpoint ages them out.
+    #[test]
+    fn recent_prunes_by_checkpoint_not_age() {
+        let r = Recent::default();
+        let (h, quiet) = (Host("pds.test".into()), Host("new.test".into()));
+        assert!(r.claim(&h, 900, "did:a", 0, 1));
+        assert!(r.claim(&quiet, 3, "did:b", 0, 1));
+        r.prune(&HashMap::from([(h.clone(), (100, 0))]), Duration::ZERO);
+        assert!(!r.claim(&h, 900, "did:a", 0, 1), "kept until the checkpoint passes it");
+        assert!(r.claim(&quiet, 3, "did:b", 0, 1), "no checkpoint: aged out");
+        r.prune(&HashMap::from([(h.clone(), (0, 1))]), Duration::from_secs(60));
+        assert!(r.claim(&h, 900, "did:a", 0, 1), "the old sequence's entry went with the restart");
+        r.prune(&HashMap::from([(h.clone(), (10, 1))]), Duration::from_secs(60));
+        assert!(!r.claim(&h, 900, "did:a", 0, 1), "the same generation prunes by cursor only");
     }
 
     /// The zombie-plus-crash gap: a second copy of an event is a duplicate
@@ -1902,7 +1948,7 @@ mod tests {
         assert_eq!(cs.read(shard, "log-c").await.unwrap().len(), 1);
 
         // pruned past the checkpoint: C's object goes away
-        c.prune(&HashMap::from([(h.clone(), 41)]), Duration::from_secs(60));
+        c.prune(&HashMap::from([(h.clone(), (41, 0))]), Duration::from_secs(60));
         cs.write(shard, c.inherited(3)).await.unwrap();
         assert!(cs.read(shard, "log-c").await.unwrap().is_empty());
     }
