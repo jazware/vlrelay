@@ -472,6 +472,8 @@ impl ClusterNode {
                     tokio::spawn(async move { reach_loop(me).await });
                 }
                 let me = Arc::downgrade(self);
+                tokio::spawn(async move { lag_loop(me).await });
+                let me = Arc::downgrade(self);
                 let every = self.opts.checkpoint_every;
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(every);
@@ -1030,6 +1032,35 @@ async fn reach_loop(me: Weak<ClusterNode>) {
     }
 }
 
+static MERGE_LAG: std::sync::LazyLock<prometheus::HistogramVec> = std::sync::LazyLock::new(|| {
+    prometheus::register_histogram_vec!(
+        "vlrelay_cluster_log_lag_seconds",
+        "Sampled every 100 ms: each followed peer log's watermark behind our clock (peer), and our own log's oldest append not yet durable (own)",
+        &["log"],
+        prometheus::exponential_buckets(0.0005, 1.6, 24).unwrap()
+    )
+    .unwrap()
+});
+
+/// The merge waits on the slowest log, so these say how far each one holds
+/// the merged firehose back.
+async fn lag_loop(me: Weak<ClusterNode>) {
+    let (own, peer) = (MERGE_LAG.with_label_values(&["own"]), MERGE_LAG.with_label_values(&["peer"]));
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let Some(n) = me.upgrade() else { return };
+        if n.stop.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(l) = &n.log {
+            own.observe(l.pending_age().as_secs_f64());
+        }
+        for a in n.followers.watermark_ages() {
+            peer.observe(a.as_secs_f64());
+        }
+    }
+}
+
 /// How many times the median peer log's watermark age our oldest pending
 /// append must be for our log to count as the slow one.
 const OUTLIER: u32 = 4;
@@ -1065,10 +1096,12 @@ impl forward::Route for NodeRoute {
     async fn remote(&self, addr: &str, batch: Vec<Forwarded>) -> anyhow::Result<Vec<StageResult>> {
         let n = self.0.upgrade().ok_or_else(|| anyhow::anyhow!("stopped"))?;
         let http = n.http.as_ref().ok_or_else(|| anyhow::anyhow!("no peer transport"))?;
+        let body = forward::encode_batch(&batch);
+        forward::FORWARD_BYTES.inc_by(body.len() as u64);
         let r = http
             .post(format!("{}{}", addr.trim_end_matches('/'), peer::FORWARD))
             .header(peer::TOKEN_HEADER, &n.opts.internal_token)
-            .body(forward::encode_batch(&batch))
+            .body(body)
             .send()
             .await?
             .error_for_status()?;

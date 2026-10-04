@@ -116,6 +116,29 @@ pub trait Route: Send + Sync + 'static {
 
 type Reply = oneshot::Sender<Result<Outcome, ForwardError>>;
 
+static FORWARD_EVENTS: std::sync::LazyLock<prometheus::IntCounterVec> = std::sync::LazyLock::new(|| {
+    prometheus::register_int_counter_vec!(
+        "vlrelay_cluster_forward_events_total",
+        "Events sent to their DID owner, by where it is (local: this node's stage, remote: a peer)",
+        &["to"]
+    )
+    .unwrap()
+});
+static FORWARD_SECONDS: std::sync::LazyLock<prometheus::HistogramVec> = std::sync::LazyLock::new(|| {
+    prometheus::register_histogram_vec!(
+        "vlrelay_cluster_forward_batch_seconds",
+        "A forwarded batch's send to its owner's answer (made durable or decided), by where the owner is",
+        &["to"],
+        prometheus::exponential_buckets(0.0005, 1.6, 24).unwrap()
+    )
+    .unwrap()
+});
+/// Request body bytes of forwards to peers.
+pub(crate) static FORWARD_BYTES: std::sync::LazyLock<prometheus::IntCounter> = std::sync::LazyLock::new(|| {
+    prometheus::register_int_counter!("vlrelay_cluster_forward_bytes_total", "Request body bytes forwarded to peers")
+        .unwrap()
+});
+
 struct Item {
     ev: Forwarded,
     reply: Reply,
@@ -276,6 +299,9 @@ async fn run_batch(cfg: &ForwardConfig, route: &dyn Route, mut pending: Vec<Item
         }
         let sends = groups.into_iter().map(|(owner, items)| async move {
             let evs: Vec<Forwarded> = items.iter().map(|i| i.ev.clone()).collect();
+            let to = if owner.is_none() { "local" } else { "remote" };
+            FORWARD_EVENTS.with_label_values(&[to]).inc_by(evs.len() as u64);
+            let t0 = Instant::now();
             let res = match &owner {
                 None => Ok(route.local(evs).await),
                 // A hung owner (SIGSTOP, a GC pause, a blackholed link) keeps
@@ -292,6 +318,7 @@ async fn run_batch(cfg: &ForwardConfig, route: &dyn Route, mut pending: Vec<Item
                     _ = moved_off(route, &items, &owner) => Err(anyhow::anyhow!("a DID's owner moved off {addr} mid-forward")),
                 },
             };
+            FORWARD_SECONDS.with_label_values(&[to]).observe(t0.elapsed().as_secs_f64());
             (items, res)
         });
         let mut why = String::from("no live owner");
