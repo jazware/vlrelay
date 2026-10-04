@@ -4471,6 +4471,7 @@ dependencies = [
  "hdrhistogram",
  "hyper",
  "hyper-util",
+ "libc",
  "lru 0.12.5",
  "mime_guess",
  "object_store",

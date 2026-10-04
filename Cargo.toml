@@ -64,6 +64,7 @@ path = "src/bin/devnet.rs"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+libc = "0.2"
 # differential tests against a second atproto implementation, as vlpds does
 shrike = { version = "=0.7.0", default-features = false, features = ["syntax", "cbor", "crypto", "mst", "repo", "car", "sync"] }
 
