@@ -103,6 +103,13 @@ pub trait IdentitySource: Send + Sync {
 pub trait AccountGate: Send + Sync {
     /// Called once the account's host checked out.
     fn admit_account(&self, host: &str, did: &str, how: Arrival) -> NewAccount;
+
+    /// Takes one fresh DID document fetch from `host`'s own budget. An event
+    /// whose host has none left is checked against the cached document, so
+    /// one host's `#identity` stream can't spend everyone's PLC budget.
+    fn forced_lookup(&self, _host: &str) -> bool {
+        true
+    }
 }
 
 /// How an account reaches the [`AccountGate`]. A relay starting cold sees
@@ -543,25 +550,30 @@ impl<C: Chain> StateStore<C> {
     }
 
     /// The event's host must be the PDS the DID document names. A mismatch
-    /// re-resolves once (if the stored document isn't brand new); `#identity`
-    /// always re-resolves.
+    /// re-resolves once (if the stored document isn't brand new). An
+    /// `#identity` re-resolves when its host is the account's PDS, or the
+    /// stored document isn't brand new. Fresh lookups spend the sending
+    /// host's budget ([`AccountGate::forced_lookup`]).
     async fn check_authority(
         &self,
         rec: &mut Record,
         ev: &Incoming<'_, C::Verified>,
         new_account: bool,
-        force: bool,
+        identity: bool,
     ) -> Result<Authority, Reject> {
         let hk = HostKey::of(&ev.host.0);
-        if !force && !new_account && rec.fetched_at != 0 && rec.pds == Some(hk) {
+        let owner = rec.fetched_at != 0 && rec.pds == Some(hk);
+        let recent = rec.fetched_at != 0 && ev.now.saturating_sub(rec.fetched_at) < self.config.reresolve_after_secs;
+        let force = identity && (owner || !recent);
+        if !force && !new_account && owner {
             return Ok(Authority::Ok);
         }
-        let recent = rec.fetched_at != 0 && ev.now.saturating_sub(rec.fetched_at) < self.config.reresolve_after_secs;
         if !force && !new_account && recent {
             return Ok(Authority::Wrong);
         }
+        let budget = |host: &str| self.account_gate().is_none_or(|g| g.forced_lookup(host));
         // a new DID tries the cache first, then one fresh lookup
-        let mut fresh = force || !new_account;
+        let mut fresh = (force || !new_account) && budget(&ev.host.0);
         loop {
             let id = self.identity.resolve(ev.did, fresh).await?;
             let Some(id) = id else {
@@ -579,7 +591,7 @@ impl<C: Chain> StateStore<C> {
             if rec.pds == Some(hk) {
                 return Ok(Authority::Ok);
             }
-            if fresh {
+            if fresh || !budget(&ev.host.0) {
                 return Ok(Authority::Wrong);
             }
             fresh = true;

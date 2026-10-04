@@ -4,7 +4,9 @@
 //! Lookups are single-flighted (concurrent callers for one DID share one
 //! fetch), spend from a global lookups/s budget (PLC is shared, and did:web
 //! hosts are anyone's), and failures are cached briefly so a burst of events
-//! from a broken DID costs one fetch. `#identity` events force a refresh.
+//! from a broken DID costs one fetch. `#identity` events force a refresh, at
+//! most one per DID per `min_refresh`: any host can send `#identity` for any
+//! DID, and each forced fetch spends the shared budget.
 //! This is a bounded hot cache; the durable copy of an account's key and host
 //! lives in the DID owner's state. A miss asks the [`Seeder`] (the state
 //! record or the PLC export's entry, `crate::plc_seed`) before it fetches.
@@ -214,6 +216,10 @@ pub struct Options {
     /// How often a store also drops expired entries, so the cache holds the
     /// DIDs seen within a TTL rather than every DID up to `capacity`.
     pub sweep_every: Duration,
+    /// A forced refresh within this long of the DID's last one returns that
+    /// one's result. 30 s is the state step's re-resolve interval for a
+    /// host mismatch, so it opens no window that path doesn't have already.
+    pub min_refresh: Duration,
 }
 
 impl Default for Options {
@@ -226,6 +232,7 @@ impl Default for Options {
             burst: 100.0,
             max_budget_wait: Duration::from_secs(2),
             sweep_every: Duration::from_secs(60),
+            min_refresh: Duration::from_secs(30),
         }
     }
 }
@@ -240,6 +247,8 @@ type Flight = Arc<OnceCell<Outcome>>;
 struct Entry {
     at: Instant,
     v: Outcome,
+    /// When a forced refresh last fetched this.
+    forced_at: Option<Instant>,
 }
 
 struct Bucket {
@@ -254,6 +263,8 @@ pub struct Stats {
     pub fetches: AtomicU64,
     pub joined: AtomicU64,
     pub over_budget: AtomicU64,
+    /// Forced refreshes answered by one made within `min_refresh`.
+    pub refresh_coalesced: AtomicU64,
     /// Misses the seeder filled, with no fetch.
     pub seeded: AtomicU64,
 }
@@ -391,7 +402,14 @@ impl<F: Fetch> IdentityCache<F> {
     /// Seeds the cache, e.g. from the DID owner's stored state.
     pub fn insert(&self, id: Identity) {
         let did = id.did.clone();
-        self.store(&did, Ok(Arc::new(id)));
+        self.store(&did, Ok(Arc::new(id)), false);
+    }
+
+    /// The outcome of a forced refresh made within `min_refresh`.
+    fn recently_forced(&self, did: &str) -> Option<Outcome> {
+        let e = self.entries.lock();
+        let e = e.get(did)?;
+        e.forced_at.is_some_and(|t| t.elapsed() < self.opts.min_refresh).then(|| e.v.clone())
     }
 
     /// Whether `host` is the DID's current PDS per the cached document.
@@ -412,6 +430,10 @@ impl<F: Fetch> IdentityCache<F> {
     }
 
     async fn lookup(&self, did: &str, force: bool) -> Outcome {
+        if force && let Some(v) = self.recently_forced(did) {
+            self.stats.refresh_coalesced.fetch_add(1, Ordering::Relaxed);
+            return v;
+        }
         let asked = Instant::now();
         let cell = {
             let mut m = self.inflight.lock();
@@ -436,12 +458,12 @@ impl<F: Fetch> IdentityCache<F> {
                 {
                     self.stats.seeded.fetch_add(1, Ordering::Relaxed);
                     let r: Outcome = Ok(Arc::new(id));
-                    self.store(did, r.clone());
+                    self.store(did, r.clone(), false);
                     return r;
                 }
                 let r = self.fetch_now(did).await;
                 if !matches!(r, Err(LookupError::OverBudget)) {
-                    self.store(did, r.clone());
+                    self.store(did, r.clone(), force);
                 }
                 r
             })
@@ -506,7 +528,7 @@ impl<F: Fetch> IdentityCache<F> {
         Ok(())
     }
 
-    fn store(&self, did: &str, v: Outcome) {
+    fn store(&self, did: &str, v: Outcome, forced: bool) {
         let due = {
             let mut s = self.swept.lock();
             let due = s.elapsed() >= self.opts.sweep_every;
@@ -527,13 +549,9 @@ impl<F: Fetch> IdentityCache<F> {
                 m.remove(&k);
             }
         }
-        m.insert(
-            did.to_string(),
-            Entry {
-                at: Instant::now(),
-                v,
-            },
-        );
+        let now = Instant::now();
+        let forced_at = if forced { Some(now) } else { m.get(did).and_then(|e| e.forced_at) };
+        m.insert(did.to_string(), Entry { at: now, v, forced_at });
     }
 
     fn drop_expired(m: &mut HashMap<String, Entry>, o: &Options) {

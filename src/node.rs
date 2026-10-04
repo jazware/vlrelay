@@ -1008,22 +1008,28 @@ impl Node {
         let out = match ev {
             event::Event::Commit(c) => {
                 let v = self
-                    .verified(&c.repo, f.frame.len(), |k| verify::verify_commit_with(&c, k, &opts))
+                    .verified(&c.repo, &f.host, f.frame.len(), |k| verify::verify_commit_with(&c, k, &opts))
                     .await
                     .map_err(|r| (c.repo.clone(), r))?;
                 Some(checked(c.repo.clone(), CheckedKind::Commit(v), c.frame.clone(), c.seq_span))
             }
             event::Event::Sync(s) => {
                 let v = self
-                    .verified(&s.did, f.frame.len(), |k| verify::verify_sync_with(&s, k, &opts))
+                    .verified(&s.did, &f.host, f.frame.len(), |k| verify::verify_sync_with(&s, k, &opts))
                     .await
                     .map_err(|r| (s.did.clone(), r))?;
                 Some(checked(s.did.clone(), CheckedKind::Sync(v), s.frame.clone(), s.seq_span))
             }
             event::Event::Identity(i) => {
-                // the DID owner re-resolves on #identity; drop the stale copy
-                // so the host stage's next lookup is fresh too
-                self.identity.invalidate(&i.did);
+                if let Some(p) = &self.policy
+                    && !p.take_identity_event(&f.host.0)
+                {
+                    let detail = "over the host's identityEventsPerHour".to_string();
+                    return Err((i.did.clone(), Rejection { reason: policy::IDENTITY_RATE, detail }));
+                }
+                // the DID owner refreshes the document (within its host's
+                // budget); dropping our copy here would spend the shared
+                // budget on every #identity
                 Some(checked(i.did.clone(), CheckedKind::Identity, i.frame.clone(), i.seq_span))
             }
             event::Event::Account(a) => Some(checked(
@@ -1039,10 +1045,12 @@ impl Node {
     }
 
     /// Runs `check` against the DID's signing key, refreshing the key once
-    /// when it may be stale.
+    /// when it may be stale and the host's lookup budget allows: a forged
+    /// signature would otherwise buy a fresh fetch.
     async fn verified(
         &self,
         did: &str,
+        host: &Host,
         len: usize,
         check: impl Fn(&SigningKey) -> Result<Verified, Reject>,
     ) -> Result<Verified, Rejection> {
@@ -1058,10 +1066,14 @@ impl Node {
             };
             metrics::VERIFY.busy(t1.elapsed());
             match r {
-                Err(e) if e.may_be_stale_key() && !fresh => fresh = true,
+                Err(e) if e.may_be_stale_key() && !fresh && self.refresh_allowed(host) => fresh = true,
                 r => return r.map_err(Rejection::verify),
             }
         }
+    }
+
+    fn refresh_allowed(&self, host: &Host) -> bool {
+        self.policy.as_ref().is_none_or(|p| p.take_forced_lookup(&host.0))
     }
 
     async fn lookup(&self, did: &str, fresh: bool) -> Result<Arc<Identity>, Rejection> {

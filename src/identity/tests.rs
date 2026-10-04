@@ -306,3 +306,25 @@ async fn expired_entries_are_swept_before_the_cache_fills() {
     c.resolve("did:plc:s0").await.unwrap();
     assert_eq!(c.len(), 1);
 }
+
+/// Any host can send `#identity` for any DID: a stream of them for one DID
+/// costs one fetch per `min_refresh`, not one each.
+#[tokio::test]
+async fn forced_refreshes_are_coalesced_per_did() {
+    let m = Arc::new(Mock::default());
+    let k = Signer::new(Curve::K256, 1).multibase();
+    m.docs.lock().insert("did:plc:abc".into(), doc("did:plc:abc", &k, "https://pds.example.com"));
+    let c = cache(&m, Options { min_refresh: Duration::from_millis(300), ..Options::default() });
+    c.resolve("did:plc:abc").await.unwrap();
+    // a plain lookup isn't a refresh: the first #identity still fetches
+    c.refresh("did:plc:abc").await.unwrap();
+    assert_eq!(m.calls.load(Ordering::SeqCst), 2);
+    for _ in 0..20 {
+        c.refresh("did:plc:abc").await.unwrap();
+    }
+    assert_eq!(m.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(c.stats.refresh_coalesced.load(Ordering::Relaxed), 20);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    c.refresh("did:plc:abc").await.unwrap();
+    assert_eq!(m.calls.load(Ordering::SeqCst), 3);
+}

@@ -349,14 +349,19 @@ async fn identity_event_refreshes_the_key() {
     assert_eq!(acc.delta.kind, ChangeKind::Identity);
     assert_eq!(id.fresh.load(Relaxed), 1);
     assert_eq!(st.get(&did).await.unwrap().unwrap().key.as_ref().unwrap().0[2], 2);
-    // #identity from a host the fresh document doesn't name: refreshed and
-    // emitted all the same (the document is the authority), and the
-    // account stays with its PDS
+    // #identity from a host the document doesn't name: emitted all the
+    // same (the document is the authority), and the account stays with its
+    // PDS. A brand new document isn't fetched again for it.
     id.set(&did, "pds.a", 3);
     let r = st.apply(Incoming { did: &did, host: &host("pds.z"), now: NOW + 2, kind: EventKind::Identity }).await;
     let Ok(Applied::Append(acc)) = r else { panic!("{r:?}") };
-    assert!(acc.key_changed);
+    assert!(!acc.key_changed);
     assert_eq!(acc.delta.host, HostKey::of("pds.a"));
+    assert_eq!(id.fresh.load(Relaxed), 1);
+    // an older one is
+    let r = st.apply(Incoming { did: &did, host: &host("pds.z"), now: NOW + 40, kind: EventKind::Identity }).await;
+    let Ok(Applied::Append(acc)) = r else { panic!("{r:?}") };
+    assert!(acc.key_changed);
     assert_eq!(id.fresh.load(Relaxed), 2);
     let rec = st.get(&did).await.unwrap().unwrap();
     assert_eq!((rec.host, rec.key.as_ref().unwrap().0[2]), (HostKey::of("pds.a"), 3));
@@ -729,6 +734,37 @@ async fn only_a_repos_first_commit_is_a_creation() {
         (dids[3].clone(), FirstSeen),
         (dids[3].clone(), FirstCommit { created: false }),
     ]);
+}
+
+/// No lookup budget left for the host: fresh fetches its events ask for
+/// fall back to the cached document.
+#[tokio::test]
+async fn fresh_lookups_spend_the_senders_budget() {
+    struct NoBudget;
+    impl AccountGate for NoBudget {
+        fn admit_account(&self, _host: &str, _did: &str, _how: Arrival) -> NewAccount {
+            NewAccount::Admit
+        }
+        fn forced_lookup(&self, _host: &str) -> bool {
+            false
+        }
+    }
+    let id = MapIdentity::new();
+    let did = plc(30);
+    id.set(&did, "pds.a", 1);
+    let st = open(1, id.clone(), ApplyConfig::default()).await;
+    st.set_account_gate(Arc::new(NoBudget));
+    let h = host("pds.a");
+    commit(&st, &did, &h, claim(&did, 1), NOW).await.unwrap();
+    for (i, sender) in ["pds.a", "pds.z", "pds.a", "pds.z"].into_iter().enumerate() {
+        let now = NOW + 100 * (i as u32 + 1);
+        let r = st.apply(Incoming { did: &did, host: &host(sender), now, kind: EventKind::Identity }).await;
+        assert!(matches!(r, Ok(Applied::Append(_))), "{r:?}");
+    }
+    // nor does a commit from a host the document doesn't name
+    let r = commit(&st, &did, &host("pds.z"), claim(&did, 2), NOW + 1000).await;
+    assert!(matches!(r, Err(Reject::WrongHost { .. })), "{r:?}");
+    assert_eq!(id.fresh.load(Relaxed), 0);
 }
 
 /// Another host's #identity for an unknown DID must not create the account

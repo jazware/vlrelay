@@ -43,6 +43,7 @@ lazy!(IDENTITY_CACHE: IntGauge = register_int_gauge!("vlrelay_identity_cache_ent
 lazy!(ACK_PENDING: IntGauge = register_int_gauge!("vlrelay_ack_pending", "Upstream events read but not yet durable, rejected or skipped"));
 lazy!(ACCOUNTS_THROTTLED: IntCounterVec = register_int_counter_vec!("vlrelay_accounts_throttled_total", "New accounts created throttled by policy, by why (host_cap)", &["why"]));
 lazy!(ACCOUNTS_DEFERRED: IntCounterVec = register_int_counter_vec!("vlrelay_accounts_deferred_total", "Events of new accounts dropped while a new-account budget was spent, by which (host_rate, cluster_budget)", &["why"]));
+lazy!(FORCED_LOOKUPS_REFUSED: IntCounter = register_int_counter!("vlrelay_forced_lookups_refused_total", "Fresh DID document fetches an event asked for that its host's budget refused (the cached document was used)"));
 lazy!(LANE_QUEUED: IntGauge = register_int_gauge!("vlrelay_lane_queued", "Events queued in front of the pipeline lanes"));
 
 /// One pipeline stage's series, resolved once: `with_label_values` hashes

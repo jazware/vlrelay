@@ -61,6 +61,12 @@ struct HostState {
     accounts: i64,
     admitted_since_sync: i64,
     new_accounts: Hourly,
+    /// `identityEventsPerHour`.
+    identity_events: Hourly,
+    /// Fresh DID document fetches this host's events asked for, at the same
+    /// hourly rate with a minute's depth: a burst of them would otherwise
+    /// drain the node's PLC budget that every host's lookups wait on.
+    forced_lookups: Hourly,
     throttle_eps: Option<f64>,
 }
 
@@ -77,9 +83,13 @@ impl Hourly {
     }
 
     fn try_take(&mut self, per_hour: f64, now: Instant) -> bool {
+        self.try_take_depth(per_hour, per_hour, now)
+    }
+
+    fn try_take_depth(&mut self, per_hour: f64, depth: f64, now: Instant) -> bool {
         let dt = now.saturating_duration_since(self.at).as_secs_f64();
         self.at = now;
-        self.tokens = (self.tokens + dt * per_hour / 3_600.0).min(per_hour);
+        self.tokens = (self.tokens + dt * per_hour / 3_600.0).min(depth);
         let ok = self.tokens >= 1.0;
         if ok {
             self.tokens -= 1.0;
@@ -188,6 +198,9 @@ const STATE_REASONS: &[&str] = &[
 const NOT_SIGNALS: &[&str] =
     &["stale", "desynchronized", "inactive", "rate_limited", "new_account_deferred", "identity_unavailable", "store", "not_owner"];
 
+/// An `#identity` past its host's `identityEventsPerHour`.
+pub const IDENTITY_RATE: &str = "identity_rate";
+
 fn oversized(reason: &str) -> bool {
     matches!(reason, "frame_too_big" | "blocks_too_big" | "too_many_ops" | "too_many_blocks")
 }
@@ -286,6 +299,8 @@ impl PolicyHooks {
                         accounts: rec.account_count,
                         admitted_since_sync: 0,
                         new_accounts: Hourly::new(),
+                        identity_events: Hourly::new(),
+                        forced_lookups: Hourly::new(),
                         throttle_eps,
                     },
                 );
@@ -302,6 +317,31 @@ impl PolicyHooks {
     /// Accounts on a host: the record's count plus those admitted since.
     pub fn accounts(&self, host: &str) -> Option<u64> {
         self.cache.lock().get(host).map(|s| s.accounts.max(0) as u64)
+    }
+
+    /// Takes one `#identity` from the host's `identityEventsPerHour` (0:
+    /// unlimited). False: drop it.
+    pub fn take_identity_event(&self, host: &str) -> bool {
+        let mut c = self.cache.lock();
+        let Some(st) = c.get_mut(host) else { return true };
+        let Some(per_hour) = st.limits.limits.as_ref().map(|l| l.identity_events_per_hour) else { return true };
+        per_hour == 0 || st.identity_events.try_take(per_hour as f64, Instant::now())
+    }
+
+    /// Takes one fresh DID document fetch from the host's budget: its
+    /// `identityEventsPerHour`, at most a minute's worth (and 10) at once.
+    pub fn take_forced_lookup(&self, host: &str) -> bool {
+        let mut c = self.cache.lock();
+        let Some(st) = c.get_mut(host) else { return true };
+        let Some(per_hour) = st.limits.limits.as_ref().map(|l| l.identity_events_per_hour) else { return true };
+        if per_hour == 0 {
+            return true;
+        }
+        let ok = st.forced_lookups.try_take_depth(per_hour as f64, (per_hour as f64 / 60.0).max(10.0), Instant::now());
+        if !ok {
+            super::metrics::FORCED_LOOKUPS_REFUSED.inc();
+        }
+        ok
     }
 
     /// The operator throttle on a host (events/s), as last synced.
@@ -395,7 +435,12 @@ impl PolicyHooks {
         if NOT_SIGNALS.contains(&reason) {
             return;
         }
-        let kind = if oversized(reason) { SignalKind::OversizedCommit } else { SignalKind::FailedValidation };
+        let kind = match reason {
+            r if oversized(r) => SignalKind::OversizedCommit,
+            // the same churn an accepted one counts as
+            IDENTITY_RATE => SignalKind::IdentityChange,
+            _ => SignalKind::FailedValidation,
+        };
         let did = (!did.is_empty()).then_some(did);
         let mut s = Signal::new(kind, host, did);
         let d = format!("{reason}: {detail}");
@@ -507,6 +552,10 @@ impl state::AccountGate for PolicyHooks {
         }
         verdict
     }
+
+    fn forced_lookup(&self, host: &str) -> bool {
+        self.take_forced_lookup(host)
+    }
 }
 
 #[async_trait::async_trait]
@@ -551,6 +600,23 @@ mod tests {
         }
         let engine = Engine::new(store, "n1", Arc::new(FixedNodes::new(1)));
         (PolicyHooks::new(engine, state.clone(), false), state)
+    }
+
+    #[tokio::test]
+    async fn identity_events_and_forced_lookups_are_per_host() {
+        let (hooks, state) = setup().await;
+        add_host(&state, "noisy.example", Tier::Throttled).await;
+        add_host(&state, "quiet.example", Tier::Throttled).await;
+        hooks.load().await.unwrap();
+        let per_hour = policy::TierLimits::throttled().identity_events_per_hour;
+        let taken = (0..per_hour + 50).filter(|_| hooks.take_identity_event("noisy.example")).count() as u64;
+        assert_eq!(taken, per_hour);
+        assert!(hooks.take_identity_event("quiet.example"));
+        // forced lookups: a minute's depth (at least 10), not an hour's
+        let forced = (0..per_hour).filter(|_| hooks.take_forced_lookup("noisy.example")).count();
+        assert_eq!(forced, 10);
+        assert!(hooks.take_forced_lookup("quiet.example"));
+        assert!(state::AccountGate::forced_lookup(&*hooks, "quiet.example"));
     }
 
     async fn add_host(state: &State, h: &str, tier: Tier) {
