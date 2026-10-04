@@ -9,6 +9,7 @@ and how it was measured.
 | Page | What's in it |
 |---|---|
 | [Design](design.html) | The design-session doc: the job, what carries over from vlpds, host and DID shards, sequencing, validation, policy, archival mode, replicas, cost and failure modes. Open it in a browser. |
+| [Cost](cost.md) | What it costs today and at 10x, 100x and 1000x: CPU, peer traffic, bucket requests and storage, consumer egress, priced on OVH, Hetzner and AWS with six object stores (`scripts/cost_model.py`) |
 | [Build plan](PLAN.md) | The design session's decisions (linger, where signatures are checked, archival defaults) and who owns which module |
 
 ## Operations
