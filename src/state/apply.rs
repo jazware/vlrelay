@@ -413,7 +413,12 @@ impl<C: Chain> StateStore<C> {
             Err(e) => return Err(e),
         }
         let created = matches!(&ev.kind, EventKind::Commit(v) if self.chain.created(v));
-        let arrival = if new_account {
+        let arrival = if !from_owner {
+            // another host's #identity spends nothing of that host's
+            // new-account budget; the account's own PDS is gated at its
+            // first commit (FirstCommit below)
+            None
+        } else if new_account {
             Some(if created { Arrival::Created } else { Arrival::FirstSeen })
         } else if rec.chain.is_none()
             && matches!(ev.kind, EventKind::Commit(_) | EventKind::Sync { .. })
