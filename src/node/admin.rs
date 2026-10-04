@@ -348,6 +348,9 @@ impl NodeAdmin {
             None => None,
         };
         self.policy.engine.takedowns.record(did, takedown, by, reason).await?;
+        // before the #account below: this node's consumers must not see it
+        // and then the account's old commits replayed
+        self.node.serve.takedowns.apply_local(did, takedown);
         let st = self
             .node
             .state

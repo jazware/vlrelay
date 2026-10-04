@@ -347,6 +347,7 @@ impl ClusterNode {
         let http = opts.tls.clone().map(|t| vlpds::http::PeerClient::new(opts.peer_connections, t));
         let serve_cfg = ServeConfig { write_seq_checkpoints: opts.role == Role::Core, ..opts.serve.clone() };
         let serve = Serve::new(store.clone(), serve_cfg, opts.runtime.clone());
+        serve.load_takedowns().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         // A failed log (lease lapsed, fenced) can never append again, but a
         // renewal sent before the lapse can still land and keep the lease

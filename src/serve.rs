@@ -23,6 +23,7 @@
 //! route, the retention loop, and the client address behind a proxy
 //! ([`real_ip`]) that the per-IP limits key on.
 
+use crate::policy::takedowns::TakedownSet;
 use crate::seq::{self, LogConfig, NodeLog};
 use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::middleware::Next;
@@ -58,6 +59,9 @@ pub struct ServeConfig {
     /// Frame bytes the merger may hold while it waits for the slowest
     /// log's watermark; past it a log spills to reading back from the bucket.
     pub merge_queue_bytes: usize,
+    /// How often the takedown set re-reads `policy/takedowns/current/`
+    /// (zero: never; [`Serve::load_takedowns`] still reads it once).
+    pub takedown_poll: Duration,
 }
 
 impl Default for ServeConfig {
@@ -75,12 +79,15 @@ impl Default for ServeConfig {
             seq_checkpoint_every: seq::dense::DEFAULT_CHECKPOINT_EVERY,
             write_seq_checkpoints: true,
             merge_queue_bytes: MERGE_QUEUE_BYTES,
+            takedown_poll: crate::policy::REFRESH_EVERY,
         }
     }
 }
 
 pub struct Serve {
     pub firehose: Arc<Firehose>,
+    /// The firehose's filter: taken-down accounts' commits and syncs.
+    pub takedowns: Arc<TakedownSet>,
     seqs: seq::dense::DenseSeqs,
     pub store: Store,
     cfg: ServeConfig,
@@ -146,8 +153,11 @@ impl Serve {
         // JavaScript consumers need seqs below 2^53, and indigo's are dense
         let seqs = seq::dense::DenseSeqs::new(store.clone(), cfg.seq_checkpoint_every, cfg.write_seq_checkpoints);
         fh.set_renumber(Arc::new(seqs.clone()));
+        let takedowns = Arc::new(TakedownSet::default());
+        fh.set_filter(takedowns.clone());
         let s = Arc::new(Serve {
             firehose: fh,
+            takedowns,
             seqs,
             store,
             cfg,
@@ -155,7 +165,18 @@ impl Serve {
             next_consumer: AtomicU64::new(1),
         });
         tokio::spawn(sample_consumers(Arc::downgrade(&s)));
+        if !s.cfg.takedown_poll.is_zero() {
+            tokio::spawn(poll_takedowns(Arc::downgrade(&s), s.cfg.takedown_poll));
+        }
         s
+    }
+
+    /// Reads the takedown list once. Call it before serving: until the first
+    /// read, taken-down accounts' old frames would replay.
+    pub async fn load_takedowns(&self) {
+        if let Err(e) = self.takedowns.poll(&self.store).await {
+            tracing::warn!("loading the takedown list failed (retrying every poll): {e:#}");
+        }
     }
 
     /// The newest `n` stream seq checkpoints this node knows (docs/seq.md).
@@ -377,6 +398,18 @@ async fn sample_consumers(serve: Weak<Serve>) {
     }
 }
 
+async fn poll_takedowns(serve: Weak<Serve>, every: Duration) {
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let Some(s) = serve.upgrade() else { return };
+        if let Err(e) = s.takedowns.poll(&s.store).await {
+            tracing::warn!("takedown list poll failed (retrying): {e:#}");
+        }
+    }
+}
+
 /// A running single-node relay log with its firehose.
 pub struct Started {
     pub log: Arc<NodeLog>,
@@ -422,6 +455,7 @@ pub async fn start_single_node(
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let srv = Serve::new(store.clone(), serve, runtime);
+    srv.load_takedowns().await;
     cfg.seq_floor = cfg.seq_floor.max(srv.firehose.position()).max(recovered.seq_floor);
     let (tx, rx) = mpsc::unbounded_channel();
     let log = NodeLog::start(store, cfg, tx, on_fatal);

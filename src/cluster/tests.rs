@@ -148,6 +148,7 @@ fn opts(ca: &Ca, id: &str, role: Role, addr: &str) -> ClusterOptions {
     o.serve.retention_interval = Duration::ZERO;
     o.serve.threads = 1;
     o.serve.ring_bytes = 64 << 20;
+    o.serve.takedown_poll = Duration::from_millis(100);
     o.internal_token = "test-token".into();
     o.poll = Duration::from_millis(50);
     o.guard = Duration::from_millis(100);
@@ -771,6 +772,116 @@ async fn a_restarted_sequence_survives_a_stale_owners_cursor() {
     assert_eq!(e2.acked_seq(), Some(70));
     e2.ack(80);
     assert_eq!(cur.durable_cursor(&h), Some(80), "then our own acks count");
+}
+
+fn commit_fwd(i: usize, upstream_seq: i64) -> Forwarded {
+    let d = did(i);
+    let cid = vlpds::cid::Cid::dag_cbor(b"x");
+    let ops = [vlpds::events::RepoOp { action: "create", path: "app.bsky.feed.post/3k", cid: Some(cid), prev: None }];
+    let f = vlpds::events::commit_frame(&vlpds::events::CommitFrame {
+        repo: &d,
+        rev: "3kabc",
+        since: None,
+        commit: cid,
+        prev_data: None,
+        blocks: &[7u8; 64],
+        ops: &ops,
+        time: "2026-10-04T00:00:00.000Z",
+    });
+    let mut raw = Vec::new();
+    f.finish(upstream_seq, &mut raw);
+    Forwarded { frame: Bytes::from(raw), ..fwd(i, upstream_seq) }
+}
+
+fn account_fwd(i: usize, upstream_seq: i64, active: bool) -> Forwarded {
+    let d = did(i);
+    let status = (!active).then_some("takendown");
+    let f = vlpds::events::account_frame(&d, active, status, "2026-10-04T00:00:00.000Z");
+    let mut raw = Vec::new();
+    f.finish(upstream_seq, &mut raw);
+    Forwarded { frame: Bytes::from(raw), ..fwd(i, upstream_seq) }
+}
+
+/// A takedown leaves the account's earlier #commit and #sync frames out of
+/// every node's replay: at once on the core that took it down, within a
+/// poll on the edge and the replica, and from the bucket on a replica
+/// started afterwards. Its #account and everyone else's frames pass, seqs
+/// unchanged. Lifting it brings the frames back everywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn takedowns_filter_the_replay_window_on_every_role() {
+    use crate::policy::takedowns::Takedowns;
+    let (store, ca, applied) = (Store::memory(None), Ca::new(), Arc::new(Applied::default()));
+    let a = spawn(&store, &ca, "node-a", Role::Core, &applied).await;
+    let edge = spawn(&store, &ca, "edge-1", Role::Edge, &applied).await;
+    let replica = spawn(&store, &ca, "replica-1", Role::Replica, &applied).await;
+    eventually("edge and replica follow the core", Duration::from_secs(5), || {
+        edge.node.followers.followed().len() == 1 && replica.node.followers.followed().len() == 1
+    })
+    .await;
+    let mut evs = Vec::new();
+    for round in 0..3 {
+        for i in 0..6 {
+            evs.push(commit_fwd(i, round * 100 + 2 * i as i64));
+            evs.push(fwd(i, round * 100 + 2 * i as i64 + 1));
+        }
+    }
+    let written = forward_keyed(&a.node, evs).await;
+    let n = written.len();
+    let full = read_stream(a.public, 0, n, Duration::from_secs(10)).await;
+    assert_stream(&full, &written, 0, "before");
+    let taken = did(3);
+    let is_taken = |f: &[u8]| {
+        let m = vlpds::firehose::frame_meta(f);
+        m.did == Some(taken.as_bytes())
+    };
+
+    // what set_takedown does: record, apply here, then announce
+    let takedowns = Takedowns::new(store.clone());
+    takedowns.record(&taken, true, "test", "spam").await.unwrap();
+    a.node.serve.takedowns.apply_local(&taken, true);
+    let account = forward_keyed(&a.node, vec![account_fwd(3, 1000, false)]).await;
+    assert_eq!(account.len(), 1);
+    let head = full.last().unwrap().0 + 1;
+    let want: Vec<(i64, Vec<u8>)> = full.iter().filter(|(_, f)| !is_taken(f)).cloned().collect();
+    assert_eq!(want.len(), n - 6, "did 3's 3 commits and 3 syncs");
+    let check = |got: Vec<(i64, Vec<u8>)>, what: &str| {
+        assert_eq!(got.len(), want.len() + 1, "{what}");
+        assert_eq!(got[..want.len()], want[..], "{what}: everything but did 3's commits and syncs");
+        let last = &got[want.len()];
+        assert_eq!(last.0, head, "{what}: the #account keeps its seq");
+        let m = vlpds::firehose::frame_meta(&last.1);
+        assert_eq!((m.kind, m.did), (vlpds::firehose::FrameKind::Account, Some(taken.as_bytes())), "{what}");
+    };
+    check(read_stream(a.public, 0, want.len() + 1, Duration::from_secs(10)).await, "core, at once");
+    for (t, what) in [(&edge, "edge"), (&replica, "replica")] {
+        eventually("the takedown reaches it by polling", Duration::from_secs(5), || {
+            t.node.serve.takedowns.contains(&taken)
+        })
+        .await;
+        check(read_stream(t.public, 0, want.len() + 1, Duration::from_secs(10)).await, what);
+    }
+    // a replica started now has the list before it serves, and backfills
+    let late = spawn(&store, &ca, "replica-2", Role::Replica, &applied).await;
+    assert!(late.node.serve.takedowns.contains(&taken), "loaded at start");
+    eventually("the late replica anchors its seqs", Duration::from_secs(10), || {
+        late.node.serve.firehose.last_emitted.load(Ordering::Acquire) == head
+    })
+    .await;
+    check(read_stream(late.public, 0, want.len() + 1, Duration::from_secs(10)).await, "late replica");
+
+    // lifted: the old frames replay again
+    takedowns.record(&taken, false, "test", "").await.unwrap();
+    a.node.serve.takedowns.apply_local(&taken, false);
+    let all = read_stream(a.public, 0, n + 1, Duration::from_secs(10)).await;
+    assert_eq!(all[..n], full[..], "core: did 3's frames are back");
+    for t in [&edge, &replica, &late] {
+        eventually("the reversal reaches it", Duration::from_secs(5), || !t.node.serve.takedowns.contains(&taken))
+            .await;
+        assert_eq!(read_stream(t.public, 0, n + 1, Duration::from_secs(10)).await, all);
+    }
+    for t in [&late, &replica, &edge, &a] {
+        t.node.shutdown().await.unwrap();
+    }
 }
 
 /// An admin takedown's `#account` is appended outside the stage: its hold
