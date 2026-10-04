@@ -100,3 +100,18 @@ benchbox-build *args:
 # Run a bin on benchbox under a memory cap (MEM, default 8G): just benchbox-run vlrelay --help
 benchbox-run bin *args:
     scripts/benchbox.sh run {{bin}} {{args}}
+
+# ---- images (Dockerfile; the build context is packages/) -------------------
+
+# Production image for this machine's platform (tools=1 adds fakepds and e2e_check)
+docker-build tag="vlrelay:local" tools="":
+    docker buildx build -f Dockerfile --build-arg VLRELAY_TOOLS={{tools}} -t {{tag}} --load ..
+
+# The amd64 image, built on benchbox and loaded here (build/benchbox-image.sh; PUSH=1 also pushes)
+docker-build-benchbox tag="":
+    build/benchbox-image.sh {{tag}}
+
+# Regenerate docs/operations/configuration.md from `vlrelay --help` (run after changing a flag)
+config-doc:
+    cargo build --quiet --bin vlrelay
+    {{bin}}/vlrelay --help | python3 build/config_doc.py > docs/operations/configuration.md
