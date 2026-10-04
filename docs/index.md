@@ -28,6 +28,7 @@ and how it was measured.
 | [Policy](policy.md) | Tiers, limits, domain rules, requestCrawl admission, spam counting and cases |
 | [Performance](perf.md) | The node bench, each optimization pass, the per-node ceiling and fan-out |
 | [Compatibility](compat.md) | indigo's consumers, goat, `@atproto/sync`, Jetstream and indigo's relay against vlRelay, every difference classified |
+| [Shadow run](shadow.md) | Two hours against ten real PDSes beside `bsky.network`: matches, latency, policy on real traffic, leaks, bugs found |
 | [Reference notes](reference-notes.md) | How indigo's relay and the production relay behave, the baseline vlRelay is checked against |
 
 Archival mode (a full mirror of every repo, `docs/design.html` "Archival mode") is in progress and
