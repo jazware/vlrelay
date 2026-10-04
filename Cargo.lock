@@ -4173,7 +4173,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vlpds"
 version = "1.0.0"
-source = "git+https://github.com/jazware/vlpds?rev=5780aa5a1cde49512ebc278a244c94823c6adbc1#5780aa5a1cde49512ebc278a244c94823c6adbc1"
+source = "git+https://github.com/jazware/vlpds?rev=2778ca6a58d5c5ba19133072dc9e6f703cdd1ab0#2778ca6a58d5c5ba19133072dc9e6f703cdd1ab0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4246,8 +4246,11 @@ dependencies = [
  "clap",
  "futures",
  "hdrhistogram",
+ "hyper",
+ "hyper-util",
  "lru 0.12.5",
  "mime_guess",
+ "object_store",
  "parking_lot",
  "rand 0.8.8",
  "reqwest 0.12.28",
