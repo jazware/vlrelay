@@ -53,6 +53,9 @@ pub struct ServeConfig {
     pub seq_checkpoint_every: Duration,
     /// Whether this node writes them (core nodes; edges and replicas only read).
     pub write_seq_checkpoints: bool,
+    /// Frame bytes the merger may hold while it waits for the slowest
+    /// log's watermark; past it a log spills to reading back from the bucket.
+    pub merge_queue_bytes: usize,
 }
 
 impl Default for ServeConfig {
@@ -69,6 +72,7 @@ impl Default for ServeConfig {
             retention_interval: Duration::from_secs(60),
             seq_checkpoint_every: seq::dense::DEFAULT_CHECKPOINT_EVERY,
             write_seq_checkpoints: true,
+            merge_queue_bytes: MERGE_QUEUE_BYTES,
         }
     }
 }
@@ -112,6 +116,12 @@ struct Consumer {
 }
 
 const USER_AGENT_MAX: usize = 200;
+/// vlpds's 256 MiB is half a second of a 100k/s stream of ~5.4 KB frames,
+/// less than a linger plus one slow PUT. A cluster merges three logs, each
+/// that far behind at times, and at 90k/s spilled every few seconds; the
+/// read-back couldn't keep up and the stream fell 25 s behind.
+pub const MERGE_QUEUE_BYTES: usize = 1 << 30;
+
 const CONSUMER_SAMPLE: Duration = Duration::from_secs(1);
 
 impl Serve {
@@ -129,6 +139,7 @@ impl Serve {
             runtime,
         };
         let fh = Firehose::new(opts);
+        fh.set_max_queue_bytes(cfg.merge_queue_bytes);
         *fh.store.write() = Some(store.clone());
         // JavaScript consumers need seqs below 2^53, and indigo's are dense
         let seqs = seq::dense::DenseSeqs::new(store.clone(), cfg.seq_checkpoint_every, cfg.write_seq_checkpoints);
