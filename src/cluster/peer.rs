@@ -39,6 +39,10 @@ pub struct NudgeIn {
     /// Step the host shards now.
     #[serde(default)]
     pub hosts: bool,
+    /// The sender is leaving: hand it nothing, even before its draining
+    /// lease is listed.
+    #[serde(default)]
+    pub leaving: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -124,6 +128,9 @@ async fn hello(State(n): S, h: HeaderMap, axum::Json(inp): axum::Json<HelloIn>) 
 async fn nudge(State(n): S, h: HeaderMap, axum::Json(inp): axum::Json<NudgeIn>) -> Response {
     if let Err(r) = authorized(&n, &h) {
         return r.into_response();
+    }
+    if let Some(id) = inp.leaving {
+        n.peer_leaving(id);
     }
     n.nudged(inp.handoffs, inp.hosts);
     StatusCode::OK.into_response()

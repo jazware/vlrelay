@@ -788,7 +788,9 @@ impl ReplaySource for SpanTail<'_> {
 impl Shards {
     async fn open_one(&self, id: ShardId, history: &[Span], replay: &LogReplay) -> anyhow::Result<usize> {
         let g = &self.0;
+        let t0 = Instant::now();
         let s = g.state.open_shard(id, None).await?;
+        let opened = t0.elapsed();
         let mut n = 0;
         for sp in history {
             let before = s.applied_marker(&sp.log_id).await?;
@@ -813,6 +815,14 @@ impl Shards {
                 }
             }
         }
+        tracing::info!(
+            shard = %id,
+            spans = history.len(),
+            replayed = n,
+            open_ms = opened.as_millis() as u64,
+            replay_ms = (t0.elapsed() - opened).as_millis() as u64,
+            "opened DID shard"
+        );
         Ok(n)
     }
 }
@@ -822,20 +832,18 @@ impl DidShards for Shards {
     async fn open(&self, shards: Vec<(ShardId, Vec<Span>)>) -> Vec<(ShardId, anyhow::Result<()>)> {
         let t0 = Instant::now();
         let replay = LogReplay::new(self.0.state.store.clone());
-        let mut out = Vec::new();
-        for (id, history) in shards {
-            let r = self.open_one(id, &history, &replay).await;
-            match &r {
-                Ok(n) => {
-                    tracing::info!(shard = %id, spans = history.len(), replayed = n, "opened DID shard")
-                }
-                Err(e) => {
+        let opens = shards.into_iter().map(|(id, history)| {
+            let replay = &replay;
+            async move {
+                let r = self.open_one(id, &history, replay).await;
+                if let Err(e) = &r {
                     tracing::warn!(shard = %id, "opening DID shard failed: {e:#}");
                     let _ = self.0.state.close_shard(id).await;
                 }
+                (id, r.map(|_| ()))
             }
-            out.push((id, r.map(|_| ())));
-        }
+        });
+        let out = futures::future::join_all(opens).await;
         CLUSTER_SHARD_OPEN.observe(t0.elapsed().as_secs_f64());
         out
     }

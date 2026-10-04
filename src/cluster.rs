@@ -268,6 +268,7 @@ pub struct ClusterNode {
     halted: AtomicBool,
     stop: Arc<AtomicBool>,
     host_nudge: Arc<Notify>,
+    leaving_peers: Mutex<HashMap<String, Instant>>,
 }
 
 impl ClusterNode {
@@ -356,6 +357,7 @@ impl ClusterNode {
                 halted: AtomicBool::new(false),
                 stop: Arc::new(AtomicBool::new(false)),
                 host_nudge: Arc::new(Notify::new()),
+                leaving_peers: Mutex::new(HashMap::new()),
             }
         });
         Ok(node)
@@ -579,10 +581,44 @@ impl ClusterNode {
             return Vec::new();
         };
         let me = c.own_lease();
+        let leaving = self.leaving_peers.lock().clone();
         std::iter::once(me)
             .chain(c.peers())
-            .map(|l| Member { node_id: l.node_id, log_id: l.log_id, addr: l.addr, draining: l.draining })
+            .map(|l| Member {
+                draining: l.draining || leaving.contains_key(&l.log_id),
+                node_id: l.node_id,
+                log_id: l.log_id,
+                addr: l.addr,
+            })
             .collect()
+    }
+
+    /// Tells every peer we're leaving, ahead of their next lease listing.
+    async fn announce_leaving(&self, log_id: &str) {
+        let (Some(c), Some(http)) = (&self.cluster, &self.http) else { return };
+        let sends = c.peers().into_iter().map(|l| async move {
+            let body = peer::NudgeIn { handoffs: Vec::new(), hosts: false, leaving: Some(log_id.to_string()) };
+            let r = http
+                .post(format!("{}{}", l.addr.trim_end_matches('/'), peer::NUDGE))
+                .header(peer::TOKEN_HEADER, &self.opts.internal_token)
+                .json(&body)
+                .timeout(Duration::from_secs(1))
+                .send()
+                .await
+                .and_then(|r| r.error_for_status());
+            if let Err(e) = r {
+                tracing::debug!(peer = %l.node_id, "leaving nudge failed: {e}");
+            }
+        });
+        futures::future::join_all(sends).await;
+    }
+
+    /// A peer said it's leaving (by its log id, so a restart of the same
+    /// node is a member again).
+    pub(crate) fn peer_leaving(&self, log_id: String) {
+        let mut m = self.leaving_peers.lock();
+        m.retain(|_, at| at.elapsed() < Duration::from_secs(60));
+        m.insert(log_id, Instant::now());
     }
 
     /// One host-shard round now (tests; the loop does this every
@@ -605,7 +641,7 @@ impl ClusterNode {
             let r = http
                 .post(format!("{}{}", addr.trim_end_matches('/'), peer::NUDGE))
                 .header(peer::TOKEN_HEADER, &self.opts.internal_token)
-                .json(&peer::NudgeIn { handoffs: Vec::new(), hosts: true })
+                .json(&peer::NudgeIn { handoffs: Vec::new(), hosts: true, leaving: None })
                 .timeout(Duration::from_secs(1))
                 .send()
                 .await
@@ -637,6 +673,11 @@ impl ClusterNode {
     /// over, quiesces and fences our log, and deletes our lease.
     pub async fn shutdown(self: &Arc<Self>) -> anyhow::Result<()> {
         if let (Some(c), Some(h)) = (&self.cluster, &self.hosts) {
+            // peers that still count us as a member hand host shards back
+            // to us while we hand them out
+            let host: Arc<dyn ShardHost> = self.clone();
+            c.announce_drain(&host).await;
+            self.announce_leaving(&c.log_id).await;
             let mut members = self.members();
             for m in members.iter_mut().filter(|m| m.node_id == self.node_id) {
                 m.draining = true;
@@ -650,7 +691,6 @@ impl ClusterNode {
             if let Err(e) = h.checkpoint().await {
                 tracing::warn!("final host checkpoint failed: {e:#}");
             }
-            let host: Arc<dyn ShardHost> = self.clone();
             c.shutdown(&host).await?;
         }
         self.stop.store(true, Ordering::Release);
@@ -852,7 +892,7 @@ impl ShardHost for ClusterNode {
             let r = http
                 .post(format!("{}{}", addr.trim_end_matches('/'), peer::NUDGE))
                 .header(peer::TOKEN_HEADER, &self.opts.internal_token)
-                .json(&peer::NudgeIn { handoffs, hosts: false })
+                .json(&peer::NudgeIn { handoffs, hosts: false, leaving: None })
                 .timeout(Duration::from_secs(1))
                 .send()
                 .await

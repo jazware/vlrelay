@@ -425,6 +425,9 @@ impl HostShards {
                 tracing::warn!(shard = s.0, "reading host checkpoints failed: {e:#}");
             }
         }
+        if !report.adopted.is_empty() {
+            tracing::info!(shards = ?report.adopted, "adopted host shards handed to us");
+        }
         if !report.lost.is_empty() {
             tracing::warn!(shards = ?report.lost, "host shards reassigned under us");
         }

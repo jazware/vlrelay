@@ -86,13 +86,13 @@ for n in names:
     print(f"  {n:<8} n={len(v):<6} p50 {pct(v, .5):7.1f}  p90 {pct(v, .9):7.1f}  p99 {pct(v, .99):7.1f}  max {max(v, default=float('nan')):7.1f}")
 
 if events:
-    print("\npauses: the worst upstream -> relay latency of events that reached each stream in the 15 s after the event, ms")
-    for what, node, t in events:
-        if what == "exited":
-            continue
+    print("\npauses: the worst upstream -> relay latency of events that reached each stream after the event (up to 15 s or the next event), ms")
+    marks = [e for e in events if e[0] != "exited"]
+    for k, (what, node, t) in enumerate(marks):
+        end = min(t + 15000, marks[k + 1][2] if k + 1 < len(marks) else t + 15000)
         row = []
         for n in names:
-            v = [l for tt, l in lat_rows(n) if t <= tt < t + 15000]
+            v = [l for tt, l in lat_rows(n) if t <= tt < end]
             row.append(f"{n} {max(v, default=float('nan')):7.1f}")
         print(f"  {what:<8} {node} @{(t - t_load) / 1000:5.1f}s   " + "  ".join(row))
 
@@ -117,7 +117,7 @@ if events:
     for what, node, t in events:
         if what not in ("kill9", "term", "restart"):
             continue
-        for kind, pat in (("DID shards opened", "opened DID shard"), ("host shards taken", "acquired host shards")):
+        for kind, pat in (("DID shards opened", "opened DID shard"), ("host shards taken", "(acquired|adopted) host shards")):
             hits = []
             for i in range(1, 4):
                 hits += [x - t for x in log_times(f"{out}/n{i}.log", pat) if t <= x < t + 30000]
