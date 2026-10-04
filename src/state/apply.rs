@@ -327,16 +327,18 @@ impl<C: Chain> StateStore<C> {
         match &r {
             Ok(Applied::Append(a)) => {
                 self.note_host(hk, &ev.host.0);
-                let mut c = super::host::HostCounts { events: 1, ..Default::default() };
+                self.add_host_counts(hk, super::host::HostCounts { events: 1, ..Default::default() });
+                // the account's host: the sender, except for an #identity
+                // relayed by another host
+                let owner = a.delta.host;
                 if a.new_account {
-                    c.accounts = 1;
+                    self.add_host_counts(owner, super::host::HostCounts { accounts: 1, ..Default::default() });
                 }
-                self.add_host_counts(hk, c);
                 if !a.new_account
                     && let Some(old) = prev.as_ref().map(|p| p.host)
-                    && old != hk
+                    && old != owner
                 {
-                    self.add_host_counts(hk, super::host::HostCounts { accounts: 1, ..Default::default() });
+                    self.add_host_counts(owner, super::host::HostCounts { accounts: 1, ..Default::default() });
                     self.add_host_counts(old, super::host::HostCounts { accounts: -1, ..Default::default() });
                 }
             }
@@ -393,8 +395,13 @@ impl<C: Chain> StateStore<C> {
         }
 
         let fresh_identity = matches!(ev.kind, EventKind::Identity);
+        // the DID document is the authority on identity, not the host that
+        // sent it (indigo passes #identity from any host): the re-resolve
+        // above refreshed it, so emit it whoever sent it
+        let mut from_owner = true;
         match self.check_authority(&mut rec, ev, new_account, fresh_identity).await {
             Ok(Authority::Ok) => {}
+            Ok(Authority::Wrong) if fresh_identity => from_owner = false,
             Ok(Authority::Wrong) => {
                 let expected = rec.pds;
                 rec.failed_checks = rec.failed_checks.saturating_add(1);
@@ -495,9 +502,14 @@ impl<C: Chain> StateStore<C> {
                 ChangeKind::Account
             }
         };
-        rec.host = hk;
+        if from_owner {
+            rec.host = hk;
+        } else if new_account && let Some(pds) = rec.pds {
+            rec.host = pds;
+        }
         let status = rec.status();
-        let delta = StateDelta { did: ev.did.to_string(), host: hk, kind, chain: rec.chain, upstream: rec.upstream };
+        let delta =
+            StateDelta { did: ev.did.to_string(), host: rec.host, kind, chain: rec.chain, upstream: rec.upstream };
         let key_changed = rec.key != key_before;
         let ticket = shard.stage_logged(ev.did, rec);
         if let Some(r) = mirror_rows {

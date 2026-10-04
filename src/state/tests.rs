@@ -349,9 +349,26 @@ async fn identity_event_refreshes_the_key() {
     assert_eq!(acc.delta.kind, ChangeKind::Identity);
     assert_eq!(id.fresh.load(Relaxed), 1);
     assert_eq!(st.get(&did).await.unwrap().unwrap().key.as_ref().unwrap().0[2], 2);
-    // #identity from a host the fresh document doesn't name: rejected
+    // #identity from a host the fresh document doesn't name: refreshed and
+    // emitted all the same (the document is the authority), and the
+    // account stays with its PDS
+    id.set(&did, "pds.a", 3);
     let r = st.apply(Incoming { did: &did, host: &host("pds.z"), now: NOW + 2, kind: EventKind::Identity }).await;
-    assert!(matches!(r, Err(Reject::WrongHost { .. })));
+    let Ok(Applied::Append(acc)) = r else { panic!("{r:?}") };
+    assert!(acc.key_changed);
+    assert_eq!(acc.delta.host, HostKey::of("pds.a"));
+    assert_eq!(id.fresh.load(Relaxed), 2);
+    let rec = st.get(&did).await.unwrap().unwrap();
+    assert_eq!((rec.host, rec.key.as_ref().unwrap().0[2]), (HostKey::of("pds.a"), 3));
+    // so is one for a DID nothing was heard from yet
+    let other = plc(19);
+    id.set(&other, "pds.a", 1);
+    let r = st.apply(Incoming { did: &other, host: &host("pds.z"), now: NOW + 3, kind: EventKind::Identity }).await;
+    let Ok(Applied::Append(acc)) = r else { panic!("{r:?}") };
+    assert_eq!(acc.delta.host, HostKey::of("pds.a"));
+    // commits from that host still aren't
+    let r = commit(&st, &did, &host("pds.z"), claim(&did, 2), NOW + 4).await;
+    assert!(matches!(r, Err(Reject::WrongHost { .. })), "{r:?}");
 }
 
 #[tokio::test]
