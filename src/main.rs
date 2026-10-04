@@ -13,6 +13,14 @@ use vlrelay::node::{Node, NodeConfig, admin::NodeAdmin};
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// Segments are ~8 MiB, jemalloc's default oversize threshold: allocations
+/// that size get an arena that returns pages to the OS as soon as they're
+/// freed, so every segment buffer and its compressed copy were faulted in
+/// afresh (~3% of a loaded node's CPU). Without the oversize arena they
+/// reuse dirty pages within the normal decay time.
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static MALLOC_CONF: &[u8; 21] = b"oversize_threshold:0\0";
+
 #[derive(Parser, Debug)]
 #[command(version, about = "An atproto relay whose only durable state is an object store")]
 struct Args {
