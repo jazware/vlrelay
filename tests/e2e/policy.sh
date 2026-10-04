@@ -13,8 +13,9 @@
 #         banned by a domain rule mid-run
 #
 # It passes when host 1 is auto-throttled, cases open for hosts 1 and 2, the
-# ban rule disconnects host 3, and e2e_check finds nothing missing or extra
-# for the clean hosts. Needs no docker: fakepds serves its own PLC. Env:
+# ban rule disconnects host 3, e2e_check finds nothing missing or extra for
+# the clean hosts, and a takedown hides the account's commits from a replay
+# from cursor 0 until it's lifted. Needs no docker: fakepds serves its own PLC. Env:
 # OUT (dev/state/e2e-policy), RELAY_PORT (2978), FLEET_PORT (30100).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -157,4 +158,34 @@ print(f"policy e2e: clean hosts: missing {r['missing']}, extra {r['extra']}")
 sys.exit(0 if r["missing"] == 0 and r["extra"] == 0 else 1)
 EOF
 [ $rc = 0 ] || fail "e2e_check exited $rc"
+
+# A takedown leaves the account's earlier commits out of a replay from
+# cursor 0 (its #account still comes), and lifting it brings them back.
+replay() { python3 tests/e2e/replay.py --url "http://127.0.0.1:$relay_port" "$@"; }
+replay --frames 2000 >"$out/replay-before.jsonl" || fail "replay before the takedown"
+did=$(python3 -c '
+import collections, json, sys
+n = collections.Counter(d for _, t, d in map(json.loads, open(sys.argv[1])) if t == "#commit")
+print(n.most_common(1)[0][0])' "$out/replay-before.jsonl")
+upto=$(tail -1 "$out/replay-before.jsonl" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0])')
+send POST "accounts/$did/takedown" '{"reason": "policy e2e"}' >/dev/null || fail "takedown $did"
+replay --until-account "$did" --after "$upto" >"$out/replay-taken.jsonl" || fail "replay after the takedown"
+send POST "accounts/$did/untakedown" '{}' >/dev/null || fail "untakedown $did"
+taken_at=$(tail -1 "$out/replay-taken.jsonl" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0])')
+replay --until-account "$did" --after "$taken_at" >"$out/replay-lifted.jsonl" || fail "replay after lifting it"
+python3 - "$did" "$out" <<'EOF' || fail "the takedown didn't filter the replay window"
+import json, sys
+did, out = sys.argv[1], sys.argv[2]
+read = lambda name: [json.loads(l) for l in open(f"{out}/{name}.jsonl")]
+before, taken, lifted = read("replay-before"), read("replay-taken"), read("replay-lifted")
+upto = before[-1][0]
+commits = lambda evs: [s for s, t, d in evs if d == did and t in ("#commit", "#sync") and s <= upto]
+others = lambda evs: [s for s, t, d in evs if d != did and s <= upto]
+assert commits(before), "no commits to take down"
+assert not commits(taken), f"{len(commits(taken))} of {did}'s commits replayed while taken down"
+assert others(taken) == others(before), "other accounts' events changed"
+assert taken[-1][1] == "#account", taken[-1]
+assert commits(lifted) == commits(before), "the lifted account's commits didn't come back"
+print(f"policy e2e: ok: takedown hid {len(commits(before))} replayed commits of {did}, lifting it restored them")
+EOF
 echo "policy e2e: PASS in $(($(date +%s) - t0))s (logs in $out)"
