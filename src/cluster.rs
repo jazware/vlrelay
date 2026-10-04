@@ -932,6 +932,7 @@ async fn reach_loop(me: Weak<ClusterNode>) {
             failing_since = None;
             continue;
         }
+        let probed = Instant::now();
         let ok = n.reachable(timeout).await;
         n.self_reachable.store(ok, Ordering::Release);
         // not joined (`may_join` holds it meanwhile), we hold nothing
@@ -941,7 +942,7 @@ async fn reach_loop(me: Weak<ClusterNode>) {
             }
             continue;
         }
-        let since = *failing_since.get_or_insert_with(Instant::now);
+        let since = *failing_since.get_or_insert(probed);
         tracing::warn!(failing_ms = since.elapsed().as_millis() as u64, addr = %n.opts.addr, "our advertised peer address doesn't answer");
         if since.elapsed() < window {
             continue;
