@@ -467,6 +467,25 @@ async fn reads_follow_the_account_status() {
     assert_eq!(s, 200, "{}", String::from_utf8_lossy(&b));
     let (_, blocks) = vlpds::car::read_car(&b).unwrap();
     assert_eq!(blocks.len(), 3);
+    assert_eq!(a.reads.walks.load(Relaxed), 1, "the leaf");
+    // a CID the repo doesn't hold costs one walk, not one per request
+    let nope = Cid { codec: vlpds::cid::CODEC_DAG_CBOR, digest: [7; 32] };
+    for _ in 0..3 {
+        let (s, b) = get(format!("/xrpc/com.atproto.sync.getBlocks?did={did}&cids={nope}&cids={rc}")).await;
+        assert_eq!(s, 400);
+        assert!(String::from_utf8_lossy(&b).contains("BlockNotFound"));
+    }
+    assert_eq!(a.reads.walks.load(Relaxed), 2);
+    let many: String = (0..=read::MAX_BLOCKS_CIDS)
+        .map(|i| {
+            let mut digest = [0; 32];
+            digest[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            format!("&cids={}", Cid { codec: vlpds::cid::CODEC_DAG_CBOR, digest })
+        })
+        .collect();
+    let (s, b) = get(format!("/xrpc/com.atproto.sync.getBlocks?did={did}{many}")).await;
+    assert_eq!(s, 400);
+    assert!(String::from_utf8_lossy(&b).contains("at most"));
     let (s, _) = get(format!("/xrpc/com.atproto.sync.listBlobs?did={did}")).await;
     assert_eq!(s, 501);
     st.set_relay_takedown(&did, true).await.unwrap();

@@ -84,8 +84,8 @@ After a policy change (and at startup), it also walks the shard's sync records a
 | Endpoint | Served |
 |---|---|
 | `com.atproto.sync.getRepo` | streamed from one SlateDB snapshot by vlpds's export (`xrpc::stream_export`), in the streamable CAR order. `since` sends only records written after that rev, with the whole current tree, as vlpds does. 32 at once. |
-| `com.atproto.sync.getRecord` | the commit, the proof path and the record |
-| `com.atproto.sync.getBlocks` | commit, `M/` nodes and records by CID; leaves found with one walk of the tree |
+| `com.atproto.sync.getRecord` | the commit, the proof path and the record. Shares 64 slots with getBlocks (a request waits up to 2 s for one, then `Overloaded`). |
+| `com.atproto.sync.getBlocks` | commit, `M/` nodes and records by CID; leaves found with one walk of the tree. At most 1,000 CIDs, 2 walks at once (`Overloaded` past that), and a CID a walk didn't find answers `BlockNotFound` without another walk until the repo's tree changes. |
 | `com.atproto.sync.listBlobs` | 501 `MethodNotImplemented`: blobs stay on the PDS |
 
 Errors follow the PDS's `assertRepoAvailability`: `RepoTakendown`, `RepoSuspended`, `RepoDeactivated`, and `RepoNotFound` for a deleted account, an unknown one, or one that isn't mirrored. Desynchronized and throttled accounts are served.

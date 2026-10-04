@@ -94,6 +94,8 @@ pub struct Stats {
 pub struct ReadStats {
     pub exports: AtomicU64,
     pub export_us: AtomicU64,
+    /// getBlocks tree walks (for MST leaves, which aren't stored).
+    pub walks: AtomicU64,
 }
 
 pub struct Archive {

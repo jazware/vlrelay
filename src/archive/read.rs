@@ -3,6 +3,13 @@
 //! blobs stay on the PDS). Only the DID's owner answers (PLAN.md decision
 //! 7); a cluster node that doesn't hold the shard hands the request to
 //! [`Forward`].
+//!
+//! These are unauthenticated, so their cost is bounded: getRecord and
+//! getBlocks share [`MAX_BLOCK_READS`] slots, getBlocks takes at most
+//! [`MAX_BLOCKS_CIDS`] CIDs, and the tree walk that finds unstored MST leaves
+//! (a whole-repo scan) runs [`MAX_WALKS`] at a time. A CID one walk didn't
+//! find is remembered for the repo's current tree, so asking again for blocks
+//! that don't exist doesn't walk again.
 
 use super::mirror;
 use crate::state::{AccountStatus, Chain, StateStore, StoreError};
@@ -16,6 +23,7 @@ use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use vlpds::cid::Cid;
 use vlpds::state::{self as vs, Head};
 use vlpds::tid::Tid;
@@ -32,16 +40,33 @@ pub struct Reads<C: Chain> {
     pub state: Arc<StateStore<C>>,
     pub forward: Option<Arc<dyn Forward>>,
     exports: Arc<tokio::sync::Semaphore>,
+    blocks: Arc<tokio::sync::Semaphore>,
+    walks: Arc<tokio::sync::Semaphore>,
+    /// CIDs a walk of (DID, generation, tree root) didn't find.
+    misses: parking_lot::Mutex<HashMap<(String, u64, Cid), HashSet<Cid>>>,
     pub stall: std::time::Duration,
 }
 
 pub const MAX_EXPORTS: usize = 32;
+pub const MAX_BLOCK_READS: usize = 64;
+pub const MAX_BLOCKS_CIDS: usize = 1000;
+pub const MAX_WALKS: usize = 2;
+const MISSES_MAX: usize = 10_000;
+/// How long a getRecord or getBlocks waits for a slot.
+const SLOT_WAIT: Duration = Duration::from_secs(2);
+
+fn overloaded(what: &str) -> XrpcError {
+    XrpcError::unavailable("Overloaded", format!("too many {what} in progress; retry shortly"))
+}
 
 pub fn router<C: Chain>(state: Arc<StateStore<C>>, forward: Option<Arc<dyn Forward>>) -> Router {
     let r = Arc::new(Reads {
         state,
         forward,
         exports: Arc::new(tokio::sync::Semaphore::new(MAX_EXPORTS)),
+        blocks: Arc::new(tokio::sync::Semaphore::new(MAX_BLOCK_READS)),
+        walks: Arc::new(tokio::sync::Semaphore::new(MAX_WALKS)),
+        misses: Default::default(),
         stall: vlpds::xrpc::DEFAULT_EXPORT_STALL,
     });
     Router::new()
@@ -76,6 +101,13 @@ enum Owner {
 }
 
 impl<C: Chain> Reads<C> {
+    async fn block_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, XrpcError> {
+        match tokio::time::timeout(SLOT_WAIT, self.blocks.clone().acquire_owned()).await {
+            Ok(Ok(p)) => Ok(p),
+            _ => Err(overloaded("block reads")),
+        }
+    }
+
     /// The mirror to read, checked the way a PDS checks repo availability.
     async fn open(&self, did: &str, pq: &str) -> Result<Owner, XrpcError> {
         did_ok(did)?;
@@ -197,6 +229,7 @@ async fn get_record<C: Chain>(
             Owner::Here(g, h, s) => (g, h, s),
             Owner::Elsewhere(resp) => return Ok(resp),
         };
+        let _slot = r.block_slot().await?;
         let path = format!("{coll}/{rkey}");
         let mut out = Vec::new();
         vlpds::car::write_header(&mut out, &head.commit);
@@ -251,12 +284,16 @@ async fn get_blocks<C: Chain>(State(r): S<C>, RawQuery(raw): RawQuery) -> Respon
                 if seen.insert(c) {
                     want.push(c);
                 }
+                if want.len() > MAX_BLOCKS_CIDS {
+                    return Err(XrpcError::bad("InvalidRequest", format!("at most {MAX_BLOCKS_CIDS} cids")));
+                }
             }
         }
         let (generation, head, snap) = match r.open(&did, &pq("/xrpc/com.atproto.sync.getBlocks", &raw)).await? {
             Owner::Here(g, h, s) => (g, h, s),
             Owner::Elsewhere(resp) => return Ok(resp),
         };
+        let _slot = r.block_slot().await?;
         let mut found: HashMap<Cid, Vec<u8>> = HashMap::new();
         if seen.contains(&head.commit) {
             found.insert(head.commit, head.commit_block.to_vec());
@@ -273,7 +310,14 @@ async fn get_blocks<C: Chain>(State(r): S<C>, RawQuery(raw): RawQuery) -> Respon
         }
         // leaves aren't stored: one walk of the tree finds the rest
         let rest: HashSet<Cid> = want.iter().filter(|c| !found.contains_key(c)).copied().collect();
-        if !rest.is_empty() {
+        let key = (did.clone(), generation, head.data);
+        let known_missing = r.misses.lock().get(&key).is_some_and(|m| rest.iter().any(|c| m.contains(c)));
+        if !rest.is_empty() && !known_missing {
+            let _walk = r.walks.clone().try_acquire_owned().map_err(|_| overloaded("block lookups"))?;
+            if let Some(a) = r.state.archive() {
+                a.reads.walks.fetch_add(1, Ordering::Relaxed);
+            }
+            let wanted = rest.clone();
             let (snap2, d, root) = (snap.clone(), did.clone(), head.data);
             let got = tokio::task::spawn_blocking(move || {
                 let rt = tokio::runtime::Handle::current();
@@ -291,6 +335,14 @@ async fn get_blocks<C: Chain>(State(r): S<C>, RawQuery(raw): RawQuery) -> Respon
             .map_err(internal)?
             .map_err(internal)?;
             found.extend(got);
+            let gone: HashSet<Cid> = wanted.into_iter().filter(|c| !found.contains_key(c)).collect();
+            if !gone.is_empty() {
+                let mut m = r.misses.lock();
+                if m.len() >= MISSES_MAX && !m.contains_key(&key) {
+                    m.clear();
+                }
+                m.entry(key).or_default().extend(gone);
+            }
         }
         let missing: Vec<String> = want.iter().filter(|c| !found.contains_key(c)).map(|c| c.to_string()).collect();
         if !missing.is_empty() {
