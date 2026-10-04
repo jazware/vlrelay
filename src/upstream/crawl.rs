@@ -344,9 +344,9 @@ impl Crawler {
         if !resp.status().is_success() {
             return Err(CrawlError::Unreachable(format!("describeServer: HTTP {}", resp.status())));
         }
-        let body = resp.bytes().await.map_err(|e| CrawlError::Unreachable(format!("describeServer: {e}")))?;
-        let j: serde_json::Value = serde_json::from_slice(&body[..body.len().min(64 * 1024)])
-            .map_err(|_| CrawlError::Unreachable("describeServer: not JSON".into()))?;
+        let body = read_capped(resp, DESCRIBE_MAX_BYTES).await?;
+        let j: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| CrawlError::Unreachable("describeServer: not JSON".into()))?;
         if !j.get("did").and_then(|d| d.as_str()).is_some_and(|d| d.starts_with("did:")) {
             return Err(CrawlError::Unreachable("describeServer: no service DID".into()));
         }
@@ -357,6 +357,20 @@ impl Crawler {
         let _ = tokio::time::timeout(Duration::from_secs(1), ws.close(None)).await;
         Ok(())
     }
+}
+
+const DESCRIBE_MAX_BYTES: usize = 64 << 10;
+
+/// The body, refused past `max` bytes without reading the rest.
+async fn read_capped(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>, CrawlError> {
+    let mut body = Vec::new();
+    while let Some(c) = resp.chunk().await.map_err(|e| CrawlError::Unreachable(format!("describeServer: {e}")))? {
+        if body.len() + c.len() > max {
+            return Err(CrawlError::Unreachable(format!("describeServer: over {max} bytes")));
+        }
+        body.extend_from_slice(&c);
+    }
+    Ok(body)
 }
 
 struct Unmark<'a>(&'a Mutex<HashSet<Host>>, Host);
@@ -454,6 +468,29 @@ mod tests {
         let r = c.request_crawl("127.0.0.1:1").await;
         assert!(matches!(&r, Err(CrawlError::Unreachable(m)) if m.contains("cached")), "{r:?}");
         assert_eq!(*count.0.lock(), vec![false]);
+    }
+
+    /// describeServer answers a few hundred bytes: a host streaming more is
+    /// cut off instead of buffered whole.
+    #[tokio::test]
+    async fn describe_server_body_is_capped() {
+        let big = "x".repeat(4 << 20);
+        let app = Router::new().route(
+            "/xrpc/com.atproto.server.describeServer",
+            axum::routing::get(move || {
+                let big = big.clone();
+                async move { big }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = Host(l.local_addr().unwrap().to_string());
+        tokio::spawn(async move { axum::serve(l, app).await });
+        let mut cfg = UpstreamConfig::new(true);
+        cfg.endpoint = Arc::new(|h: &Host| format!("http://{}", h.0));
+        let (m, _rx) = Manager::new(cfg, Arc::new(MemHostStore::default()), None);
+        let c = Crawler::new(m, CrawlPolicy::default());
+        let r = c.probe(&host, Duration::from_secs(5)).await;
+        assert!(matches!(&r, Err(CrawlError::Unreachable(m)) if m.contains("over 65536 bytes")), "{r:?}");
     }
 
     #[test]
