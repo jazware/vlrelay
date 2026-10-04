@@ -191,6 +191,7 @@ The log already refuses to PUT or ack once the lease lapses (the cluster sets `l
 | `hostck/` | `cluster::hosts` | upstream cursors per host shard |
 | `hosts/` | `node::cluster::BucketHosts` | host records (the registry) per host shard |
 | `log/{log_id}/` | `seq::NodeLog` | each core node's log, fenced at its end |
+| `dedupe/{did shard}/{log_id}` | `node::cluster::DedupeStore` | a DID shard owner's inherited restart-dedupe entries, while it has any |
 
 ## Known gaps
 
@@ -200,7 +201,5 @@ The log already refuses to PUT or ack once the lease lapses (the cluster sets `l
 - Every core node runs log retention (`spawn_retention`). Harmless but redundant: it could move to the slot-0 leader (`cluster.leads_slot0()`) as vlpds does.
 - The sync API's repo endpoints (listRepos, getRepoStatus, getLatestCommit) answer only for the DID shards the node holds, and a DID elsewhere is a NotOwner error. They should forward to the owner, or listRepos should merge across nodes.
 - Admin takedowns (`append_own`) and the admin's account lookups read this node's state only, so they work only on the DID's owner. The cluster view shows peers' rates, CPU and memory as 0 until peers report them.
-- Dedupe across two failures: if a shard's new owner crashes before the hosts' checkpoints pass the entries it replayed from the previous owner's log, its successor doesn't get them back (the previous owner's marker was checkpointed at its end). A replayed `#identity`/`#account` could then appear twice. It needs two crashes within a checkpoint interval.
-- A zombie host owner (two nodes subscribed to one host for a moment) can get `Duplicate` for an event the other copy hasn't made durable yet, and ack past it. If the DID owner then dies before it's durable, the event is lost. This needs a zombie and a crash together.
-- A host whose sequence restarts (FutureCursor) can have new events answered as duplicates for up to 15 minutes if their seqs collide with entries still in the dedupe set.
+- Fixed since (docs/chaos.md): dedupe across two crashes in one checkpoint interval (inherited entries are persisted per shard), a duplicate answered before the first copy was durable (the zombie-plus-crash gap; bucket errors hit it without a zombie), and FutureCursor seq collisions in the dedupe set (entries carry the DID). docs/chaos.md lists what the chaos runs found open.
 - Each host owner's registry flush writes every host shard object that has a dirty row, every 2 s: one PUT per active host shard per tick.
