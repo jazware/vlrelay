@@ -38,7 +38,7 @@ Defined in `src/node/metrics.rs` and `src/node/cluster.rs`.
 | `vlrelay_durable_lag_ms` | gauge | | Mean append-to-durable time over the last second |
 | `vlrelay_hosts` | gauge | `status` | Upstream hosts by status |
 | `vlrelay_consumers` | gauge | | Connected `subscribeRepos` consumers |
-| `vlrelay_identity_cache_entries` | gauge | | DID documents in the identity cache (bounded at 2^20: when full, expired entries go, then an arbitrary eighth) |
+| `vlrelay_identity_cache_entries` | gauge | | DID documents in the identity cache: the DIDs looked up within the TTL (1 h). Expired entries are swept every minute; at 2^20 an arbitrary eighth goes too |
 | `vlrelay_ack_pending` | gauge | | Upstream events read but not yet durable, rejected or skipped |
 | `vlrelay_lane_queued` | gauge | | Events queued in front of the pipeline lanes |
 | `vlrelay_accounts_throttled_total` | counter | `why` | New accounts created throttled by policy (`host_cap`) |

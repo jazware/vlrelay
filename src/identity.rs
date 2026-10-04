@@ -211,6 +211,9 @@ pub struct Options {
     pub burst: f64,
     /// A lookup waits at most this long for budget, else [`LookupError::OverBudget`].
     pub max_budget_wait: Duration,
+    /// How often a store also drops expired entries, so the cache holds the
+    /// DIDs seen within a TTL rather than every DID up to `capacity`.
+    pub sweep_every: Duration,
 }
 
 impl Default for Options {
@@ -222,6 +225,7 @@ impl Default for Options {
             lookups_per_sec: 50.0,
             burst: 100.0,
             max_budget_wait: Duration::from_secs(2),
+            sweep_every: Duration::from_secs(60),
         }
     }
 }
@@ -258,6 +262,7 @@ pub struct IdentityCache<F: Fetch = HttpFetch> {
     fetcher: F,
     opts: Options,
     entries: Mutex<HashMap<String, Entry>>,
+    swept: Mutex<Instant>,
     /// DID -> (when the fetch began, its shared result).
     inflight: Mutex<HashMap<String, (Instant, Flight)>>,
     budget: Mutex<Bucket>,
@@ -286,6 +291,7 @@ impl<F: Fetch> IdentityCache<F> {
             }),
             opts,
             entries: Default::default(),
+            swept: Mutex::new(Instant::now()),
             inflight: Default::default(),
             gate: Default::default(),
             seeder: Default::default(),
@@ -501,17 +507,24 @@ impl<F: Fetch> IdentityCache<F> {
     }
 
     fn store(&self, did: &str, v: Outcome) {
+        let due = {
+            let mut s = self.swept.lock();
+            let due = s.elapsed() >= self.opts.sweep_every;
+            if due {
+                *s = Instant::now();
+            }
+            due
+        };
         let mut m = self.entries.lock();
-        if m.len() >= self.opts.capacity && !m.contains_key(did) {
-            let (ttl, neg) = (self.opts.ttl, self.opts.negative_ttl);
-            m.retain(|_, e| e.at.elapsed() < if e.v.is_ok() { ttl } else { neg });
-            if m.len() >= self.opts.capacity {
-                // arbitrary eighth: HashMap order is random per process
-                let drop: Vec<String> =
-                    m.keys().take(self.opts.capacity / 8 + 1).cloned().collect();
-                for k in drop {
-                    m.remove(&k);
-                }
+        let full = m.len() >= self.opts.capacity && !m.contains_key(did);
+        if due || full {
+            Self::drop_expired(&mut m, &self.opts);
+        }
+        if full && m.len() >= self.opts.capacity {
+            // arbitrary eighth: HashMap order is random per process
+            let drop: Vec<String> = m.keys().take(self.opts.capacity / 8 + 1).cloned().collect();
+            for k in drop {
+                m.remove(&k);
             }
         }
         m.insert(
@@ -521,6 +534,10 @@ impl<F: Fetch> IdentityCache<F> {
                 v,
             },
         );
+    }
+
+    fn drop_expired(m: &mut HashMap<String, Entry>, o: &Options) {
+        m.retain(|_, e| e.at.elapsed() < if e.v.is_ok() { o.ttl } else { o.negative_ttl });
     }
 
     pub fn len(&self) -> usize {

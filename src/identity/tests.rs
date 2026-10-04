@@ -277,3 +277,32 @@ async fn handles_are_found_in_cached_documents() {
     assert_eq!(dids("ali*"), ["did:plc:a"]);
     assert!(dids("ali").is_empty() && dids("*").is_empty() && dids("bob.test").is_empty());
 }
+
+#[tokio::test]
+async fn expired_entries_are_swept_before_the_cache_fills() {
+    let m = Arc::new(Mock::default());
+    let k = Signer::new(Curve::K256, 1).multibase();
+    for i in 0..50 {
+        let did = format!("did:plc:s{i}");
+        m.docs.lock().insert(did.clone(), doc(&did, &k, "https://pds.example.com"));
+    }
+    let c = cache(
+        &m,
+        Options {
+            ttl: Duration::from_millis(500),
+            negative_ttl: Duration::from_millis(500),
+            sweep_every: Duration::from_millis(20),
+            lookups_per_sec: 1e6,
+            burst: 1e6,
+            ..Options::default()
+        },
+    );
+    for i in 0..50 {
+        c.resolve(&format!("did:plc:s{i}")).await.unwrap();
+    }
+    assert_eq!(c.len(), 50);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    // one store sweeps the 50 that expired, far below capacity
+    c.resolve("did:plc:s0").await.unwrap();
+    assert_eq!(c.len(), 1);
+}
