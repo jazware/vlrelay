@@ -134,6 +134,7 @@ pub struct Glue {
     pub cluster: Arc<ClusterNode>,
     pub hosts: Arc<BucketHosts>,
     pub recent: Arc<Recent>,
+    inflight: Inflight,
     state: Arc<State>,
     log: Arc<NodeLog>,
     local: Arc<LocalOwner>,
@@ -203,6 +204,7 @@ impl Node {
             cluster: cluster.clone(),
             hosts: hosts.clone(),
             recent: Arc::new(Recent::default()),
+            inflight: Inflight::default(),
             state: state.clone(),
             log: log.clone(),
             local: local.clone(),
@@ -598,6 +600,9 @@ impl Stage {
         let mut waits = Vec::new();
         let mut blocked: Option<StageError> = None;
         for (i, f) in evs {
+            // claim, apply, append and register as one step per DID, so a
+            // second copy from another host owner sees the first one's append
+            let _did = g.inflight.lock(&f.did).await;
             if let Some(e) = &blocked {
                 out.push((i, Err(e.clone())));
                 continue;
@@ -615,7 +620,7 @@ impl Stage {
                 && !g.recent.claim(&f.host, f.upstream_seq, &f.did, shard, g.log.next_ordinal.load(Ordering::Acquire))
             {
                 metrics::EVENTS_DUPLICATE.with_label_values(&["cluster_recent"]).inc();
-                out.push((i, Ok(Outcome::Duplicate)));
+                waits.push(Wait::Duplicate { i, of: g.inflight.watch(&f.did) });
                 continue;
             }
             let identity = matches!(m.kind, CheckedKind::Identity);
@@ -636,10 +641,23 @@ impl Stage {
                 }
             };
             match r {
-                Submitted::Appended(rx) => waits.push((i, rx, f.host, f.upstream_seq, dedupe, identity, f.did)),
+                Submitted::Appended(rx) => {
+                    let (id, done) = g.inflight.begin(&f.did);
+                    waits.push(Wait::Appended {
+                        i,
+                        rx,
+                        host: f.host,
+                        useq: f.upstream_seq,
+                        dedupe,
+                        identity,
+                        did: f.did,
+                        id,
+                        done,
+                    })
+                }
                 Submitted::Duplicate => {
                     unclaim();
-                    out.push((i, Ok(Outcome::Duplicate)));
+                    waits.push(Wait::Duplicate { i, of: g.inflight.watch(&f.did) });
                 }
                 Submitted::Rejected(rj) => {
                     unclaim();
@@ -658,7 +676,16 @@ impl Stage {
             }
         }
         let mut changed_keys = Vec::new();
-        for (i, rx, host, useq, dedupe, identity, did) in waits {
+        for w in waits {
+            let (i, rx, host, useq, dedupe, identity, did, id, done) = match w {
+                Wait::Appended { i, rx, host, useq, dedupe, identity, did, id, done } => {
+                    (i, rx, host, useq, dedupe, identity, did, id, done)
+                }
+                Wait::Duplicate { i, of } => {
+                    out.push((i, g.duplicate(of).await));
+                    continue;
+                }
+            };
             let r = match rx.await {
                 Ok(Ok(d)) if g.cluster.lease_valid() => {
                     g.committed.fetch_max(d.ordinal + 1, Ordering::AcqRel);
@@ -677,6 +704,7 @@ impl Stage {
             if r.is_err() && dedupe {
                 g.recent.release(&host, useq, &did);
             }
+            g.inflight.done(&did, id, done, r.is_ok());
             out.push((i, r));
         }
         if !changed_keys.is_empty() {
@@ -684,6 +712,99 @@ impl Stage {
             tokio::spawn(async move { c.invalidate_keys(changed_keys).await });
         }
         out
+    }
+}
+
+/// Resolves to whether an append became durable (None until it did or failed).
+type Durability = tokio::sync::watch::Receiver<Option<bool>>;
+
+enum Wait {
+    Appended {
+        i: usize,
+        rx: super::DurableRx,
+        host: Host,
+        useq: i64,
+        dedupe: bool,
+        identity: bool,
+        did: String,
+        id: u64,
+        done: tokio::sync::watch::Sender<Option<bool>>,
+    },
+    Duplicate {
+        i: usize,
+        of: Option<Durability>,
+    },
+}
+
+impl Glue {
+    /// A duplicate is answered only once the copy it duplicates is durable.
+    /// The first copy may still be in flight (a zombie host owner and the
+    /// real one both sent it), and a host owner acks past a duplicate: if
+    /// this node died before the first copy landed, the event would be
+    /// acked and lost.
+    async fn duplicate(&self, of: Option<Durability>) -> StageResult {
+        let durable = match of {
+            None => true,
+            Some(rx) => durable(rx, Duration::from_secs(10)).await,
+        };
+        if durable && self.cluster.lease_valid() {
+            Ok(Outcome::Duplicate)
+        } else {
+            Err(StageError::Unavailable("the duplicated event isn't durable".into()))
+        }
+    }
+}
+
+async fn durable(mut rx: Durability, limit: Duration) -> bool {
+    matches!(
+        tokio::time::timeout(limit, rx.wait_for(|v| v.is_some())).await,
+        Ok(Ok(v)) if *v == Some(true)
+    )
+}
+
+/// Per DID, the newest event this owner appended that may not be durable
+/// yet, and a lock per stripe of DIDs held from the dedupe claim to the
+/// append's registration here.
+struct Inflight {
+    stripes: Box<[tokio::sync::Mutex<()>]>,
+    last: Mutex<HashMap<String, (u64, Durability)>>,
+    next: AtomicU64,
+}
+
+impl Default for Inflight {
+    fn default() -> Inflight {
+        Inflight {
+            stripes: (0..1024).map(|_| tokio::sync::Mutex::new(())).collect(),
+            last: Mutex::new(HashMap::new()),
+            next: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Inflight {
+    async fn lock(&self, did: &str) -> tokio::sync::MutexGuard<'_, ()> {
+        self.stripes[(did_key(did) % self.stripes.len() as u64) as usize].lock().await
+    }
+
+    fn begin(&self, did: &str) -> (u64, tokio::sync::watch::Sender<Option<bool>>) {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        self.last.lock().insert(did.to_string(), (id, rx));
+        (id, tx)
+    }
+
+    /// The log commits in append order, so the newest append's outcome
+    /// covers every earlier one of the DID.
+    fn watch(&self, did: &str) -> Option<Durability> {
+        self.last.lock().get(did).map(|(_, rx)| rx.clone())
+    }
+
+    fn done(&self, did: &str, id: u64, tx: tokio::sync::watch::Sender<Option<bool>>, ok: bool) {
+        let _ = tx.send(Some(ok));
+        let mut m = self.last.lock();
+        if m.get(did).is_some_and(|(i, _)| *i == id) {
+            m.remove(did);
+        }
     }
 }
 
@@ -1344,6 +1465,29 @@ mod tests {
         assert!(!r.claim(&h, 12, "did:b", 1, 5));
         r.release(&h, 10, "did:a");
         assert_eq!(r.len(), 1);
+    }
+
+    /// The zombie-plus-crash gap: a second copy of an event is a duplicate
+    /// only once the first copy is durable, and not at all if it failed.
+    #[tokio::test]
+    async fn a_duplicate_waits_for_the_first_copy() {
+        let inf = Inflight::default();
+        assert!(inf.watch("did:a").is_none(), "nothing in flight: answer at once");
+        let (id, tx) = inf.begin("did:a");
+        let rx = inf.watch("did:a").unwrap();
+        assert!(!durable(rx.clone(), Duration::from_millis(20)).await, "not durable yet");
+        let waiter = tokio::spawn(durable(rx, Duration::from_secs(5)));
+        inf.done("did:a", id, tx, true);
+        assert!(waiter.await.unwrap());
+        assert!(inf.watch("did:a").is_none());
+
+        let (id1, tx1) = inf.begin("did:b");
+        let (id2, tx2) = inf.begin("did:b");
+        let rx = inf.watch("did:b").unwrap();
+        inf.done("did:b", id1, tx1, true);
+        assert!(inf.watch("did:b").is_some(), "the newer append is still in flight");
+        inf.done("did:b", id2, tx2, false);
+        assert!(!durable(rx, Duration::from_secs(1)).await, "a failed append is no duplicate to ack");
     }
 
     /// The FutureCursor gap: a host whose sequence restarts reuses seqs the
