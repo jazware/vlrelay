@@ -37,6 +37,13 @@ Frames are still logged with the merge key in `seq`, as before. The merger sorts
 
 **Anchoring.** A node's merged stream starts at a floor F (the clock at startup, as before). Before it emits anything, the merger waits until every followed log is durable up to F, which is the same `settled` condition backfill already uses. Then it asks `anchor(F)`: the newest checkpoint (K, N) with K ≤ F, plus a count of the events in (K, F] read from the bucket with the ordinary backfill reader. That's at most one checkpoint interval of events. Subscribers wait until the stream is anchored, which takes a few hundred milliseconds at startup.
 
+The count is only right if the merge can't settle past F before the node follows every peer's log. Otherwise the peers get followed from wherever the merge had reached, and their events between F and there are neither counted nor streamed. Time-based seqs hid this gap, because nobody counts. Two holds close it:
+
+- A core node follows the peers its join found before the merger starts. It also keeps a `~join` source just below F until its first membership sync, or a lease TTL at most.
+- Edges and replicas start their membership source just below F instead of at it.
+
+The cluster e2e catches a node that numbers differently, even one no checker is reading, by its `seq checkpoints disagree` log line.
+
 **Old cursors.** A cursor below the ring's floor is located with `locate(cursor)`: the newest pair (K, N) with N ≤ cursor and K at or above the retained floor. Backfill reads the bucket from K, numbers events N+1, N+2, … and skips the ones at or below the cursor. When the backfill reaches the ring floor, its count has to land exactly on the ring floor's seq. If it doesn't, that's logged as a numbering error.
 
 ## Cursor semantics

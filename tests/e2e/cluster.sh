@@ -181,6 +181,13 @@ for n in "${names[@]}"; do
   grep -E '^\s+#|latency|out of order' "$out/check-$n.txt" || true
 done
 python3 tests/e2e/cluster_report.py "$out" || rc=1
+# a restarted node's stream seqs, which no checker may be reading, show up
+# in its seq checkpoints (docs/seq.md)
+if grep -h "seq checkpoints disagree" "$out"/n*.log >/dev/null 2>&1; then
+  echo "e2e-cluster: nodes numbered the stream differently:"
+  grep -h "seq checkpoints disagree" "$out"/n*.log | sed 's/\x1b\[[0-9;]*m//g' | head -5
+  rc=1
+fi
 tail -3 "$out/load.log"
 echo "e2e-cluster: $( [ $rc = 0 ] && echo PASS || echo FAIL ) in $(($(date +%s) - t0))s ($out)"
 [ "${KEEP:-}" = 1 ] || { rm -rf "${TMPDIR:-/tmp}/vlrelay-e2e-cluster-last" && cp -r "$out" "${TMPDIR:-/tmp}/vlrelay-e2e-cluster-last"; } 2>/dev/null || true

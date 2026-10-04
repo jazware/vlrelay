@@ -54,6 +54,10 @@ use vlpds::nodelog::{LeaseCheck, Span};
 use vlpds::slots::{Layout, ShardId};
 use vlpds::store::Store;
 
+/// The merger source that holds a joining core's merge below its start
+/// floor until it follows its peers.
+const JOIN_HOLD: &str = "~join";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Role {
     /// Lease, DID and host shards, a log; serves.
@@ -335,7 +339,6 @@ impl ClusterNode {
         } else {
             (None, None, None)
         };
-        serve.firehose.spawn_merger(rx);
         let followers = follow::Followers::new(
             serve.firehose.clone(),
             store.clone(),
@@ -344,6 +347,25 @@ impl ClusterNode {
             if opts.role == Role::Replica { None } else { http.clone() },
             log.as_ref().map(|l| l.log_id.to_string()),
         );
+        // Follow the peers the join found before the merger runs. With only
+        // our own log as a source it would settle past the start floor, the
+        // peers would then be followed from there, and their events between
+        // the two would be in nobody's stream count on this node (stream
+        // seqs anchor at the start floor).
+        // The join may not list them yet, so the merge is also held just
+        // below the floor until the first membership sync (or a lease TTL).
+        if let Some(c) = &cluster {
+            let live: Vec<follow::LiveLog> = c.peers().iter().map(follow::LiveLog::from).collect();
+            followers.sync(&live);
+            let hold = Arc::new(std::sync::atomic::AtomicI64::new(serve.firehose.position() - 1));
+            serve.firehose.set_source(JOIN_HOLD, Some(vlpds::firehose::Source::Remote(hold)));
+            let (fh, wait) = (serve.firehose.clone(), opts.ttl + opts.skew);
+            tokio::spawn(async move {
+                tokio::time::sleep(wait).await;
+                fh.set_source(JOIN_HOLD, None);
+            });
+        }
+        serve.firehose.spawn_merger(rx);
         let node = Arc::new_cyclic(|me: &Weak<ClusterNode>| {
             let forwarder = (opts.role == Role::Core)
                 .then(|| Forwarder::start(opts.forward.clone(), Arc::new(NodeRoute(me.clone()))));
@@ -914,6 +936,7 @@ impl ShardHost for ClusterNode {
         let peers = c.peers();
         let live: Vec<follow::LiveLog> = peers.iter().map(follow::LiveLog::from).collect();
         self.followers.sync(&live);
+        self.serve.firehose.set_source(JOIN_HOLD, None);
         let ids: HashSet<String> = peers.iter().map(|l| l.log_id.clone()).collect();
         self.fence_dead(&ids);
     }

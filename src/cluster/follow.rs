@@ -260,7 +260,9 @@ pub fn spawn_membership(
     guard: Duration,
     stop: Arc<AtomicBool>,
 ) {
-    let wm = Arc::new(AtomicI64::new(followers.fh.position()));
+    // just below the start floor: nothing settles (and stream seqs don't
+    // anchor) until the first listing's logs are followed and vouch for it
+    let wm = Arc::new(AtomicI64::new(followers.fh.position() - 1));
     followers.fh.set_source(MEMBERSHIP_SOURCE, Some(Source::Remote(wm.clone())));
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(poll);
