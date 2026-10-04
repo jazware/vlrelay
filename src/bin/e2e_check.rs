@@ -13,6 +13,9 @@
 //!
 //! `--relay` is repeatable and the relay side is the union of its streams,
 //! so `--upstream A --upstream B --relay A --relay B` checks the checker.
+//! `--separate` instead compares each relay with the same upstream sockets,
+//! so two relays are measured under the same conditions with one socket per
+//! upstream.
 
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
@@ -30,9 +33,17 @@ struct Args {
     #[arg(long = "upstream", required = true)]
     upstreams: Vec<String>,
     /// A relay to compare against the upstreams, same forms. Repeatable (the
-    /// relay side is the union). None: only the upstreams are watched.
+    /// relay side is the union, unless --separate). None: only the upstreams
+    /// are watched.
     #[arg(long = "relay")]
     relays: Vec<String>,
+    /// Compare each --relay with the upstreams on its own, over one set of
+    /// upstream sockets, and report each (JSON: `{"comparisons": [...]}`).
+    #[arg(long)]
+    separate: bool,
+    /// With --separate: the scope of the n-th --relay (default --scope).
+    #[arg(long = "relay-scope")]
+    relay_scopes: Vec<String>,
     /// Seconds of upstream events to expect on the relay.
     #[arg(long, default_value_t = 30)]
     duration: u64,
@@ -119,7 +130,9 @@ enum Msg {
         what: String,
     },
     /// The upstream restarted its sequence (FutureCursor): its seqs start over.
-    Restarted { src: usize },
+    Restarted {
+        src: usize,
+    },
 }
 
 fn subscribe_url(s: &str) -> String {
@@ -133,18 +146,13 @@ fn subscribe_url(s: &str) -> String {
     } else {
         format!("wss://{s}")
     };
-    if s.contains("/xrpc/") {
-        s
-    } else {
-        format!("{s}/xrpc/com.atproto.sync.subscribeRepos")
-    }
+    if s.contains("/xrpc/") { s } else { format!("{s}/xrpc/com.atproto.sync.subscribeRepos") }
 }
 
 fn http_origin(s: &str) -> String {
     let u = subscribe_url(s);
     let u = u.split("/xrpc/").next().unwrap_or(&u).to_string();
-    u.replacen("wss://", "https://", 1)
-        .replacen("ws://", "http://", 1)
+    u.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1)
 }
 
 /// What identifies an event across a relay, or None for frames that don't
@@ -200,13 +208,7 @@ fn classify(frame: &[u8]) -> Result<Option<Classified>, String> {
         "#account" => {
             let active = matches!(body.get("active"), Some(ValueRef::Bool(true)));
             let status = s("status").unwrap_or_else(|| "-".into());
-            (
-                did,
-                Kind::Account,
-                format!("a:{active}:{status}"),
-                None,
-                seq,
-            )
+            (did, Kind::Account, format!("a:{active}:{status}"), None, seq)
         }
         _ => return Ok(None),
     }))
@@ -229,11 +231,7 @@ async fn subscribe(side: Side, src: usize, base: String, tx: mpsc::UnboundedSend
         let tls = tokio_tungstenite::Connector::Rustls(tls_config());
         match tokio_tungstenite::connect_async_tls_with_config(&u, None, false, Some(tls)).await {
             Ok((mut ws, _)) => {
-                let _ = tx.send(Msg::Status {
-                    side,
-                    src,
-                    what: format!("connected {u}"),
-                });
+                let _ = tx.send(Msg::Status { side, src, what: format!("connected {u}") });
                 backoff = Duration::from_millis(250);
                 while let Some(m) = ws.next().await {
                     let at = Instant::now();
@@ -244,20 +242,12 @@ async fn subscribe(side: Side, src: usize, base: String, tx: mpsc::UnboundedSend
                             continue;
                         }
                         Ok(Message::Close(f)) => {
-                            let _ = tx.send(Msg::Status {
-                                side,
-                                src,
-                                what: format!("closed: {f:?}"),
-                            });
+                            let _ = tx.send(Msg::Status { side, src, what: format!("closed: {f:?}") });
                             break;
                         }
                         Ok(_) => continue,
                         Err(e) => {
-                            let _ = tx.send(Msg::Status {
-                                side,
-                                src,
-                                what: format!("read error: {e}"),
-                            });
+                            let _ = tx.send(Msg::Status { side, src, what: format!("read error: {e}") });
                             break;
                         }
                     };
@@ -266,19 +256,7 @@ async fn subscribe(side: Side, src: usize, base: String, tx: mpsc::UnboundedSend
                             if seq > 0 {
                                 cursor = Some(seq);
                             }
-                            if tx
-                                .send(Msg::Event {
-                                    side,
-                                    src,
-                                    did,
-                                    kind,
-                                    base,
-                                    rev,
-                                    seq,
-                                    at,
-                                })
-                                .is_err()
-                            {
+                            if tx.send(Msg::Event { side, src, did, kind, base, rev, seq, at }).is_err() {
                                 return;
                             }
                         }
@@ -297,11 +275,7 @@ async fn subscribe(side: Side, src: usize, base: String, tx: mpsc::UnboundedSend
                 }
             }
             Err(e) => {
-                let _ = tx.send(Msg::Status {
-                    side,
-                    src,
-                    what: format!("connect {u}: {e}"),
-                });
+                let _ = tx.send(Msg::Status { side, src, what: format!("connect {u}: {e}") });
             }
         }
         if urls.len() > 1 {
@@ -316,9 +290,7 @@ async fn subscribe(side: Side, src: usize, base: String, tx: mpsc::UnboundedSend
 
 /// Every DID an upstream hosts (com.atproto.sync.listRepos), for --scope hosted.
 async fn list_repos(origin: &str) -> anyhow::Result<Vec<String>> {
-    let c = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    let c = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
     let mut out = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -333,9 +305,7 @@ async fn list_repos(origin: &str) -> anyhow::Result<Vec<String>> {
             }
         }
         match r["cursor"].as_str() {
-            Some(c) if !r["repos"].as_array().is_none_or(|a| a.is_empty()) => {
-                cursor = Some(c.to_string())
-            }
+            Some(c) if !r["repos"].as_array().is_none_or(|a| a.is_empty()) => cursor = Some(c.to_string()),
             _ => return Ok(out),
         }
     }
@@ -347,7 +317,7 @@ struct Waiting {
     kind: Kind,
     /// The event's position in its DID's upstream stream (Up side only).
     pos: u64,
-    /// (upstream index, seq) of the upstream copy.
+    /// (upstream index, seq) of the upstream copy (Up side only).
     from: (usize, i64),
 }
 
@@ -369,6 +339,417 @@ struct KindCounts {
     extra: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    All,
+    Hosted,
+    Seen,
+}
+
+impl Scope {
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        Ok(match s {
+            "all" => Scope::All,
+            "hosted" => Scope::Hosted,
+            "seen" => Scope::Seen,
+            s => anyhow::bail!("scope {s}: want all, hosted or seen"),
+        })
+    }
+}
+
+/// A relay event held until its DID's first upstream event (`--scope
+/// seen`): the relay often beats the checker's own PDS socket to a DID's
+/// first event, which would otherwise count it out of scope and then the
+/// upstream copy as missing.
+struct Held {
+    kind: Kind,
+    base: String,
+    rev: Option<String>,
+    seq: i64,
+    at: Instant,
+}
+
+/// Held relay events older than this never get an upstream copy.
+const HOLD: Duration = Duration::from_secs(60);
+
+/// One relay side (one `--relay`, or their union) against the upstreams.
+struct Cmp {
+    relays: Vec<String>,
+    scope: Scope,
+    in_scope: std::collections::HashSet<String>,
+    held: HashMap<String, Vec<Held>>,
+    held_since_prune: Instant,
+    dids: HashMap<String, DidState>,
+    waiting: HashMap<(String, String), Waiting>,
+    counts: HashMap<Kind, KindCounts>,
+    lat: Histogram<u64>,
+    lat_kind: HashMap<Kind, Histogram<u64>>,
+    last_seq: HashMap<usize, i64>,
+    seq_regressions: u64,
+    duplicates: u64,
+    out_of_order: u64,
+    rev_regressions: u64,
+    relay_first: u64,
+    out_of_scope: u64,
+    bad_frames: u64,
+    examples: HashMap<&'static str, Vec<String>>,
+    /// Every missing or extra #sync, #identity and #account (they're rare
+    /// enough to list in full).
+    diffs: Vec<serde_json::Value>,
+    /// Every missing event with the upstream and seq it came from (capped).
+    missing_events: Vec<serde_json::Value>,
+    /// (upstream index, seq) of the Up event being handled.
+    cur_from: (usize, i64),
+}
+
+struct Window {
+    start: Instant,
+    start_ms: u128,
+    warm_end: Instant,
+    collect_end: Instant,
+    show: usize,
+}
+
+type Out = Option<std::io::BufWriter<std::fs::File>>;
+
+impl Cmp {
+    fn new(relays: Vec<String>, scope: Scope, in_scope: std::collections::HashSet<String>) -> Self {
+        Cmp {
+            relays,
+            scope,
+            in_scope,
+            held: HashMap::new(),
+            held_since_prune: Instant::now(),
+            dids: HashMap::new(),
+            waiting: HashMap::new(),
+            counts: HashMap::new(),
+            lat: hist(),
+            lat_kind: HashMap::new(),
+            last_seq: HashMap::new(),
+            seq_regressions: 0,
+            duplicates: 0,
+            out_of_order: 0,
+            rev_regressions: 0,
+            relay_first: 0,
+            out_of_scope: 0,
+            bad_frames: 0,
+            examples: HashMap::new(),
+            diffs: Vec::new(),
+            missing_events: Vec::new(),
+            cur_from: (0, 0),
+        }
+    }
+
+    fn note(&mut self, what: &'static str, s: String, show: usize) {
+        let v = self.examples.entry(what).or_default();
+        if v.len() < show {
+            v.push(s);
+        }
+    }
+
+    fn relay_name(&self, src: usize) -> String {
+        format!("relay {}", self.relays[src])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_up(
+        &mut self,
+        w: &Window,
+        from: (usize, i64),
+        did: String,
+        kind: Kind,
+        base: String,
+        at: Instant,
+        seq_out: &mut Out,
+        lat_out: &mut Out,
+    ) -> anyhow::Result<()> {
+        if self.scope != Scope::All
+            && self.in_scope.insert(did.clone())
+            && let Some(held) = self.held.remove(&did)
+        {
+            for h in held {
+                self.on_event(w, Side::Relay, did.clone(), h.kind, h.base, h.rev, h.seq, h.at, seq_out, lat_out)?;
+            }
+        }
+        self.cur_from = from;
+        self.on_event(w, Side::Up, did, kind, base, None, 0, at, seq_out, lat_out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_relay(
+        &mut self,
+        w: &Window,
+        src: usize,
+        did: String,
+        kind: Kind,
+        base: String,
+        rev: Option<String>,
+        seq: i64,
+        at: Instant,
+        seq_out: &mut Out,
+        lat_out: &mut Out,
+    ) -> anyhow::Result<()> {
+        if seq > 0 {
+            if let Some(&prev) = self.last_seq.get(&src)
+                && seq <= prev
+            {
+                self.seq_regressions += 1;
+                let s = format!("{}: seq {seq} after {prev}", self.relay_name(src));
+                self.note("seq regressions", s, w.show);
+            }
+            self.last_seq.insert(src, seq);
+        }
+        match self.scope {
+            Scope::All => {}
+            _ if self.in_scope.contains(&did) => {}
+            Scope::Hosted => {
+                self.out_of_scope += 1;
+                return Ok(());
+            }
+            Scope::Seen => {
+                self.held.entry(did).or_default().push(Held { kind, base, rev, seq, at });
+                if self.held_since_prune.elapsed() > HOLD {
+                    self.prune_held(Instant::now());
+                }
+                return Ok(());
+            }
+        }
+        self.on_event(w, Side::Relay, did, kind, base, rev, seq, at, seq_out, lat_out)
+    }
+
+    fn prune_held(&mut self, now: Instant) {
+        let mut dropped = 0;
+        self.held.retain(|_, v| {
+            let n = v.len();
+            v.retain(|h| now.duration_since(h.at) < HOLD);
+            dropped += n - v.len();
+            !v.is_empty()
+        });
+        self.out_of_scope += dropped as u64;
+        self.held_since_prune = now;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_event(
+        &mut self,
+        w: &Window,
+        side: Side,
+        did: String,
+        kind: Kind,
+        base: String,
+        rev: Option<String>,
+        seq: i64,
+        at: Instant,
+        seq_out: &mut Out,
+        lat_out: &mut Out,
+    ) -> anyhow::Result<()> {
+        use std::io::Write;
+        let st = self.dids.entry(did.clone()).or_default();
+        let occ_map = if side == Side::Up { &mut st.up_occ } else { &mut st.relay_occ };
+        let occ = occ_map.entry(base.clone()).or_insert(0);
+        let seen_before = *occ > 0;
+        *occ += 1;
+        let occ = *occ;
+        if seen_before && matches!(kind, Kind::Commit | Kind::Sync) {
+            if side == Side::Relay {
+                self.duplicates += 1;
+                self.note("duplicates", format!("{did} {base}"), w.show);
+            }
+            return Ok(());
+        }
+        let key = if matches!(kind, Kind::Commit | Kind::Sync) { base.clone() } else { format!("{base}#{}", occ - 1) };
+        let c = self.counts.entry(kind).or_default();
+        match side {
+            Side::Up => c.up += 1,
+            Side::Relay => c.relay += 1,
+        }
+        let st = self.dids.get_mut(&did).expect("inserted above");
+        let mut regression = None;
+        if side == Side::Relay
+            && let Some(rev) = &rev
+        {
+            if let Some(prev) = &st.relay_last_rev {
+                // a #sync restates the current rev (e.g. on reactivation)
+                if rev < prev || (rev == prev && kind == Kind::Commit) {
+                    regression = Some(format!("{did}: rev {rev} after {prev}"));
+                }
+            }
+            st.relay_last_rev = Some(rev.clone());
+        }
+        let pos = if side == Side::Up {
+            st.up_pos += 1;
+            st.up_pos
+        } else {
+            0
+        };
+        if let Some(r) = regression {
+            self.rev_regressions += 1;
+            self.note("rev regressions", r, w.show);
+        }
+        if side == Side::Relay
+            && let Some(o) = seq_out.as_mut()
+        {
+            writeln!(o, "{seq} {did} {key}")?;
+        }
+        let wk = (did.clone(), key);
+        match self.waiting.remove(&wk) {
+            Some(wt) if wt.side != side => {
+                let (up_at, up_pos) = if side == Side::Up { (at, pos) } else { (wt.at, wt.pos) };
+                let re_at = if side == Side::Up { wt.at } else { at };
+                if up_at >= w.warm_end {
+                    let us = if re_at >= up_at {
+                        re_at.duration_since(up_at).as_micros() as u64
+                    } else {
+                        self.relay_first += 1;
+                        0
+                    };
+                    self.lat.saturating_record(us.max(1));
+                    if let Some(o) = lat_out.as_mut() {
+                        let t = w.start_ms + re_at.max(up_at).duration_since(w.start).as_millis();
+                        writeln!(o, "{t} {:.1}", us as f64 / 1000.0)?;
+                    }
+                    self.lat_kind.entry(kind).or_insert_with(hist).saturating_record(us.max(1));
+                }
+                self.counts.entry(kind).or_default().matched += 1;
+                if side == Side::Relay {
+                    let st = self.dids.get_mut(&did).expect("inserted above");
+                    let bad = st.relay_max_pos.is_some_and(|m| up_pos < m);
+                    st.relay_max_pos = Some(st.relay_max_pos.map_or(up_pos, |m| m.max(up_pos)));
+                    if bad {
+                        self.out_of_order += 1;
+                        self.note("out of order", format!("{did} {}", wk.1), w.show);
+                    }
+                }
+            }
+            Some(wt) => {
+                // the same side again (two relay streams carrying one event)
+                self.waiting.insert(wk, wt);
+            }
+            None => {
+                self.waiting.insert(wk, Waiting { side, at, kind, pos, from: self.cur_from });
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, w: &Window, upstreams: &[String]) {
+        self.prune_held(Instant::now() + HOLD);
+        let waiting = std::mem::take(&mut self.waiting);
+        let ms_at = |at: Instant| w.start_ms + at.duration_since(w.start).as_millis();
+        for ((did, key), wt) in &waiting {
+            let which = match wt.side {
+                Side::Up if wt.at >= w.warm_end && wt.at <= w.collect_end => "missing",
+                Side::Relay if wt.at >= w.warm_end => "extra",
+                _ => continue,
+            };
+            let c = self.counts.entry(wt.kind).or_default();
+            if which == "missing" {
+                c.missing += 1;
+                if self.missing_events.len() < 10_000 {
+                    self.missing_events.push(serde_json::json!({
+                        "upstream": upstreams[wt.from.0], "seq": wt.from.1, "did": did, "key": key,
+                    }));
+                }
+            } else {
+                c.extra += 1;
+            }
+            self.note(which, format!("{did} {key}"), w.show);
+            if wt.kind != Kind::Commit {
+                self.diffs.push(serde_json::json!({
+                    "kind": wt.kind.name(), "what": which, "did": did, "key": key, "at_ms": ms_at(wt.at),
+                }));
+            }
+        }
+        self.diffs.sort_by_key(|d| d["at_ms"].as_u64());
+    }
+
+    fn tot(&self, f: fn(&KindCounts) -> u64) -> u64 {
+        self.counts.values().map(f).sum()
+    }
+
+    fn print(&self, upstreams: usize, duration: u64, settle: u64) {
+        let secs = duration as f64;
+        println!(
+            "e2e_check: {upstreams} upstream(s), {} relay stream(s) [{}], {secs:.0}s + {settle}s settle",
+            self.relays.len(),
+            self.relays.join(" "),
+        );
+        println!("  {:<10} {:>9} {:>9} {:>9} {:>8} {:>8}", "kind", "upstream", "relay", "matched", "missing", "extra");
+        for k in Kind::ALL {
+            let c = self.counts.get(&k).copied().unwrap_or_default();
+            println!("  {:<10} {:>9} {:>9} {:>9} {:>8} {:>8}", k.name(), c.up, c.relay, c.matched, c.missing, c.extra);
+        }
+        println!("  upstream rate {:.0} ev/s, DIDs {}", self.tot(|c| c.up) as f64 / secs, self.dids.len());
+        println!(
+            "  latency upstream->relay: p50 {:.2} ms  p90 {:.2} ms  p99 {:.2} ms  max {:.2} ms  (n={}, relay-first {})",
+            ms(self.lat.value_at_quantile(0.5)),
+            ms(self.lat.value_at_quantile(0.9)),
+            ms(self.lat.value_at_quantile(0.99)),
+            ms(self.lat.max()),
+            self.lat.len(),
+            self.relay_first,
+        );
+        println!(
+            "  out of order per DID {}, rev regressions {}, duplicates {}, seq regressions {}, out of scope {}, bad frames {}",
+            self.out_of_order,
+            self.rev_regressions,
+            self.duplicates,
+            self.seq_regressions,
+            self.out_of_scope,
+            self.bad_frames
+        );
+        let mut keys: Vec<_> = self.examples.keys().copied().collect();
+        keys.sort();
+        for k in keys {
+            println!("  {k}:");
+            for e in &self.examples[k] {
+                println!("    {e}");
+            }
+        }
+    }
+
+    fn json(&self, args: &Args) -> serde_json::Value {
+        let per_kind: serde_json::Map<String, serde_json::Value> = Kind::ALL
+            .iter()
+            .map(|k| {
+                let c = self.counts.get(k).copied().unwrap_or_default();
+                let l = self.lat_kind.get(k);
+                (
+                    k.name().to_string(),
+                    serde_json::json!({
+                        "upstream": c.up, "relay": c.relay, "matched": c.matched, "missing": c.missing, "extra": c.extra,
+                        "p50_ms": l.map(|h| ms(h.value_at_quantile(0.5))), "p99_ms": l.map(|h| ms(h.value_at_quantile(0.99))),
+                    }),
+                )
+            })
+            .collect();
+        let lat = &self.lat;
+        serde_json::json!({
+            "upstreams": args.upstreams, "relays": self.relays, "duration_s": args.duration, "settle_s": args.settle,
+            "kinds": per_kind, "missing": self.tot(|c| c.missing), "extra": self.tot(|c| c.extra),
+            "out_of_order": self.out_of_order, "rev_regressions": self.rev_regressions, "duplicates": self.duplicates,
+            "seq_regressions": self.seq_regressions, "bad_frames": self.bad_frames, "relay_first": self.relay_first,
+            "out_of_scope": self.out_of_scope,
+            "latency_ms": {"p50": ms(lat.value_at_quantile(0.5)), "p90": ms(lat.value_at_quantile(0.9)),
+                           "p99": ms(lat.value_at_quantile(0.99)), "max": ms(lat.max()), "n": lat.len()},
+            "examples": self.examples,
+            "diffs": self.diffs,
+            "missing_events": self.missing_events,
+        })
+    }
+
+    fn failed(&self) -> bool {
+        let commit_extra =
+            self.counts.get(&Kind::Commit).map_or(0, |c| c.extra) + self.counts.get(&Kind::Sync).map_or(0, |c| c.extra);
+        self.tot(|c| c.missing) > 0
+            || commit_extra > 0
+            || self.out_of_order > 0
+            || self.rev_regressions > 0
+            || self.duplicates > 0
+            || self.seq_regressions > 0
+    }
+}
+
 fn hist() -> Histogram<u64> {
     Histogram::new_with_bounds(1, 600_000_000, 3).unwrap()
 }
@@ -384,17 +765,10 @@ fn rustls_provider() {
 /// webpki roots set here rather than through a tungstenite feature: a
 /// feature change would rebuild tungstenite and, behind it, vlpds.
 fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
-    static CFG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> =
-        std::sync::OnceLock::new();
+    static CFG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
     CFG.get_or_init(|| {
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        std::sync::Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        )
+        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        std::sync::Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth())
     })
     .clone()
 }
@@ -403,18 +777,41 @@ fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
 async fn main() -> anyhow::Result<()> {
     rustls_provider();
     let args = Args::parse();
-    let hosted = match args.scope.as_str() {
-        "all" => false,
-        "hosted" | "seen" => true,
-        s => anyhow::bail!("--scope {s}: want all, hosted or seen"),
-    };
-    let mut in_scope: std::collections::HashSet<String> = Default::default();
-    if args.scope == "hosted" {
+    let scope = Scope::parse(&args.scope)?;
+    if args.separate && (args.seq_out.is_some() || args.lat_out.is_some()) {
+        anyhow::bail!("--seq-out and --lat-out take one relay side, not --separate");
+    }
+    if args.relay_scopes.len() > args.relays.len() {
+        anyhow::bail!("more --relay-scope than --relay");
+    }
+    let scope_of =
+        |i: usize| -> anyhow::Result<Scope> { args.relay_scopes.get(i).map_or(Ok(scope), |s| Scope::parse(s)) };
+    let mut listed: std::collections::HashSet<String> = Default::default();
+    let any_hosted = (0..args.relays.len().max(1)).any(|i| scope_of(i).ok() == Some(Scope::Hosted));
+    if any_hosted {
         for u in &args.upstreams {
             let dids = list_repos(&http_origin(u)).await?;
             eprintln!("e2e_check: {} hosts {} repos", http_origin(u), dids.len());
-            in_scope.extend(dids);
+            listed.extend(dids);
         }
+    }
+
+    // cmp_of[relay src] = (comparison, its src index within it)
+    let mut cmps: Vec<Cmp> = Vec::new();
+    let mut cmp_of: Vec<(usize, usize)> = Vec::new();
+    if args.separate {
+        for (i, r) in args.relays.iter().enumerate() {
+            let sc = scope_of(i)?;
+            let seed = if sc == Scope::Hosted { listed.clone() } else { Default::default() };
+            cmps.push(Cmp::new(vec![r.clone()], sc, seed));
+            cmp_of.push((i, 0));
+        }
+    } else {
+        if !args.relay_scopes.is_empty() {
+            anyhow::bail!("--relay-scope needs --separate");
+        }
+        cmps.push(Cmp::new(args.relays.clone(), scope, listed));
+        cmp_of = (0..args.relays.len()).map(|i| (0, i)).collect();
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -432,42 +829,23 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let start = Instant::now();
-    let start_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
-    let warm_end = start + Duration::from_secs(args.warmup);
-    let collect_end = start + Duration::from_secs(args.duration);
-    let end = collect_end
-        + if relay_on {
-            Duration::from_secs(args.settle)
-        } else {
-            Duration::ZERO
-        };
+    let w = Window {
+        start,
+        start_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis(),
+        warm_end: start + Duration::from_secs(args.warmup),
+        collect_end: start + Duration::from_secs(args.duration),
+        show: args.show,
+    };
+    let end = w.collect_end + if relay_on { Duration::from_secs(args.settle) } else { Duration::ZERO };
 
-    let mut dids: HashMap<String, DidState> = HashMap::new();
-    let mut waiting: HashMap<(String, String), Waiting> = HashMap::new();
-    let mut counts: HashMap<Kind, KindCounts> = HashMap::new();
-    let mut lat = hist();
-    let mut lat_kind: HashMap<Kind, Histogram<u64>> = HashMap::new();
-    let mut last_seq: HashMap<(bool, usize), i64> = HashMap::new();
-    let mut seq_regressions = 0u64;
+    let mut up_counts: HashMap<Kind, u64> = HashMap::new();
+    let mut up_dids: std::collections::HashSet<String> = Default::default();
+    let mut up_last_seq: HashMap<usize, i64> = HashMap::new();
     let mut upstream_replays = 0u64;
     let mut upstream_restarts = 0u64;
-    let mut missing_events: Vec<serde_json::Value> = Vec::new();
-    let mut duplicates = 0u64;
-    let mut out_of_order = 0u64;
-    let mut rev_regressions = 0u64;
-    let mut relay_first = 0u64;
-    let mut out_of_scope = 0u64;
-    let mut bad_frames = 0u64;
-    let mut examples: HashMap<&'static str, Vec<String>> = HashMap::new();
-    let mut note = |what: &'static str, s: String, show: usize| {
-        let v = examples.entry(what).or_default();
-        if v.len() < show {
-            v.push(s);
-        }
-    };
+    let mut up_bad_frames = 0u64;
 
-    use std::io::Write;
-    let open = |p: &Option<String>| -> anyhow::Result<Option<std::io::BufWriter<std::fs::File>>> {
+    let open = |p: &Option<String>| -> anyhow::Result<Out> {
         Ok(match p {
             Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)),
             None => None,
@@ -479,321 +857,126 @@ async fn main() -> anyhow::Result<()> {
     tick.tick().await;
     let deadline = tokio::time::sleep_until(end.into());
     tokio::pin!(deadline);
-    let (mut last_up, mut last_relay, mut last_t) = (0u64, 0u64, Instant::now());
+    let (mut last_up, mut last_relay, mut last_t) = (0u64, vec![0u64; cmps.len()], Instant::now());
     loop {
         let msg = tokio::select! {
             _ = &mut deadline => break,
             _ = tick.tick() => {
-                let up: u64 = counts.values().map(|c| c.up).sum();
-                let re: u64 = counts.values().map(|c| c.relay).sum();
+                let up: u64 = up_counts.values().sum();
                 let dt = last_t.elapsed().as_secs_f64();
-                let pending = waiting.values().filter(|w| w.side == Side::Up).count();
-                eprintln!(
-                    "e2e_check: t={:>4.0}s upstream {up} ({:.0}/s) relay {re} ({:.0}/s) awaiting relay {pending} p50 {:.1} ms p99 {:.1} ms",
-                    start.elapsed().as_secs_f64(), (up - last_up) as f64 / dt, (re - last_relay) as f64 / dt,
-                    ms(lat.value_at_quantile(0.5)), ms(lat.value_at_quantile(0.99)),
+                let mut line = format!(
+                    "e2e_check: t={:>4.0}s upstream {up} ({:.0}/s)",
+                    start.elapsed().as_secs_f64(), (up - last_up) as f64 / dt,
                 );
-                (last_up, last_relay, last_t) = (up, re, Instant::now());
+                for (i, c) in cmps.iter().enumerate() {
+                    let re = c.tot(|k| k.relay);
+                    let pending = c.waiting.values().filter(|w| w.side == Side::Up).count();
+                    line.push_str(&format!(
+                        " | relay{} {re} ({:.0}/s) awaiting {pending} p50 {:.1} ms p99 {:.1} ms",
+                        if cmps.len() > 1 { format!(" {}", c.relays.join(",")) } else { String::new() },
+                        (re - last_relay[i]) as f64 / dt,
+                        ms(c.lat.value_at_quantile(0.5)), ms(c.lat.value_at_quantile(0.99)),
+                    ));
+                    last_relay[i] = re;
+                }
+                eprintln!("{line}");
+                (last_up, last_t) = (up, Instant::now());
                 continue;
             }
             m = rx.recv() => match m { Some(m) => m, None => break },
         };
-        let (side, src, did, kind, base, rev, seq, at) = match msg {
-            Msg::Status { side, src, what } => {
-                eprintln!("e2e_check: {}: {what}", name(side, src));
-                continue;
-            }
+        match msg {
             Msg::Restarted { src } => {
                 eprintln!("e2e_check: {}: sequence restarted", name(Side::Up, src));
-                last_seq.remove(&(true, src));
+                up_last_seq.remove(&src);
                 upstream_restarts += 1;
-                continue;
+            }
+            Msg::Status { side, src, what } => {
+                eprintln!("e2e_check: {}: {what}", name(side, src));
             }
             Msg::Other { side, src, what } => {
-                bad_frames += 1;
-                note(
-                    "bad frames",
-                    format!("{}: {what}", name(side, src)),
-                    args.show,
-                );
-                continue;
-            }
-            Msg::Event {
-                side,
-                src,
-                did,
-                kind,
-                base,
-                rev,
-                seq,
-                at,
-            } => (side, src, did, kind, base, rev, seq, at),
-        };
-        if seq > 0 {
-            let k = (side == Side::Up, src);
-            if side == Side::Up
-                && last_seq.get(&k).is_some_and(|&prev| seq <= prev)
-            {
-                // the upstream sent these again (a replay fault): they're
-                // not new events, and the relay shouldn't carry them twice
-                upstream_replays += 1;
-                continue;
-            }
-            if let Some(&prev) = last_seq.get(&k)
-                && seq <= prev
-            {
-                seq_regressions += 1;
-                note(
-                    "seq regressions",
-                    format!("{}: seq {seq} after {prev}", name(side, src)),
-                    args.show,
-                );
-            }
-            last_seq.insert(k, seq);
-        }
-        match side {
-            Side::Up => {
-                if hosted {
-                    in_scope.insert(did.clone());
-                }
-            }
-            Side::Relay => {
-                if hosted && !in_scope.contains(&did) {
-                    out_of_scope += 1;
-                    continue;
-                }
-            }
-        }
-        let st = dids.entry(did.clone()).or_default();
-        let occ_map = if side == Side::Up {
-            &mut st.up_occ
-        } else {
-            &mut st.relay_occ
-        };
-        let occ = occ_map.entry(base.clone()).or_insert(0);
-        let seen_before = *occ > 0;
-        *occ += 1;
-        if seen_before && matches!(kind, Kind::Commit | Kind::Sync) {
-            if side == Side::Relay {
-                duplicates += 1;
-                note("duplicates", format!("{did} {base}"), args.show);
-            }
-            continue;
-        }
-        let key = if matches!(kind, Kind::Commit | Kind::Sync) {
-            base.clone()
-        } else {
-            format!("{base}#{}", *occ - 1)
-        };
-        let c = counts.entry(kind).or_default();
-        match side {
-            Side::Up => c.up += 1,
-            Side::Relay => c.relay += 1,
-        }
-        if side == Side::Relay
-            && let Some(rev) = &rev
-        {
-            if let Some(prev) = &st.relay_last_rev {
-                // a #sync restates the current rev (e.g. on reactivation)
-                if rev < prev || (rev == prev && kind == Kind::Commit) {
-                    rev_regressions += 1;
-                    note(
-                        "rev regressions",
-                        format!("{did}: rev {rev} after {prev}"),
-                        args.show,
-                    );
-                }
-            }
-            st.relay_last_rev = Some(rev.clone());
-        }
-        let pos = if side == Side::Up {
-            st.up_pos += 1;
-            st.up_pos
-        } else {
-            0
-        };
-        if !relay_on {
-            continue;
-        }
-        if side == Side::Relay
-            && let Some(w) = seq_out.as_mut()
-        {
-            writeln!(w, "{seq} {did} {key}")?;
-        }
-        let wk = (did.clone(), key);
-        match waiting.remove(&wk) {
-            Some(w) if w.side != side => {
-                let (up_at, up_pos) = if side == Side::Up {
-                    (at, pos)
-                } else {
-                    (w.at, w.pos)
-                };
-                let re_at = if side == Side::Up { w.at } else { at };
-                if up_at >= warm_end {
-                    let us = if re_at >= up_at {
-                        re_at.duration_since(up_at).as_micros() as u64
-                    } else {
-                        relay_first += 1;
-                        0
-                    };
-                    lat.saturating_record(us.max(1));
-                    if let Some(w) = lat_out.as_mut() {
-                        let t = start_ms + re_at.max(up_at).duration_since(start).as_millis();
-                        writeln!(w, "{t} {:.1}", us as f64 / 1000.0)?;
+                let s = format!("{}: {what}", name(side, src));
+                match side {
+                    Side::Up => {
+                        up_bad_frames += 1;
+                        for c in &mut cmps {
+                            c.bad_frames += 1;
+                            c.note("bad frames", s.clone(), args.show);
+                        }
                     }
-                    lat_kind
-                        .entry(kind)
-                        .or_insert_with(hist)
-                        .saturating_record(us.max(1));
-                }
-                counts.entry(kind).or_default().matched += 1;
-                if side == Side::Relay {
-                    if st.relay_max_pos.is_some_and(|m| up_pos < m) {
-                        out_of_order += 1;
-                        note("out of order", format!("{did} {}", wk.1), args.show);
+                    Side::Relay => {
+                        let c = &mut cmps[cmp_of[src].0];
+                        c.bad_frames += 1;
+                        c.note("bad frames", s, args.show);
                     }
-                    st.relay_max_pos = Some(st.relay_max_pos.map_or(up_pos, |m| m.max(up_pos)));
                 }
             }
-            Some(w) => {
-                // the same side again (two relay streams carrying one event)
-                waiting.insert(wk, w);
-            }
-            None => {
-                waiting.insert(
-                    wk,
-                    Waiting {
-                        side,
-                        at,
-                        kind,
-                        pos,
-                        from: (src, seq),
-                    },
-                );
-            }
-        }
-    }
-
-    for w in [seq_out.as_mut(), lat_out.as_mut()].into_iter().flatten() {
-        w.flush()?;
-    }
-    for ((did, key), w) in &waiting {
-        let c = counts.entry(w.kind).or_default();
-        match w.side {
-            Side::Up if w.at >= warm_end && w.at <= collect_end => {
-                c.missing += 1;
-                note("missing", format!("{did} {key}"), args.show);
-                if missing_events.len() < 10_000 {
-                    missing_events.push(serde_json::json!({
-                        "upstream": args.upstreams[w.from.0], "seq": w.from.1, "did": did, "key": key,
-                    }));
+            Msg::Event { side: Side::Up, src, did, kind, base, seq, at, .. } => {
+                if seq > 0 {
+                    if up_last_seq.get(&src).is_some_and(|&prev| seq <= prev) {
+                        // the upstream sent these again (a replay fault): they're
+                        // not new events, and the relay shouldn't carry them twice
+                        upstream_replays += 1;
+                        continue;
+                    }
+                    up_last_seq.insert(src, seq);
+                }
+                *up_counts.entry(kind).or_default() += 1;
+                up_dids.insert(did.clone());
+                if relay_on {
+                    for c in &mut cmps {
+                        c.on_up(&w, (src, seq), did.clone(), kind, base.clone(), at, &mut seq_out, &mut lat_out)?;
+                    }
                 }
             }
-            Side::Relay if w.at >= warm_end => {
-                c.extra += 1;
-                note("extra", format!("{did} {key}"), args.show);
+            Msg::Event { side: Side::Relay, src, did, kind, base, rev, seq, at } => {
+                let (ci, csrc) = cmp_of[src];
+                cmps[ci].on_relay(&w, csrc, did, kind, base, rev, seq, at, &mut seq_out, &mut lat_out)?;
             }
-            _ => {}
         }
     }
 
-    let tot = |f: fn(&KindCounts) -> u64| counts.values().map(f).sum::<u64>();
-    let (missing, extra) = (tot(|c| c.missing), tot(|c| c.extra));
-    let commit_extra = counts.get(&Kind::Commit).map_or(0, |c| c.extra)
-        + counts.get(&Kind::Sync).map_or(0, |c| c.extra);
-    let secs = args.duration as f64;
-    println!(
-        "e2e_check: {} upstream(s), {} relay stream(s), {secs:.0}s + {}s settle",
-        args.upstreams.len(),
-        args.relays.len(),
-        if relay_on { args.settle } else { 0 }
-    );
-    println!(
-        "  {:<10} {:>9} {:>9} {:>9} {:>8} {:>8}",
-        "kind", "upstream", "relay", "matched", "missing", "extra"
-    );
-    for k in Kind::ALL {
-        let c = counts.get(&k).copied().unwrap_or_default();
-        println!(
-            "  {:<10} {:>9} {:>9} {:>9} {:>8} {:>8}",
-            k.name(),
-            c.up,
-            c.relay,
-            c.matched,
-            c.missing,
-            c.extra
-        );
+    for o in [seq_out.as_mut(), lat_out.as_mut()].into_iter().flatten() {
+        std::io::Write::flush(o)?;
     }
-    println!(
-        "  upstream rate {:.0} ev/s, DIDs {}",
-        tot(|c| c.up) as f64 / secs,
-        dids.len()
-    );
-    if relay_on {
-        println!(
-            "  latency upstream->relay: p50 {:.2} ms  p90 {:.2} ms  p99 {:.2} ms  max {:.2} ms  (n={}, relay-first {relay_first})",
-            ms(lat.value_at_quantile(0.5)),
-            ms(lat.value_at_quantile(0.9)),
-            ms(lat.value_at_quantile(0.99)),
-            ms(lat.max()),
-            lat.len()
-        );
-        println!(
-            "  out of order per DID {out_of_order}, rev regressions {rev_regressions}, duplicates {duplicates}, seq regressions {seq_regressions}, out of scope {out_of_scope}, bad frames {bad_frames}"
-        );
-    } else {
-        println!(
-            "  (no --relay: upstreams only) seq regressions {seq_regressions}, bad frames {bad_frames}"
-        );
-    }
-    let mut keys: Vec<_> = examples.keys().copied().collect();
-    keys.sort();
-    for k in keys {
-        println!("  {k}:");
-        for e in &examples[k] {
-            println!("    {e}");
-        }
-    }
-
-    if let Some(path) = &args.json_out {
-        let per_kind: serde_json::Map<String, serde_json::Value> = Kind::ALL
-            .iter()
-            .map(|k| {
-                let c = counts.get(k).copied().unwrap_or_default();
-                let l = lat_kind.get(k);
-                (
-                    k.name().to_string(),
-                    serde_json::json!({
-                        "upstream": c.up, "relay": c.relay, "matched": c.matched, "missing": c.missing, "extra": c.extra,
-                        "p50_ms": l.map(|h| ms(h.value_at_quantile(0.5))), "p99_ms": l.map(|h| ms(h.value_at_quantile(0.99))),
-                    }),
-                )
-            })
-            .collect();
-        let j = serde_json::json!({
-            "upstreams": args.upstreams, "relays": args.relays, "duration_s": args.duration, "settle_s": args.settle,
-            "kinds": per_kind, "missing": missing, "extra": extra,
-            "out_of_order": out_of_order, "rev_regressions": rev_regressions, "duplicates": duplicates,
-            "seq_regressions": seq_regressions, "bad_frames": bad_frames, "relay_first": relay_first, "out_of_scope": out_of_scope,
-            "latency_ms": {"p50": ms(lat.value_at_quantile(0.5)), "p90": ms(lat.value_at_quantile(0.9)),
-                           "p99": ms(lat.value_at_quantile(0.99)), "max": ms(lat.max()), "n": lat.len()},
-            "examples": examples, "upstream_replays": upstream_replays, "upstream_restarts": upstream_restarts,
-            "missing_events": missing_events,
-        });
-        std::fs::write(path, serde_json::to_vec_pretty(&j)?)?;
-    }
-
-    let failed = relay_on
-        && (missing > 0
-            || commit_extra > 0
-            || out_of_order > 0
-            || rev_regressions > 0
-            || duplicates > 0);
-    let empty = tot(|c| c.up) == 0;
+    let empty = up_counts.values().sum::<u64>() == 0;
     if empty {
         eprintln!("e2e_check: no upstream events at all (is anything writing?)");
     }
-    if (failed || empty || seq_regressions > 0) && !args.report_only {
+    if !relay_on {
+        println!(
+            "e2e_check: {} upstream(s), upstreams only: {} events, DIDs {}, replays {upstream_replays}, restarts {upstream_restarts}, bad frames {up_bad_frames}",
+            args.upstreams.len(),
+            up_counts.values().sum::<u64>(),
+            up_dids.len()
+        );
+        if empty && !args.report_only {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    for c in &mut cmps {
+        c.finish(&w, &args.upstreams);
+        c.print(args.upstreams.len(), args.duration, args.settle);
+    }
+
+    if let Some(path) = &args.json_out {
+        let with_up = |c: &Cmp| {
+            let mut j = c.json(&args);
+            j["upstream_replays"] = upstream_replays.into();
+            j["upstream_restarts"] = upstream_restarts.into();
+            j
+        };
+        let j = if args.separate {
+            serde_json::json!({ "comparisons": cmps.iter().map(with_up).collect::<Vec<_>>() })
+        } else {
+            with_up(&cmps[0])
+        };
+        std::fs::write(path, serde_json::to_vec_pretty(&j)?)?;
+    }
+
+    let failed = cmps.iter().any(Cmp::failed);
+    if (failed || empty) && !args.report_only {
         std::process::exit(1);
     }
     Ok(())

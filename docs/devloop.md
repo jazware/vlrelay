@@ -171,9 +171,9 @@ Results (Mac, dev build, the ports above, `--duration 80`, about 110 s end to en
 
 ### Against real PDSes
 
-`scripts/prodcmp.sh [SECONDS]` runs vlRelay locally (`--memory`, 127.0.0.1) against the same three PDSes the reference work used (amanita, eurosky.social, blacksky.app), with plain `--host` and no requestCrawl. It runs two checkers over the same window, one against vlRelay and one against `wss://bsky.network`, so both latencies are measured under the same conditions.
+`scripts/prodcmp.sh [SECONDS]` runs vlRelay locally (`--memory`, 127.0.0.1) against the same three PDSes the reference work used (amanita, eurosky.social, blacksky.app), with plain `--host` and no requestCrawl. It runs one checker with `--separate`, which compares vlRelay and `wss://bsky.network` with the PDSes each on its own, over the same PDS sockets, so both latencies are measured against the same arrivals and each PDS gets one socket from the checker.
 
-Use `--scope all` for vlRelay, since it carries only those hosts, and `--scope seen` for production. With `seen`, an event that reaches the relay stream before the checker's own PDS socket has named the DID is counted out of scope, and then counted missing when the PDS copy arrives. vlRelay beats the checker's PDS sockets often enough (~1,250 relay-first events in 10 minutes) that the first run reported 221 commits missing that vlRelay had in fact emitted.
+Use `--scope all` for vlRelay (`--relay-scope`, in `--relay` order), since it carries only those hosts, and `--scope seen` for production. With `seen`, a relay event for a DID the checker's PDS sockets haven't named yet is held for up to 60 s and matched once they do. Before that hold, such an event counted out of scope and its PDS copy then counted missing: vlRelay beats the checker's PDS sockets often enough (~1,250 relay-first events in 10 minutes) that the first run reported 221 commits missing that vlRelay had in fact emitted, and the production column below still carries ~60 of these per 10 minutes.
 
 10 minutes, 2026-10-04 ~10:33Z, ~14 events/s, 1,938 DIDs:
 

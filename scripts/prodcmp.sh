@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Read-only comparison with production (docs/devloop.md "Against real PDSes"):
-# vlRelay (--memory, local) subscribes to a few real PDSes, and two checkers
-# run side by side over the same window, one against vlRelay and one against
-# the production relay, so the two latencies share every condition.
+# vlRelay (--memory, local) subscribes to a few real PDSes, and one checker
+# compares both vlRelay and the production relay with the same PDS sockets
+# (e2e_check --separate), so the two latencies share every condition.
 #
 #   scripts/prodcmp.sh [DURATION_S] [OUT_DIR]
 #
@@ -32,15 +32,14 @@ for _ in $(seq 1 100); do
   sleep 0.2
 done
 # the first minute fills the DID cache: every account is new to vlRelay
-# vlRelay carries only these hosts, so every event of its stream is in scope;
-# --scope seen would drop a DID's events that reach vlRelay's stream before
-# the checker's own PDS socket names the DID, and count them missing
-common="--warmup ${WARMUP:-60} --duration $duration --settle 20 --report-only"
-"$target/e2e_check" $up_flags --relay "http://127.0.0.1:$port" --scope all $common --json-out "$out/vlrelay.json" >"$out/vlrelay.txt" 2>"$out/vlrelay.log" &
-a=$!
-"$target/e2e_check" $up_flags --relay wss://bsky.network --scope seen $common --json-out "$out/prod.json" >"$out/prod.txt" 2>"$out/prod.log" &
-b=$!
-wait $a $b || true
+# One checker, so each PDS gets one socket from it and both relays are
+# measured against the same upstream arrivals. vlRelay carries only these
+# hosts, so every event of its stream is in scope; production needs --scope
+# seen (relay-first events are held until the PDS names the DID).
+"$target/e2e_check" $up_flags --separate \
+  --relay "http://127.0.0.1:$port" --relay-scope all \
+  --relay wss://bsky.network --relay-scope seen \
+  --warmup "${WARMUP:-60}" --duration "$duration" --settle 20 --report-only --show 20 \
+  --json-out "$out/cmp.json" >"$out/cmp.txt" 2>"$out/cmp.log" || true
 curl -sf "http://127.0.0.1:$port/metrics" | grep '^vlrelay_' >"$out/metrics.txt" || true
-echo "== vlRelay"; cat "$out/vlrelay.txt"
-echo "== production (bsky.network)"; cat "$out/prod.txt"
+cat "$out/cmp.txt"
