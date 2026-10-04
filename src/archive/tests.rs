@@ -172,7 +172,7 @@ async fn live_commits_apply_to_the_stored_tree() {
     st.commit(&tickets).await.unwrap();
     assert_eq!(a.stats.mismatches.load(Relaxed), 0);
     assert_eq!(a.stats.applied.load(Relaxed), 60);
-    assert_eq!(st.shard_for(&did).unwrap().mirror.len(), (0, 0), "trees dropped once committed");
+    assert_eq!(st.shard_for(&did).unwrap().mirror.len().1, 0, "every ticket's rows written");
     assert_mirror(&st, &mut acct).await;
 }
 
@@ -596,10 +596,16 @@ async fn bench_archival() {
     for acct in &accts {
         id_off.set(&acct.repo.did, "pds.a", 1);
     }
-    for (label, s) in [("off", &off), ("on", &st)] {
+    // the commits go round the accounts, so "cold" (no idle trees kept)
+    // reopens every tree and "warm" finds each one kept from its last commit
+    let half = evs.len() / 2;
+    let runs: [(&str, &Arc<StateStore>, &[_], usize); 3] =
+        [("off", &off, &evs[..], 4096), ("on, cold", &st, &evs[..half], 0), ("on, warm", &st, &evs[half..], 4096)];
+    for (label, s, evs, idle) in runs {
+        mirror::IDLE_TREES.store(idle, Relaxed);
         let (t0, c0) = (std::time::Instant::now(), cpu_us());
         let mut tickets = Vec::new();
-        for (did, f, c) in &evs {
+        for (did, f, c) in evs {
             tickets.push(apply(s, did, f, *c).await);
             if tickets.len() == 64 {
                 s.commit(&std::mem::take(&mut tickets)).await.unwrap();

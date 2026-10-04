@@ -132,7 +132,15 @@ struct Slot {
     tree: Option<LazyTree>,
     /// Applied commits whose rows aren't written yet.
     outstanding: u32,
+    used: u64,
 }
+
+/// Trees with nothing outstanding kept per shard, so an active account's
+/// next commit doesn't reopen its tree from the DB (most of the apply cost).
+pub static IDLE_TREES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4096);
+/// Loaded levels an idle tree keeps: the top of the tree is shared by every
+/// path, the rest is one commit's paths.
+const IDLE_DEPTH: usize = 3;
 
 /// The shard's in-memory side of its mirrors: the trees of repos with
 /// uncommitted commits (so the next commit builds on them), and each
@@ -140,6 +148,7 @@ struct Slot {
 #[derive(Default)]
 pub struct ShardMirror {
     slots: Mutex<HashMap<Arc<str>, Slot>>,
+    tick: std::sync::atomic::AtomicU64,
     by_ticket: Mutex<HashMap<u64, (Arc<str>, Vec<Mutation>)>>,
 }
 
@@ -155,17 +164,36 @@ impl ShardMirror {
     /// Puts the tree back after an apply; `added` counts one more
     /// uncommitted commit.
     fn finish(&self, did: &str, generation: u64, head: HeadLite, tree: Option<LazyTree>, added: bool) {
+        let used = self.tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut m = self.slots.lock();
-        let s = m.entry(Arc::from(did)).or_insert(Slot { generation, head, tree: None, outstanding: 0 });
+        let s = m.entry(Arc::from(did)).or_insert(Slot { generation, head, tree: None, outstanding: 0, used });
         s.generation = generation;
         s.head = head;
         s.tree = tree;
+        s.used = used;
         if added {
             s.outstanding += 1;
         }
-        if s.outstanding == 0 {
+        if s.outstanding == 0 && s.tree.is_none() {
             m.remove(did);
         }
+        Self::trim(&mut m);
+    }
+
+    /// Evicts the least recently used idle trees past [`IDLE_TREES`], down
+    /// to three quarters of it so the scan is rare.
+    fn trim(m: &mut HashMap<Arc<str>, Slot>) {
+        let cap = IDLE_TREES.load(std::sync::atomic::Ordering::Relaxed);
+        let idle = |s: &Slot| s.outstanding == 0 && s.tree.is_some();
+        if m.values().filter(|s| idle(s)).count() <= cap {
+            return;
+        }
+        let mut ages: Vec<u64> = m.values().filter(|s| idle(s)).map(|s| s.used).collect();
+        ages.sort_unstable();
+        let keep = cap * 3 / 4;
+        let cut = ages.len().saturating_sub(keep);
+        let below = if cut == 0 { 0 } else { ages[cut - 1] + 1 };
+        m.retain(|_, s| !idle(s) || s.used >= below);
     }
 
     pub fn attach(&self, ticket: u64, did: &str, rows: Vec<Mutation>) {
@@ -181,10 +209,13 @@ impl ShardMirror {
         let mut m = self.slots.lock();
         if let Some(s) = m.get_mut(did) {
             s.outstanding = s.outstanding.saturating_sub(1);
-            if s.outstanding == 0 && s.tree.is_some() {
-                m.remove(did);
+            if s.outstanding == 0
+                && let Some(t) = s.tree.as_mut()
+            {
+                t.unload(IDLE_DEPTH);
             }
         }
+        Self::trim(&mut m);
     }
 
     pub fn outstanding(&self, did: &str) -> u32 {

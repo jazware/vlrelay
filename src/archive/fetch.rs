@@ -515,7 +515,9 @@ pub async fn import<C: Chain>(a: &Archive, state: &StateStore<C>, did: &str, f: 
         a.queue.finish(did);
     }
     drop(g);
-    s.flush_memtable().await?;
+    // no flush of its own: an SST per import piles up L0 files every read
+    // then checks. A crash before the shard's next checkpoint loses the
+    // rows and the switch together, and the next commit fetches again.
     if !meta.garbage.is_empty() {
         let (s2, d2) = (s.clone(), did.to_string());
         tokio::spawn(async move {
