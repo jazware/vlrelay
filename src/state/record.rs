@@ -135,6 +135,13 @@ pub fn applied_key(log_id: &str) -> Vec<u8> {
 /// A host by the first 8 bytes of sha256(hostname): fixed width in every
 /// record, and nothing to allocate or coordinate across shards. Names come
 /// back from host records.
+///
+/// Host authority compares these, so a hostname whose key equals a real
+/// PDS's would pass as it. 64 bits holds: matching one given host is a
+/// second preimage, ~2^64 hashes, and the ~2^32 birthday collision only
+/// pairs two names the attacker chose, which gains nothing. Widen it if
+/// that margin stops being enough (the record format may change freely
+/// until vlRelay ships).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HostKey(pub u64);
 
