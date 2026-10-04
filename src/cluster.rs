@@ -696,10 +696,20 @@ impl ClusterNode {
     async fn step_down(self: &Arc<Self>, bound: Duration, why: &str) {
         STEP_DOWNS.inc();
         tracing::error!(addr = %self.opts.addr, "{why} for a TTL: handing our shards over and stepping down");
-        match tokio::time::timeout(bound, self.shutdown()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!("stepping down: leave failed: {e:#}"),
-            Err(_) => tracing::warn!("stepping down: leave timed out"),
+        let left = match tokio::time::timeout(bound, self.shutdown()).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                tracing::warn!("stepping down: leave failed: {e:#}");
+                false
+            }
+            Err(_) => {
+                tracing::warn!("stepping down: leave timed out");
+                false
+            }
+        };
+        // peers then take over without waiting out our lease
+        if !left && let Some(c) = &self.cluster {
+            self.peers_fence(&c.log_id).await;
         }
         self.lost_now(&format!("{why}: stepped down"));
     }
@@ -972,9 +982,13 @@ async fn reach_loop(me: Weak<ClusterNode>) {
         if age < slow / 2 || !c.joined() {
             slow_since = None;
         } else if age > slow {
-            let ages = n.followers.watermark_ages();
-            let keeping_up = ages.iter().filter(|a| **a < slow * 2).count();
-            if keeping_up * 2 > ages.len() {
+            // An outlier only: under a bucket slow for everyone our appends
+            // wait as long as everyone's (minio-latency's 100-500 ms made a
+            // core step down when it was compared with a fixed bound).
+            let mut ages = n.followers.watermark_ages();
+            ages.sort();
+            let peers = ages.get(ages.len() / 2).copied();
+            if peers.is_some_and(|p| age > p * OUTLIER) {
                 let since = *slow_since.get_or_insert_with(Instant::now);
                 tracing::warn!(
                     pending_ms = age.as_millis() as u64,
@@ -985,6 +999,8 @@ async fn reach_loop(me: Weak<ClusterNode>) {
                     n.step_down(window, "our log is slow to land (our bucket path?)").await;
                     return;
                 }
+            } else {
+                slow_since = None;
             }
         }
         let probed = Instant::now();
@@ -1006,6 +1022,10 @@ async fn reach_loop(me: Weak<ClusterNode>) {
         return;
     }
 }
+
+/// How many times the median peer log's watermark age our oldest pending
+/// append must be for our log to count as the slow one.
+const OUTLIER: u32 = 4;
 
 static STEP_DOWNS: std::sync::LazyLock<prometheus::IntCounter> = std::sync::LazyLock::new(|| {
     prometheus::register_int_counter!(
