@@ -4242,6 +4242,7 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "mime_guess",
  "parking_lot",
  "serde",
  "serde_json",
