@@ -1,0 +1,71 @@
+# One vlRelay node on a local MinIO (docs/operations/deploy.md).
+#
+#   cd deploy/single
+#   UPSTREAM=morel.us-east.host.bsky.network VLRELAY_ADMIN_TOKEN=$(openssl rand -hex 16) docker compose up -d --build
+#
+# The firehose is ws://127.0.0.1:2980/xrpc/com.atproto.sync.subscribeRepos and
+# the dashboard is http://127.0.0.1:2980/admin (user admin, the token).
+# Everything the relay keeps is in the bucket: `docker compose down` and `up`
+# again resumes every host from its cursor, and `down -v` wipes it.
+name: vlrelay-single
+
+services:
+  minio:
+    # MinIO no longer publishes images, so this builds the server from source
+    # (shared with vlpds's dev setup)
+    build:
+      context: ../../../vlpds/build
+      dockerfile: Dockerfile.minio
+    image: vlpds-minio:local
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      retries: 30
+
+  minio-init:
+    image: vlpds-minio:local
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-minioadmin} >/dev/null
+      && mc mb -p local/vlrelay >/dev/null && echo bucket vlrelay ready"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+
+  vlrelay:
+    build:
+      context: ../../..
+      dockerfile: vlrelay/Dockerfile
+    image: ${VLRELAY_IMAGE:-vlrelay:local}
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    environment:
+      VLRELAY_S3_ENDPOINT: http://minio:9000
+      VLRELAY_S3_BUCKET: vlrelay
+      VLRELAY_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      VLRELAY_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      VLRELAY_ADMIN_TOKEN: ${VLRELAY_ADMIN_TOKEN:?set VLRELAY_ADMIN_TOKEN (the dashboard password)}
+    command:
+      - --host
+      - ${UPSTREAM:?set UPSTREAM to a PDS hostname to subscribe to}
+      - --crawl
+    ports:
+      - "${PUBLISH_ADDR:-127.0.0.1}:2980:2980"
+    ulimits:
+      nofile: 1048576
+    stop_grace_period: 30s
+
+volumes:
+  minio-data:

@@ -1,0 +1,2 @@
+# certs.sh output: the CA key and every node key
+pki/
