@@ -25,7 +25,7 @@ They match indigo's relay where the reference notes give a number.
 
 | Setting | Default | indigo |
 |---|---|---|
-| Accounts per host (`tiers.default.maxAccounts`), every account the host serves | 100 | `--default-account-limit` 100 |
+| Accounts per host (`tiers.default.maxAccounts`), every account the host serves | 1,000 (higher than indigo's, so mid-sized PDSes aren't throttled on day one) | `--default-account-limit` 100 |
 | Accounts per trusted host | 10,000,000 | `TrustedRepoLimit` |
 | Newly created accounts per host (`tiers.*.newAccountsPerHour`) | 100 (`default`), 25 (`new`), 10 (`throttled`), none (`trusted`) | none |
 | Newly created accounts per cluster (`cluster.newAccountsPerMin`) | 6,000 | none |
@@ -80,7 +80,7 @@ The state host record. The policy engine writes it (operator actions through `Po
 
 - Accounts go through `state::AccountGate` after their host checks out. The gate tells a **newly created** account from one that's only **first seen**. A relay that starts cold sees all ~56M established accounts for the first time, and none of them is new.
   - Newly created means the event is the repo's first commit: a `#commit` with no `since`, and no `prevData` or the empty tree's (`verify::Verified::created`, carried to a remote DID owner in the forward's meta flags). A PDS usually announces a new account with `#identity` and `#account` first. So the gate is asked again at a known account's first commit (`Arrival::FirstCommit`), as well as when an unknown DID shows up (`FirstSeen` or `Created`).
-  - Every account counts toward its host's cap (`maxAccounts`, indigo's per-host account limit). Past it the account is created throttled (`relay_throttled`, status `throttled`): its commits are dropped, an upstream `#account` doesn't lift it, and an operator's untakedown does. The cap counts the record's `account_count` plus the accounts admitted since the last sync, so it can lag by one counter flush (5 s), never overcount. Bluesky's PDSes (`*.host.bsky.network`) are trusted, at 10M each, well above the ~0.5-1M accounts a mushroom holds. An untrusted PDS is held to 100, as in indigo.
+  - Every account counts toward its host's cap (`maxAccounts`, indigo's per-host account limit). Past it the account is created throttled (`relay_throttled`, status `throttled`): its commits are dropped, an upstream `#account` doesn't lift it, and an operator's untakedown does. The cap counts the record's `account_count` plus the accounts admitted since the last sync, so it can lag by one counter flush (5 s), never overcount. Bluesky's PDSes (`*.host.bsky.network`) are trusted, at 10M each, well above the ~0.5-1M accounts a mushroom holds. An untrusted PDS is held to 1,000 by default (indigo uses 100). Raise well-known PDSes per host when deploying.
   - Only newly created accounts spend the host's `newAccountsPerHour` and the cluster's `NewAccountsPerMin` budget, and only they are `NewAccount` signals. The signal is recorded once per creation, deferred or not, so a farm trips `hostNewAccounts` at the rate it creates accounts. Past a rate the event is dropped (`new_account_deferred`) and the DID is remembered for an hour (100k at most), so its later events, which no longer look like a creation, wait for the budget too.
   - First-seen accounts aren't deferred. Each costs a DID lookup, which the PLC budget paces (below).
   - Creation can be faked: a farm can send a first commit with a made-up `since` and `prevData`, and the relay holds no earlier state to check them against. The host's account cap still applies, and that's 100 for an untrusted host. Checking the DID's PLC creation op would catch it, but that's an audit-log fetch per unknown DID (56M on a cold start), so it isn't done.
@@ -153,7 +153,7 @@ Each request needs a window to carry it, about rate × 0.64 s of them, so 4 wind
 
 ## Big independent PDSes and the account cap
 
-The default tier holds a host to 100 accounts, as indigo does. On a relay that has just started, or
+The default tier holds a host to 1,000 accounts (indigo holds it to 100). On a relay that has just started, or
 has just added a host, every active account is one the relay hasn't seen, so a real PDS reaches the
 cap within minutes: on the [shadow run](shadow.md) eurosky.social (36k accounts), blacksky.app
 (42k) and atproto.brid.gy (65k) were each past 100 in the first ten minutes, and 3,508 of their

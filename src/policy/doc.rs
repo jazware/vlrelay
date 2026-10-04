@@ -36,7 +36,7 @@ pub struct TierLimits {
 
 impl Default for TierLimits {
     fn default() -> Self {
-        TierLimits::untrusted(100)
+        TierLimits::untrusted(1000)
     }
 }
 
@@ -105,10 +105,10 @@ impl Default for Tiers {
     fn default() -> Self {
         Tiers {
             trusted: TierLimits::trusted(),
-            default: TierLimits::untrusted(100),
+            default: TierLimits::untrusted(1000),
             new: TierLimits {
                 new_accounts_per_hour: 25,
-                ..TierLimits::untrusted(100)
+                ..TierLimits::untrusted(1000)
             },
             throttled: TierLimits::throttled(),
         }

@@ -601,6 +601,7 @@ mod tests {
         edit_policy(&hooks, |p| {
             p.tiers.default.max_accounts = 2;
             p.tiers.new.new_accounts_per_hour = 1;
+            p.tiers.new.max_accounts = 100;
         })
         .await;
         add_host(&state, "capped.example", Tier::Default).await;
@@ -825,7 +826,7 @@ mod tests {
         hooks.load().await.unwrap();
         let a = hp(&hooks, "a.example");
         assert_eq!((a.tier, a.connect), (upstream::Tier::Default, true));
-        assert_eq!(a.limits.unwrap().events_per_hour, 2_600.0);
+        assert_eq!(a.limits.unwrap().events_per_hour, 3_500.0);
 
         // an operator throttle caps events/s; a ban disconnects
         hooks.admin.host_action("a.example", HostAction::Throttle { events_per_sec: Some(2.0) }, "op").await.unwrap();

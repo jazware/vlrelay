@@ -288,7 +288,7 @@ async fn audit_log_lists_every_changed_leaf() {
     // the first save diffs against the defaults
     assert_eq!(
         audit[1].changes,
-        vec!["tiers.default.eventsPerSec: 50.1 → 80.0".to_string()]
+        vec!["tiers.default.eventsPerSec: 51.0 → 80.0".to_string()]
     );
     assert_eq!(
         audit[0].changes,
@@ -491,16 +491,16 @@ async fn for_host_and_admission_apply_rules_and_budgets() {
     let l = e.for_host(&rec("x.slow.example", Tier::Default, 0));
     assert_eq!(l.limits.unwrap().events_per_sec, 2.0);
     let mut r = rec("plain.example", Tier::Default, 0);
-    assert_eq!(e.for_host(&r).limits.unwrap().events_per_sec, 50.1);
+    assert_eq!(e.for_host(&r).limits.unwrap().events_per_sec, 51.0);
     tiers::apply_manual(&mut r, &Manual::Throttle(Some(1.5)), 0).unwrap();
     assert_eq!(e.for_host(&r).limits.unwrap().events_per_sec, 1.5);
     // an operator's account cap replaces the tier's (indigo's per-host repo_limit)
-    assert_eq!(e.for_host(&r).limits.unwrap().max_accounts, 100);
+    assert_eq!(e.for_host(&r).limits.unwrap().max_accounts, 1000);
     tiers::apply_manual(&mut r, &Manual::AccountLimit(Some(50_000)), 0).unwrap();
     let l = e.for_host(&r).limits.unwrap();
     assert_eq!((l.max_accounts, l.events_per_sec), (50_000, 1.5));
     tiers::apply_manual(&mut r, &Manual::AccountLimit(None), 0).unwrap();
-    assert_eq!(e.for_host(&r).limits.unwrap().max_accounts, 100);
+    assert_eq!(e.for_host(&r).limits.unwrap().max_accounts, 1000);
     assert!(!e.for_host(&rec("s.example", Tier::Suspended, 0)).connect);
 
     let admit = |h: &'static str, by_admin| {
@@ -649,7 +649,7 @@ async fn peers_hot_reload_policy_and_rules() {
     a.save_policy(0, body, "t", "").await.unwrap();
     let r = rec("x.example", Tier::New, 0);
     assert_eq!(a.for_host(&r).limits.unwrap().max_accounts, 7);
-    assert_eq!(b.for_host(&r).limits.unwrap().max_accounts, 100);
+    assert_eq!(b.for_host(&r).limits.unwrap().max_accounts, 1000);
     assert!(b.refresh().await.unwrap());
     assert_eq!(b.for_host(&r).limits.unwrap().max_accounts, 7);
     assert!(!b.refresh().await.unwrap(), "304 until the next change");
@@ -1040,7 +1040,7 @@ async fn policy_admin_maps_the_wire_types() {
     assert!(
         audit[0]
             .changes
-            .contains(&"tiers.default.eventsPerSec: 50.1 → 75.0".to_string()),
+            .contains(&"tiers.default.eventsPerSec: 51.0 → 75.0".to_string()),
         "{:?}",
         audit[0].changes
     );
