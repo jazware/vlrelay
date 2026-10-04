@@ -20,7 +20,7 @@
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use hdrhistogram::Histogram;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -857,6 +857,7 @@ async fn main() -> anyhow::Result<()> {
     let mut up_last_seq: HashMap<usize, i64> = HashMap::new();
     let mut upstream_replays = 0u64;
     let mut upstream_restarts = 0u64;
+    let mut up_commits: HashSet<(String, String)> = HashSet::new();
     let mut up_bad_frames = 0u64;
 
     let open = |p: &Option<String>| -> anyhow::Result<Out> {
@@ -926,7 +927,20 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             Msg::Event { side: Side::Up, src, did, kind, base, seq, at, .. } => {
+                let commit = matches!(kind, Kind::Commit | Kind::Sync);
                 if seq > 0 {
+                    // A commit this upstream never sent, far below its last
+                    // seq: its sequence restarted under a socket that never got
+                    // FutureCursor (it reconnected past the new head). A replay
+                    // fault goes back a few dozen frames, to commits already seen.
+                    if commit
+                        && up_last_seq.get(&src).is_some_and(|&prev| seq.saturating_mul(2) < prev)
+                        && !up_commits.contains(&(did.clone(), base.clone()))
+                    {
+                        eprintln!("e2e_check: {}: sequence restarted (seq {seq} is a new commit)", name(Side::Up, src));
+                        up_last_seq.remove(&src);
+                        upstream_restarts += 1;
+                    }
                     if up_last_seq.get(&src).is_some_and(|&prev| seq <= prev) {
                         // the upstream sent these again (a replay fault): they're
                         // not new events, and the relay shouldn't carry them twice
@@ -934,6 +948,9 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     up_last_seq.insert(src, seq);
+                }
+                if commit {
+                    up_commits.insert((did.clone(), base.clone()));
                 }
                 *up_counts.entry(kind).or_default() += 1;
                 up_dids.insert(did.clone());
