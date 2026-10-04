@@ -88,15 +88,35 @@ impl DidStage for LogStage {
 struct FakeHosts {
     acked: Mutex<HashMap<Host, i64>>,
     released: Mutex<Vec<Host>>,
+    /// Sockets open, as `follow` (the manager's filter-follower) leaves them.
+    running: Mutex<BTreeSet<Host>>,
+}
+
+impl FakeHosts {
+    /// Stops the hosts each published filter drops, as
+    /// `upstream::Manager::follow_filter` does, racing `release`.
+    fn follow(self: &Arc<Self>, mut rx: watch::Receiver<HostFilter>) {
+        let me = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let f = rx.borrow_and_update().clone();
+                let Some(me) = me.upgrade() else { return };
+                me.running.lock().retain(|h| f(h));
+            }
+        });
+    }
 }
 
 #[async_trait::async_trait]
 impl HostHandler for FakeHosts {
-    async fn release(&self, keep: HostFilter) -> Vec<(Host, i64)> {
+    async fn release(&self, give: HostFilter) -> Vec<(Host, i64)> {
+        // the follower has stopped them by now
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.running.lock().retain(|h| !give(h));
         let acked = self.acked.lock().clone();
         let mut out = Vec::new();
         for (h, s) in acked {
-            if !keep(&h) {
+            if give(&h) {
                 self.released.lock().push(h.clone());
                 out.push((h, s));
             }
@@ -432,7 +452,9 @@ async fn a_planned_handoff_checkpoints_and_pauses_under_a_second() {
     let c_hosts: Vec<Host> = (0..50).map(|i| Host(format!("h{i}.test"))).filter(|h| c.node.owns_host(h)).collect();
     for (i, h) in c_hosts.iter().enumerate() {
         c.hosts.acked.lock().insert(h.clone(), 5000 + i as i64);
+        c.hosts.running.lock().insert(h.clone());
     }
+    c.hosts.follow(c.node.host_filter().unwrap());
     // steady traffic through a survivor while c leaves
     let stop = Arc::new(AtomicBool::new(false));
     let load = {
@@ -478,7 +500,9 @@ async fn a_planned_handoff_checkpoints_and_pauses_under_a_second() {
     let pause = arrivals.windows(2).map(|w| w[1].0 - w[0].0).max().unwrap();
     eprintln!("planned handoff: shards moved in {moved:?}, longest pause {pause:?}");
     assert!(pause < Duration::from_secs(1), "longest pause {pause:?}");
-    // c closed its sockets and checkpointed their cursors before handing over
+    // c closed its sockets and checkpointed their cursors before handing
+    // over, every one of them, though its filter-follower stopped them first
+    assert!(c.hosts.running.lock().is_empty());
     let released: BTreeSet<Host> = c.hosts.released.lock().iter().cloned().collect();
     assert_eq!(released, c_hosts.iter().cloned().collect());
     for (i, h) in c_hosts.iter().enumerate() {

@@ -343,6 +343,11 @@ impl Manager {
         Ok(dropped)
     }
 
+    /// The filter last applied, if any.
+    pub fn filter(&self) -> Option<HostFilter> {
+        self.filter.lock().clone()
+    }
+
     /// Applies every filter `rx` publishes until the manager is dropped.
     pub fn follow_filter(self: &Arc<Self>, mut rx: tokio::sync::watch::Receiver<HostFilter>) {
         let me = Arc::downgrade(self);

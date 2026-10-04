@@ -204,7 +204,7 @@ mgr.start().await?;
 
 `Manager::set_filter` stops the sockets of hosts that left, flushes the registry, reloads it (for hosts another node admitted) and connects the ones that arrived. `node.host_watch()` carries the same thing as `HostOwnership` if something else wants it.
 
-`set_host_handler` takes a `HostHandler`. Its `release(keep)` is what makes a planned handoff graceful: call `mgr.set_filter(keep)`, then return the acked cursor of each host it stopped. `acked()` returns the acked cursor of every subscribed host, and the cluster writes them to `hostck/{shard}` every `checkpoint_every`. A crash takeover resumes from there and the PDS replays the rest.
+`set_host_handler` takes a `HostHandler`. Its `release(give)` is what makes a planned handoff graceful: stop every host `give` passes (the hosts of the shards being handed over), let their in-flight events land, fence them, and return each one's acked cursor. It acts on the hosts `give` names, not on whatever `mgr.set_filter` finds still running: the narrower filter is published first, and `follow_filter` may already have stopped them, which once made a SIGTERM handoff skip the drain, the fence and the final `hostck/` write. `acked()` returns the acked cursor of every subscribed host, and the cluster writes them to `hostck/{shard}` every `checkpoint_every`. A crash takeover resumes from there and the PDS replays the rest.
 
 The upstream `HostStore` (the registry rows) has to be shared by all nodes, so `listHosts` and admission see every host. That isn't the cluster's: it's whatever node.rs gives the manager. Cursors no longer depend on it.
 

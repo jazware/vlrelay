@@ -81,9 +81,12 @@ pub struct Member {
 /// What the cluster asks of the upstream side when host shards move.
 #[async_trait::async_trait]
 pub trait HostHandler: Send + Sync + 'static {
-    /// Stops subscribing to every host `keep` rejects. Returns the acked
-    /// cursor of each host it stopped.
-    async fn release(&self, keep: HostFilter) -> Vec<(Host, i64)>;
+    /// Stops subscribing to every host `give` passes (the hosts of the
+    /// shards being handed over), lets their in-flight events land, and
+    /// returns each one's acked cursor. Acts on the hosts `give` names, not
+    /// on the ones it finds subscribed: the narrower filter is already
+    /// published, and the manager following it may have stopped some first.
+    async fn release(&self, give: HostFilter) -> Vec<(Host, i64)>;
     /// The acked cursor of every host this node subscribes to.
     fn acked(&self) -> Vec<(Host, i64)>;
 }
@@ -670,8 +673,12 @@ impl HostShards {
         self.publish();
         let handler = self.handler.read().clone();
         if let Some(h) = handler {
-            let keep = self.ownership().filter();
-            let stopped = h.release(keep).await;
+            let give: HostFilter = {
+                let (layout, giving) = (self.layout.clone(), giving.clone());
+                Arc::new(move |h: &Host| giving.contains(&layout.shard_of(&h.0)))
+            };
+            let stopped = h.release(give).await;
+
             let mut by: HashMap<ShardId, Vec<(Host, i64)>> = HashMap::new();
             for (host, seq) in stopped {
                 by.entry(self.layout.shard_of(&host.0)).or_default().push((host, seq));

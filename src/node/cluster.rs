@@ -1503,17 +1503,23 @@ struct Upstreams {
 
 #[async_trait::async_trait]
 impl HostHandler for Upstreams {
-    async fn release(&self, keep: HostFilter) -> Vec<(Host, i64)> {
+    async fn release(&self, give: HostFilter) -> Vec<(Host, i64)> {
         let Some(node) = self.node.upgrade() else {
             return Vec::new();
         };
-        let stopped = match node.manager.set_filter(keep).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("releasing hosts failed: {e:#}");
-                return Vec::new();
-            }
+        // The manager's filter-follower may have stopped these hosts already
+        // (the narrower filter is published first), so the set comes from
+        // `give`, not from what this call finds still running.
+        let current = node.manager.filter();
+        let keep: HostFilter = {
+            let give = give.clone();
+            Arc::new(move |h: &Host| !give(h) && current.as_ref().is_none_or(|f| f(h)))
         };
+        if let Err(e) = node.manager.set_filter(keep).await {
+            tracing::warn!("releasing hosts failed: {e:#}");
+        }
+        let stopped: Vec<Host> =
+            node.manager.hosts().into_iter().map(|v| Host(v.record.hostname)).filter(|h| give(h)).collect();
         // what's still in the pipeline lands before the cursor is handed
         // over, so the next owner doesn't get it again
         let deadline = Instant::now() + Duration::from_secs(5);
