@@ -67,11 +67,14 @@ pub enum RejectReason {
     TooLarge,
     RateLimited,
     Takendown,
+    /// The account isn't active on this relay: deactivated, suspended,
+    /// throttled by policy, deleted or taken down.
+    Inactive,
     Malformed,
 }
 
 impl RejectReason {
-    pub const ALL: [RejectReason; 10] = [
+    pub const ALL: [RejectReason; 11] = [
         Self::BadSignature,
         Self::InvalidCommit,
         Self::RevOutOfOrder,
@@ -81,6 +84,7 @@ impl RejectReason {
         Self::TooLarge,
         Self::RateLimited,
         Self::Takendown,
+        Self::Inactive,
         Self::Malformed,
     ];
 }

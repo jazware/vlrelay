@@ -1298,6 +1298,7 @@ fn reject_detail(r: RejectReason) -> &'static str {
         RejectReason::TooLarge => "frame over 2 MiB",
         RejectReason::RateLimited => "host over its tier's events/s",
         RejectReason::Takendown => "account is taken down on this relay",
+        RejectReason::Inactive => "account is throttled, deactivated or suspended on this relay",
         RejectReason::Malformed => "frame header isn't valid DAG-CBOR",
     }
 }

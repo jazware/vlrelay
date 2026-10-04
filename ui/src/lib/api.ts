@@ -26,6 +26,7 @@ export type RejectReason =
   | 'too-large'
   | 'rate-limited'
   | 'takendown'
+  | 'inactive'
   | 'malformed'
 
 export type HostRow = {

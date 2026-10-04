@@ -179,7 +179,7 @@ pub fn reject_class(reason: &str) -> RejectReason {
         "prev_data_mismatch" | "inversion_mismatch" | "desynchronized" | "chain" => RejectReason::PrevDataMismatch,
         "wrong_host" => RejectReason::WrongHost,
         "unknown_did" | "no_identity" | "identity_unavailable" => RejectReason::UnknownDid,
-        "inactive" => RejectReason::Takendown,
+        "inactive" => RejectReason::Inactive,
         "rate_limited" | "new_account_deferred" => RejectReason::RateLimited,
         _ => RejectReason::InvalidCommit,
     }
@@ -1092,5 +1092,18 @@ fn full_doc(d: &crate::policy::Stored<crate::policy::PolicyBody>) -> admin::Full
         updated_by: d.updated_by.clone(),
         note: d.note.clone(),
         policy: serde_json::to_value(&d.body).unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inactive_rejects_are_not_takedowns() {
+        // a policy-throttled or deactivated account's commits come back as
+        // "inactive"; calling them takedowns sent operators looking for one
+        assert_eq!(reject_class("inactive"), RejectReason::Inactive);
+        assert_eq!(serde_json::to_value(RejectReason::Inactive).unwrap(), "inactive");
     }
 }

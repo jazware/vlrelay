@@ -40,6 +40,7 @@ export const REASON_LABEL: Record<RejectReason, string> = {
   'too-large': 'too large',
   'rate-limited': 'rate-limited',
   takendown: 'taken down',
+  inactive: 'inactive account',
   malformed: 'malformed frame',
 }
 
@@ -54,6 +55,7 @@ export const REASON_COLOR: Record<RejectReason, string> = {
   'too-large': 'ink3',
   'rate-limited': 'amber',
   takendown: 'danger',
+  inactive: 'accent',
   malformed: 'ink2',
 }
 
