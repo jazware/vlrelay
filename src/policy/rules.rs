@@ -96,12 +96,24 @@ fn valid_labels(name: &str) -> bool {
         && !labels.last().is_some_and(|t| t.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// `Example.COM.` → `example.com`, `*.Example.com` → `*.example.com`.
+/// `Example.COM.` → `example.com`, `*.Example.com` → `*.example.com`. An
+/// exact pattern may also name one host by IPv4 address or `localhost`,
+/// with a port, which is how hosts on a dev network (or a PDS on a port)
+/// are known.
 pub fn normalize_pattern(p: &str) -> Result<String, String> {
     let p = p.trim().trim_end_matches('.').to_ascii_lowercase();
-    let base = p.strip_prefix("*.").unwrap_or(&p);
-    if !valid_labels(base) {
-        return Err(format!("{p:?} isn't a hostname or *.domain pattern"));
+    let bad = || format!("{p:?} isn't a hostname or *.domain pattern");
+    if let Some(base) = p.strip_prefix("*.") {
+        return if valid_labels(base) { Ok(p.clone()) } else { Err(bad()) };
+    }
+    let name = match p.rsplit_once(':') {
+        Some((n, port)) if port.parse::<u16>().is_ok_and(|x| x > 0) => n,
+        Some(_) => return Err(bad()),
+        None => p.as_str(),
+    };
+    let ok = valid_labels(name) || name == "localhost" || name.parse::<std::net::Ipv4Addr>().is_ok();
+    if !ok {
+        return Err(bad());
     }
     Ok(p)
 }
@@ -201,6 +213,9 @@ impl Compiled {
 
     /// The most specific rule for a normalized hostname.
     pub fn lookup(&self, host: &str) -> Option<&Rule> {
+        if let Some(&i) = self.exact.get(host) {
+            return Some(&self.set.rules[i]);
+        }
         let host = host.split(':').next().unwrap_or(host);
         if let Some(&i) = self.exact.get(host) {
             return Some(&self.set.rules[i]);

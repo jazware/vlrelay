@@ -81,7 +81,7 @@ pub fn reject_class(reason: &str) -> RejectReason {
         "wrong_host" => RejectReason::WrongHost,
         "unknown_did" | "no_identity" | "identity_unavailable" => RejectReason::UnknownDid,
         "inactive" => RejectReason::Takendown,
-        "rate_limited" => RejectReason::RateLimited,
+        "rate_limited" | "new_account_deferred" => RejectReason::RateLimited,
         _ => RejectReason::InvalidCommit,
     }
 }

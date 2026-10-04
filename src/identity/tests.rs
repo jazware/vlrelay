@@ -248,3 +248,32 @@ async fn check_host_rechecks_on_mismatch() {
         Ok(false)
     );
 }
+
+#[tokio::test]
+async fn the_cluster_gate_holds_back_fetches() {
+    let m = Arc::new(Mock::default());
+    m.docs.lock().insert("did:plc:ok".into(), doc("did:plc:ok", "zQ3sh", "https://pds.example.com"));
+    let c = cache(&m, Options { max_budget_wait: Duration::from_millis(100), ..Options::default() });
+    let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let o = open.clone();
+    c.set_budget_gate(Arc::new(move || o.load(Ordering::SeqCst)));
+    assert!(matches!(c.resolve("did:plc:ok").await, Err(LookupError::OverBudget)));
+    assert_eq!(m.calls.load(Ordering::SeqCst), 0);
+    // over budget isn't cached: the next try fetches once the gate opens
+    open.store(true, Ordering::SeqCst);
+    assert!(c.resolve("did:plc:ok").await.is_ok());
+    assert_eq!(m.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn handles_are_found_in_cached_documents() {
+    let m = Arc::new(Mock::default());
+    m.docs.lock().insert("did:plc:a".into(), doc("did:plc:a", "zQ3sh", "https://pds.example.com"));
+    let c = cache(&m, Options::default());
+    c.resolve("did:plc:a").await.unwrap();
+    let dids = |q: &str| c.find_handle(q, 10).iter().map(|i| i.did.clone()).collect::<Vec<_>>();
+    assert_eq!(dids("alice.test"), ["did:plc:a"]);
+    assert_eq!(dids("@Alice.Test"), ["did:plc:a"]);
+    assert_eq!(dids("ali*"), ["did:plc:a"]);
+    assert!(dids("ali").is_empty() && dids("*").is_empty() && dids("bob.test").is_empty());
+}

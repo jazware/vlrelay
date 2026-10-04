@@ -566,3 +566,96 @@ async fn concurrent_applies_for_one_did_stay_ordered() {
     assert_eq!(appended, 3);
     assert_eq!(st.get(&did).await.unwrap().unwrap().chain.unwrap().rev, rev(3));
 }
+
+#[tokio::test]
+async fn update_host_is_atomic_against_counter_flushes() {
+    let st = open(2, MapIdentity::new(), ApplyConfig::default()).await;
+    st.put_host(&HostRecord::new("pds.example", Tier::Default, NOW)).await.unwrap();
+    // a tier change and counter flushes interleaving on one record: none lost
+    let mut tasks = Vec::new();
+    for i in 0..50u64 {
+        let st = st.clone();
+        tasks.push(tokio::spawn(async move {
+            if i % 10 == 0 {
+                st.update_host(
+                    "pds.example",
+                    Box::new(|cur| {
+                        let mut r = cur?;
+                        r.tier = Tier::Throttled;
+                        Some(r)
+                    }),
+                )
+                .await
+                .unwrap();
+            } else {
+                st.add_counts(&[("pds.example".into(), HostCounts { events: 1, ..Default::default() })]).await.unwrap();
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let r = st.get_host("pds.example").await.unwrap().unwrap();
+    assert_eq!((r.tier, r.events), (Tier::Throttled, 45));
+    // None writes nothing; an unknown host is offered None
+    assert!(st.update_host("pds.example", Box::new(|_| None)).await.unwrap().is_none());
+    let seen = st
+        .update_host(
+            "nope.example",
+            Box::new(|cur| {
+                assert!(cur.is_none());
+                None
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(seen.is_none() && st.get_host("nope.example").await.unwrap().is_none());
+}
+
+struct CapGate(AtomicU32);
+
+impl AccountGate for CapGate {
+    fn admit_account(&self, _host: &str, did: &str) -> NewAccount {
+        if did == plc(9) {
+            return NewAccount::Defer;
+        }
+        if self.0.fetch_add(1, Relaxed) < 1 { NewAccount::Admit } else { NewAccount::Throttle }
+    }
+}
+
+#[tokio::test]
+async fn accounts_past_the_gate_are_created_throttled() {
+    let id = MapIdentity::new();
+    let st = open(1, id.clone(), ApplyConfig::default()).await;
+    let gate = Arc::new(CapGate(AtomicU32::new(0)));
+    st.set_account_gate(gate.clone());
+    let h = host("pds.example");
+    let (a, b) = (plc(1), plc(2));
+    id.set(&a, "pds.example", 1);
+    id.set(&b, "pds.example", 2);
+    // the first is admitted, the second is over the cap
+    commit(&st, &a, &h, claim(&a, 1), NOW).await.unwrap();
+    let r = commit(&st, &b, &h, claim(&b, 1), NOW).await;
+    assert!(matches!(r, Err(Reject::Inactive(AccountStatus::Throttled))), "{r:?}");
+    let rec = st.get(&b).await.unwrap().unwrap();
+    assert!(rec.relay_throttled && rec.drops_commits());
+    // kept: the next event isn't a new account, so the gate isn't asked again
+    let r = commit(&st, &b, &h, claim(&b, 2), NOW).await;
+    assert!(matches!(r, Err(Reject::Inactive(AccountStatus::Throttled))), "{r:?}");
+    assert_eq!(gate.0.load(Relaxed), 2);
+    // an upstream #account doesn't lift it; an operator's untakedown does
+    account(&st, &b, &h, true, None).await.unwrap();
+    assert_eq!(st.get(&b).await.unwrap().unwrap().status(), AccountStatus::Throttled);
+    st.set_relay_takedown(&b, false).await.unwrap();
+    commit(&st, &b, &h, claim(&b, 3), NOW).await.unwrap();
+    // a deferred account isn't created: its next event asks again
+    let d = plc(9);
+    id.set(&d, "pds.example", 9);
+    let r = commit(&st, &d, &h, claim(&d, 1), NOW).await;
+    assert!(matches!(r, Err(Reject::NewAccountDeferred)), "{r:?}");
+    assert!(st.get(&d).await.unwrap().is_none());
+    // the flag survives the record's encoding
+    let mut r = Record::new(HostKey::of("pds.example"), NOW);
+    r.relay_throttled = true;
+    assert_eq!(Record::decode(&r.encode()).unwrap(), r);
+}

@@ -387,9 +387,20 @@ fn rule_matching_prefers_the_most_specific() {
         rules::normalize_pattern(" *.Example.COM. ").unwrap(),
         "*.example.com"
     );
-    for bad in ["com", "*.com", "a..b", "-a.com", "1.2.3.4", "*.*.x.com", ""] {
+    for bad in ["com", "*.com", "a..b", "-a.com", "*.1.2.3.4", "*.*.x.com", "", "x.com:0", "x.com:http", "*.x.com:443"] {
         assert!(rules::normalize_pattern(bad).is_err(), "{bad}");
     }
+    // one host by address and port, as a dev network or a PDS on a port is known
+    for ok in ["1.2.3.4", "127.0.0.1:30003", "localhost:2583", "pds.example.com:8443"] {
+        assert_eq!(rules::normalize_pattern(ok).as_deref(), Ok(ok));
+    }
+    let ports = Compiled::new(RuleSet {
+        next_id: 3,
+        rules: vec![mk(1, "127.0.0.1:30003", RuleEffect::Ban), mk(2, "10.0.0.1", RuleEffect::Ban)],
+    });
+    assert_eq!(ports.lookup("127.0.0.1:30003").map(|r| r.id), Some(1));
+    assert_eq!(ports.lookup("127.0.0.1:30004").map(|r| r.id), None);
+    assert_eq!(ports.lookup("10.0.0.1:443").map(|r| r.id), Some(2), "a portless rule covers every port");
     let dup = RuleSet {
         next_id: 3,
         rules: vec![

@@ -95,10 +95,18 @@ pub trait IdentitySource: Send + Sync {
 
 /// The policy engine's decision on a DID the relay hasn't seen before.
 pub trait AccountGate: Send + Sync {
-    /// Called once per new account, after its host checked out. False:
-    /// create it throttled (the host is at its account cap, or the
-    /// cluster's new-account budget is spent).
-    fn admit_account(&self, host: &str, did: &str) -> bool;
+    /// Called for a new account once its host checked out.
+    fn admit_account(&self, host: &str, did: &str) -> NewAccount;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewAccount {
+    Admit,
+    /// Create it throttled: the host is at its account cap.
+    Throttle,
+    /// Drop this event and create nothing: a rate budget is spent for now,
+    /// and the account's next event asks again.
+    Defer,
 }
 
 pub enum EventKind<V> {
@@ -221,6 +229,8 @@ pub enum Reject {
     Chain(ChainError),
     #[error("over {limit} commits per minute")]
     RateLimited { limit: u32 },
+    #[error("new account deferred: its host's or the cluster's new-account budget is spent")]
+    NewAccountDeferred,
     #[error("DID document not found or has no PDS")]
     NoIdentity,
     #[error("CID is not dag-cbor")]
@@ -362,11 +372,12 @@ impl<C: Chain> StateStore<C> {
             }
             Err(e) => return Err(e),
         }
-        if new_account
-            && let Some(g) = self.account_gate()
-            && !g.admit_account(&ev.host.0, ev.did)
-        {
-            rec.relay_throttled = true;
+        if new_account && let Some(g) = self.account_gate() {
+            match g.admit_account(&ev.host.0, ev.did) {
+                NewAccount::Admit => {}
+                NewAccount::Throttle => rec.relay_throttled = true,
+                NewAccount::Defer => return Err(Reject::NewAccountDeferred),
+            }
         }
 
         let kind = match &ev.kind {

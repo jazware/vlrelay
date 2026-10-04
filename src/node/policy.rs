@@ -17,10 +17,9 @@
 
 use super::State;
 use crate::policy::admin::PolicyAdmin;
-use crate::policy::budget::Bucket;
 use crate::policy::driver::Driver;
 use crate::policy::{self, Admit, AdmitRequest, BudgetKind, Engine, HostLimits, RejectHost, Signal, SignalKind};
-use crate::state::{self, HostCounts, HostKey, HostPage, HostRecord, HostStore, HostUpdate};
+use crate::state::{self, HostCounts, HostKey, HostPage, HostRecord, HostStore, HostUpdate, NewAccount};
 use crate::types::Host;
 use crate::upstream::{self, Admission, CrawlError, HostPolicy, Manager, PolicySource};
 use parking_lot::Mutex;
@@ -50,8 +49,32 @@ struct HostState {
     /// by that many seconds of new accounts, never overcount.
     accounts: i64,
     admitted_since_sync: i64,
-    new_accounts: Bucket,
+    new_accounts: Hourly,
     throttle_eps: Option<f64>,
+}
+
+/// A per-hour limit with an hour's allowance as its depth, the way the
+/// tier limit reads (the cluster budgets' buckets hold one second).
+struct Hourly {
+    tokens: f64,
+    at: Instant,
+}
+
+impl Hourly {
+    fn new() -> Hourly {
+        Hourly { tokens: f64::MAX, at: Instant::now() }
+    }
+
+    fn try_take(&mut self, per_hour: f64, now: Instant) -> bool {
+        let dt = now.saturating_duration_since(self.at).as_secs_f64();
+        self.at = now;
+        self.tokens = (self.tokens + dt * per_hour / 3_600.0).min(per_hour);
+        let ok = self.tokens >= 1.0;
+        if ok {
+            self.tokens -= 1.0;
+        }
+        ok
+    }
 }
 
 pub struct PolicyHooks {
@@ -141,6 +164,7 @@ const STATE_REASONS: &[&str] = &[
     "prev_data_mismatch",
     "chain",
     "rate_limited",
+    "new_account_deferred",
     "no_identity",
     "bad_cid",
     "not_owner",
@@ -150,7 +174,7 @@ const STATE_REASONS: &[&str] = &[
 
 /// Not the host's fault, or a follow-on of a failure already counted.
 const NOT_SIGNALS: &[&str] =
-    &["stale", "desynchronized", "inactive", "rate_limited", "identity_unavailable", "store", "not_owner"];
+    &["stale", "desynchronized", "inactive", "rate_limited", "new_account_deferred", "identity_unavailable", "store", "not_owner"];
 
 fn oversized(reason: &str) -> bool {
     matches!(reason, "frame_too_big" | "blocks_too_big" | "too_many_ops" | "too_many_blocks")
@@ -236,7 +260,7 @@ impl PolicyHooks {
                         limits: limits.clone(),
                         accounts: rec.account_count,
                         admitted_since_sync: 0,
-                        new_accounts: Bucket::default(),
+                        new_accounts: Hourly::new(),
                         throttle_eps,
                     },
                 );
@@ -358,32 +382,43 @@ impl PolicySource for PolicyHooks {
     }
 }
 
+/// Past the host's account cap an account is created throttled, as indigo
+/// does. Past a rate (the host's new accounts per hour, the cluster's per
+/// minute) its event is dropped and nothing is created, so a burst of
+/// real accounts on a fresh relay isn't throttled for good.
 impl state::AccountGate for PolicyHooks {
-    fn admit_account(&self, host: &str, did: &str) -> bool {
-        self.engine.record_signal(Signal::new(SignalKind::NewAccount, host, Some(did)));
+    fn admit_account(&self, host: &str, did: &str) -> NewAccount {
         let mut c = self.cache.lock();
-        if let Some(st) = c.get_mut(host)
-            && let Some(l) = &st.limits.limits
-        {
-            if l.max_accounts > 0 && st.accounts >= l.max_accounts as i64 {
-                super::metrics::ACCOUNTS_THROTTLED.with_label_values(&["host_cap"]).inc();
-                return false;
+        let verdict = 'v: {
+            if let Some(st) = c.get_mut(host)
+                && let Some(l) = &st.limits.limits
+            {
+                if l.max_accounts > 0 && st.accounts >= l.max_accounts as i64 {
+                    super::metrics::ACCOUNTS_THROTTLED.with_label_values(&["host_cap"]).inc();
+                    break 'v NewAccount::Throttle;
+                }
+                if l.new_accounts_per_hour > 0
+                    && !st.new_accounts.try_take(l.new_accounts_per_hour as f64, Instant::now())
+                {
+                    super::metrics::ACCOUNTS_DEFERRED.with_label_values(&["host_rate"]).inc();
+                    break 'v NewAccount::Defer;
+                }
             }
-            let per_sec = l.new_accounts_per_hour as f64 / 3_600.0;
-            if l.new_accounts_per_hour > 0 && !st.new_accounts.try_take(per_sec, 1.0, policy::store::now_ms()) {
-                super::metrics::ACCOUNTS_THROTTLED.with_label_values(&["host_rate"]).inc();
-                return false;
+            if !self.engine.try_take(BudgetKind::NewAccountsPerMin, 1.0) {
+                super::metrics::ACCOUNTS_DEFERRED.with_label_values(&["cluster_budget"]).inc();
+                break 'v NewAccount::Defer;
             }
+            if let Some(st) = c.get_mut(host) {
+                st.accounts += 1;
+                st.admitted_since_sync += 1;
+            }
+            NewAccount::Admit
+        };
+        drop(c);
+        if verdict != NewAccount::Defer {
+            self.engine.record_signal(Signal::new(SignalKind::NewAccount, host, Some(did)));
         }
-        if !self.engine.try_take(BudgetKind::NewAccountsPerMin, 1.0) {
-            super::metrics::ACCOUNTS_THROTTLED.with_label_values(&["cluster_budget"]).inc();
-            return false;
-        }
-        if let Some(st) = c.get_mut(host) {
-            st.accounts += 1;
-            st.admitted_since_sync += 1;
-        }
-        true
+        verdict
     }
 }
 
@@ -407,5 +442,228 @@ impl Admission for PolicyHooks {
                 }
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::HostAction;
+    use crate::node::adapters::VerifyChain;
+    use crate::policy::{FixedNodes, Rule, RuleEffect, RuleSet};
+    use crate::state::{AccountGate, ApplyConfig, StateStore, Tier};
+    use vlpds::store::Store;
+
+    async fn setup() -> (Arc<PolicyHooks>, Arc<State>) {
+        let store = Store::memory(None);
+        let layout = vlpds::slots::Layout::uniform(2).shards;
+        let id = crate::state::tests::MapIdentity::new();
+        let state = Arc::new(StateStore::new(store.clone(), layout.clone(), VerifyChain, id, ApplyConfig::default()));
+        for s in layout {
+            state.open_shard(s.id, None).await.unwrap();
+        }
+        let engine = Engine::new(store, "n1", Arc::new(FixedNodes::new(1)));
+        (PolicyHooks::new(engine, state.clone(), false), state)
+    }
+
+    async fn add_host(state: &State, h: &str, tier: Tier) {
+        state.put_host(&HostRecord::new(h, tier, state::now_secs())).await.unwrap();
+    }
+
+    async fn edit_policy(hooks: &PolicyHooks, f: impl FnOnce(&mut policy::PolicyBody)) {
+        let cur = hooks.engine.policy();
+        let mut body = cur.body.clone();
+        f(&mut body);
+        hooks.engine.save_policy(cur.version, body, "test", "").await.unwrap();
+    }
+
+    fn hp(hooks: &PolicyHooks, h: &str) -> HostPolicy {
+        hooks.host_policy(&Host(h.into())).expect("cached")
+    }
+
+    #[tokio::test]
+    async fn rejects_become_signals_and_count_against_the_host() {
+        let (hooks, state) = setup().await;
+        add_host(&state, "pds.example", Tier::Default).await;
+        for _ in 0..3 {
+            hooks.on_reject("pds.example", "did:plc:a", "bad_signature", "sig");
+        }
+        // the state step's own rejects aren't counted twice; follow-ons aren't signals
+        hooks.on_reject("pds.example", "did:plc:a", "prev_data_mismatch", "chain");
+        hooks.on_reject("pds.example", "did:plc:a", "desynchronized", "waiting");
+        hooks.on_reject("pds.example", "did:plc:a", "frame_too_big", "big");
+        let now = policy::store::now_ms();
+        let snap = hooks.engine.signals.snapshot("pds.example", Some("did:plc:a"), now);
+        assert_eq!(snap.get("failed-validation"), Some(&4.0), "{snap:?}");
+        assert_eq!(snap.get("account-failed-validation"), Some(&4.0), "{snap:?}");
+        assert_eq!(snap.get("oversized-commits"), Some(&1.0), "{snap:?}");
+        state.flush_host_counts(&*state).await.unwrap();
+        // bad_signature x3 and frame_too_big; prev_data_mismatch is the state step's
+        assert_eq!(state.get_host("pds.example").await.unwrap().unwrap().failed_checks, 4);
+
+        hooks.on_accepted("pds.example", "did:plc:b", "commit");
+        hooks.on_accepted("pds.example", "did:plc:b", "identity");
+        let snap = hooks.engine.signals.snapshot("pds.example", Some("did:plc:b"), now);
+        assert_eq!(snap.get("account-records"), Some(&1.0), "{snap:?}");
+        assert_eq!(snap.get("identity-churn"), Some(&1.0), "{snap:?}");
+    }
+
+    #[tokio::test]
+    async fn new_accounts_hit_the_host_cap_and_rate() {
+        let (hooks, state) = setup().await;
+        edit_policy(&hooks, |p| {
+            p.tiers.default.max_accounts = 2;
+            p.tiers.new.new_accounts_per_hour = 1;
+        })
+        .await;
+        add_host(&state, "capped.example", Tier::Default).await;
+        add_host(&state, "young.example", Tier::New).await;
+        hooks.load().await.unwrap();
+        let admit = |h: &str, i: u32| hooks.admit_account(h, &format!("did:plc:{h}{i}"));
+        use NewAccount::*;
+        assert_eq!([admit("capped.example", 1), admit("capped.example", 2), admit("capped.example", 3)], [
+            Admit, Admit, Throttle
+        ]);
+        assert_eq!([admit("young.example", 1), admit("young.example", 2)], [Admit, Defer]);
+        // admitted and throttled accounts are new-account signals, deferred ones not yet
+        let now = policy::store::now_ms();
+        assert_eq!(hooks.engine.signals.snapshot("capped.example", None, now).get("new-accounts"), Some(&3.0));
+        assert_eq!(hooks.engine.signals.snapshot("young.example", None, now).get("new-accounts"), Some(&1.0));
+        // an hourly limit holds an hour's allowance, not one second's
+        edit_policy(&hooks, |p| p.tiers.default.new_accounts_per_hour = 50).await;
+        add_host(&state, "busy.example", Tier::Default).await;
+        hooks.refresh_host("busy.example").await.unwrap();
+        edit_policy(&hooks, |p| p.tiers.default.max_accounts = 1000).await;
+        hooks.refresh_host("busy.example").await.unwrap();
+        let admitted = (0..60).filter(|i| admit("busy.example", *i) == Admit).count();
+        assert_eq!(admitted, 50);
+        // the cluster budget: one node's share of 60/min is one a second
+        edit_policy(&hooks, |p| p.cluster.new_accounts_per_min = 60.0).await;
+        add_host(&state, "open.example", Tier::Trusted).await;
+        hooks.refresh_host("open.example").await.unwrap();
+        assert_eq!(admit("open.example", 1), Admit);
+        assert_eq!(admit("open.example", 2), Defer);
+    }
+
+    #[tokio::test]
+    async fn host_policy_follows_records_actions_and_rules() {
+        let (hooks, state) = setup().await;
+        add_host(&state, "a.example", Tier::Default).await;
+        add_host(&state, "b.spam.example", Tier::Trusted).await;
+        hooks.load().await.unwrap();
+        let a = hp(&hooks, "a.example");
+        assert_eq!((a.tier, a.connect), (upstream::Tier::Default, true));
+        assert_eq!(a.limits.unwrap().events_per_hour, 2_600.0);
+
+        // an operator throttle caps events/s; a ban disconnects
+        hooks.admin.host_action("a.example", HostAction::Throttle { events_per_sec: Some(2.0) }, "op").await.unwrap();
+        hooks.refresh_host("a.example").await.unwrap();
+        assert_eq!(hp(&hooks, "a.example").limits.unwrap().events_per_sec, 2.0);
+        assert_eq!(hooks.throttle("a.example"), Some(2.0));
+        hooks.admin.host_action("a.example", HostAction::Ban { reason: "spam".into() }, "op").await.unwrap();
+        hooks.refresh_host("a.example").await.unwrap();
+        let a = hp(&hooks, "a.example");
+        assert_eq!((a.tier, a.connect, a.limits), (upstream::Tier::Banned, false, None));
+
+        // a domain rule bans a host whose record says trusted
+        let set = RuleSet {
+            next_id: 2,
+            rules: vec![Rule {
+                id: 1,
+                pattern: "*.spam.example".into(),
+                effect: RuleEffect::Ban,
+                note: String::new(),
+                created_at_ms: 0,
+                created_by: "op".into(),
+            }],
+        };
+        hooks.engine.save_rules(0, set, "op", "").await.unwrap();
+        hooks.refresh_host("b.spam.example").await.unwrap();
+        let b = hp(&hooks, "b.spam.example");
+        assert_eq!((b.tier, b.connect), (upstream::Tier::Banned, false));
+        assert_eq!(hooks.limits("b.spam.example").unwrap().rule, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_spam_trip_throttles_the_host_through_the_driver() {
+        let (hooks, state) = setup().await;
+        edit_policy(&hooks, |p| {
+            p.spam.host_failed_validation.limit = 10.0;
+        })
+        .await;
+        add_host(&state, "bad.example", Tier::Default).await;
+        hooks.load().await.unwrap();
+        for _ in 0..11 {
+            hooks.on_reject("bad.example", "", "bad_signature", "sig");
+        }
+        let r = hooks.driver.process_trips().await.unwrap();
+        assert_eq!(r.moved.len(), 1, "{r:?}");
+        assert_eq!(r.cases.len(), 1, "{r:?}");
+        // the driver wrote through the notifying store: the sync loop would
+        // pick it up; here it's applied by hand
+        hooks.refresh_host("bad.example").await.unwrap();
+        let b = hp(&hooks, "bad.example");
+        assert_eq!((b.tier, b.connect), (upstream::Tier::Throttled, true));
+        assert_eq!(b.limits.unwrap().events_per_sec, 5.0);
+    }
+
+    #[tokio::test]
+    async fn admission_is_the_engines() {
+        let (hooks, state) = setup().await;
+        edit_policy(&hooks, |p| p.cluster.new_hosts_per_day = 1).await;
+        let set = RuleSet {
+            next_id: 2,
+            rules: vec![Rule {
+                id: 1,
+                pattern: "*.spam.example".into(),
+                effect: RuleEffect::Ban,
+                note: String::new(),
+                created_at_ms: 0,
+                created_by: "op".into(),
+            }],
+        };
+        hooks.engine.save_rules(0, set, "op", "").await.unwrap();
+        let admit = |h: &str| {
+            let h = Host(h.to_string());
+            let hooks = hooks.clone();
+            async move { hooks.admit(&h).await }
+        };
+        assert_eq!(admit("x.spam.example").await, Err(CrawlError::HostBanned));
+        assert_eq!(admit("one.example").await, Ok(upstream::Tier::New));
+        assert_eq!(admit("two.example").await, Err(CrawlError::Budget));
+        // trusted domains skip the budget and start trusted
+        assert_eq!(admit("morel.us-east.host.bsky.network").await, Ok(upstream::Tier::Trusted));
+        // a known host keeps its tier, unless it's banned
+        add_host(&state, "known.example", Tier::Default).await;
+        assert_eq!(admit("known.example").await, Ok(upstream::Tier::Default));
+        add_host(&state, "gone.example", Tier::Banned).await;
+        assert_eq!(admit("gone.example").await, Err(CrawlError::HostBanned));
+        assert!(matches!(admit("localhost").await, Err(CrawlError::Refused(_))));
+    }
+
+    #[tokio::test]
+    async fn the_manager_disconnects_and_reconnects_with_the_policy() {
+        let (hooks, state) = setup().await;
+        add_host(&state, "127.0.0.1:9", Tier::Default).await;
+        hooks.load().await.unwrap();
+        let mut cfg = upstream::UpstreamConfig::new(true);
+        cfg.endpoint = Arc::new(|h: &Host| format!("http://{}", h.0));
+        let store: Arc<dyn upstream::HostStore> = Arc::new(upstream::MemHostStore::default());
+        let (m, _rx) = Manager::new(cfg, store, None);
+        m.set_policy_source(hooks.clone());
+        let _ = hooks.manager.set(Arc::downgrade(&m));
+        m.start().await.unwrap();
+        let h = Host("127.0.0.1:9".into());
+        m.admit(&h, upstream::Tier::Default).await.unwrap();
+        assert_eq!(m.running(), 1);
+        hooks.admin.host_action(&h.0, HostAction::Suspend { reason: "x".into() }, "op").await.unwrap();
+        hooks.refresh_host(&h.0).await.unwrap();
+        assert_eq!(m.running(), 0);
+        assert_eq!(m.host(&h).unwrap().record.tier, upstream::Tier::Suspended);
+        hooks.admin.host_action(&h.0, HostAction::Unban, "op").await.unwrap();
+        hooks.refresh_host(&h.0).await.unwrap();
+        assert_eq!(m.running(), 1);
+        assert_eq!(m.host(&h).unwrap().record.tier, upstream::Tier::Default);
+        m.shutdown().await.unwrap();
     }
 }

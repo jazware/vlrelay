@@ -244,6 +244,7 @@ fn state_rejection(e: &state::Reject) -> Rejection {
         R::Chain(state::ChainError::PrevDataMismatch) => "prev_data_mismatch",
         R::Chain(_) => "chain",
         R::RateLimited { .. } => "rate_limited",
+        R::NewAccountDeferred => "new_account_deferred",
         R::NoIdentity => "no_identity",
         R::BadCid => "bad_cid",
         R::NotOwner(_) => "not_owner",

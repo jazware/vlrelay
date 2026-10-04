@@ -75,6 +75,10 @@ e2e-self *args:
 e2e *args:
     tests/e2e/run.sh {{args}}
 
+# Policy e2e: one relay vs a fakepds fleet with faults (auto-throttle, cases, a ban rule, clean hosts untouched)
+e2e-policy *args:
+    tests/e2e/policy.sh {{args}}
+
 # ---- benchbox (scripts/benchbox.sh) --------------------------------------------
 
 # Ship the working tree (tracked + uncommitted) to benchbox:~/vlrelay-dev

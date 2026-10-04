@@ -17,7 +17,7 @@ pub mod record;
 pub mod shard;
 
 pub use apply::{
-    AccountGate, Accepted, ApplyConfig, Applied, Chain, ChainError, ChangeKind, CommitClaim, EventKind, Identity, IdentityError,
+    AccountGate, Accepted, ApplyConfig, NewAccount, Applied, Chain, ChainError, ChangeKind, CommitClaim, EventKind, Identity, IdentityError,
     IdentitySource, Incoming, Reject, StateDelta, StubChain,
 };
 pub use host::{Conn, HostCounts, HostPage, HostRecord, HostStore, HostUpdate, Tier};

@@ -25,6 +25,8 @@ busy relay (below).
 | PUT, DELETE | `domain-rules/{id}` | PUT as POST | the rule, or 204 |
 | GET, PUT | `policy` | PUT `{baseVersion, policy, note}` | `PolicyDoc` (version, policy, updated at/by) |
 | GET | `policy/audit` | | `PolicyAudit[]`, newest first |
+| GET, PUT | `policy/full` | PUT `{baseVersion, policy, note}` | `FullPolicyDoc`: the engine's whole document (tier limits, transitions, spam thresholds and actions, cluster budgets, consumer limits, crawl settings) |
+| GET | `domain-rules/audit` | | `PolicyAudit[]` of the domain rules, newest first |
 | GET | `consumers` | | `Consumer[]` |
 | POST | `consumers/{id}/kick` | | 204 |
 | GET | `cluster` | | nodes (lease, shards, rates, build) and the owner of every host shard and DID shard |
@@ -34,6 +36,7 @@ busy relay (below).
 | POST | `accounts/{did}/untakedown` | | `Account` |
 | GET | `cases` | `status`: open, acknowledged, resolved, dismissed | `Case[]`, worst severity first |
 | GET, POST | `cases/{id}` | POST `{status?, note}` | `Case` |
+| GET | `cases/{id}/evidence` | | `CaseDetail`: the case, its trip count and the newest trips (what was measured, every signal's count at the time) |
 
 ## Policy
 
@@ -48,7 +51,13 @@ exists, rates are positive, the hourly and daily caps aren't below the per-secon
 reject ratio is between 0 and 1. The UI runs the same checks before it offers Save.
 
 A domain rule is `example.com` (that host) or `*.example.com` (the domain and every subdomain), with
-an effect of `ban`, `tier` or `throttle`.
+an effect of `ban`, `allow`, `tier` or `throttle`. An exact rule may also name one host by IPv4
+address or `localhost`, with a port (`127.0.0.1:30003`), which is how dev-network hosts are known.
+
+On the relay (`node::admin::NodeAdmin`), consumers are the live `subscribeRepos` connections with
+their events/s, bytes/s and cursor lag, and a kick drops the socket at once. Account search takes a
+DID, a handle or a handle prefix ending in `*`, matched against the DID documents in the identity
+cache (every account with recent traffic).
 
 ## Demo backend
 

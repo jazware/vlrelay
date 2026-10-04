@@ -53,56 +53,36 @@ The policy state (where to recover to, last trip, trip count, operator throttle,
 
 `policy::driver::Driver` applies it. `process_trips()` runs every second, throttles the hosts whose trips say so and opens or updates cases. `sweep()` runs every 30 s and steps every host its `HostStore` lists, using the counter deltas since the previous sweep for the error budget. After a restart the first sweep only takes a baseline. Records are only written when something changed.
 
-## Integration points
+## Wiring
 
-The lead wires these up. Nothing outside `src/policy*` calls the engine yet.
+`src/node/policy.rs` (`PolicyHooks`) carries the engine's decisions to the parts that enforce them and feeds it what they see. `main` builds the engine (`FixedNodes(1)` on one node; a cluster passes its own `LiveNodes`) and hands it to the node in `NodeConfig.policy`. `Node::start` installs the hooks before the upstream manager starts, so no host connects against the policy, then starts the engine's refresher, the driver and the sync loop.
 
-Construction and loops (in `main` or the node module):
+### Who owns a host's tier
 
-```rust
-let engine = policy::Engine::new(store.clone(), &node_id, live_nodes);  // live_nodes: Arc<dyn LiveNodes>
-engine.spawn_refresher();
-let driver = Arc::new(policy::driver::Driver::new(engine.clone(), host_store.clone()));
-driver.spawn();
-```
+The state host record. The policy engine writes it (operator actions through `PolicyAdmin`, the driver's throttles and recoveries), and everything else follows it:
 
-`LiveNodes` is a one-method trait (`live_nodes() -> usize`). The cluster module should implement it over the node leases. `FixedNodes` covers tests and single-node runs.
+- `HostStore::update_host(hostname, f)` is an atomic read-modify-write under the host's lock. The driver, `PolicyAdmin::host_action`, the counter flush and the upstream registry's flush each change only their own fields, so a counter flush can't overwrite a tier change or the other way round.
+- The upstream registry's flush (`node::adapters::StateHosts`) only seeds the tier when it creates a record (a new host's admission tier). After that it never writes it.
+- The hooks keep a per-host cache of `engine.for_host(&record)` (tier after domain rules, `connect`, limits, rule, operator throttle). It's the upstream manager's `PolicySource`. It's refreshed when a record is written through the hooks' `HostStore` (which names every host it writes to the sync loop), when the policy or the domain rules change version (checked every second), and every 30 s for records written elsewhere.
+- `Manager::apply_policy(host)` copies the cache onto the host's registry entry: its tier, its limits (the socket's buckets are retuned in place, keeping what they hold or owe), and a disconnect or a connect when `connect` flips. So a domain-rule ban added later disconnects a host that's already registered, within about a second.
 
-### Upstream (`src/upstream*`)
+### Upstream
 
-- `engine.admit_host(&AdmitRequest { hostname, by_admin, existing })` before subscribing. It parses and normalizes the hostname (indigo's rules), checks the crawl switch, domain bans, the host's own tier and the allow-list mode, picks the starting tier and spends the daily budget. On `Admit::Admit { host, tier, .. }` the upstream calls `describeServer` and creates the record with `tier`. `Reject` carries a message fit for the XRPC error.
-- `engine.for_host(&record)` gives the `HostLimits` to enforce: `connect` (false for suspended and banned), and the tier's events/s, per hour and per day, bytes/s, account cap, new accounts per hour, identity events per hour and reconnects per hour. Rule and operator throttles are already folded in. Re-read it when `HostLimits.policy_version` or the record's tier changes (cheap, two hash probes per label).
-- `engine.record_signal(Signal { kind, host, did, count, detail })` for `FailedValidation`, `OversizedCommit` and `IdentityChange` as frames are checked. It returns any trips right away, and also queues them for the driver.
-- The host's `events` and `failed_checks` counters (already flushed by `add_counts`) feed the error budget. The upstream doesn't need to do anything else for it.
+- requestCrawl goes through `engine.admit_host` (`upstream::Admission`): crawl switch, hostname rules, domain bans, a known host's own tier, allow-list mode, the starting tier and the cluster's daily new-host budget. A known host is checked too, so a ban added since holds. On a dev network the engine's indigo hostname rules refuse IPs and ports, so those hosts are admitted as an operator would add them.
+- `for_host` limits: events/s, bytes/s, events per hour and per day (each a token bucket as deep as its window), reconnects per hour (a dial bucket). `--host` upstreams start at `--host-tier` (default `trusted`) the first time they're seen.
+- Signals: the node's reject hook turns every verification failure into `FailedValidation` (with the reason as detail) and oversized frames into `OversizedCommit`. Follow-ons and the relay's own trouble (`stale`, `desynchronized`, `inactive`, `rate_limited`, `identity_unavailable`, `store`, `not_owner`) aren't signals. Rejects from the host stage (signatures, malformed frames, oversized commits) also count toward the host's `failed_checks`, so the error budget sees them. The state step counts its own.
+- Accepted `#identity` events are `IdentityChange`.
 
-### State (`src/state*`)
+### State and the node
 
-- `engine.record_signal(...)` with `NewAccount` the first time a DID appears on a host, and `Record` per commit (or `count` = ops), on the DID owner.
-- `engine.try_take(BudgetKind::NewAccountsPerMin, 1.0)` before creating an account. When it's false, create it `host-throttled`. Use `try_take(BudgetKind::PlcLookupsPerSec, 1.0)` before a PLC resolve.
-- `for_host(...).limits.max_accounts` is the per-host account cap.
-- `HostStore` would do well with an atomic `update_host(hostname, FnOnce(&mut HostRecord))`. Today the driver reads, steps and puts, so a counter flush landing in between can be overwritten. The window is small and only opens when a tier changes. The fix belongs in the state module.
+- New accounts go through `state::AccountGate` once, after their host checks out. The gate records `NewAccount` and then checks the host's account cap (`maxAccounts`), its `newAccountsPerHour` and the cluster's `NewAccountsPerMin` budget. An account past any of them is created throttled (`relay_throttled`, status `throttled`): its commits are dropped, an upstream `#account` doesn't lift it, and an operator's untakedown does. The cap counts the record's `account_count` plus the accounts admitted since the last sync, so it can lag by one counter flush (5 s), never overcount.
+- Accepted commits are `Record` signals (count 1).
+- DID document fetches spend the cluster's `PlcLookupsPerSec` share (`IdentityCache::set_budget_gate`), waiting up to the cache's `max_budget_wait` for it.
+- A takedown or its reversal is written to `policy/takedowns/audit/` (one object per action, If-None-Match) and `policy/takedowns/current/{sha256(did)}.json` (who, when, why, for the account page) before the account changes, and logged on `vlrelay::audit`.
 
-### Serving (`src/serve.rs`)
+### Operator API
 
-- `engine.consumer_limits()` gives connections per IP, consumers per node, the slow-consumer lag cutoff and the backfill limit.
-
-### Operator API (`src/admin.rs`)
-
-`policy::admin::PolicyAdmin { engine, hosts }` implements the policy half of `AdminSource`. The relay's real source forwards these calls to it.
-
-| `AdminSource` method | `PolicyAdmin` |
-|---|---|
-| `policy`, `update_policy`, `policy_audit` | same names. The wire `Policy` is a subset, and a PUT keeps every field it doesn't carry. |
-| `domain_rules`, `create_domain_rule`, `update_domain_rule`, `delete_domain_rule` | same names. `matches` comes from one scan of the host records. |
-| `cases`, `case`, `update_case` | same names. Resolving or dismissing frees the dedupe key. |
-| `host_action` | returns the updated `HostRecord`, which the caller turns into a `HostRow`. `Reconnect` is the upstream's and is refused here. |
-| `host` (the detail page) | `host_limits(&rec)` for `limits`, `host_actions(&rec)` for `actions`. |
-
-Extras with no endpoint yet are `full_policy` and `update_full_policy` (the whole document, for an editor that shows cluster budgets, transitions and consumer limits), `domain_rules_audit` and `case_detail` (a case with its evidence).
-
-Changes made to `src/admin.rs` and the demo:
-
-- `RuleEffect` gained `Allow` (`{"kind": "allow"}`). The demo treats it as a no-op. `ui/src/lib/api.ts` and the rules page need the new variant.
+`node::admin::NodeAdmin` forwards policy, domain rules, cases and every host action but `reconnect` to `PolicyAdmin`, then applies the host's new policy to its socket right away. `GET/PUT policy/full`, `GET domain-rules/audit` and `GET cases/{id}/evidence` carry the whole document, the rules' audit log and a case's evidence.
 
 ## Spam counting
 
@@ -114,7 +94,10 @@ Actions are `alert` (log only), `case`, `throttle` and `throttle-and-case`. A pe
 
 ## Gaps
 
-- No `policy/*` HTTP endpoints for the full document, rules audit or case evidence yet (the methods exist).
+- `engine.consumer_limits()` isn't enforced by `serve.rs` yet (connections per IP, consumers per node, the slow-consumer cutoff and the backfill limit come from vlpds's firehose options).
+- `LiveNodes` is `FixedNodes(1)`; the cluster module should pass one over its node leases.
+- A relay-throttled account stays throttled until an operator lifts it, even after its host drops below its cap.
+- The account cap and the per-host new-account rate are per node, so a host shard that moves starts them over from the record's count.
 - Peer nudges after a save aren't sent. Peers pick changes up within 10 s.
 - The new-hosts counter is per UTC day. indigo uses a sliding 24 h window.
 - Signals don't feed Prometheus yet. `Signals::top()` returns the busiest keys per rule for a bounded-cardinality gauge.

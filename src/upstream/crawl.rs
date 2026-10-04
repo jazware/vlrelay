@@ -111,7 +111,7 @@ pub struct Crawler {
     probing: Mutex<HashSet<Host>>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CrawlError {
     InvalidHost(HostnameError),
     HostBanned,
@@ -320,6 +320,34 @@ async fn handle(State(c): State<Arc<Crawler>>, body: Option<Json<CrawlBody>>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upstream::{MemHostStore, UpstreamConfig};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Refuse(AtomicUsize, Result<Tier, CrawlError>);
+
+    #[async_trait::async_trait]
+    impl Admission for Refuse {
+        async fn admit(&self, _host: &Host) -> Result<Tier, CrawlError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            self.1.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_decides_before_any_probe() {
+        let (m, _rx) = Manager::new(UpstreamConfig::new(false), Arc::new(MemHostStore::default()), None);
+        let c = Crawler::new(m.clone(), CrawlPolicy::default());
+        let banned = Arc::new(Refuse(AtomicUsize::new(0), Err(CrawlError::HostBanned)));
+        c.set_admission(banned.clone());
+        // refused without a describeServer call (this host doesn't exist)
+        assert_eq!(c.request_crawl("pds.nowhere.dev").await, Err(CrawlError::HostBanned));
+        // a known host is asked about again, so a ban added since holds
+        m.admit(&Host("known.example.com".into()), Tier::Default).await.unwrap();
+        assert_eq!(c.request_crawl("known.example.com").await, Err(CrawlError::HostBanned));
+        assert_eq!(banned.0.load(Ordering::SeqCst), 2);
+        c.set_admission(Arc::new(Refuse(AtomicUsize::new(0), Ok(Tier::New))));
+        assert_eq!(c.request_crawl("known.example.com").await, Ok(false));
+    }
 
     #[test]
     fn domain_rules() {
