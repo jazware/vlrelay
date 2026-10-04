@@ -642,6 +642,23 @@ pub struct Stage(Arc<Glue>);
 #[async_trait::async_trait]
 impl DidStage for Stage {
     async fn apply(&self, batch: Vec<Forwarded>) -> Vec<StageResult> {
+        // Detached from the caller: a peer's request dropped mid-batch (its
+        // forwarder moved on, or the peer died) would otherwise cancel an
+        // append between its dedupe claim and its durability. Its in-flight
+        // entry would never resolve, and every later copy of the event, a
+        // duplicate, would wait on it until the forward gave up (kill9: a
+        // 25 s stall).
+        let n = batch.len();
+        let stage = Stage(self.0.clone());
+        match tokio::spawn(async move { stage.apply_batch(batch).await }).await {
+            Ok(r) => r,
+            Err(e) => vec![Err(StageError::Unavailable(format!("stage task: {e}"))); n],
+        }
+    }
+}
+
+impl Stage {
+    async fn apply_batch(&self, batch: Vec<Forwarded>) -> Vec<StageResult> {
         // DIDs in parallel, each DID's events in order
         let mut by_did: HashMap<String, Vec<(usize, Forwarded)>> = HashMap::new();
         let n = batch.len();
@@ -657,9 +674,7 @@ impl DidStage for Stage {
         }
         out.into_iter().map(|r| r.unwrap_or_else(|| Err(StageError::Unavailable("unanswered".into())))).collect()
     }
-}
 
-impl Stage {
     async fn apply_did(&self, evs: Vec<(usize, Forwarded)>) -> Vec<(usize, StageResult)> {
         let g = &self.0;
         let mut out = Vec::with_capacity(evs.len());
