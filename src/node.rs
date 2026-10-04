@@ -82,6 +82,8 @@ pub struct NodeConfig {
     pub max_segment_bytes: usize,
     pub did_shards: u32,
     pub retention: Duration,
+    /// None: the firehose's default.
+    pub max_lag_bytes: Option<usize>,
     /// Pipeline lanes (each a task; a DID always maps to the same one).
     pub lanes: usize,
     /// Threads of the runtime the lanes run on.
@@ -116,6 +118,7 @@ impl NodeConfig {
             max_segment_bytes: seq::DEFAULT_MAX_SEGMENT_BYTES,
             did_shards: 4,
             retention: seq::DEFAULT_RETENTION,
+            max_lag_bytes: None,
             lanes: 64,
             ingest_threads: cores.clamp(2, 16),
             serve_threads: 4,
@@ -126,6 +129,23 @@ impl NodeConfig {
             policy: None,
             cli_host_tier: Tier::Trusted,
             plc_export: None,
+        }
+    }
+
+    pub fn serve_config(&self) -> ServeConfig {
+        let d = ServeConfig::default();
+        ServeConfig {
+            retention: self.retention,
+            threads: self.serve_threads,
+            max_lag_bytes: self.max_lag_bytes.unwrap_or(d.max_lag_bytes),
+            // a short (dev) window still prunes and checkpoints well inside it
+            retention_interval: d.retention_interval.min(self.retention / 2).max(Duration::from_secs(1)),
+            seq_checkpoint_every: d.seq_checkpoint_every.min(self.retention / 4).max(Duration::from_millis(250)),
+            // the ring serves whatever it holds, however old: a window short
+            // enough to test with (dev only) gets a ring small enough that old
+            // cursors go to the bucket, where retention applies
+            ring_bytes: if self.retention < Duration::from_secs(3600) { 1 << 20 } else { d.ring_bytes },
+            ..d
         }
     }
 }
@@ -507,7 +527,7 @@ impl Node {
         lcfg.linger = cfg.linger;
         lcfg.inflight = cfg.log_inflight.max(1);
         lcfg.max_segment_bytes = cfg.max_segment_bytes.max(64 << 10);
-        let scfg = ServeConfig { retention: cfg.retention, threads: cfg.serve_threads, ..Default::default() };
+        let scfg = cfg.serve_config();
         let on_fatal: seq::OnFatal = Box::new(|e: &LogError| {
             let code = if matches!(e, LogError::LeaseLapsed) { 5 } else { 3 };
             vlpds::lifecycle::fail_stop(code, &format!("node log: {e}"));

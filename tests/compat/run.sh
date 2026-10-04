@@ -34,6 +34,7 @@ trap '[ $keep = 1 ] || "$net" down >/dev/null 2>&1' EXIT
 
 "$net" up
 "$net" vlrelay
+"$net" vlrelay-short
 "$net" indigo
 nohup "$gobin/jetstream-legacy" --ws-url "$VL/xrpc/com.atproto.sync.subscribeRepos" --data-dir "$run/jetstream" \
   --listen-addr "127.0.0.1:$JETSTREAM_PORT" --metrics-listen-addr "127.0.0.1:$((JETSTREAM_PORT + 1))" \
@@ -59,6 +60,8 @@ for side in vl in; do
   bg "$compat/ts.sh" "$side" "$url" "$consume"
 done
 bg "$compat/ts.sh" vl-coerced "$VL" "$consume" --coerce-seq
+# a consumer that stops reading on the short-window vlRelay: ConsumerTooSlow
+bg sh -c "python3 '$compat/slow.py' --port $((VLRELAY_PORT - 2)) --lag-mb 1 --secs $consume >'$run/slow.json'"
 bg sh -c "cd '$compat/ts' && '$node' jsconsume.mjs --url ws://127.0.0.1:$JETSTREAM_PORT/subscribe --secs $consume --out '$run/jetstream-revs.txt' >'$run/jetstream-sub.json'"
 sleep 1
 
@@ -86,6 +89,8 @@ for side in vl in; do
   "$gobin/gocheck" --url "$url" --cursor "$((last * 2))" --secs 4 >"$run/future-$side.json"
   "$gobin/gocheck" --url "$url" --cursor 1 --secs 4 >"$run/old-$side.json"
 done
+# the short-window vlRelay pruned the start of the run: OutdatedCursor
+"$gobin/gocheck" --url "ws://127.0.0.1:$((VLRELAY_PORT - 2))" --cursor 1 --secs 4 >"$run/old-short.json"
 
 python3 "$compat/states.py" --vl "http://127.0.0.1:$VLRELAY_PORT" --vl-token "$VLRELAY_ADMIN_TOKEN" \
   --indigo "http://127.0.0.1:$INDIGO_PORT" --indigo-password "$INDIGO_ADMIN_PW" \
@@ -99,6 +104,7 @@ python3 "$compat/syncdiff.py" --a "http://127.0.0.1:$VLRELAY_PORT" --b "http://1
 "$net" load 10 5 >/dev/null 2>&1
 sleep 2
 curl -s "http://127.0.0.1:$((VLRELAY_PORT - 1))/metrics" | grep -E '^vlrelay_events_(in|rejected|out)_total' >"$run/chain-vl.txt" || true
+curl -s "http://127.0.0.1:$((VLRELAY_PORT - 1))/xrpc/com.atproto.sync.listHosts" >>"$run/chain-vl.txt" || true
 "$net" indigo-add-host "localhost:$VLRELAY_PORT"
 sleep 3
 grep "localhost:$VLRELAY_PORT" "$run/indigo.log" | grep -v '"method"' >"$run/chain-indigo.txt" || true

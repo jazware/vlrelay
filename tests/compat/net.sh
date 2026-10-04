@@ -5,6 +5,7 @@
 #   net.sh tools      clone indigo, goat, jetstream(-legacy) into scratch/ and build them
 #   net.sh up         dev network on the 34xx ports with localhost hostnames, 30 accounts
 #   net.sh vlrelay    vlRelay (--memory) against every upstream on :3480
+#   net.sh vlrelay-short  vlRelay with a 10 s window and 1 MiB lag allowance on :3478
 #   net.sh indigo     indigo's relay (sqlite) on :3470, every upstream added through its admin API
 #   net.sh load R D   devnet load at R writes/s for D seconds
 #   net.sh down       stop everything
@@ -48,6 +49,14 @@ vlrelay)
   start vlrelay "$tdir/vlrelay" --listen "127.0.0.1:$VLRELAY_PORT" --memory \
     --plc-url "http://127.0.0.1:$PLC_PORT" --linger-ms 25 --admin-token "$VLRELAY_ADMIN_TOKEN" $(hosts | sed 's/^/--host /') ${VLRELAY_ARGS:-}
   wait_http "http://127.0.0.1:$VLRELAY_PORT/xrpc/_health" 30
+  ;;
+vlrelay-short)
+  # a vlRelay with a 10 s window and a 1 MiB lag allowance, so OutdatedCursor
+  # and ConsumerTooSlow can be reached
+  start vlrelay-short "$tdir/vlrelay" --listen "127.0.0.1:$((VLRELAY_PORT - 2))" --memory \
+    --plc-url "http://127.0.0.1:$PLC_PORT" --linger-ms 25 --retention-secs 10 --max-lag-mb 1 \
+    $(hosts | sed 's/^/--host /')
+  wait_http "http://127.0.0.1:$((VLRELAY_PORT - 2))/xrpc/_health" 30
   ;;
 vlrelay-chain)
   # a second vlRelay whose only upstream is indigo's relay

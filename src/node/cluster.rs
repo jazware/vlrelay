@@ -35,7 +35,6 @@ use crate::cluster::hosts::HostHandler;
 use crate::cluster::{ClusterNode, ClusterOptions, DidShards, Role};
 use crate::event::SeqSpan;
 use crate::seq::NodeLog;
-use crate::serve::ServeConfig;
 use crate::state::{self, HostPage, HostRecord, ReplaySource, StateDelta, StateStore};
 use crate::types::Host;
 use crate::upstream::{self, HostFilter, Manager, UpstreamConfig};
@@ -111,7 +110,7 @@ impl ClusterSetup {
         o.host_step = o.renew_every;
         o.checkpoint_every = self.checkpoint_every;
         o.log.linger = cfg.linger;
-        o.serve = ServeConfig { retention: cfg.retention, threads: cfg.serve_threads, ..Default::default() };
+        o.serve = cfg.serve_config();
         o.runtime = Some(vlpds::firehose::runtime(cfg.serve_threads));
         o.tls = self.tls.clone();
         o.internal_token = self.internal_token.clone();

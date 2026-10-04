@@ -73,6 +73,14 @@ struct Args {
     /// How long the log keeps events for cursor replay, in hours.
     #[arg(long, default_value_t = 72)]
     retention: u64,
+    /// Dev mode only: retention in seconds instead (overrides --retention),
+    /// so a test can see `OutdatedCursor`.
+    #[arg(long)]
+    retention_secs: Option<u64>,
+    /// Dev mode only: how far a live consumer may fall behind before
+    /// `ConsumerTooSlow`, in MiB (default 128).
+    #[arg(long)]
+    max_lag_mb: Option<usize>,
     /// Pipeline lanes; a DID always maps to the same one.
     #[arg(long, default_value_t = 64)]
     lanes: usize,
@@ -175,6 +183,13 @@ async fn run(a: Args) -> anyhow::Result<()> {
     cfg.max_segment_bytes = a.max_segment_mb << 20;
     cfg.did_shards = a.did_shards.max(1);
     cfg.retention = Duration::from_secs(a.retention.max(1) * 3600);
+    if (a.retention_secs.is_some() || a.max_lag_mb.is_some()) && !dev_mode {
+        anyhow::bail!("--retention-secs and --max-lag-mb are for dev networks (--dev-mode)");
+    }
+    if let Some(s) = a.retention_secs {
+        cfg.retention = Duration::from_secs(s.max(1));
+    }
+    cfg.max_lag_bytes = a.max_lag_mb.map(|mb| mb.max(1) << 20);
     cfg.lanes = a.lanes.max(1);
     if let Some(n) = a.ingest_threads {
         cfg.ingest_threads = n.max(1);
