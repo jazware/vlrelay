@@ -179,7 +179,18 @@ pub struct TopK {
     window: u64,
     entries: Vec<Entry>,
     index: HashMap<u64, usize>,
+    /// Eviction candidates, lightest last: the lightest `capacity / VICTIMS`
+    /// entries as of the last scan. With many more keys than room (every DID
+    /// on a busy relay) nearly every add evicts, and a scan per add was ~2%
+    /// of a loaded node's CPU.
+    victims: Vec<usize>,
+    /// The heaviest victim's estimate at that scan: a victim that has grown
+    /// past it since is skipped.
+    victim_cutoff: f64,
 }
+
+/// One scan finds candidates for this fraction of the table's evictions.
+const VICTIMS: usize = 16;
 
 pub struct Added {
     pub lower: f64,
@@ -194,6 +205,8 @@ impl TopK {
             window: 0,
             entries: Vec::with_capacity(capacity.max(1)),
             index: HashMap::with_capacity(capacity.max(1)),
+            victims: Vec::new(),
+            victim_cutoff: 0.0,
         }
     }
 
@@ -214,6 +227,7 @@ impl TopK {
                 .map(|e| e.key.len() + e.host.len() + e.detail.as_ref().map_or(0, |d| d.len()))
                 .sum::<usize>()
             + self.index.capacity() * (std::mem::size_of::<(u64, usize)>() + 1)
+            + self.victims.capacity() * std::mem::size_of::<usize>()
     }
 
     fn keep_prev(&self, now_s: u64) -> f64 {
@@ -226,6 +240,7 @@ impl TopK {
             return;
         }
         let adjacent = w == self.window + 1;
+        self.victims.clear();
         for e in &mut self.entries {
             if adjacent {
                 e.prev = e.cur;
@@ -298,13 +313,7 @@ impl TopK {
             self.index.insert(hash, i);
             return i;
         }
-        let (i, _) = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (i, e.estimate(keep)))
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .expect("capacity ≥ 1");
+        let i = self.victim(keep);
         let old = &self.entries[i];
         self.index.remove(&old.hash);
         let (cur, prev) = (old.cur, old.prev);
@@ -317,6 +326,27 @@ impl TopK {
         };
         self.index.insert(hash, i);
         i
+    }
+
+    /// A light entry to evict: one of the lightest at the last scan that
+    /// hasn't grown since. Evicting it rather than the exact minimum keeps
+    /// the lower bounds honest (the newcomer inherits its count as error).
+    fn victim(&mut self, keep: f64) -> usize {
+        loop {
+            while let Some(i) = self.victims.pop() {
+                if self.entries[i].estimate(keep) <= self.victim_cutoff {
+                    return i;
+                }
+            }
+            let mut est: Vec<(f64, usize)> =
+                self.entries.iter().enumerate().map(|(i, e)| (e.estimate(keep), i)).collect();
+            let n = (est.len() / VICTIMS).max(1);
+            est.select_nth_unstable_by(n - 1, |a, b| a.0.total_cmp(&b.0));
+            est.truncate(n);
+            est.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            self.victim_cutoff = est[0].0;
+            self.victims = est.into_iter().map(|(_, i)| i).collect();
+        }
     }
 
     /// Lower bound for `key`, 0 if it isn't tracked.
