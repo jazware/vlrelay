@@ -16,6 +16,6 @@ for pidf in "$state"/*.pid; do
   done
   kill -9 $kids "$pid" 2>/dev/null
 done
-docker compose -f "$here/docker-compose.yml" down -v --remove-orphans >/dev/null 2>&1
+docker compose -f "$here/docker-compose.yml" ${DEV_COMPOSE_EXTRA:+-f "$DEV_COMPOSE_EXTRA"} down -v --remove-orphans >/dev/null 2>&1
 rm -rf "$state"
 echo "dev-down: done"

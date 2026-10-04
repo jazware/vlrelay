@@ -83,6 +83,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# a soak outgrows MinIO's tmpfs (it counts against the 1 GB cap)
+[ "$scenario" = soak ] && export DEV_COMPOSE_EXTRA=${DEV_COMPOSE_EXTRA:-$here/minio-disk.yml}
 DEV_PDS=${DEV_PDS:-3} dev/up.sh | sed 's/^/  /'
 rm -rf "$out" && mkdir -p "$out"
 accts="$DEV_STATE/accounts.json"
@@ -202,6 +204,27 @@ contn() { kill -CONT "$(cat "$out/stopped-n$1")" 2>/dev/null || true; mark sigco
 bucket_all() { for i in 1 2 3 4 5; do fault "s3n$i" "$1"; done; }
 heal_all() { for i in 1 2 3 4 5; do fault "s3n$i"; done; for i in 1 2 3; do fault "peer$i"; done; }
 
+# resource samples (RSS, fds, bucket objects) every 60 s until the checkers finish
+sample() {
+  local t
+  t=$(ms)
+  for i in 1 2 3 4 5; do
+    local p; p=$(vpid "$i")
+    [ -n "$p" ] || continue
+    local rss fds
+    rss=$(ps -o rss= -p "$p" 2>/dev/null | tr -d ' ')
+    fds=$(lsof -p "$p" 2>/dev/null | wc -l | tr -d ' ')
+    echo "$t n$i $p ${rss:-0} ${fds:-0}" >>"$out/resources.txt"
+  done
+  docker stats --no-stream --format '{{.MemUsage}}' "$COMPOSE_PROJECT_NAME-minio-1" 2>/dev/null | sed "s/^/$t minio /" >>"$out/minio-mem.txt" || true
+  docker compose -f dev/docker-compose.yml exec -T minio sh -c \
+    "mc alias set l http://localhost:9000 minioadmin minioadmin >/dev/null 2>&1; mc ls --recursive l/vlrelay/$prefix/ 2>/dev/null" |
+    awk -v t="$t" '{p=$NF; split(p, a, "/"); k=a[1]; if (k=="log") k="log/" a[2]; n[k]++; s[k]+=0} END {for (k in n) print t, k, n[k]}' >>"$out/objects.txt" || true
+}
+( while [ ! -f "$out/stop" ] && [ ! -f "$out/sampled" ]; do sample; sleep 60; done ) &
+sampler=$!
+pids+=($sampler)
+
 # ---- the scenarios (seconds into the load)
 f0=15
 case $scenario in
@@ -289,26 +312,6 @@ case $scenario in
       esac
     done ;;
 esac
-
-# resource samples (RSS, fds, bucket objects) every 60 s until the checkers finish
-sample() {
-  local t
-  t=$(ms)
-  for i in 1 2 3 4 5; do
-    local p; p=$(vpid "$i")
-    [ -n "$p" ] || continue
-    local rss fds
-    rss=$(ps -o rss= -p "$p" 2>/dev/null | tr -d ' ')
-    fds=$(lsof -p "$p" 2>/dev/null | wc -l | tr -d ' ')
-    echo "$t n$i $p ${rss:-0} ${fds:-0}" >>"$out/resources.txt"
-  done
-  docker compose -f dev/docker-compose.yml exec -T minio sh -c \
-    "mc alias set l http://localhost:9000 minioadmin minioadmin >/dev/null 2>&1; mc ls --recursive l/vlrelay/$prefix/ 2>/dev/null" |
-    awk -v t="$t" '{p=$NF; split(p, a, "/"); k=a[1]; if (k=="log") k="log/" a[2]; n[k]++; s[k]+=0} END {for (k in n) print t, k, n[k]}' >>"$out/objects.txt" || true
-}
-( while [ ! -f "$out/stop" ] && [ ! -f "$out/sampled" ]; do sample; sleep 60; done ) &
-sampler=$!
-pids+=($sampler)
 
 rc=0
 for k in "${!checks[@]}"; do

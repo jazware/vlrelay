@@ -3,7 +3,8 @@
 # PDS in docker, plus $DEV_PDS native vlpds upstreams, each memory-capped.
 # Idempotent: a running piece is left alone.
 #
-# Env: DEV_PDS (2: vlpds upstreams, at most 3), DEV_STATE (dev/state), VLPDS_BIN (skip building vlpds),
+# Env: DEV_PDS (2: vlpds upstreams, at most 3), DEV_STATE (dev/state),
+# DEV_COMPOSE_EXTRA (a compose override file), VLPDS_BIN (skip building vlpds),
 # VLPDS_MEM_MB (2048: each vlpds's cap), DEV_PDS_HOST (127.0.0.1: the vlpds
 # upstreams' public hostname; tests/compat sets localhost, the only name with a
 # port that indigo's relay accepts), DEV_NO_DOCKER=1 (vlpds only, no PLC:
@@ -25,8 +26,8 @@ small="--firehose-ring-mb 64 --live-ring-mb 32 --firehose-merge-queue-mb 32 --fi
 
 t0=$(date +%s)
 if [ "${DEV_NO_DOCKER:-}" != 1 ]; then
-  docker compose --progress quiet -f "$here/docker-compose.yml" up -d --wait minio plc-db plc ref-pds >/dev/null
-  docker compose --progress quiet -f "$here/docker-compose.yml" run --rm minio-init
+  docker compose --progress quiet -f "$here/docker-compose.yml" ${DEV_COMPOSE_EXTRA:+-f "$DEV_COMPOSE_EXTRA"} up -d --wait minio plc-db plc ref-pds >/dev/null
+  docker compose --progress quiet -f "$here/docker-compose.yml" ${DEV_COMPOSE_EXTRA:+-f "$DEV_COMPOSE_EXTRA"} run --rm minio-init
 fi
 echo "dev-up: docker services up in $(($(date +%s) - t0))s"
 
