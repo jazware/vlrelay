@@ -26,6 +26,7 @@ lazy!(EVENTS_ACCEPTED: IntCounterVec = register_int_counter_vec!("vlrelay_events
 lazy!(EVENTS_OUT: IntCounter = register_int_counter!("vlrelay_events_out_total", "Events emitted on subscribeRepos by the merger"));
 lazy!(EVENTS_REJECTED: IntCounterVec = register_int_counter_vec!("vlrelay_events_rejected_total", "Upstream events dropped, by reason", &["reason"]));
 lazy!(EVENTS_DUPLICATE: IntCounterVec = register_int_counter_vec!("vlrelay_events_duplicate_total", "Upstream events already applied (replays after a reconnect or restart), by where they were caught", &["at"]));
+lazy!(EVENTS_FENCED: IntCounter = register_int_counter!("vlrelay_events_fenced_total", "Events dropped unsent because an earlier event of their host socket gave up or the host moved; the host replays them"));
 lazy!(EVENTS_SKIPPED: IntCounterVec = register_int_counter_vec!("vlrelay_events_skipped_total", "Upstream frames not relayed by design (#info, unknown types)", &["kind"]));
 lazy!(IDENTITY_LOOKUPS: IntGaugeVec = register_int_gauge_vec!("vlrelay_identity_lookups", "DID document cache lookups since start: hits, misses the seeder filled (state record or PLC export entry) and PLC/did:web fetches", &["outcome"]));
 lazy!(PLC_EXPORT: IntGaugeVec = register_int_gauge_vec!("vlrelay_plc_export", "The PLC export reader since start (requests, pages, ops, bytes, written, nullified, invalid, throttled, errors, restarts), whether it's caught up, and the newest createdAt read (unix s)", &["what"]));

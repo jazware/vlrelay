@@ -5,7 +5,7 @@ use super::fair::HostQueue;
 use super::frame::{Peek, peek};
 use super::host::{HostEntry, HostStatus};
 use super::limits::{HostLimiter, TokenBucket};
-use super::{CursorSource, UpstreamConfig};
+use super::{ConnectFn, CursorSource, UpstreamConfig};
 use crate::types::{Host, UpstreamFrame};
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -32,6 +32,7 @@ pub(crate) struct HostTask {
     /// Cuts a backoff short (a requestCrawl for a known host).
     pub wake: Arc<Notify>,
     pub on_refused: Option<super::OnRefused>,
+    pub on_connect: Option<ConnectFn>,
 }
 
 /// A host we won't subscribe to however often we retry (it's a relay).
@@ -76,6 +77,7 @@ impl HostTask {
                 }
                 continue;
             }
+            let restarted = skip_cursor;
             let cursor = if skip_cursor { None } else { self.cursor.durable_cursor(&self.entry.host) };
             skip_cursor = false;
             // a fresh socket replays from the durable cursor: anything still
@@ -87,12 +89,15 @@ impl HostTask {
                 .await
             {
                 Ok(Ok(ws)) => {
-                    self.entry.note_connected();
+                    let epoch = self.entry.note_connected();
+                    if let Some(f) = &self.on_connect {
+                        f(&self.entry.host, epoch, cursor, restarted);
+                    }
                     self.entry.set_status(HostStatus::Active);
                     if let Some(c) = cursor {
                         self.entry.set_received_seq(c);
                     }
-                    let (end, got_frames) = self.read(ws, &mut skip_cursor).await;
+                    let (end, got_frames) = self.read(ws, epoch, &mut skip_cursor).await;
                     if got_frames || started.elapsed() > self.cfg.backoff_max {
                         attempt = 0;
                     }
@@ -141,7 +146,7 @@ impl HostTask {
         self.entry.set_status(HostStatus::Idle);
     }
 
-    async fn read(&mut self, mut ws: Socket, skip_cursor: &mut bool) -> (End, bool) {
+    async fn read(&mut self, mut ws: Socket, epoch: u64, skip_cursor: &mut bool) -> (End, bool) {
         let cfg = self.cfg.clone();
         let mut limiter =
             HostLimiter::new(&self.entry.limits(&cfg.limits), self.entry.limits_gen(), std::time::Instant::now());
@@ -248,7 +253,7 @@ impl HostTask {
             let len = data.len();
             self.entry.frames.fetch_add(1, Ordering::Relaxed);
             self.entry.bytes.fetch_add(len as u64, Ordering::Relaxed);
-            let frame = UpstreamFrame { host: self.entry.host.clone(), upstream_seq, frame: data };
+            let frame = UpstreamFrame { host: self.entry.host.clone(), upstream_seq, frame: data, epoch };
 
             let now = std::time::Instant::now();
             let g = self.entry.limits_gen();

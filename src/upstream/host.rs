@@ -171,6 +171,8 @@ pub struct HostEntry {
     pub(crate) frames: AtomicU64,
     pub(crate) bytes: AtomicU64,
     pub(crate) connects: AtomicU64,
+    /// The current socket's epoch (see `UpstreamFrame::epoch`).
+    epoch: AtomicU64,
     last_connected_ms: AtomicU64,
     account_count: AtomicU64,
     admitted_ms: u64,
@@ -198,6 +200,7 @@ impl HostEntry {
             frames: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             connects: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
             last_connected_ms: AtomicU64::new(r.last_connected_ms.unwrap_or(0)),
             account_count: AtomicU64::new(r.account_count),
             admitted_ms: r.admitted_ms,
@@ -293,10 +296,18 @@ impl HostEntry {
         self.dirty.store(true, Ordering::Relaxed);
     }
 
-    pub(crate) fn note_connected(&self) {
+    /// The current socket's epoch.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// A new socket: returns its epoch.
+    pub(crate) fn note_connected(&self) -> u64 {
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         self.connects.fetch_add(1, Ordering::Relaxed);
         self.last_connected_ms.store(now_ms(), Ordering::Relaxed);
         self.dirty.store(true, Ordering::Relaxed);
+        epoch
     }
 
     pub(crate) fn set_account_count(&self, n: u64) {

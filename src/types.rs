@@ -16,6 +16,8 @@ pub struct UpstreamFrame {
     pub upstream_seq: i64,
     /// The raw DAG-CBOR frame (header + body), exactly as received.
     pub frame: Bytes,
+    /// The socket it came on: a host's epoch goes up with each connection.
+    pub epoch: u64,
 }
 
 /// A HashMap for the per-event hot paths. SipHash was ~2% of a loaded node's

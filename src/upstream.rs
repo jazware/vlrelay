@@ -36,6 +36,11 @@ use tokio::task::JoinHandle;
 /// in the host shards this node owns; a single node takes every host.
 pub type HostFilter = Arc<dyn Fn(&Host) -> bool + Send + Sync>;
 
+/// Called when a host's socket is up, before any of its frames: the host,
+/// the socket's epoch, the cursor it resumed after (None: live), and whether
+/// the host's sequence restarted (FutureCursor).
+pub type ConnectFn = Arc<dyn Fn(&Host, u64, Option<i64>, bool) + Send + Sync>;
+
 /// Base URL for a host (`https://{host}` in production); the client turns
 /// it into the `wss://` subscribeRepos URL.
 pub type EndpointFn = Arc<dyn Fn(&Host) -> String + Send + Sync>;
@@ -139,6 +144,7 @@ pub struct Manager {
     filter: Mutex<Option<HostFilter>>,
     policy: parking_lot::RwLock<Option<Arc<dyn PolicySource>>>,
     on_refused: parking_lot::RwLock<Option<OnRefused>>,
+    on_connect: parking_lot::RwLock<Option<ConnectFn>>,
 }
 
 /// Called once when a host is refused for good (`client::Refused`): its
@@ -168,6 +174,7 @@ impl Manager {
             filter: Mutex::new(None),
             policy: parking_lot::RwLock::new(None),
             on_refused: parking_lot::RwLock::new(None),
+            on_connect: parking_lot::RwLock::new(None),
         };
         (Arc::new(m), rx)
     }
@@ -188,6 +195,11 @@ impl Manager {
     /// [`Manager::start`] so no host connects against the policy.
     pub fn set_policy_source(&self, p: Arc<dyn PolicySource>) {
         *self.policy.write() = Some(p);
+    }
+
+    /// Set before [`Manager::start`]: sockets opened earlier don't call it.
+    pub fn on_connect(&self, f: ConnectFn) {
+        *self.on_connect.write() = Some(f);
     }
 
     /// Copies the policy's view of the host onto its entry and says whether
@@ -283,6 +295,7 @@ impl Manager {
             kick: kick.clone(),
             wake: wake.clone(),
             on_refused: self.on_refused.read().clone(),
+            on_connect: self.on_connect.read().clone(),
         };
         let join = tokio::spawn(task.run());
         tasks.insert(entry.host.clone(), Running { stop: stop_tx, kick, wake, queue, join });
@@ -383,6 +396,14 @@ impl Manager {
     pub fn kick(&self, host: &Host) {
         if let Some(r) = self.tasks.lock().get(host) {
             r.kick.notify_one();
+        }
+    }
+
+    /// [`Self::kick`], only if `host` is still on socket `epoch`: the events
+    /// of an older socket that fail can't drop the replay that replaced it.
+    pub fn kick_epoch(&self, host: &Host, epoch: u64) {
+        if self.registry.get(host).is_some_and(|e| e.epoch() == epoch) {
+            self.kick(host);
         }
     }
 

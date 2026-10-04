@@ -16,10 +16,19 @@
 //! An owner that answers `NotOwner` or can't be reached is looked up again
 //! after a short backoff, so a takeover costs the time until the new owner
 //! has opened the shard, as with vlpds's forwarded writes.
+//!
+//! Giving up on an event breaks its DID's order: the host owner has the
+//! host replay it, but the DID's later events would reach the owner first,
+//! fail `prevData` and desynchronize the account. So an event carries its
+//! host socket's [`Fence`]: giving up trips it, and nothing else from that
+//! socket is sent from then on (`ForwardError::Fenced`). The replay comes
+//! on a new socket and brings all of them again, in order.
 
 use crate::types::Host;
 use bytes::{Buf, BufMut, Bytes};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
@@ -70,8 +79,36 @@ pub trait DidStage: Send + Sync + 'static {
 pub enum ForwardError {
     #[error("gave up after {0:?}: {1}")]
     GaveUp(Duration, String),
+    /// Not sent: an event from the same host socket gave up first, and the
+    /// host replays this one too.
+    #[error("fenced: an earlier event of its host socket gave up")]
+    Fenced,
     #[error("forwarder stopped")]
     Stopped,
+}
+
+/// One host socket's events, as far as forwarding goes: live until one of
+/// them gives up (or the host owner fences the socket). Every socket of a
+/// host shares `below`: sockets older than it are fenced.
+#[derive(Clone, Debug)]
+pub struct Fence {
+    epoch: u64,
+    below: Arc<AtomicU64>,
+}
+
+impl Fence {
+    pub fn new(epoch: u64, below: Arc<AtomicU64>) -> Fence {
+        Fence { epoch, below }
+    }
+
+    pub fn live(&self) -> bool {
+        self.epoch >= self.below.load(Ordering::Acquire)
+    }
+
+    /// Fences this socket and every older one. True if it wasn't already.
+    pub fn trip(&self) -> bool {
+        self.below.fetch_max(self.epoch + 1, Ordering::AcqRel) <= self.epoch
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +196,13 @@ struct Item {
     ev: Forwarded,
     reply: Reply,
     since: Instant,
+    fence: Option<Fence>,
+}
+
+impl Item {
+    fn live(&self) -> bool {
+        self.fence.as_ref().is_none_or(|f| f.live())
+    }
 }
 
 pub struct Forwarder {
@@ -179,9 +223,18 @@ impl Forwarder {
     /// Queues an event (waiting while its lane is full). The receiver
     /// resolves with its outcome.
     pub async fn submit(&self, ev: Forwarded) -> oneshot::Receiver<Result<Outcome, ForwardError>> {
+        self.submit_fenced(ev, None).await
+    }
+
+    /// [`Self::submit`] for an event of the host socket `fence` stands for.
+    pub async fn submit_fenced(
+        &self,
+        ev: Forwarded,
+        fence: Option<Fence>,
+    ) -> oneshot::Receiver<Result<Outcome, ForwardError>> {
         let (reply, rx) = oneshot::channel();
         let lane = vlpds::slots::slot_of(&ev.did) as usize % self.lanes.len();
-        let item = Item { ev, reply, since: Instant::now() };
+        let item = Item { ev, reply, since: Instant::now(), fence };
         if let Err(mpsc::error::SendError(item)) = self.lanes[lane].send(item).await {
             let _ = item.reply.send(Err(ForwardError::Stopped));
         }
@@ -314,14 +367,25 @@ async fn run_batch(cfg: &ForwardConfig, route: &dyn Route, mut pending: Vec<Item
     loop {
         let mut groups: Vec<(Option<String>, Vec<Item>)> = Vec::new();
         let mut unrouted: Vec<Item> = Vec::new();
+        // one lookup per DID per pass: an owner appearing mid-pass must not
+        // send a DID's later event while its earlier one waits unrouted
+        let mut owners: HashMap<String, Option<Option<String>>> = HashMap::new();
         for it in pending.drain(..) {
-            match route.owner(&it.ev.did) {
+            if !it.live() {
+                let _ = it.reply.send(Err(ForwardError::Fenced));
+                continue;
+            }
+            let owner = owners.entry(it.ev.did.clone()).or_insert_with(|| route.owner(&it.ev.did)).clone();
+            match owner {
                 None => unrouted.push(it),
                 Some(o) => match groups.iter_mut().find(|(g, _)| *g == o) {
                     Some((_, v)) => v.push(it),
                     None => groups.push((o, vec![it])),
                 },
             }
+        }
+        if groups.is_empty() && unrouted.is_empty() {
+            return;
         }
         let sends = groups.into_iter().map(|(owner, items)| async move {
             let evs: Vec<Forwarded> = items.iter().map(|i| i.ev.clone()).collect();
@@ -379,9 +443,22 @@ async fn run_batch(cfg: &ForwardConfig, route: &dyn Route, mut pending: Vec<Item
         }
         // the lane's order: arrival order within the batch
         retry.sort_by_key(|i| i.since);
-        let (expired, live): (Vec<Item>, Vec<Item>) =
-            retry.into_iter().partition(|i| i.since.elapsed() >= cfg.retry_budget);
+        // A DID whose event gives up gives up the rest of its events too;
+        // the fence stops the rest of the host socket's (from this batch and
+        // every later one) before anything else is sent.
+        let mut gave_up: HashSet<String> = HashSet::new();
+        let (expired, live): (Vec<Item>, Vec<Item>) = retry.into_iter().partition(|i| {
+            if i.since.elapsed() >= cfg.retry_budget || gave_up.contains(&i.ev.did) {
+                gave_up.insert(i.ev.did.clone());
+                true
+            } else {
+                false
+            }
+        });
         for it in expired {
+            if let Some(f) = &it.fence {
+                f.trip();
+            }
             let _ = it.reply.send(Err(ForwardError::GaveUp(cfg.retry_budget, why.clone())));
         }
         if live.is_empty() {
@@ -686,6 +763,64 @@ mod tests {
             let got: Vec<i64> = applied.iter().filter(|x| x.0 == did).map(|x| x.1).collect();
             assert_eq!(got, (0..10).collect::<Vec<_>>(), "{did}");
         }
+    }
+
+    /// Issue 2 in docs/chaos.md: N gives up while N+1 waits behind it; once
+    /// an owner appears N+1 must not reach it ahead of N's replay, or the
+    /// account desynchronizes. Neither may anything else from that socket.
+    #[tokio::test]
+    async fn a_give_up_fences_the_rest_of_its_socket() {
+        let r = Arc::new(Flaky {
+            owner: Mutex::new(HashMap::new()),
+            applied: Mutex::new(Vec::new()),
+            refuse_on: Mutex::new(String::new()),
+        });
+        let cfg = ForwardConfig { lanes: 1, retry_budget: Duration::from_millis(200), ..Default::default() };
+        let f = Forwarder::start(cfg, r.clone());
+        let below = Arc::new(AtomicU64::new(0));
+        let old = Fence::new(1, below.clone());
+        let n = f.submit_fenced(ev("did:x", 1), Some(old.clone())).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let n1 = f.submit_fenced(ev("did:x", 2), Some(old.clone())).await;
+        let other = f.submit_fenced(ev("did:y", 3), Some(old.clone())).await;
+        assert!(matches!(n.await.unwrap(), Err(ForwardError::GaveUp(..))));
+        r.owner.lock().insert("did:x".into(), None);
+        r.owner.lock().insert("did:y".into(), None);
+        assert_eq!(n1.await.unwrap(), Err(ForwardError::Fenced));
+        assert_eq!(other.await.unwrap(), Err(ForwardError::Fenced));
+        assert!(r.applied.lock().is_empty());
+        // the replay comes on the next socket
+        let replay = Fence::new(2, below);
+        assert!(replay.live());
+        for s in [1, 2] {
+            let got = f.submit_fenced(ev("did:x", s), Some(replay.clone())).await.await.unwrap();
+            assert_eq!(got, Ok(Outcome::Appended(s)));
+        }
+        assert_eq!(r.applied.lock().iter().map(|x| x.2).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    /// Within one batch: a DID's later event goes down with its earlier one.
+    #[tokio::test]
+    async fn a_give_up_takes_the_dids_later_events_in_the_batch() {
+        let r = Arc::new(Flaky {
+            owner: Mutex::new(HashMap::new()),
+            applied: Mutex::new(Vec::new()),
+            refuse_on: Mutex::new(String::new()),
+        });
+        let cfg = ForwardConfig {
+            lanes: 1,
+            retry_budget: Duration::from_millis(200),
+            window: Duration::from_millis(150),
+            ..Default::default()
+        };
+        let f = Forwarder::start(cfg, r.clone());
+        let n = f.submit(ev("did:x", 1)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let n1 = f.submit(ev("did:x", 2)).await;
+        assert!(matches!(n.await.unwrap(), Err(ForwardError::GaveUp(..))));
+        r.owner.lock().insert("did:x".into(), None);
+        assert!(matches!(n1.await.unwrap(), Err(ForwardError::GaveUp(..))));
+        assert!(r.applied.lock().is_empty());
     }
 
     #[tokio::test]

@@ -167,6 +167,9 @@ pub struct Checked {
     pub received: Instant,
     /// The first copy of this upstream seq (not a reconnect's replay).
     pub first_sighting: bool,
+    /// The host socket it came on, for the forwarder (None on the DID
+    /// owner's side).
+    pub fence: Option<crate::cluster::forward::Fence>,
 }
 
 #[derive(Clone)]
@@ -432,6 +435,7 @@ struct Job {
     frame: UpstreamFrame,
     received: Instant,
     first: bool,
+    fence: crate::cluster::forward::Fence,
 }
 
 pub struct Node {
@@ -453,6 +457,8 @@ pub struct Node {
     /// (host, upstream seq) pairs already in an earlier log past the host's
     /// durable cursor: the replay after a restart drops them.
     replayed: Mutex<HashMap<Host, HashSet<i64>>>,
+    /// Per host: sockets below this epoch are fenced (`forward::Fence`).
+    fences: Mutex<crate::types::FastMap<Host, Arc<AtomicU64>>>,
     lanes: Vec<mpsc::Sender<Job>>,
     pub ingest: tokio::runtime::Handle,
     pub started_ms: i64,
@@ -706,6 +712,7 @@ impl Node {
             rejects: Mutex::new(HashMap::new()),
             policy: hooks.clone(),
             replayed: Mutex::new(replayed),
+            fences: Mutex::new(Default::default()),
             lanes: lane_tx,
             ingest: ingest_handle.clone(),
             started_ms: upstream::host::now_ms() as i64,
@@ -713,6 +720,12 @@ impl Node {
             cluster,
             plc_ingest: Default::default(),
         });
+        let weak = Arc::downgrade(&node);
+        manager.on_connect(Arc::new(move |host: &Host, epoch, cursor, restarted| {
+            if let Some(n) = weak.upgrade() {
+                n.acks.connected(host, epoch, cursor, restarted);
+            }
+        }));
         for rx in lane_rx {
             ingest_handle.spawn(node.clone().lane(rx));
         }
@@ -735,30 +748,31 @@ impl Node {
                 Ok(r) => r,
                 Err(e) => {
                     metrics::EVENTS_IN.with_label_values(&["malformed"]).inc();
-                    self.acks.begin_at(&f.host, f.upstream_seq, received);
+                    self.acks.begin_at(&f.host, f.upstream_seq, f.epoch, received);
                     self.reject(&f.host, "", f.upstream_seq, Rejection::verify(e));
-                    self.finish(&f.host, f.upstream_seq, None);
+                    self.finish(&f.host, f.upstream_seq, f.epoch, None);
                     continue;
                 }
             };
             metrics::IN_BY_KIND.inc(r.kind.as_str());
-            let first = self.acks.begin_at(&f.host, f.upstream_seq, received);
+            let first = self.acks.begin_at(&f.host, f.upstream_seq, f.epoch, received);
             let did = match (r.kind, r.did) {
                 (Kind::Commit | Kind::Sync | Kind::Identity | Kind::Account, Some(d)) => d,
                 (k, _) => {
                     metrics::EVENTS_SKIPPED.with_label_values(&[k.as_str()]).inc();
-                    self.finish(&f.host, f.upstream_seq, None);
+                    self.finish(&f.host, f.upstream_seq, f.epoch, None);
                     continue;
                 }
             };
             if self.already_logged(&f.host, f.upstream_seq) {
                 metrics::EVENTS_DUPLICATE.with_label_values(&["restart_log"]).inc();
-                self.finish(&f.host, f.upstream_seq, None);
+                self.finish(&f.host, f.upstream_seq, f.epoch, None);
                 continue;
             }
             let lane = &self.lanes[lane_of(did, self.lanes.len())];
+            let fence = self.fence(&f.host, f.epoch);
             metrics::LANE_QUEUED.inc();
-            if lane.send(Job { frame: f, received, first }).await.is_err() {
+            if lane.send(Job { frame: f, received, first, fence }).await.is_err() {
                 return;
             }
         }
@@ -781,9 +795,22 @@ impl Node {
         }
     }
 
-    fn finish(&self, host: &Host, seq: i64, ordinal: Option<u64>) {
-        if let Some(acked) = self.acks.finish(host, seq, ordinal) {
+    fn finish(&self, host: &Host, seq: i64, epoch: u64, ordinal: Option<u64>) {
+        if let Some(acked) = self.acks.finish(host, seq, epoch, ordinal) {
             self.manager.ack(host, acked);
+        }
+    }
+
+    fn fence(&self, host: &Host, epoch: u64) -> crate::cluster::forward::Fence {
+        let below = self.fences.lock().entry(host.clone()).or_default().clone();
+        crate::cluster::forward::Fence::new(epoch, below)
+    }
+
+    /// Stops what's left in the pipeline from `host`'s current and earlier
+    /// sockets: none of it is forwarded, and none of it moves the cursor.
+    pub fn fence_host(&self, host: &Host) {
+        if let Some(e) = self.manager.registry().get(host) {
+            self.fence(host, e.epoch()).trip();
         }
     }
 
@@ -792,14 +819,14 @@ impl Node {
         use futures::stream::FuturesUnordered;
         // durable acks of this lane's appended (or forwarded) events, polled
         // between jobs instead of a task per event
-        let mut acks: FuturesUnordered<futures::future::BoxFuture<'static, Option<(Host, i64, u64)>>> =
-            FuturesUnordered::new();
+        type Done = Option<(Host, i64, u64, u64)>;
+        let mut acks: FuturesUnordered<futures::future::BoxFuture<'static, Done>> = FuturesUnordered::new();
         loop {
             let job = tokio::select! {
                 biased;
                 Some(done) = acks.next(), if !acks.is_empty() => {
-                    if let Some((host, useq, ordinal)) = done {
-                        self.finish(&host, useq, Some(ordinal));
+                    if let Some((host, useq, epoch, ordinal)) = done {
+                        self.finish(&host, useq, epoch, Some(ordinal));
                     }
                     continue;
                 }
@@ -811,15 +838,21 @@ impl Node {
             metrics::LANE_QUEUED.dec();
             let host = job.frame.host.clone();
             let useq = job.frame.upstream_seq;
+            let epoch = job.frame.epoch;
+            if !job.fence.live() {
+                metrics::EVENTS_FENCED.inc();
+                self.acks.fail(&host, useq, epoch);
+                continue;
+            }
             let checked = match self.check(job).await {
                 Ok(Some(c)) => c,
                 Ok(None) => {
-                    self.finish(&host, useq, None);
+                    self.finish(&host, useq, epoch, None);
                     continue;
                 }
                 Err((did, r)) => {
                     self.reject(&host, &did, useq, r);
-                    self.finish(&host, useq, None);
+                    self.finish(&host, useq, epoch, None);
                     continue;
                 }
             };
@@ -835,7 +868,7 @@ impl Node {
                         async move {
                             // a failed log fail-stops the process (on_fatal): no ack
                             match rx.await {
-                                Ok(Ok(d)) => Some((host, useq, d.ordinal)),
+                                Ok(Ok(d)) => Some((host, useq, epoch, d.ordinal)),
                                 _ => None,
                             }
                         }
@@ -844,17 +877,17 @@ impl Node {
                 }
                 Submitted::Duplicate => {
                     metrics::EVENTS_DUPLICATE.with_label_values(&["state"]).inc();
-                    self.finish(&host, useq, None);
+                    self.finish(&host, useq, epoch, None);
                 }
                 Submitted::Rejected(r) => {
                     self.reject(&host, &did, useq, r);
-                    self.finish(&host, useq, None);
+                    self.finish(&host, useq, epoch, None);
                 }
                 Submitted::Forwarded(rx) => {
                     let node = self.clone();
                     acks.push(
                         async move {
-                            node.forwarded(rx, host, did, useq, kind).await;
+                            node.forwarded(rx, host, did, useq, epoch, kind).await;
                             None
                         }
                         .boxed(),
@@ -863,15 +896,15 @@ impl Node {
             }
         }
         while let Some(done) = acks.next().await {
-            if let Some((host, useq, ordinal)) = done {
-                self.finish(&host, useq, Some(ordinal));
+            if let Some((host, useq, epoch, ordinal)) = done {
+                self.finish(&host, useq, epoch, Some(ordinal));
             }
         }
     }
 
     /// The host owner's stage: strict parse and the stateless checks.
     async fn check(&self, job: Job) -> Result<Option<Checked>, (String, Rejection)> {
-        let Job { frame: f, received, first } = job;
+        let Job { frame: f, received, first, fence } = job;
         let t0 = Instant::now();
         let ev = cpu(f.frame.len(), || event::parse(f.frame.clone(), &event::Limits::default()))
             .map_err(|r| (String::new(), Rejection::verify(r)))?;
@@ -885,6 +918,7 @@ impl Node {
             span,
             received,
             first_sighting: first,
+            fence: Some(fence.clone()),
         };
         let opts = verify::Options::default();
         let out = match ev {

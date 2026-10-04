@@ -443,7 +443,7 @@ impl DidOwner for Forwarding {
         };
         let meta = encode_meta(&c);
         let ev = Forwarded { did: c.did, host: c.host, upstream_seq: c.upstream_seq, meta, frame: c.frame };
-        Submitted::Forwarded(f.submit(ev).await)
+        Submitted::Forwarded(f.submit_fenced(ev, c.fence).await)
     }
 }
 
@@ -457,29 +457,36 @@ impl Node {
         host: Host,
         did: String,
         useq: i64,
+        epoch: u64,
         kind: &'static str,
     ) {
+        use crate::cluster::forward::ForwardError;
         match rx.await {
             Ok(Ok(Outcome::Appended(_))) => {
                 metrics::ACCEPTED_BY_KIND.inc(kind);
-                self.finish(&host, useq, None);
+                self.finish(&host, useq, epoch, None);
             }
             Ok(Ok(Outcome::Duplicate)) => {
                 metrics::EVENTS_DUPLICATE.with_label_values(&["owner"]).inc();
-                self.finish(&host, useq, None);
+                self.finish(&host, useq, epoch, None);
             }
             Ok(Ok(Outcome::Rejected(m))) => {
                 let (reason, detail) = m.split_once(": ").unwrap_or((m.as_str(), ""));
                 let r = Rejection { reason: static_reason(reason), detail: detail.to_string() };
                 self.reject(&host, &did, useq, r);
-                self.finish(&host, useq, None);
+                self.finish(&host, useq, epoch, None);
+            }
+            Ok(Err(ForwardError::Fenced)) => {
+                metrics::EVENTS_FENCED.inc();
+                self.acks.fail(&host, useq, epoch);
             }
             Ok(Err(e)) => {
                 tracing::warn!(host = %host.0, did, useq, "forward failed, replaying from the host: {e}");
-                self.acks.fail(&host, useq);
-                self.manager.kick(&host);
+                self.acks.fail(&host, useq, epoch);
+                // the forwarder fenced the socket: one replay per socket
+                self.manager.kick_epoch(&host, epoch);
             }
-            Err(_) => self.acks.fail(&host, useq),
+            Err(_) => self.acks.fail(&host, useq, epoch),
         }
     }
 }
@@ -685,6 +692,7 @@ impl Stage {
                 span: m.span,
                 received: Instant::now(),
                 first_sighting: m.first_sighting,
+                fence: None,
             };
             let r = g.local.submit(c).await;
             let unclaim = || {
@@ -1397,6 +1405,11 @@ impl HostHandler for Upstreams {
         while stopped.iter().any(|h| node.acks.pending_for(h) > 0) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        // the next owner replays the rest from the cursor handed over; our
+        // copies would only race its
+        for h in &stopped {
+            node.fence_host(h);
+        }
         stopped
             .into_iter()
             .filter_map(|h| node.manager.host(&h).and_then(|v| v.record.acked_seq).map(|s| (h, s)))
@@ -1696,6 +1709,7 @@ mod tests {
             span: SeqSpan { start: 3, end: 9 },
             received: Instant::now(),
             first_sighting: true,
+            fence: None,
         };
         for kind in [
             CheckedKind::Commit(v.clone()),
