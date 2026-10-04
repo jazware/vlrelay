@@ -161,6 +161,16 @@ async fn lane(cfg: ForwardConfig, route: Arc<dyn Route>, mut rx: mpsc::Receiver<
     }
 }
 
+/// Resolves once any of `items` is no longer owned by `owner`.
+async fn moved_off(route: &dyn Route, items: &[Item], owner: &Option<String>) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if items.iter().any(|i| route.owner(&i.ev.did).as_ref() != Some(owner)) {
+            return;
+        }
+    }
+}
+
 /// Until every event is resolved: split by owner, send, keep the retryable
 /// failures in order, back off, look owners up again.
 async fn run_batch(cfg: &ForwardConfig, route: &dyn Route, mut pending: Vec<Item>) {
@@ -181,9 +191,18 @@ async fn run_batch(cfg: &ForwardConfig, route: &dyn Route, mut pending: Vec<Item
             let evs: Vec<Forwarded> = items.iter().map(|i| i.ev.clone()).collect();
             let res = match &owner {
                 None => Ok(route.local(evs).await),
-                Some(addr) => match tokio::time::timeout(cfg.rpc_timeout, route.remote(addr, evs)).await {
-                    Ok(r) => r,
-                    Err(_) => Err(anyhow::anyhow!("forward to {addr} timed out")),
+                // A hung owner (SIGSTOP, a GC pause, a blackholed link) keeps
+                // the socket open, so the request would sit out the whole
+                // timeout with the lane blocked behind it, even after the
+                // DID's shard moved. Once it moved, the old owner can't make
+                // the event durable or answer for it, so asking the new one
+                // is safe.
+                Some(addr) => tokio::select! {
+                    r = tokio::time::timeout(cfg.rpc_timeout, route.remote(addr, evs)) => match r {
+                        Ok(r) => r,
+                        Err(_) => Err(anyhow::anyhow!("forward to {addr} timed out")),
+                    },
+                    _ = moved_off(route, &items, &owner) => Err(anyhow::anyhow!("a DID's owner moved off {addr} mid-forward")),
                 },
             };
             (items, res)
@@ -447,6 +466,38 @@ mod tests {
         assert_eq!(b, (0..20).collect::<Vec<_>>());
         assert!(applied.iter().filter(|x| x.1 == "did:a").all(|x| x.0 == "https://c"));
         assert!(applied.iter().filter(|x| x.1 == "did:b").all(|x| x.0 == "local"));
+    }
+
+    /// An owner that accepts the request and never answers (SIGSTOPped).
+    struct Hung {
+        owner: Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Route for Hung {
+        fn owner(&self, _did: &str) -> Option<Option<String>> {
+            Some(self.owner.lock().clone())
+        }
+        async fn local(&self, batch: Vec<Forwarded>) -> Vec<StageResult> {
+            batch.iter().map(|e| Ok(Outcome::Appended(e.upstream_seq))).collect()
+        }
+        async fn remote(&self, _addr: &str, _batch: Vec<Forwarded>) -> anyhow::Result<Vec<StageResult>> {
+            std::future::pending().await
+        }
+    }
+
+    /// The zombie scenario's 10 s stall: a forward to a hung owner is
+    /// abandoned once the DID moves, not after the RPC timeout.
+    #[tokio::test]
+    async fn a_hung_owner_is_abandoned_when_the_did_moves() {
+        let r = Arc::new(Hung { owner: Mutex::new(Some("https://zombie".into())) });
+        let f = Forwarder::start(ForwardConfig { lanes: 1, ..Default::default() }, r.clone());
+        let t0 = Instant::now();
+        let w = f.submit(ev("did:a", 1)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        *r.owner.lock() = None;
+        assert!(matches!(w.await.unwrap(), Ok(Outcome::Appended(1))));
+        assert!(t0.elapsed() < Duration::from_secs(2), "took {:?}", t0.elapsed());
     }
 
     #[tokio::test]
