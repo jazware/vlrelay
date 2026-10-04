@@ -180,7 +180,7 @@ async fn crash_restart_drops_unacked_replays_acked_never_reuses_seqs() {
         c.max_segment_events = 100;
     })
     .await;
-    // 100 events fill a segment; 30 more sit in the open one, unacked
+    // 100 events fill a segment, and 30 more sit in the open one, unacked
     let acked = st.log.append(batch(0, 100, 500)).await.unwrap().seqs;
     let pending = st.log.submit(batch(100, 30, 500)).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -256,4 +256,37 @@ async fn outdated_and_future_cursors() {
     let future = vlpds::nodelog::seq_floor(vlpds::tid::now_micros() + 3_600_000_000);
     let got = read_until(addr, Some(future), i64::MAX).await;
     assert_eq!(got, vec![Got::Error("FutureCursor".into())]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_consumer_is_cut_off_and_others_keep_up() {
+    let store = store();
+    let (st, addr) = start(&store, "g", |_, s| {
+        s.max_lag_bytes = 1 << 20;
+        s.ring_bytes = 64 << 20;
+    })
+    .await;
+    let first = st.log.append(batch(0, 1, 100)).await.unwrap().seqs[0];
+    let url = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor={first}");
+    let (mut stalled, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    // ~40 MiB while the stalled one reads nothing and a live one reads all
+    let live = tokio::spawn(read_until(addr, Some(first), i64::MAX - 1));
+    let t = std::time::Instant::now();
+    let mut all = Vec::new();
+    for b in 0..40 {
+        all.extend(st.log.append(batch(b * 100, 100, 10_000)).await.unwrap().seqs);
+    }
+    let appended_in = t.elapsed();
+    let mut got = Vec::new();
+    while let Some(Ok(m)) = stalled.next().await {
+        if let Message::Binary(b) = m {
+            got.push(classify(&b));
+        }
+    }
+    assert_eq!(got.last(), Some(&Got::Error("ConsumerTooSlow".into())), "after {} frames", got.len());
+    assert!(seqs(&got).len() < all.len());
+    live.abort();
+    let got = read_until(addr, Some(first), *all.last().unwrap()).await;
+    assert_eq!(seqs(&got), all);
+    assert!(appended_in < Duration::from_secs(10), "appends took {appended_in:?}");
 }

@@ -47,8 +47,13 @@ struct Args {
     subscribers: usize,
     #[arg(long, default_value_t = 4)]
     firehose_threads: usize,
+    #[arg(long, default_value_t = 4)]
+    client_threads: usize,
     #[arg(long, default_value_t = 1)]
     zstd: i32,
+    /// share of each payload that is zeros
+    #[arg(long, default_value_t = 0.5)]
+    compressible: f64,
 }
 
 fn store(a: &Args) -> Store {
@@ -68,9 +73,14 @@ fn store(a: &Args) -> Store {
     }
 }
 
-fn template(size: usize, i: u64) -> Bytes {
+/// `compressible` of the payload is zeros, the rest random (CAR blocks are
+/// mostly hashes and signatures, so real frames compress ~2-3x at best).
+fn template(size: usize, i: u64, compressible: f64) -> Bytes {
     let did = format!("did:plc:{:024}", i % 100_000);
-    let f = vlpds::events::sync_frame(&did, "3jzfcijpj2z2a", &vec![(i % 251) as u8; size], "2026-10-04T00:00:00.000Z");
+    let zeros = (size as f64 * compressible) as usize;
+    let mut payload: Vec<u8> = (0..size - zeros).map(|_| rand::random::<u8>()).collect();
+    payload.resize(size, 0);
+    let f = vlpds::events::sync_frame(&did, "3jzfcijpj2z2a", &payload, "2026-10-04T00:00:00.000Z");
     let mut raw = Vec::new();
     f.finish(i as i64, &mut raw);
     raw.into()
@@ -167,14 +177,17 @@ async fn run(a: Args) {
     // subscribers on their own runtime, so their CPU isn't counted as serving
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sub_stats = Arc::new(SubStats::default());
-    let client_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).thread_name("client").enable_all().build().unwrap();
+    let client_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(a.client_threads).thread_name("client").enable_all().build().unwrap();
     for i in 0..a.subscribers {
         client_rt.spawn(subscriber(addr, sub_stats.clone(), i == 0, stop.clone()));
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
 
+    // ~48 MB of distinct frames: more than zstd's window, so segments don't
+    // compress better than real traffic would
+    let n = (48_000_000 / a.size.max(1)).clamp(1024, 200_000) as u64;
     let templates: Arc<Vec<SeqSplice>> =
-        Arc::new((0..64).map(|i| SeqSplice::parse(template(a.size, i)).unwrap()).collect());
+        Arc::new((0..n).map(|i| SeqSplice::parse(template(a.size, i, a.compressible)).unwrap()).collect());
     let lat = Arc::new(parking_lot::Mutex::new(Vec::<f64>::new()));
     let sent = Arc::new(AtomicU64::new(0));
     let t0 = Instant::now();
@@ -184,7 +197,7 @@ async fn run(a: Args) {
     for p in 0..a.producers {
         let (log, templates, lat, sent, a) = (st.log.clone(), templates.clone(), lat.clone(), sent.clone(), a.clone());
         tasks.push(tokio::spawn(async move {
-            // each producer paces its share; several batches in flight each
+            // each producer paces its share, with several batches in flight
             let per = if a.rate == 0 { 0.0 } else { a.rate as f64 / a.producers as f64 };
             let mut inflight = futures::stream::FuturesUnordered::new();
             let mut i = 0u64;

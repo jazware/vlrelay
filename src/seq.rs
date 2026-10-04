@@ -262,7 +262,7 @@ pub struct NodeLog {
 }
 
 impl NodeLog {
-    /// Starts a new log; durable batches go to `out` (the firehose merger).
+    /// Starts a new log. Durable batches go to `out` (the firehose merger).
     /// `on_fatal` runs once if the log is fenced or its lease lapses.
     pub fn start(
         store: Store,
