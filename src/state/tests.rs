@@ -729,3 +729,84 @@ async fn only_a_repos_first_commit_is_a_creation() {
         (dids[3].clone(), FirstCommit { created: false }),
     ]);
 }
+
+/// A split and a merge carry every slot-keyed family (sync records, mirror
+/// rows, host rows, seeds) to the shard that owns its slot, and leave the
+/// per-shard applied markers behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_and_merge_carry_every_family() {
+    use vlpds::slots::ShardRange;
+    let id = MapIdentity::new();
+    let st = open(1, id.clone(), ApplyConfig::default()).await;
+    let store = st.store.clone();
+    let dids: Vec<String> = (0..60).map(plc).collect();
+    for d in &dids {
+        id.set(d, "pds0.example", 1);
+    }
+    let hosts: Vec<String> = (0..20).map(|i| format!("pds{i}.example")).collect();
+    let h = host("pds0.example");
+    for d in &dids {
+        let a = commit(&st, d, &h, claim(d, 0), NOW).await.unwrap();
+        st.commit(&[ticket(&a)]).await.unwrap();
+        let s = st.shard_for(d).unwrap();
+        s.put_raw(crate::plc_seed::seed_key(d), Bytes::from(format!("seed {d}"))).await.unwrap();
+        s.put_raw(crate::archive::mirror::meta_key(d), Bytes::from(format!("mirror {d}"))).await.unwrap();
+    }
+    for (i, hn) in hosts.iter().enumerate() {
+        let mut r = HostRecord::new(hn, Tier::Default, NOW);
+        r.cursor = 100 + i as i64;
+        st.put_host(&r).await.unwrap();
+    }
+    st.shard(ShardId(0)).unwrap().checkpoint("log-a", 41).await.unwrap();
+    let mut before = Vec::new();
+    for d in &dids {
+        before.push(st.get(d).await.unwrap().unwrap());
+    }
+    st.close_shard(ShardId(0)).await.unwrap();
+
+    let check = |layout: Vec<ShardRange>| {
+        let (store, dids, hosts, before) = (store.clone(), &dids, &hosts, &before);
+        async move {
+            let st = StateStore::new(store, layout.clone(), StubChain, MapIdentity::new(), ApplyConfig::default());
+            for r in &layout {
+                st.open_shard(r.id, None).await.unwrap();
+            }
+            for (d, rec) in dids.iter().zip(before) {
+                assert_eq!(st.get(d).await.unwrap().as_deref(), Some(&**rec), "{d}");
+                let s = st.shard_for(d).unwrap();
+                let seed = s.db.get(crate::plc_seed::seed_key(d)).await.unwrap();
+                assert_eq!(seed.as_deref(), Some(format!("seed {d}").as_bytes()), "seed of {d}");
+                let m = s.db.get(crate::archive::mirror::meta_key(d)).await.unwrap();
+                assert_eq!(m.as_deref(), Some(format!("mirror {d}").as_bytes()), "mirror of {d}");
+            }
+            for (i, hn) in hosts.iter().enumerate() {
+                assert_eq!(st.get_host(hn).await.unwrap().map(|r| r.cursor), Some(100 + i as i64), "{hn}");
+            }
+            let mut listed = 0;
+            for r in &layout {
+                let s = st.shard(r.id).unwrap();
+                assert_eq!(s.applied_marker("log-a").await.unwrap(), None, "a marker of the parent's log");
+                let (a, b) = s.range_keys();
+                let mut it = vlpds::state::BatchedScan::new(s.db.scan(a.to_vec()..b.to_vec()).await.unwrap());
+                while let Some(kv) = it.next().await.unwrap() {
+                    let slot = vlpds::state::key_slot(&kv.key).unwrap() as u32;
+                    assert!((r.lo..r.hi).contains(&slot), "shard {} holds slot {slot}", r.id);
+                    listed += 1;
+                }
+            }
+            assert_eq!(listed, dids.len() * 2);
+            assert_eq!(st.list_repos(None, 1000).await.unwrap().repos.len(), dids.len());
+            assert_eq!(HostStore::list_hosts(&st, None, 1000).await.unwrap().hosts.len(), hosts.len());
+            for r in &layout {
+                st.close_shard(r.id).await.unwrap();
+            }
+        }
+    };
+    let halves = [(ShardId(1), 0u32, 32768u32), (ShardId(2), 32768, 65536)];
+    for (c, lo, hi) in halves {
+        vlpds::partition::clone_db_families(&store, c, &[(ShardId(0), lo, hi)], CLONE_FAMILIES).await.unwrap();
+    }
+    check(halves.iter().map(|&(id, lo, hi)| ShardRange { id, lo, hi }).collect()).await;
+    vlpds::partition::clone_db_families(&store, ShardId(3), &halves, CLONE_FAMILIES).await.unwrap();
+    check(vec![ShardRange { id: ShardId(3), lo: 0, hi: 65536 }]).await;
+}

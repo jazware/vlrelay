@@ -178,6 +178,11 @@ pub trait DidShards: Send + Sync + 'static {
         false
     }
     fn on_layout(&self, _layout: Arc<Layout>) {}
+    /// Creates reshard `op`'s children from their frozen (closed) parents:
+    /// each child with its sources, (parent, lo, hi). Idempotent.
+    async fn clone_children(&self, _op: u64, _plans: Vec<(ShardId, Vec<(ShardId, u32, u32)>)>) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// No per-shard state (tests, and a pipeline that hasn't wired state yet).
@@ -1231,5 +1236,31 @@ impl ShardHost for ClusterNode {
 
     fn on_layout(&self, layout: Arc<Layout>) {
         self.did_shards.read().on_layout(layout);
+    }
+
+    async fn clone_shards(&self, layout: &Layout, op: &vlpds::slots::Reshard) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let parents: Vec<vlpds::slots::ShardRange> = op
+            .parents
+            .iter()
+            .map(|p| layout.range_of(*p).ok_or_else(|| anyhow::anyhow!("parent {p} not in layout v{}", layout.version)))
+            .collect::<anyhow::Result<_>>()?;
+        // each child takes the slots it shares with every parent it overlaps
+        let plans: Vec<(ShardId, Vec<(ShardId, u32, u32)>)> = op
+            .children
+            .iter()
+            .map(|c| {
+                let srcs = parents
+                    .iter()
+                    .filter(|p| p.lo < c.hi && c.lo < p.hi)
+                    .map(|p| (p.id, p.lo.max(c.lo), p.hi.min(c.hi)))
+                    .collect();
+                (c.id, srcs)
+            })
+            .collect();
+        let handler = self.did_shards.read().clone();
+        handler.clone_children(op.id, plans).await?;
+        tracing::info!(op = op.id, children = ?op.children.iter().map(|c| c.id).collect::<Vec<_>>(), elapsed_ms = started.elapsed().as_millis() as u64, "cloned reshard children");
+        Ok(())
     }
 }

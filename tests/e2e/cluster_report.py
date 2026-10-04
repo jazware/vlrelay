@@ -10,7 +10,7 @@ import re
 import sys
 
 out = sys.argv[1]
-names = ["core1", "core2", "core3", "edge", "replica"]
+names = os.environ.get("STREAMS", "core1 core2 core3 edge replica").split()
 fail = False
 
 events = []

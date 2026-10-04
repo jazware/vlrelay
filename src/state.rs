@@ -77,6 +77,31 @@ pub trait ReplaySource: Send + Sync {
     }
 }
 
+/// The slot-keyed key families of a DID shard's SlateDB, each one
+/// contiguous key range per slot range, that a split or merge should carry
+/// into the children (`vlpds::partition::clone_db_families`):
+///
+/// - `0x01 ‖ slot`: sync records, and archival mode's mirror rows (`V/` and
+///   vlpds's generation-keyed record, MST and backlink families);
+/// - `0x02 ‖ slot`: host records (single-node mode only; a cluster keeps
+///   them in the bucket);
+/// - `0x03 ‖ slot`: PLC export seeds.
+///
+/// `meta/applied/{log}` is per shard and stays behind: a child starts with
+/// no log history, so it has nothing to replay from a marker.
+pub const CLONE_FAMILIES: &[vlpds::partition::FamilyRange] =
+    &[vlpds::state::slot_range_keys, record::host_range_keys, crate::plc_seed::seed_range_keys];
+
+/// What a live split or merge carries today: `0x01` only. Cloning the other
+/// tags too (their own staged clones, unioned) passes in one process, but in
+/// a live cluster a child's first memtable flush failed SlateDB's L0 ULID
+/// cutoff (`InvalidClockTick`) and the node fail-stopped; the `0x01`-only
+/// clone has never hit it. Seeds are a cache (a child's DIDs resolve from
+/// PLC on a miss) and a cluster's host records are in the bucket, so losing
+/// `0x02` and `0x03` costs lookups, not correctness. docs/cluster.md,
+/// "Resharding".
+pub const RESHARD_FAMILIES: &[vlpds::partition::FamilyRange] = &[vlpds::state::slot_range_keys];
+
 pub struct StateStore<C: Chain = StubChain> {
     archive: std::sync::OnceLock<Arc<crate::archive::Archive>>,
     pub store: Store,

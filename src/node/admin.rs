@@ -28,6 +28,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+fn layout_json(c: &vlpds::cluster::Cluster) -> serde_json::Value {
+    let l = c.layout();
+    let shards: Vec<serde_json::Value> = l
+        .shards
+        .iter()
+        .map(|r| serde_json::json!({"id": r.id, "lo": r.lo, "hi": r.hi, "owner": c.owner_of(r.id).map(|o| o.0)}))
+        .collect();
+    serde_json::json!({"version": l.version, "shards": shards, "nextId": l.next_id, "op": l.op})
+}
+
 pub struct NodeAdmin {
     pub node: Arc<Node>,
     pub policy: Arc<PolicyHooks>,
@@ -348,6 +358,15 @@ impl NodeAdmin {
 
 fn status_str(s: AccountStatus) -> &'static str {
     s.as_str().unwrap_or(if s.is_active() { "active" } else { "inactive" })
+}
+
+impl NodeAdmin {
+    fn vlpds_cluster(&self) -> AdminResult<(Arc<vlpds::cluster::Cluster>, Arc<dyn vlpds::cluster::ShardHost>)> {
+        let g = self.node.cluster.as_ref().ok_or_else(|| AdminError::BadRequest("not a cluster core node".into()))?;
+        let c = g.cluster.cluster.clone().ok_or_else(|| AdminError::BadRequest("not a cluster core node".into()))?;
+        let host: Arc<dyn vlpds::cluster::ShardHost> = g.cluster.clone();
+        Ok((c, host))
+    }
 }
 
 /// For the peer RPC's query strings.
@@ -963,6 +982,53 @@ impl AdminSource for NodeAdmin {
 
     async fn pipeline_view(&self) -> AdminResult<admin::PipelineView> {
         Ok(fleet::pipeline_view(&self.members().await, 50))
+    }
+
+    async fn shard_layout(&self) -> AdminResult<serde_json::Value> {
+        let (c, _) = self.vlpds_cluster()?;
+        Ok(layout_json(&c))
+    }
+
+    async fn reshard(&self, req: admin::ReshardReq) -> AdminResult<serde_json::Value> {
+        use vlpds::reshard::Plan;
+        use vlpds::slots::ShardId;
+        let (c, host) = self.vlpds_cluster()?;
+        let (plan, wait) = match req {
+            admin::ReshardReq::Split { shard, at, wait } => (Plan::Split { shard: ShardId(shard), at }, wait),
+            admin::ReshardReq::Merge { left, right, wait } => {
+                (Plan::Merge { left: ShardId(left), right: ShardId(right) }, wait)
+            }
+            admin::ReshardReq::Abort => {
+                let op = c.abort_reshard(&host).await?;
+                return Ok(serde_json::json!({ "aborted": op, "layout": layout_json(&c) }));
+            }
+        };
+        let before = c.layout().version;
+        let op = c.plan_reshard(&host, plan).await.map_err(|e| AdminError::BadRequest(format!("{e:#}")))?;
+        let mut out = serde_json::json!({ "op": op });
+        if wait {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                let l = c.layout();
+                if l.version > before && l.op.as_ref().is_none_or(|o| o.id != op.id) {
+                    out["done"] = l.shards.iter().any(|r| op.children.iter().any(|ch| ch.id == r.id)).into();
+                    break;
+                }
+                if l.op.is_none() && l.version == before {
+                    out["done"] = false.into();
+                    break;
+                }
+                if Instant::now() > deadline {
+                    return Err(AdminError::Internal(anyhow::anyhow!(
+                        "reshard {} still in progress after 120 s",
+                        op.id
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        out["layout"] = layout_json(&c);
+        Ok(out)
     }
 
     async fn accounts(&self, q: admin::AccountQuery) -> AdminResult<Vec<admin::Account>> {

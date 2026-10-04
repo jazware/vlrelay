@@ -34,6 +34,8 @@ busy relay (below).
 | GET | `ops/seq` | | `SeqView`: each node's stream head and newest seq checkpoint, and the recent 10 s boundaries with the seq each node counted, flagged where they disagree |
 | GET | `ops/archive` | | `ArchiveView`: archival mode and policy version, mirrored repos, fetch queue (queued, running), failed, retried, fetched bytes and records, mismatches, per core, and the newest fetch failures |
 | GET | `ops/plc` | | `PlcView`: the core reading the PLC export, ops read and their rate, written, throttled (429s), errors, caught up or not, per-window progress from the stored checkpoint, per core |
+| GET | `cluster/layout` | | the DID shard layout: `{version, shards: [{id, lo, hi, owner}], nextId, op}` (cluster core nodes only) |
+| POST | `cluster/reshard` | `{"op": "split", "shard", "at"?, "wait"?}`, `{"op": "merge", "left", "right", "wait"?}`, `{"op": "abort"}` | `{op, done?, layout}` (`done` with `wait`: the op flipped). See [Cluster](cluster.md#resharding) |
 | GET | `accounts` | `q`: a DID, a handle or a prefix | up to 100 `Account`s |
 | GET | `accounts/{did}` | | `Account`, with `archive` (wanted, mirrored, mirror rev, fetching, staging, last fetch error, takedown time) on an archiving relay |
 | POST | `accounts/{did}/takedown` | `{reason}` (required) | `Account` |

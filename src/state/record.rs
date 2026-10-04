@@ -13,8 +13,8 @@
 //! ```
 //!
 //! Host rows get their own tag so a shard's hosts are one short scan, not a
-//! walk over its DIDs. A split/merge clone must project both tags' ranges
-//! (vlpds's `clone_db` projects only `0x01`'s today).
+//! walk over its DIDs. A split/merge clone carries only `0x01` today
+//! ([`super::RESHARD_FAMILIES`] and [`super::CLONE_FAMILIES`]).
 
 use bytes::{BufMut, Bytes};
 use sha2::{Digest, Sha256};
@@ -117,6 +117,11 @@ pub fn host_slot_key(slot: u32) -> Vec<u8> {
     }
     let [a, b] = (slot as u16).to_be_bytes();
     vec![HOST_TAG, a, b]
+}
+
+/// Host rows of slots [lo, hi).
+pub fn host_range_keys(lo: u32, hi: u32) -> (Bytes, Bytes) {
+    (host_slot_key(lo).into(), host_slot_key(hi).into())
 }
 
 pub fn host_from_key(key: &[u8]) -> Option<&str> {

@@ -68,6 +68,41 @@ What the chaos runs (docs/chaos.md) changed, and why each piece is safe.
 
 **Replicas read the bucket through a window.** `follow::follow_bucket` keeps a window of GETs past the last segment it delivered (2 when caught up, doubling to 32 while each lands), delivers in order up to the first missing one or the fence, polls every 20 ms, and LISTs (for retention pruning) only after 5 s without a new segment. vlpds's `catch_up`, which replicas used, did one GET per segment and a LIST plus a 100 ms sleep at the end.
 
+## Resharding
+
+A DID shard can be split, or two adjacent ones merged, online. It's vlpds's reshard (its `reshard.rs`): the layout carries the op, the parents' owners close and freeze them, the driver clones the children from the frozen parents and flips the layout, and the children are then ordinary free shards that any core takes. The forwarder holds a parent's events (it retries for up to 20 s) from the freeze until a child opens; the clone is O(manifest), so the pause is the freeze, the clone and an open, well under a second.
+
+There's no automatic policy. An operator triggers it on any core node's admin API:
+
+```
+curl -u admin:$TOKEN -H 'content-type: application/json' localhost:2980/admin/api/cluster/layout
+curl -u admin:$TOKEN -H 'content-type: application/json' localhost:2980/admin/api/cluster/reshard \
+     -d '{"op": "split", "shard": 3, "wait": true}'          # at the midpoint, or "at": <first slot of the right half>
+curl ... -d '{"op": "merge", "left": 8, "right": 9, "wait": true}'   # adjacent, left holds the lower slots
+curl ... -d '{"op": "abort"}'                                # only before the flip
+```
+
+`wait` answers once the op flipped (`done: true`) or was aborted, at most 120 s. Any core can drive: the op is in the bucket, and a driver that dies is replaced by the lowest-named live core.
+
+### What a DID shard's SlateDB holds
+
+vlpds's clone projects a source to one key range, and vlpds keeps everything a shard owns under `0x01 ‖ slot`. vlRelay has three slot-keyed tags. vlpds now has an opt-in `partition::clone_db_families` that takes one key range per tag: it stages each tag past the first as a clone of its own and makes the child the union, all O(manifest). vlpds itself still clones with `clone_db`, unchanged. `state::CLONE_FAMILIES` lists vlRelay's three tags, and `state::tests::split_and_merge_carry_every_family` passes with all three in one process. In a live cluster, though, a split with all three made the children's first memtable flush fail SlateDB's L0 ULID cutoff (`InvalidClockTick { last_tick: 1791128121023, next_tick: 1791128120714 }`). The watermark matches the parent's last flush at the freeze, and the rejected ULID is 300 ms older, before the child existed. That looks like an inherited L0 counted as newly added rather than a skewed clock, but it isn't confirmed. The node fail-stopped. The same run with `0x01` alone passed. So `ClusterNode::clone_shards` clones `state::RESHARD_FAMILIES`, which is `0x01` only, until that's understood. The table says what that means for each family.
+
+| Family | Key | Slot | On a split or merge |
+|---|---|---|---|
+| Sync records | `0x01 ‖ slot ‖ 'd' ‖ DID` | the DID's | follows the slot range |
+| Archival mirrors: `V/{did}` meta, and vlpds's generation-keyed records, MST nodes and backlinks (`R/`, `c/`, `M/`, `h/`, …) | `0x01 ‖ slot ‖ family ‖ …` | the DID's | follows the slot range |
+| Host records (single node only) | `0x02 ‖ slot ‖ hostname` | the hostname's | should follow the slot range. Not carried today, and nothing in a cluster reads them (below). |
+| PLC export seeds | `0x03 ‖ slot ‖ DID` | the DID's | should follow the slot range. Not carried today: a child's DIDs miss the seed and resolve from PLC at the lookup budget, which is correct but costs lookups. The export reader doesn't re-send old ops, so they stay unseeded. |
+| Applied markers | `meta/applied/{log_id}` | none: per shard | stays with the parent. A child starts with no log history (the parents were checkpointed and closed at the freeze, so their SSTs hold everything), so it has no span to replay and no marker to start from. |
+
+Two more things are per shard but live outside SlateDB:
+
+- **The restart dedupe set** (`Recent`, `dedupe/{shard}/{log_id}`). A child replays none of its parents' logs, so it can't rebuild the set the way a takeover does. So a DID shard's close writes its whole set (not only the inherited entries) to `dedupe/{shard}/{our log}` and drops it from memory. The driver reads each parent's objects and writes their union to `dedupe/{child}/reshard` before the flip, and a child's open reads that along with its history's objects. Entries carry a hash of the DID, not its slot, so every child of a parent gets all of the parent's entries. One that isn't for the child's DIDs can never match an event, and it ages out with the host's checkpoint.
+- **Host records and cursors.** In a cluster these are in the bucket, keyed by host shard (`hosts/`, `hostck/`), and a DID reshard doesn't touch them. The `0x02` rows are the single node's `StateHosts`, which never reshards. They stay in the DID shards because on a single node the host and DID slot spaces are the same shards, and a host's record is in the shard that serves its slot. A bucket that started on one node and later runs as a cluster leaves them in its DID shards, unread.
+
+`tests/e2e/reshard.sh` (`just e2e-reshard`) splits and merges under load with archival on. `state::tests::split_and_merge_carry_every_family` and vlpds's `clone_with_families_splits_and_merges_every_family` cover the families clone in one process.
+
 ## Results
 
 Local, M-series Mac, dev build, `tests/e2e/cluster.sh --duration 80` (defaults: 50 writes/s, 30 accounts, 4 upstreams with `DEV_PDS=3`, lease TTL 3 s, 8 DID shards, 15 host shards). Five checker streams: one per core, each listing all three cores to fail over to, plus the edge and the replica.
@@ -224,3 +259,5 @@ The log already refuses to PUT or ack once the lease lapses (the cluster sets `l
 - Fixed: admin takedowns and account lookups go to the DID's owner over the peer admin RPC, and the dashboard's numbers are the whole cluster's (docs/admin-api.md "On a cluster").
 - Fixed since (docs/chaos.md): dedupe across two crashes in one checkpoint interval (inherited entries are persisted per shard), a duplicate answered before the first copy was durable (the zombie-plus-crash gap; bucket errors hit it without a zombie), and FutureCursor seq collisions in the dedupe set (entries carry the DID). docs/chaos.md lists what the chaos runs found open.
 - Each host owner's registry flush writes every host shard object that has a dirty row, every 2 s: one PUT per active host shard per tick.
+- A split or merge carries only `0x01` (sync records and mirrors). PLC seeds (`0x03`) and single-node host rows (`0x02`) stay with the parent ("Resharding" has why).
+- Resharding leaves the retired parents' state dirs and `dedupe/{parent}/` objects in the bucket. vlRelay doesn't run vlpds's reshard GC (`reshard_gc`), which would delete a parent's dir once no child reads its SSTs, and the children's compactions don't detach them early either. There's no reshard policy (split by size or write rate): only the admin trigger.

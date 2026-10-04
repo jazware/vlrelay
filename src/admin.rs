@@ -853,6 +853,23 @@ impl IntoResponse for AdminError {
 
 pub type AdminResult<T> = Result<T, AdminError>;
 
+/// An online DID shard split or merge (vlpds's `reshard`), or aborting the
+/// one in flight before it flips. With `wait`, the answer comes once the op
+/// flipped or was aborted (at most 120 s).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "op")]
+pub enum ReshardReq {
+    /// `at`: the first slot of the right half (default: the midpoint).
+    Split { shard: u32, at: Option<u32>, #[serde(default)] wait: bool },
+    /// `left` holds the lower slots.
+    Merge { left: u32, right: u32, #[serde(default)] wait: bool },
+    Abort,
+}
+
+fn no_cluster() -> AdminError {
+    AdminError::BadRequest("not a cluster core node".into())
+}
+
 /// What the dashboard needs from a relay. `by` is the operator label the
 /// audit trail records (the admin token has no user, so it's "admin" plus
 /// the client IP).
@@ -935,6 +952,13 @@ pub trait AdminSource: Send + Sync + 'static {
     }
 
     fn cluster(&self) -> impl Future<Output = AdminResult<ClusterView>> + Send;
+    /// The DID shard layout: version, shards (id, slots, owner), the op in flight.
+    fn shard_layout(&self) -> impl Future<Output = AdminResult<serde_json::Value>> + Send {
+        async { Err(no_cluster()) }
+    }
+    fn reshard(&self, _req: ReshardReq) -> impl Future<Output = AdminResult<serde_json::Value>> + Send {
+        async { Err(no_cluster()) }
+    }
 
     fn accounts(&self, q: AccountQuery) -> impl Future<Output = AdminResult<Vec<Account>>> + Send;
     fn account(&self, did: &str) -> impl Future<Output = AdminResult<Account>> + Send;
@@ -1006,6 +1030,8 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
         .route("/admin/api/ops/plc", get(plc_view::<S>))
         .route("/admin/api/ops/seq", get(seq_view::<S>))
         .route("/admin/api/ops/pipeline", get(pipeline_view::<S>))
+        .route("/admin/api/cluster/layout", get(shard_layout::<S>))
+        .route("/admin/api/cluster/reshard", post(reshard::<S>))
         .route("/admin/api/accounts", get(accounts::<S>))
         .route("/admin/api/accounts/{did}", get(account::<S>))
         .route("/admin/api/accounts/{did}/takedown", post(takedown::<S>))
@@ -1157,6 +1183,16 @@ async fn pipeline_view<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Pipe
 }
 async fn cluster<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<ClusterView>> {
     Ok(Json(c.src.cluster().await?))
+}
+async fn shard_layout<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<serde_json::Value>> {
+    Ok(Json(c.src.shard_layout().await?))
+}
+async fn reshard<S: AdminSource>(
+    State(c): Ax<S>,
+    Json(req): Json<ReshardReq>,
+) -> AdminResult<Json<serde_json::Value>> {
+    tracing::info!(target: "vlrelay::audit", ?req, by = BY, "reshard");
+    Ok(Json(c.src.reshard(req).await?))
 }
 async fn accounts<S: AdminSource>(
     State(c): Ax<S>,

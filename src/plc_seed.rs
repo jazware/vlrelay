@@ -37,9 +37,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Seed rows: `0x03 ‖ slot ‖ DID`, outside the `0x01` state records so
-/// `listRepos` scans never walk them. A split/merge clone must project this
-/// tag too, as it must the host rows' `0x02`.
+/// `listRepos` scans never walk them. A split or merge doesn't carry them
+/// yet ([`crate::state::RESHARD_FAMILIES`]).
 pub const SEED_TAG: u8 = 0x03;
+
+/// Seed rows of slots [lo, hi).
+pub fn seed_range_keys(lo: u32, hi: u32) -> (Bytes, Bytes) {
+    let at = |s: u32| -> Bytes {
+        if s >= vlpds::slots::SLOTS {
+            Bytes::from_static(&[SEED_TAG + 1])
+        } else {
+            let [a, b] = (s as u16).to_be_bytes();
+            Bytes::copy_from_slice(&[SEED_TAG, a, b])
+        }
+    };
+    (at(lo), at(hi))
+}
 
 pub fn seed_key(did: &str) -> Vec<u8> {
     let slot = vlpds::slots::slot_of(did);

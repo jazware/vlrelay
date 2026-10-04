@@ -80,6 +80,8 @@ One listener serves `GET /xrpc/_health` (`{"version"}`), `subscribeRepos`, the s
 
 `just e2e-archival` is the archival mode's e2e on its own ports (docs/archival.md).
 
+`just e2e-reshard` splits a DID shard of a three-core cluster and merges the halves back, under load with archival on, on its own ports (base 3680, nodes on 3700+; docs/cluster.md, "Resharding").
+
 ## e2e_check
 
 `e2e_check` subscribes to each upstream's own `subscribeRepos` and to the relay's, and matches events across them:

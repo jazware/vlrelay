@@ -87,6 +87,10 @@ e2e-archival *args:
 e2e-cluster *args:
     tests/e2e/cluster.sh {{args}}
 
+# Reshard e2e: 3 cores with archival on, a DID shard split and merged under load (tests/e2e/reshard.sh)
+e2e-reshard *args:
+    tests/e2e/reshard.sh {{args}}
+
 # Ecosystem compat: vlRelay beside indigo's relay with goat, indigo's consumer, @atproto/sync and Jetstream on both (docs/compat.md)
 compat *args:
     tests/compat/run.sh {{args}}

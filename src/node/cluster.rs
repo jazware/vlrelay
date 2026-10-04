@@ -407,6 +407,10 @@ impl Glue {
         if !self.cluster.lease_valid() {
             return Ok(());
         }
+        let _g = self.dedupe.order.lock().await;
+        if self.state.shard(id).is_none() {
+            return Ok(());
+        }
         self.dedupe.write(id, self.recent.inherited(id.0)).await
     }
 
@@ -960,6 +964,24 @@ impl Recent {
         v
     }
 
+    /// Every entry of the shard, sorted.
+    pub fn all(&self, shard: u32) -> Vec<DedupeEntry> {
+        let m = self.m.lock();
+        let mut v: Vec<DedupeEntry> = m
+            .iter()
+            .flat_map(|(h, s)| s.iter().filter(|(_, e)| e.shard == shard).map(|(q, e)| (h.clone(), *q, e.did)))
+            .collect();
+        v.sort();
+        v
+    }
+
+    pub fn forget(&self, shard: u32) {
+        self.m.lock().retain(|_, s| {
+            s.retain(|_, e| e.shard != shard);
+            !s.is_empty()
+        });
+    }
+
     pub fn min_ordinal(&self, shard: u32) -> Option<u64> {
         self.m.lock().values().flat_map(|s| s.values()).filter(|e| e.shard == shard).filter_map(|e| e.ordinal).min()
     }
@@ -983,11 +1005,19 @@ impl Recent {
 /// (host, upstream seq, [`did_key`]) of one dedupe entry.
 type DedupeEntry = (Host, i64, u64);
 
+/// A reshard child's inherited set: its parents' entries, by [`did_key`]
+/// only, so every child of a parent gets all of them. One that isn't the
+/// child's DID's can't match an event of its DIDs, and ages out.
+const RESHARD_DEDUPE: &str = "reshard";
+
 struct DedupeStore {
     store: Store,
     log_id: String,
     /// What each shard's object holds as last written (absent: no object).
     written: Mutex<HashMap<ShardId, Vec<DedupeEntry>>>,
+    /// A checkpoint tick's write of a shard's inherited entries must not
+    /// land after the close's write of all of them.
+    order: tokio::sync::Mutex<()>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -998,11 +1028,34 @@ struct DedupeDoc {
 
 impl DedupeStore {
     fn new(store: Store, log_id: String) -> DedupeStore {
-        DedupeStore { store, log_id, written: Mutex::new(HashMap::new()) }
+        DedupeStore { store, log_id, written: Mutex::new(HashMap::new()), order: Default::default() }
     }
 
     fn path(&self, shard: ShardId, log_id: &str) -> Path {
         Path::from(format!("{}/dedupe/{}/{log_id}", self.store.prefix, shard.key()))
+    }
+
+    /// Every object of the shard (one per log that held it, and a reshard
+    /// child's [`RESHARD_DEDUPE`]), merged.
+    async fn read_all(&self, shard: ShardId) -> anyhow::Result<Vec<DedupeEntry>> {
+        use futures::TryStreamExt;
+        let prefix = Path::from(format!("{}/dedupe/{}", self.store.prefix, shard.key()));
+        let objs: Vec<object_store::ObjectMeta> = self.store.raw.list(Some(&prefix)).try_collect().await?;
+        let mut all = Vec::new();
+        for o in objs {
+            let Some(name) = o.location.filename() else { continue };
+            all.extend(self.read(shard, name).await?);
+        }
+        all.sort();
+        all.dedup();
+        Ok(all)
+    }
+
+    /// Written once, by the reshard's driver, before the flip.
+    async fn put_as(&self, shard: ShardId, name: &str, entries: &[DedupeEntry]) -> anyhow::Result<()> {
+        let doc = DedupeDoc { entries: entries.iter().map(|(h, q, d)| (h.0.clone(), *q, *d)).collect() };
+        self.store.raw.put(&self.path(shard, name), PutPayload::from(serde_json::to_vec(&doc)?)).await?;
+        Ok(())
     }
 
     async fn read(&self, shard: ShardId, log_id: &str) -> anyhow::Result<Vec<DedupeEntry>> {
@@ -1183,7 +1236,8 @@ impl Shards {
             }
         }
         let mut inherited = 0;
-        let sets = futures::future::join_all(logs.iter().map(|l| g.dedupe.read(id, l))).await;
+        let sets =
+            futures::future::join_all(logs.iter().copied().chain([RESHARD_DEDUPE]).map(|l| g.dedupe.read(id, l))).await;
         for set in sets {
             for (h, useq, did) in set? {
                 g.recent.replayed(&h, useq, did, id.0);
@@ -1193,7 +1247,7 @@ impl Shards {
         // ours is written before any event is routed here, so a crash right
         // after this open loses nothing; then the earlier copies can go
         g.dedupe.write(id, g.recent.inherited(id.0)).await?;
-        let earlier: Vec<&str> = logs.into_iter().filter(|l| *l != g.dedupe.log_id).collect();
+        let earlier: Vec<&str> = logs.into_iter().chain([RESHARD_DEDUPE]).filter(|l| *l != g.dedupe.log_id).collect();
         let deletes = futures::future::join_all(earlier.iter().map(|l| g.dedupe.delete(id, l))).await;
         for (l, r) in earlier.iter().zip(deletes) {
             if let Err(e) = r {
@@ -1250,7 +1304,17 @@ impl DidShards for Shards {
                 g.clean.lock().remove(&id);
                 g.checkpoint_shard(id, committed).await?;
                 g.markers.lock().remove(&id);
-                g.state.close_shard(id).await
+                g.state.close_shard(id).await?;
+                // The whole set, not only what our marker doesn't cover: a
+                // reshard child of this shard replays none of our log, so it
+                // gets its set from here. A plain next owner gets a superset.
+                let _g = g.dedupe.order.lock().await;
+                g.dedupe.write(id, g.recent.all(id.0)).await?;
+                // the next owner deletes the object: what we wrote is no
+                // guide to what's there if the shard comes back
+                g.dedupe.written.lock().remove(&id);
+                g.recent.forget(id.0);
+                anyhow::Ok(())
             }
             .await;
             if let Err(e) = &r {
@@ -1267,6 +1331,44 @@ impl DidShards for Shards {
 
     fn on_layout(&self, layout: Arc<Layout>) {
         self.0.state.set_layout(layout.shards.clone());
+    }
+
+    /// Clones the children ([`state::RESHARD_FAMILIES`]) and hands each its
+    /// parents' dedupe sets, written by their owners' closes.
+    async fn clone_children(&self, op: u64, plans: Vec<(ShardId, Vec<(ShardId, u32, u32)>)>) -> anyhow::Result<()> {
+        use futures::StreamExt;
+        let g = &self.0;
+        let results: Vec<anyhow::Result<()>> = futures::stream::iter(plans.clone())
+            .map(|(c, srcs)| {
+                let store = g.state.store.clone();
+                async move {
+                    vlpds::partition::clone_db_families(&store, c, &srcs, state::RESHARD_FAMILIES)
+                        .await
+                        .map_err(|e| e.context(format!("reshard {op}: cloning shard {c} from {srcs:?}")))
+                }
+            })
+            .buffer_unordered(4)
+            .collect()
+            .await;
+        results.into_iter().collect::<anyhow::Result<Vec<()>>>()?;
+        let mut parents: HashMap<ShardId, Vec<DedupeEntry>> = HashMap::new();
+        for (_, srcs) in &plans {
+            for (p, ..) in srcs {
+                if !parents.contains_key(p) {
+                    parents.insert(*p, g.dedupe.read_all(*p).await?);
+                }
+            }
+        }
+        for (c, srcs) in &plans {
+            let mut set: Vec<DedupeEntry> = srcs.iter().flat_map(|(p, ..)| parents[p].iter().cloned()).collect();
+            set.sort();
+            set.dedup();
+            if !set.is_empty() {
+                g.dedupe.put_as(*c, RESHARD_DEDUPE, &set).await?;
+            }
+            tracing::info!(op, child = %c, dedupe = set.len(), "reshard child cloned");
+        }
+        Ok(())
     }
 }
 

@@ -111,7 +111,7 @@ Kept thin on purpose. A line must be a well-formed op of a known type (vlpds's `
 
 `0x03 ‖ slot ‖ DID` rows in the DID shard's SlateDB, beside the state records' `0x01` (so `listRepos` scans never walk them), written by the shard's owner: version, flags, `createdAt` (varint ms), the key's multicodec bytes and the PDS host. A write keeps the newer `createdAt`, so an op the export repeats or delivers late doesn't replace a newer one.
 
-In a cluster, the lowest-named live core reads the export and forwards each batch to the DID owners (`plc_seed::peer`, `POST /internal/relay/v1/plc/apply`, then `.../flush` before a checkpoint). The alternative, every owner filtering the whole stream for its slots, costs plc.directory and every node N times the requests and bytes. A leadership change can briefly leave two readers; both write the same ops, and the checkpoint at worst sends the next reader back a few seconds. A split/merge clone must project `0x03` as it must the host rows' `0x02`.
+In a cluster, the lowest-named live core reads the export and forwards each batch to the DID owners (`plc_seed::peer`, `POST /internal/relay/v1/plc/apply`, then `.../flush` before a checkpoint). The alternative, every owner filtering the whole stream for its slots, costs plc.directory and every node N times the requests and bytes. A leadership change can briefly leave two readers; both write the same ops, and the checkpoint at worst sends the next reader back a few seconds. A split or merge doesn't carry these rows to the children yet, so the children's DIDs resolve from PLC on a miss ([Cluster](cluster.md#resharding)).
 
 ### Using it
 
