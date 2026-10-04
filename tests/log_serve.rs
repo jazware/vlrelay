@@ -117,13 +117,18 @@ fn seqs(got: &[Got]) -> Vec<i64> {
     got.iter().filter_map(|g| if let Got::Seq(s) = g { Some(*s) } else { None }).collect()
 }
 
+/// Stream seqs are dense: the n-th event the bucket ever held is seq n.
+fn dense(from: i64, to: i64) -> Vec<i64> {
+    (from..=to).collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn append_durable_then_served_in_order() {
     let store = store();
     let (st, addr) = start(&store, "a", |_, _| {}).await;
-    let first = st.log.append(batch(1, 1, 100)).await.unwrap().seqs[0];
+    st.log.append(batch(1, 1, 100)).await.unwrap();
     // a live subscriber, then many batches submitted back to back
-    let reader = tokio::spawn(read_until(addr, Some(first), i64::MAX - 1));
+    let reader = tokio::spawn(read_until(addr, Some(1), 1001));
     tokio::time::sleep(Duration::from_millis(100)).await;
     let mut tickets = Vec::new();
     for b in 0..20 {
@@ -138,10 +143,12 @@ async fn append_durable_then_served_in_order() {
     assert!(want.windows(2).all(|w| w[0] < w[1]), "seqs increase in submit order");
     let last = *want.last().unwrap();
     assert!(st.log.wm.get() >= last);
-    reader.abort();
-    let got = read_until(addr, Some(first), last).await;
-    assert_eq!(seqs(&got), want);
-    // the log in the bucket holds the same events with their metadata
+    let live = reader.await.unwrap();
+    assert_eq!(seqs(&live), dense(2, 1001));
+    let got = read_until(addr, Some(1), 1001).await;
+    assert_eq!(seqs(&got), dense(2, 1001));
+    // the log in the bucket holds the same events with their merge keys and
+    // metadata
     let logged = seq::read_log(&store, &st.log.log_id, 0).await.unwrap();
     assert_eq!(logged.len(), 1 + want.len());
     assert_eq!(logged[1].seq, want[0]);
@@ -158,18 +165,16 @@ async fn cursor_resume_has_no_gaps_or_duplicates() {
         s.ring_bytes = 32 << 10;
     })
     .await;
-    let mut all = Vec::new();
     for b in 0..30 {
-        all.extend(st.log.append(batch(b * 40, 40, 200)).await.unwrap().seqs);
+        st.log.append(batch(b * 40, 40, 200)).await.unwrap();
     }
-    let last = *all.last().unwrap();
-    let mut cursors = vec![0, all[0] - 1];
-    cursors.extend(all.iter().step_by(97).copied());
+    let last = 1200;
+    let mut cursors = vec![0, 1];
+    cursors.extend((1..last).step_by(97));
     cursors.push(last - 1);
     for c in cursors {
         let got = read_until(addr, Some(c), last).await;
-        let want: Vec<i64> = all.iter().copied().filter(|s| *s > c).collect();
-        assert_eq!(seqs(&got), want, "cursor {c}");
+        assert_eq!(seqs(&got), dense(c + 1, last), "cursor {c}");
     }
 }
 
@@ -194,9 +199,11 @@ async fn crash_restart_drops_unacked_replays_acked_never_reuses_seqs() {
     assert_eq!(st2.recovered.seq_floor, *acked.last().unwrap());
     let after = st2.log.append(batch(100, 30, 500)).await.unwrap().seqs;
     assert!(after[0] > *acked.last().unwrap());
-    let got = read_until(addr2, Some(0), *after.last().unwrap()).await;
-    let want: Vec<i64> = acked.iter().chain(after.iter()).copied().collect();
-    assert_eq!(seqs(&got), want);
+    // the restart counts the earlier log's 100 and carries on from there
+    let got = read_until(addr2, Some(0), 130).await;
+    assert_eq!(seqs(&got), dense(1, 130));
+    let got = read_until(addr2, Some(100), 130).await;
+    assert_eq!(seqs(&got), dense(101, 130));
     assert_eq!(seq::read_log(&store, &old_id, 0).await.unwrap().len(), 100);
 }
 
@@ -234,8 +241,9 @@ async fn a_second_writer_fences_the_first() {
     assert!(matches!(*fatal.lock(), Some(LogError::Fenced(_))));
     assert!(matches!(one.log.append(batch(20, 1, 100)).await, Err(LogError::Fenced(_))));
     let b = two.log.append(batch(10, 10, 100)).await.unwrap().seqs;
-    let got = read_until(addr, Some(0), *b.last().unwrap()).await;
-    assert_eq!(seqs(&got), a.iter().chain(b.iter()).copied().collect::<Vec<_>>());
+    assert!(a.last() < b.first());
+    let got = read_until(addr, Some(0), 20).await;
+    assert_eq!(seqs(&got), dense(1, 20));
 
     // two writers on one log id: the loser of an ordinal stops
     let id = seq::new_log_id("e");
@@ -253,9 +261,10 @@ async fn a_second_writer_fences_the_first() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn outdated_and_future_cursors() {
     let store = store();
-    let (st, addr) = start(&store, "f", |c, s| {
+    let (st, _) = start(&store, "f", |c, s| {
         c.max_segment_events = 10;
         s.ring_bytes = 16 << 10;
+        s.seq_checkpoint_every = Duration::from_millis(5);
     })
     .await;
     let mut all = Vec::new();
@@ -263,19 +272,45 @@ async fn outdated_and_future_cursors() {
         all.extend(st.log.append(batch(b * 10, 10, 200)).await.unwrap().seqs);
     }
     let last = *all.last().unwrap();
+    // nothing goes past the newest seq checkpoint: none yet past the end
+    while seq::dense::newest(&store).await.unwrap().is_none_or(|k| k <= last) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     // a zero window prunes everything but each log's newest object
     let p = seq::prune(&store, &st.log.log_id, Duration::ZERO, 3).await.unwrap();
     assert_eq!(p.deleted, 3);
     let p = seq::prune(&store, &st.log.log_id, Duration::ZERO, 1000).await.unwrap();
     assert_eq!(p.deleted, 6);
     assert_eq!(seq::prune(&store, &st.log.log_id, Duration::ZERO, 1000).await.unwrap().deleted, 0);
-    let got = read_until(addr, Some(0), last).await;
+    // and the checkpoints below what's left
+    assert!(seq::dense::list(&store, None).await.unwrap().iter().all(|(k, _)| *k > all[89]));
+    // a restart has only the bucket: from the oldest checkpoint left (at or
+    // past the last segment's start), then live; its count carries on
+    let (st, addr) = start(&store, "f", |c, s| {
+        c.max_segment_events = 10;
+        s.seq_checkpoint_every = Duration::from_millis(5);
+    })
+    .await;
+    let reader = tokio::spawn(read_until(addr, Some(0), 102));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    st.log.append(batch(200, 2, 200)).await.unwrap();
+    let got = reader.await.unwrap();
     assert_eq!(got[0], Got::Info("OutdatedCursor".into()));
-    assert_eq!(seqs(&got), all[90..].to_vec());
+    let s = seqs(&got);
+    assert!(s[0] > 90 && s == dense(s[0], 102), "{s:?}");
+    let got = read_until(addr, Some(100), 102).await;
+    assert_eq!(seqs(&got), dense(101, 102));
 
-    let future = vlpds::nodelog::seq_floor(vlpds::tid::now_micros() + 3_600_000_000);
-    let got = read_until(addr, Some(future), i64::MAX).await;
+    // past the head: the stream waits a moment for it, then FutureCursor
+    let t = std::time::Instant::now();
+    let got = read_until(addr, Some(103), i64::MAX).await;
     assert_eq!(got, vec![Got::Error("FutureCursor".into())]);
+    assert!(t.elapsed() >= Duration::from_secs(1));
+    // a cursor the head reaches within that moment is served
+    let pending = tokio::spawn(read_until(addr, Some(103), 104));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    st.log.append(batch(300, 2, 200)).await.unwrap();
+    assert_eq!(seqs(&pending.await.unwrap()), vec![104]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -286,7 +321,8 @@ async fn a_stalled_consumer_is_cut_off_and_others_keep_up() {
         s.ring_bytes = 64 << 20;
     })
     .await;
-    let first = st.log.append(batch(0, 1, 100)).await.unwrap().seqs[0];
+    st.log.append(batch(0, 1, 100)).await.unwrap();
+    let first = 1;
     let url = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor={first}");
     let (mut stalled, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     // ~40 MiB while the stalled one reads nothing and a live one reads all
@@ -306,7 +342,13 @@ async fn a_stalled_consumer_is_cut_off_and_others_keep_up() {
     assert_eq!(got.last(), Some(&Got::Error("ConsumerTooSlow".into())), "after {} frames", got.len());
     assert!(seqs(&got).len() < all.len());
     live.abort();
-    let got = read_until(addr, Some(first), *all.last().unwrap()).await;
-    assert_eq!(seqs(&got), all);
+    // a replay that starts while the merger is still emitting may fall
+    // further behind than it started, which is too slow by design
+    let head = 1 + all.len() as i64;
+    while st.serve.firehose.last_emitted.load(std::sync::atomic::Ordering::Acquire) < head {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let got = read_until(addr, Some(first), 1 + all.len() as i64).await;
+    assert!(seqs(&got) == dense(2, 1 + all.len() as i64), "{} frames, last {:?}", got.len(), got.last());
     assert!(appended_in < Duration::from_secs(10), "appends took {appended_in:?}");
 }

@@ -62,6 +62,8 @@ use vlpds::store::Store;
 
 use crate::types::Host;
 
+pub mod dense;
+
 pub const DEFAULT_LINGER: Duration = Duration::from_millis(25);
 pub const DEFAULT_MAX_SEGMENT_BYTES: usize = 8 << 20;
 pub const DEFAULT_MAX_SEGMENT_EVENTS: usize = 65_536;
@@ -850,6 +852,10 @@ pub struct Pruned {
 pub async fn prune(store: &Store, reporter: &str, window: Duration, max_deletes: usize) -> anyhow::Result<Pruned> {
     use futures::StreamExt;
     let cutoff = nodelog::seq_floor(vlpds::tid::now_micros().saturating_sub(window.as_micros() as u64));
+    // Stream seqs are counted from a checkpoint, so cut at one: everything
+    // after it stays numbered. What's left below it is served from it
+    // (OutdatedCursor), at most a checkpoint interval late.
+    let Some(cutoff) = dense::newest_at_or_below(store, cutoff).await? else { return Ok(Pruned::default()) };
     let mut doomed: Vec<(Path, i64)> = Vec::new();
     for log_id in vlpds::backfill::list_logs(store).await? {
         let prefix = Path::from(format!("{}/log/{}", store.prefix, log_id));
@@ -901,6 +907,7 @@ pub async fn prune(store: &Store, reporter: &str, window: Duration, max_deletes:
             Err(e) => return Err(e.into()),
         }
     }
+    dense::prune_below(store, out.pruned_seq.max(prev), max_deletes).await?;
     Ok(out)
 }
 

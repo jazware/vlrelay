@@ -962,12 +962,12 @@ impl Node {
     async fn tap(self: Arc<Self>) {
         let fh = self.serve.firehose.clone();
         let mut head = fh.subscribe();
-        let mut last = fh.position();
+        let mut last = fh.last_emitted.load(std::sync::atomic::Ordering::Acquire);
         while head.changed().await.is_ok() {
             let now = Instant::now();
             let (batches, _) = fh.from_ring(last);
             for b in batches {
-                self.ttf.emitted_batch(b.events.iter().map(|(seq, _)| *seq), now);
+                self.ttf.emitted_batch((0..b.events.len()).map(|i| b.key(i)), now);
                 metrics::EVENTS_OUT.inc_by(b.events.len() as u64);
                 last = b.last;
             }

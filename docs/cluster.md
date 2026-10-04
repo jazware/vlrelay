@@ -193,6 +193,7 @@ The log already refuses to PUT or ack once the lease lapses (the cluster sets `l
 | `hosts/` | `node::cluster::BucketHosts` | host records (the registry) per host shard |
 | `log/{log_id}/` | `seq::NodeLog` | each core node's log, fenced at its end |
 | `dedupe/{did shard}/{log_id}` | `node::cluster::DedupeStore` | a DID shard owner's inherited restart-dedupe entries, while it has any |
+| `seqck/` | `seq::dense` (core nodes) | stream seq checkpoints: consumers see dense seqs, not merge keys (docs/seq.md) |
 
 ## Known gaps
 

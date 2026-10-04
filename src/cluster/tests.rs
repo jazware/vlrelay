@@ -223,7 +223,8 @@ async fn read_stream(addr: SocketAddr, cursor: i64, n: usize, max: Duration) -> 
     while out.len() < n {
         match tokio::time::timeout_at(deadline, ws.next()).await {
             Ok(Some(Ok(Message::Binary(b)))) => {
-                let seq = crate::seq::frame_seq(&b).expect("a seq");
+                let seq = crate::seq::frame_seq(&b)
+                    .unwrap_or_else(|| panic!("{addr} cursor {cursor}: {}", String::from_utf8_lossy(&b)));
                 out.push((seq, b.to_vec()));
             }
             Ok(Some(Ok(_))) => {}
@@ -238,13 +239,36 @@ async fn forward_all(n: &ClusterNode, evs: Vec<Forwarded>) -> Vec<Outcome> {
     waits.into_iter().map(|r| r.expect("forwarded")).collect()
 }
 
-fn appended(o: &[Outcome]) -> Vec<i64> {
+/// A frame with its seq zeroed: the same for an upstream frame and the
+/// relay's copy of it.
+fn norm(f: &[u8]) -> Vec<u8> {
+    let r = crate::seq::find_seq(f).expect("a seq");
+    [&f[..r.start], &[0u8][..], &f[r.end..]].concat()
+}
+
+/// Forwards `evs` and returns the appended ones as (log key, normalized frame).
+async fn forward_keyed(n: &ClusterNode, evs: Vec<Forwarded>) -> Vec<(i64, Vec<u8>)> {
+    let frames: Vec<Vec<u8>> = evs.iter().map(|e| norm(&e.frame)).collect();
+    let o = forward_all(n, evs).await;
     o.iter()
-        .filter_map(|o| match o {
-            Outcome::Appended(s) => Some(*s),
+        .zip(frames)
+        .filter_map(|(o, f)| match o {
+            Outcome::Appended(k) => Some((*k, f)),
             _ => None,
         })
         .collect()
+}
+
+/// A stream from cursor `start` holds exactly the appended events, in key
+/// order, numbered `start + 1`, `start + 2`, ...
+fn assert_stream(got: &[(i64, Vec<u8>)], appended: &[(i64, Vec<u8>)], start: i64, what: &str) {
+    let mut want = appended.to_vec();
+    want.sort();
+    let seqs: Vec<i64> = got.iter().map(|e| e.0).collect();
+    assert_eq!(seqs, (start + 1..=start + want.len() as i64).collect::<Vec<_>>(), "{what}: dense seqs");
+    let frames: Vec<Vec<u8>> = got.iter().map(|e| norm(&e.1)).collect();
+    let want: Vec<Vec<u8>> = want.into_iter().map(|e| e.1).collect();
+    assert!(frames == want, "{what}: the appended events in key order, no gaps or duplicates");
 }
 
 async fn three(store: &Store, ca: &Ca, applied: &Arc<Applied>) -> Vec<TNode> {
@@ -261,16 +285,16 @@ async fn three(store: &Store, ca: &Ca, applied: &Arc<Applied>) -> Vec<TNode> {
 async fn shards_spread_and_every_node_serves_the_same_bytes() {
     let (store, ca, applied) = (Store::memory(None), Ca::new(), Arc::new(Applied::default()));
     let nodes = three(&store, &ca, &applied).await;
-    let start = nodes.iter().map(|n| n.node.serve.firehose.position()).max().unwrap();
+    let start = 0;
     // every node a host owner for some events: forwards cross every pair
     let mut seqs = Vec::new();
     for round in 0..3 {
         let jobs = nodes.iter().enumerate().map(|(k, n)| {
             let evs: Vec<Forwarded> = (0..40).map(|i| fwd(k * 1000 + i, round * 100 + i as i64)).collect();
-            forward_all(&n.node, evs)
+            forward_keyed(&n.node, evs)
         });
         for o in futures::future::join_all(jobs).await {
-            seqs.extend(appended(&o));
+            seqs.extend(o);
         }
     }
     assert_eq!(seqs.len(), 360);
@@ -286,22 +310,21 @@ async fn shards_spread_and_every_node_serves_the_same_bytes() {
         nodes.iter().map(|n| read_stream(n.public, start, seqs.len(), Duration::from_secs(10))),
     )
     .await;
-    let mut want = seqs.clone();
-    want.sort();
     for s in &streams {
-        assert_eq!(s.iter().map(|e| e.0).collect::<Vec<_>>(), want);
+        assert_stream(s, &seqs, start, "stream");
     }
     assert_eq!(streams[0], streams[1]);
     assert_eq!(streams[0], streams[2]);
     // and from a cursor in the middle
-    let mid = want[want.len() / 2];
+    let mid = streams[0][seqs.len() / 2].0;
     let tails = futures::future::join_all(
-        nodes.iter().map(|n| read_stream(n.public, mid, want.len() / 2 - 1, Duration::from_secs(10))),
+        nodes.iter().map(|n| read_stream(n.public, mid, seqs.len() / 2 - 1, Duration::from_secs(10))),
     )
     .await;
     assert_eq!(tails[0], tails[1]);
     assert_eq!(tails[0], tails[2]);
-    assert_eq!(tails[0].first().map(|e| e.0), want.iter().copied().find(|s| *s > mid));
+    assert_eq!(tails[0].first().map(|e| e.0), Some(mid + 1));
+    assert_eq!(tails[0][..], streams[0][seqs.len() / 2 + 1..]);
     for n in &nodes {
         n.node.shutdown().await.unwrap();
     }
@@ -311,14 +334,13 @@ async fn shards_spread_and_every_node_serves_the_same_bytes() {
 async fn a_crash_moves_its_shards_fences_only_its_log_and_consumers_see_no_gap() {
     let (store, ca, applied) = (Store::memory(None), Ca::new(), Arc::new(Applied::default()));
     let nodes = three(&store, &ca, &applied).await;
-    let start = nodes.iter().map(|n| n.node.serve.firehose.position()).max().unwrap();
+    let start = 0;
     // a consumer on a survivor from before the crash to after it
     let watcher = {
         let addr = nodes[0].public;
         tokio::spawn(async move { read_stream(addr, start, 400, Duration::from_secs(30)).await })
     };
-    let first = forward_all(&nodes[0].node, (0..100).map(|i| fwd(i, i as i64)).collect()).await;
-    let mut seqs = appended(&first);
+    let mut seqs = forward_keyed(&nodes[0].node, (0..100).map(|i| fwd(i, i as i64)).collect()).await;
     // host cursors c acked, checkpointed before the crash
     let c = &nodes[2];
     let c_hosts: Vec<Host> = (0..50).map(|i| Host(format!("h{i}.test"))).filter(|h| c.node.owns_host(h)).collect();
@@ -334,14 +356,14 @@ async fn a_crash_moves_its_shards_fences_only_its_log_and_consumers_see_no_gap()
     // forwards to its DIDs during the takeover wait, then land at the new owner
     let during = {
         let a = nodes[0].node.clone();
-        tokio::spawn(async move { forward_all(&a, (100..200).map(|i| fwd(i, i as i64)).collect()).await })
+        tokio::spawn(async move { forward_keyed(&a, (100..200).map(|i| fwd(i, i as i64)).collect()).await })
     };
     let survivors = [&nodes[0], &nodes[1]];
     eventually("survivors own every shard", Duration::from_secs(15), || spread(&survivors)).await;
     let took = crashed.elapsed();
     eprintln!("crash takeover: {took:?}");
     assert!(took >= Duration::from_millis(1500), "taken over before the lease lapsed: {took:?}");
-    seqs.extend(appended(&during.await.unwrap()));
+    seqs.extend(during.await.unwrap());
     // a one-node start on a cluster's prefix would fence live logs: refused
     let single = crate::serve::start_single_node(
         store.clone(),
@@ -365,8 +387,7 @@ async fn a_crash_moves_its_shards_fences_only_its_log_and_consumers_see_no_gap()
     // a replay of events already durable is absorbed as duplicates
     let replay = forward_all(&nodes[1].node, (0..50).map(|i| fwd(i, i as i64)).collect()).await;
     assert!(replay.iter().all(|o| *o == Outcome::Duplicate), "{replay:?}");
-    let after = forward_all(&nodes[1].node, (200..400).map(|i| fwd(i, i as i64)).collect()).await;
-    seqs.extend(appended(&after));
+    seqs.extend(forward_keyed(&nodes[1].node, (200..400).map(|i| fwd(i, i as i64)).collect()).await);
     assert_eq!(seqs.len(), 400);
     // upstreams resume from c's checkpoints at their new owners
     for (i, h) in c_hosts.iter().enumerate() {
@@ -375,10 +396,7 @@ async fn a_crash_moves_its_shards_fences_only_its_log_and_consumers_see_no_gap()
         assert_eq!(crate::upstream::CursorSource::durable_cursor(&*cs, h), Some(1000 + i as i64));
     }
     let got = watcher.await.unwrap();
-    let mut want = seqs.clone();
-    want.sort();
-    let got_seqs: Vec<i64> = got.iter().map(|e| e.0).collect();
-    assert_eq!(got_seqs, want, "no gaps, no duplicates, in order");
+    assert_stream(&got, &seqs, start, "a consumer across the crash");
     // a consumer arriving now at either survivor sees the same bytes
     let s0 = read_stream(nodes[0].public, start, 400, Duration::from_secs(10)).await;
     let s1 = read_stream(nodes[1].public, start, 400, Duration::from_secs(10)).await;
@@ -393,7 +411,7 @@ async fn a_crash_moves_its_shards_fences_only_its_log_and_consumers_see_no_gap()
 async fn a_planned_handoff_checkpoints_and_pauses_under_a_second() {
     let (store, ca, applied) = (Store::memory(None), Ca::new(), Arc::new(Applied::default()));
     let nodes = three(&store, &ca, &applied).await;
-    let start = nodes.iter().map(|n| n.node.serve.firehose.position()).max().unwrap();
+    let start = 0;
     let c = &nodes[2];
     let c_hosts: Vec<Host> = (0..50).map(|i| Host(format!("h{i}.test"))).filter(|h| c.node.owns_host(h)).collect();
     for (i, h) in c_hosts.iter().enumerate() {
@@ -407,8 +425,7 @@ async fn a_planned_handoff_checkpoints_and_pauses_under_a_second() {
             let mut out = Vec::new();
             let mut i = 0usize;
             while !stop.load(Ordering::Acquire) {
-                let o = forward_all(&a, (i..i + 5).map(|k| fwd(k, k as i64)).collect()).await;
-                out.extend(appended(&o));
+                out.extend(forward_keyed(&a, (i..i + 5).map(|k| fwd(k, k as i64)).collect()).await);
                 i += 5;
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -423,7 +440,7 @@ async fn a_planned_handoff_checkpoints_and_pauses_under_a_second() {
             let mut arrivals = Vec::new();
             while let Ok(Some(Ok(m))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
                 if let Message::Binary(b) = m {
-                    arrivals.push((Instant::now(), crate::seq::frame_seq(&b).unwrap()));
+                    arrivals.push((Instant::now(), (crate::seq::frame_seq(&b).unwrap(), b.to_vec())));
                 }
             }
             arrivals
@@ -438,11 +455,10 @@ async fn a_planned_handoff_checkpoints_and_pauses_under_a_second() {
     assert!(moved < Duration::from_secs(3), "planned handoff took {moved:?}");
     tokio::time::sleep(Duration::from_millis(500)).await;
     stop.store(true, Ordering::Release);
-    let mut seqs = load.await.unwrap();
-    seqs.sort();
+    let seqs = load.await.unwrap();
     let arrivals = watcher.await.unwrap();
-    let got: Vec<i64> = arrivals.iter().map(|a| a.1).collect();
-    assert_eq!(got, seqs, "no gaps, no duplicates");
+    let got: Vec<(i64, Vec<u8>)> = arrivals.iter().map(|a| a.1.clone()).collect();
+    assert_stream(&got, &seqs, start, "a consumer across the handoff");
     let pause = arrivals.windows(2).map(|w| w[1].0 - w[0].0).max().unwrap();
     eprintln!("planned handoff: shards moved in {moved:?}, longest pause {pause:?}");
     assert!(pause < Duration::from_secs(1), "longest pause {pause:?}");
@@ -475,16 +491,16 @@ async fn edges_and_replicas_serve_the_identical_stream() {
     })
     .await;
     assert!(edge.node.cluster.is_none() && replica.node.cluster.is_none());
-    let start = [&a, &b, &edge, &replica].iter().map(|n| n.node.serve.firehose.position()).max().unwrap();
+    let start = 0;
     let mut seqs = Vec::new();
     for round in 0..10 {
         let o = futures::future::join_all([
-            forward_all(&a.node, (0..20).map(|i| fwd(i, round * 100 + i as i64)).collect()),
-            forward_all(&b.node, (20..40).map(|i| fwd(i, round * 100 + i as i64)).collect()),
+            forward_keyed(&a.node, (0..20).map(|i| fwd(i, round * 100 + i as i64)).collect()),
+            forward_keyed(&b.node, (20..40).map(|i| fwd(i, round * 100 + i as i64)).collect()),
         ])
         .await;
         for o in o {
-            seqs.extend(appended(&o));
+            seqs.extend(o);
         }
     }
     let n = seqs.len();
@@ -492,17 +508,30 @@ async fn edges_and_replicas_serve_the_identical_stream() {
         [&a, &edge, &replica].map(|t| read_stream(t.public, start, n, Duration::from_secs(10))),
     )
     .await;
-    seqs.sort();
-    assert_eq!(reads[0].iter().map(|e| e.0).collect::<Vec<_>>(), seqs);
+    assert_stream(&reads[0], &seqs, start, "core");
     assert_eq!(reads[0], reads[1], "edge");
     assert_eq!(reads[0], reads[2], "replica");
-    // a replica started after all that serves it from the bucket (backfill
-    // across the heartbeat segments)
+    // a replica started after all that numbers from the bucket (seq
+    // checkpoints plus a count) and serves it from there (backfill across
+    // the heartbeat segments)
     tokio::time::sleep(Duration::from_millis(200)).await;
     let late = spawn(&store, &ca, "replica-2", Role::Replica, &applied).await;
-    assert!(late.node.serve.firehose.position() > reads[0].last().unwrap().0);
+    let head = reads[0].last().unwrap().0;
+    eventually("the late replica anchors its seqs", Duration::from_secs(10), || {
+        late.node.serve.firehose.last_emitted.load(Ordering::Acquire) == head
+    })
+    .await;
     let backfilled = read_stream(late.public, start, n, Duration::from_secs(10)).await;
     assert_eq!(reads[0], backfilled, "late replica");
+    // the next events get the same seqs everywhere, the late replica included
+    let more = forward_keyed(&a.node, (0..20).map(|i| fwd(i, 5000 + i as i64)).collect()).await;
+    let tails = futures::future::join_all(
+        [&a, &edge, &late].map(|t| read_stream(t.public, head, more.len(), Duration::from_secs(10))),
+    )
+    .await;
+    assert_stream(&tails[0], &more, head, "after the late start");
+    assert_eq!(tails[0], tails[1], "edge");
+    assert_eq!(tails[0], tails[2], "late replica, live");
     late.node.shutdown().await.unwrap();
     // no lease, no shards, nothing written by the edge or the replica
     let leases = store.raw.list(Some(&object_store::path::Path::from(format!("{}/nodes", store.prefix))));

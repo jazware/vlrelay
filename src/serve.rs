@@ -49,6 +49,10 @@ pub struct ServeConfig {
     pub threads: usize,
     pub retention: Duration,
     pub retention_interval: Duration,
+    /// Spacing of the stream seq checkpoints (`seq::dense`).
+    pub seq_checkpoint_every: Duration,
+    /// Whether this node writes them (core nodes; edges and replicas only read).
+    pub write_seq_checkpoints: bool,
 }
 
 impl Default for ServeConfig {
@@ -63,12 +67,15 @@ impl Default for ServeConfig {
             threads: 4,
             retention: seq::DEFAULT_RETENTION,
             retention_interval: Duration::from_secs(60),
+            seq_checkpoint_every: seq::dense::DEFAULT_CHECKPOINT_EVERY,
+            write_seq_checkpoints: true,
         }
     }
 }
 
 pub struct Serve {
     pub firehose: Arc<Firehose>,
+    seqs: seq::dense::DenseSeqs,
     pub store: Store,
     cfg: ServeConfig,
     consumers: parking_lot::Mutex<BTreeMap<u64, Consumer>>,
@@ -123,8 +130,12 @@ impl Serve {
         };
         let fh = Firehose::new(opts);
         *fh.store.write() = Some(store.clone());
+        // JavaScript consumers need seqs below 2^53, and indigo's are dense
+        let seqs = seq::dense::DenseSeqs::new(store.clone(), cfg.seq_checkpoint_every, cfg.write_seq_checkpoints);
+        fh.set_renumber(Arc::new(seqs.clone()));
         let s = Arc::new(Serve {
             firehose: fh,
+            seqs,
             store,
             cfg,
             consumers: parking_lot::Mutex::new(BTreeMap::new()),
@@ -149,8 +160,9 @@ impl Serve {
                     (0, false) => head,
                     (s, _) => s,
                 };
-                // seqs are time-based: seq >> 8 is unix microseconds
-                let lag_ms = if head > 0 { ((head >> 8) - (pos >> 8)).max(0) as f64 / 1000.0 } else { 0.0 };
+                // stream seqs are counts; their log keys are time (key >> 8 is unix µs)
+                let key = |s: i64| self.firehose.key_at(s).unwrap_or(0) >> 8;
+                let lag_ms = if pos < head { (key(head) - key(pos)).max(0) as f64 / 1000.0 } else { 0.0 };
                 ConsumerSnapshot {
                     id,
                     ip: c.ip,
@@ -198,6 +210,7 @@ impl Serve {
     /// Follows a log of this process (its watermark is read directly).
     pub fn follow_local(&self, log: &NodeLog) {
         self.firehose.set_source(&log.log_id, Some(Source::Local(log.wm.clone())));
+        self.seqs.set_own_log(&log.log_id);
     }
 
     pub fn router(self: &Arc<Self>) -> axum::Router {
