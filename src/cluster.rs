@@ -252,6 +252,9 @@ impl Gate {
     }
 }
 
+/// A supervisor's stop timeout (docker's 10 s) leaves this much for it.
+const PEER_FENCE_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub type KeyHook = Arc<dyn Fn(Vec<String>) + Send + Sync>;
 pub type LostHook = Box<dyn FnOnce(&str) + Send>;
 
@@ -680,6 +683,36 @@ impl ClusterNode {
         futures::future::join_all(sends).await;
     }
 
+    /// Asks every peer to fence our log; true once one did.
+    async fn peers_fence(&self, log_id: &str) -> bool {
+        use futures::StreamExt;
+        let (Some(c), Some(http)) = (&self.cluster, &self.http) else { return false };
+        let mut asks: futures::stream::FuturesUnordered<_> = c
+            .peers()
+            .into_iter()
+            .map(|l| async move {
+                let r = http
+                    .post(format!("{}{}", l.addr.trim_end_matches('/'), peer::FENCE))
+                    .header(peer::TOKEN_HEADER, &self.opts.internal_token)
+                    .json(&peer::FenceIn { log_id: log_id.to_string() })
+                    .timeout(PEER_FENCE_TIMEOUT)
+                    .send()
+                    .await
+                    .and_then(|r| r.error_for_status());
+                if let Err(e) = &r {
+                    tracing::warn!(peer = %l.node_id, "asking a peer to fence our log failed: {e}");
+                }
+                r.is_ok()
+            })
+            .collect();
+        while let Some(ok) = asks.next().await {
+            if ok {
+                return true;
+            }
+        }
+        false
+    }
+
     /// A peer said it's leaving (by its log id, so a restart of the same
     /// node is a member again).
     pub(crate) fn peer_leaving(&self, log_id: String) {
@@ -758,7 +791,15 @@ impl ClusterNode {
             if let Err(e) = h.checkpoint().await {
                 tracing::warn!("final host checkpoint failed: {e:#}");
             }
-            c.shutdown(&host).await?;
+            if let Err(e) = c.shutdown(&host).await {
+                // Our shards are handed over; only the fence is missing, and
+                // without it every peer's merge waits on our watermark until
+                // our lease goes quiet. A peer's bucket path may be fine.
+                if !self.peers_fence(&c.log_id).await {
+                    return Err(e);
+                }
+                tracing::warn!("a peer fenced our log after our own fence failed ({e:#}): left");
+            }
         }
         self.stop.store(true, Ordering::Release);
         self.closed.store(true, Ordering::Release);

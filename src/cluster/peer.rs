@@ -21,6 +21,13 @@ pub const HELLO: &str = "/internal/relay/v1/cluster/hello";
 pub const NUDGE: &str = "/internal/relay/v1/cluster/nudge";
 pub const FORWARD: &str = "/internal/relay/v1/forward";
 pub const KEYS: &str = "/internal/relay/v1/keys/invalidate";
+pub const FENCE: &str = "/internal/relay/v1/cluster/fence";
+
+/// A leaving node whose own fence failed asks a peer to fence its log.
+#[derive(Serialize, Deserialize)]
+pub struct FenceIn {
+    pub log_id: String,
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct HelloIn {
@@ -76,6 +83,7 @@ pub fn router(node: &Arc<ClusterNode>) -> axum::Router {
         .route(NUDGE, post(nudge))
         .route(FORWARD, post(forward_batch))
         .route(KEYS, post(keys))
+        .route(FENCE, post(fence))
         .with_state(node.clone())
 }
 
@@ -144,6 +152,25 @@ async fn nudge(State(n): S, h: HeaderMap, axum::Json(inp): axum::Json<NudgeIn>) 
     }
     n.nudged(inp.handoffs, inp.hosts);
     StatusCode::OK.into_response()
+}
+
+async fn fence(State(n): S, h: HeaderMap, axum::Json(inp): axum::Json<FenceIn>) -> Response {
+    if let Err(r) = authorized(&n, &h) {
+        return r.into_response();
+    }
+    let Some(c) = &n.cluster else { return StatusCode::NOT_FOUND.into_response() };
+    n.peer_leaving(inp.log_id.clone());
+    match c.fence(&inp.log_id).await {
+        Ok(_) => {
+            tracing::info!(log_id = %inp.log_id, "fenced a leaving peer's log at its request");
+            n.on_membership();
+            StatusCode::OK.into_response()
+        }
+        Err(e) => {
+            tracing::warn!(log_id = %inp.log_id, "fencing a leaving peer's log failed: {e:#}");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
 }
 
 async fn forward_batch(State(n): S, h: HeaderMap, body: Bytes) -> Response {
