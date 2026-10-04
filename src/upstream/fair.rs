@@ -47,7 +47,11 @@ impl FairQueue {
     /// `quantum` is the bytes a weight-1 host may send per round.
     pub fn new(quantum: usize) -> FairQueue {
         FairQueue {
-            shared: Arc::new(Shared { active: Mutex::new(VecDeque::new()), wake: Notify::new(), quantum: quantum.max(1) }),
+            shared: Arc::new(Shared {
+                active: Mutex::new(VecDeque::new()),
+                wake: Notify::new(),
+                quantum: quantum.max(1),
+            }),
         }
     }
 

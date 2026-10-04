@@ -18,8 +18,8 @@ pub mod limits;
 
 pub use crawl::{CrawlPolicy, Crawler, DomainAction, DomainRule};
 pub use host::{
-    ErrorCounters, HostEntry, HostRecord, HostStatus, HostStore, HostView, HostnameError, MemHostStore, Registry,
-    Tier, normalize_hostname,
+    ErrorCounters, HostEntry, HostRecord, HostStatus, HostStore, HostView, HostnameError, MemHostStore, Registry, Tier,
+    normalize_hostname,
 };
 pub use limits::{Limits, TierLimits, TokenBucket};
 
@@ -179,10 +179,10 @@ impl Manager {
 
     fn spawn_host(&self, entry: Arc<HostEntry>) {
         let mut tasks = self.tasks.lock();
-        if let Some(r) = tasks.get(&entry.host) {
-            if !r.join.is_finished() {
-                return;
-            }
+        if let Some(r) = tasks.get(&entry.host)
+            && !r.join.is_finished()
+        {
+            return;
         }
         let weight = self.cfg.limits.for_tier(entry.tier()).weight;
         let queue = self.fair.host_queue(self.cfg.host_queue_frames, weight);

@@ -62,8 +62,9 @@ async fn fan_child(rate: f64, size: usize) -> FanChild {
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let addr = loop {
         let l = lines.next().expect("fan child exited").unwrap();
-        if let Some(a) = l.strip_prefix("FAN_ADDR=") {
-            break a.to_string();
+        // libtest's "test ... " prefix shares the line
+        if let Some(i) = l.find("FAN_ADDR=") {
+            break l[i + "FAN_ADDR=".len()..].trim().to_string();
         }
     };
     std::thread::spawn(move || for _ in lines {});
@@ -193,6 +194,53 @@ async fn flood(hosts: usize) {
         counts.first().unwrap_or(&0),
         counts.get(counts.len() / 2).unwrap_or(&0),
         counts.last().unwrap_or(&0),
+    );
+    m.shutdown().await.unwrap();
+}
+
+/// The per-node target's shape: thousands of hosts at a modest rate each
+/// (default 2000 x 17/s = 34k events/s of 4.5 KB).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn scale_steady_many_hosts() {
+    raise_nofile();
+    let hosts = env_or("SCALE_STEADY_HOSTS", 2000);
+    let rate = env_or("SCALE_STEADY_RATE", 17) as f64;
+    let size = env_or("SCALE_FRAME", 4500);
+    let secs = env_or("SCALE_SECS", 5) as u64;
+    let fc = fan_child(rate, size).await;
+    let (m, mut rx) = Manager::new(scale_config(&fc.fan), Arc::new(MemHostStore::default()), None);
+    m.start().await.unwrap();
+    for i in 0..hosts {
+        m.admit(&Host(format!("steady{i}.fan.test")), Tier::Default).await.unwrap();
+    }
+    let t = Instant::now();
+    while m.hosts().iter().filter(|h| h.connects > 0).count() < hosts || t.elapsed() < Duration::from_secs(2) {
+        assert!(t.elapsed() < Duration::from_secs(120));
+        while rx.try_recv().is_ok() {}
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let c0 = cpu_secs();
+    let t = Instant::now();
+    let mut lat = Vec::new();
+    while t.elapsed() < Duration::from_secs(secs) {
+        let f = rx.recv().await.unwrap();
+        lat.push((super::fan::now_ns() - super::fan::sent_ns(&f.frame)) as f64 / 1e6);
+    }
+    let el = t.elapsed().as_secs_f64();
+    let cpu = cpu_secs() - c0;
+    lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p = |q: f64| lat[((lat.len() as f64 * q) as usize).min(lat.len() - 1)];
+    eprintln!(
+        "steady: {hosts} hosts x {rate}/s x {size} B: {:.0} frames/s delivered (offered {:.0}); client CPU {:.2} cores \
+         ({:.2} us/frame); fan->consumer latency p50 {:.1} ms p99 {:.1} ms; RSS {} MB",
+        lat.len() as f64 / el,
+        hosts as f64 * rate,
+        cpu / el,
+        cpu / lat.len() as f64 * 1e6,
+        p(0.5),
+        p(0.99),
+        rss_kb(std::process::id()) / 1024,
     );
     m.shutdown().await.unwrap();
 }

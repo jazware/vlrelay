@@ -74,12 +74,7 @@ impl Fan {
 
     /// A handle to a fan served by another process, for its URLs.
     pub fn remote(addr: SocketAddr) -> Fan {
-        Fan {
-            addr,
-            specs: Mutex::new(HashMap::new()),
-            hosts: Mutex::new(HashMap::new()),
-            default: Mutex::new(None),
-        }
+        Fan { addr, specs: Mutex::new(HashMap::new()), hosts: Mutex::new(HashMap::new()), default: Mutex::new(None) }
     }
 
     pub fn set(&self, name: &str, spec: HostSpec) {
@@ -165,28 +160,28 @@ async fn serve(sock: WebSocket, name: String, spec: HostSpec, host: Arc<FanHost>
     } else {
         std::mem::forget(rx);
     }
-    if let (Some(c), Some(max)) = (cursor, spec.max_seq) {
-        if c > max {
-            let _ = tx.send(Message::Binary(encode_error("FutureCursor", "cursor in the future").into())).await;
-            let _ = tx.close().await;
-            return;
-        }
+    if let (Some(c), Some(max)) = (cursor, spec.max_seq)
+        && c > max
+    {
+        let _ = tx.send(Message::Binary(encode_error("FutureCursor", "cursor in the future").into())).await;
+        let _ = tx.close().await;
+        return;
     }
     let mut seq = match cursor {
         Some(c) => c,
         None => host.head.load(Ordering::Relaxed) as i64,
     };
-    if let (Some(c), Some(min)) = (cursor, spec.min_seq) {
-        if c < min {
-            let info = encode_message(
-                "#info",
-                &[("name", Value::Text("OutdatedCursor".into())), ("message", Value::Text("too old".into()))],
-            );
-            if tx.send(Message::Binary(info.into())).await.is_err() {
-                return;
-            }
-            seq = min - 1;
+    if let (Some(c), Some(min)) = (cursor, spec.min_seq)
+        && c < min
+    {
+        let info = encode_message(
+            "#info",
+            &[("name", Value::Text("OutdatedCursor".into())), ("message", Value::Text("too old".into()))],
+        );
+        if tx.send(Message::Binary(info.into())).await.is_err() {
+            return;
         }
+        seq = min - 1;
     }
     if spec.rate <= 0.0 {
         std::future::pending::<()>().await;
@@ -208,7 +203,8 @@ async fn serve(sock: WebSocket, name: String, spec: HostSpec, host: Arc<FanHost>
             }
         }
     }
-    let tick = Duration::from_millis(5);
+    // thousands of slow hosts on 5 ms ticks would swamp the fan's own runtime
+    let tick = Duration::from_secs_f64((1.0 / spec.rate).clamp(0.005, 0.1));
     let mut t = tokio::time::interval(tick);
     t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut owed = 0.0;

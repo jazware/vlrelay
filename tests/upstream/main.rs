@@ -362,6 +362,34 @@ async fn fair_queue_bounds_latency() {
     m.shutdown().await.unwrap();
 }
 
+/// Read-only, one socket, a few seconds: the production relay through the
+/// non-dev path (wss, webpki roots, public-address check).
+///   LIVE_HOST=relay1.us-east.bsky.network cargo test --test upstream live_ -- --ignored --nocapture
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn live_upstream() {
+    let host = Host(std::env::var("LIVE_HOST").unwrap_or_else(|_| "relay1.us-east.bsky.network".into()));
+    let (m, mut rx) = Manager::new(UpstreamConfig::new(false), Arc::new(MemHostStore::default()), None);
+    m.start().await.unwrap();
+    m.admit(&host, Tier::Trusted).await.unwrap();
+    let t = Instant::now();
+    let got = collect_for(&mut rx, Duration::from_secs(5)).await;
+    let el = t.elapsed().as_secs_f64();
+    let v = m.host(&host).unwrap();
+    let bytes: usize = got.iter().map(|f| f.frame.len()).sum();
+    eprintln!(
+        "live {}: {} frames in {el:.1} s ({:.0}/s, {:.0} B avg), errors {:?}",
+        host.0,
+        got.len(),
+        got.len() as f64 / el,
+        bytes as f64 / got.len().max(1) as f64,
+        v.record.errors
+    );
+    assert!(!got.is_empty());
+    assert!(got.windows(2).all(|w| w[1].upstream_seq > w[0].upstream_seq));
+    m.shutdown().await.unwrap();
+}
+
 async fn serve_crawler(c: &Arc<Crawler>) -> String {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());

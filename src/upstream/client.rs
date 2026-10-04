@@ -47,7 +47,8 @@ impl HostTask {
         let mut attempt: u32 = 0;
         let mut skip_cursor = false;
         loop {
-            if *self.stop.borrow() {
+            // a dropped manager closes the channel without sending true
+            if *self.stop.borrow() || self.stop.has_changed().is_err() {
                 break;
             }
             let cursor = if skip_cursor { None } else { self.cursor.durable_cursor(&self.entry.host) };

@@ -58,7 +58,13 @@ pub struct CrawlPolicy {
 
 impl Default for CrawlPolicy {
     fn default() -> CrawlPolicy {
-        CrawlPolicy { allow: Vec::new(), rules: Vec::new(), allow_only: false, new_hosts_per_hour: 50, probe_timeout_secs: 10 }
+        CrawlPolicy {
+            allow: Vec::new(),
+            rules: Vec::new(),
+            allow_only: false,
+            new_hosts_per_hour: 50,
+            probe_timeout_secs: 10,
+        }
     }
 }
 
@@ -120,7 +126,9 @@ impl IntoResponse for CrawlError {
             CrawlError::Busy => {
                 (StatusCode::TOO_MANY_REQUESTS, "RateLimitExceeded", "a crawl of this host is in progress".into())
             }
-            CrawlError::Unreachable(m) => (StatusCode::BAD_REQUEST, "InvalidRequest", format!("host check failed: {m}")),
+            CrawlError::Unreachable(m) => {
+                (StatusCode::BAD_REQUEST, "InvalidRequest", format!("host check failed: {m}"))
+            }
             CrawlError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", m),
         };
         (status, Json(serde_json::json!({"error": error, "message": message}))).into_response()
@@ -154,9 +162,7 @@ impl Crawler {
 
     /// The `requestCrawl` route, for the lead to merge into the public router.
     pub fn router(self: &Arc<Self>) -> Router {
-        Router::new()
-            .route("/xrpc/com.atproto.sync.requestCrawl", post(handle))
-            .with_state(self.clone())
+        Router::new().route("/xrpc/com.atproto.sync.requestCrawl", post(handle)).with_state(self.clone())
     }
 
     /// Validates, checks policy and budget, probes, admits. Returns whether
@@ -224,11 +230,8 @@ impl Crawler {
         let base = (cfg.endpoint)(host);
         let url = format!("{}/xrpc/com.atproto.server.describeServer", base.trim_end_matches('/'));
         let req = vlpds::http::guarded(cfg.dev_mode).get(&url).map_err(CrawlError::Unreachable)?;
-        let resp = req
-            .timeout(timeout)
-            .send()
-            .await
-            .map_err(|e| CrawlError::Unreachable(format!("describeServer: {e}")))?;
+        let resp =
+            req.timeout(timeout).send().await.map_err(|e| CrawlError::Unreachable(format!("describeServer: {e}")))?;
         if !resp.status().is_success() {
             return Err(CrawlError::Unreachable(format!("describeServer: HTTP {}", resp.status())));
         }

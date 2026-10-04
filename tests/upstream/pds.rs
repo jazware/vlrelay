@@ -90,10 +90,10 @@ impl Pds {
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
         let mut out = Vec::new();
         while let Ok(Some(Ok(m))) = tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
-            if let tokio_tungstenite::tungstenite::Message::Binary(b) = m {
-                if let Ok(Peek::Message { seq: Some(s), .. }) = peek(&b) {
-                    out.push(s);
-                }
+            if let tokio_tungstenite::tungstenite::Message::Binary(b) = m
+                && let Ok(Peek::Message { seq: Some(s), .. }) = peek(&b)
+            {
+                out.push(s);
             }
         }
         out

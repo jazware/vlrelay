@@ -22,7 +22,8 @@ pub enum Tier {
 }
 
 impl Tier {
-    pub const ALL: [Tier; 6] = [Tier::Trusted, Tier::Default, Tier::New, Tier::Throttled, Tier::Suspended, Tier::Banned];
+    pub const ALL: [Tier; 6] =
+        [Tier::Trusted, Tier::Default, Tier::New, Tier::Throttled, Tier::Suspended, Tier::Banned];
 
     /// Suspended and banned hosts keep their registry row but get no socket.
     pub fn connects(self) -> bool {
@@ -397,8 +398,20 @@ pub enum HostnameError {
 }
 
 /// Special-use and private-network TLDs a public PDS can't live under.
-const RESERVED_TLDS: &[&str] =
-    &["local", "localhost", "internal", "arpa", "invalid", "test", "example", "onion", "lan", "home", "corp", "intranet"];
+const RESERVED_TLDS: &[&str] = &[
+    "local",
+    "localhost",
+    "internal",
+    "arpa",
+    "invalid",
+    "test",
+    "example",
+    "onion",
+    "lan",
+    "home",
+    "corp",
+    "intranet",
+];
 
 /// Normalizes what a requestCrawl caller or operator typed into a [`Host`]:
 /// lowercase, scheme and trailing slash or dot dropped, `:443` dropped.

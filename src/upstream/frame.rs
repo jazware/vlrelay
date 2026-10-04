@@ -6,9 +6,18 @@ use vlpds::cbor::ValueRef;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Peek<'a> {
     /// `op: 1`. `seq` is absent on frame types that don't carry one.
-    Message { t: &'a str, seq: Option<i64> },
-    Info { name: &'a str, message: Option<&'a str> },
-    Error { error: &'a str, message: Option<&'a str> },
+    Message {
+        t: &'a str,
+        seq: Option<i64>,
+    },
+    Info {
+        name: &'a str,
+        message: Option<&'a str>,
+    },
+    Error {
+        error: &'a str,
+        message: Option<&'a str>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
