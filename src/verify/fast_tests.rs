@@ -14,7 +14,7 @@ fn commit_of(frame: Bytes) -> ParsedCommit {
 }
 
 fn both(c: &ParsedCommit, data: Cid, opts: &Options) -> Result<(), Reject> {
-    let blocks: HashMap<Cid, &[u8]> = c.blocks.iter().map(|(k, v)| (*k, &v[..])).collect();
+    let blocks: BlockMap<'_> = c.blocks.iter().map(|(k, v)| (*k, &v[..])).collect();
     set_fast_path(false);
     let slow = check_ops(c, data, &blocks, opts);
     set_fast_path(true);
@@ -67,7 +67,7 @@ fn one_create_fast_path_matches_tree_path() {
             let data = data_of(&c);
             total += 1;
             assert_eq!(both(&c, data, &opts), Ok(()));
-            let blocks: HashMap<Cid, &[u8]> = c.blocks.iter().map(|(k, v)| (*k, &v[..])).collect();
+            let blocks: BlockMap<'_> = c.blocks.iter().map(|(k, v)| (*k, &v[..])).collect();
             let op = &c.ops[0];
             if vlpds::mst::single_create::undo_single_create(
                 &blocks,

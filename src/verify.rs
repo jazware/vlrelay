@@ -357,10 +357,15 @@ fn check_future_rev(rev: Tid, opts: &Options) -> Result<(), Reject> {
     Ok(())
 }
 
+/// A commit's blocks by CID. foldhash, keyed per process like std's
+/// SipHash, at a fraction of the cost per lookup.
+#[doc(hidden)]
+pub type BlockMap<'a> = HashMap<Cid, &'a [u8], foldhash::fast::RandomState>;
+
 /// Every block hashed against its CID, as a map by CID.
 #[doc(hidden)]
-pub fn block_map(blocks: &[(Cid, Bytes)]) -> Result<HashMap<Cid, &[u8]>, Reject> {
-    let mut m = HashMap::with_capacity(blocks.len());
+pub fn block_map(blocks: &[(Cid, Bytes)]) -> Result<BlockMap<'_>, Reject> {
+    let mut m = BlockMap::with_capacity_and_hasher(blocks.len(), Default::default());
     for (c, b) in blocks {
         if !vlpds::car::block_matches(c, b) {
             return Err(Reject::BlockHashMismatch);
@@ -413,7 +418,7 @@ pub fn verify_commit_with(
 pub fn check_ops(
     c: &ParsedCommit,
     data: Cid,
-    blocks: &HashMap<Cid, &[u8]>,
+    blocks: &BlockMap<'_>,
     opts: &Options,
 ) -> Result<(), Reject> {
     let net = net_ops(&c.ops)?;
@@ -510,7 +515,7 @@ fn net_ops(ops: &[RepoOp]) -> Result<Vec<NetOp<'_>>, Reject> {
             _ => net.push(start(o, i)),
         }
     }
-    net.sort_unstable_by(|a, b| b.last.cmp(&a.last));
+    net.sort_unstable_by_key(|n| std::cmp::Reverse(n.last));
     Ok(net)
 }
 
@@ -527,7 +532,7 @@ pub(crate) fn set_fast_path(on: bool) {
 fn check_ops_tree(
     c: &ParsedCommit,
     data: Cid,
-    blocks: &HashMap<Cid, &[u8]>,
+    blocks: &BlockMap<'_>,
     net: &[NetOp<'_>],
 ) -> Result<(), Reject> {
     let mut tree = Tree::load_from_blocks(blocks, data)

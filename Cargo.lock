@@ -4395,7 +4395,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vlpds"
 version = "1.0.0"
-source = "git+https://github.com/jazware/vlpds?rev=322e6808aab57a1c9406074224c4cd0ea92fa196#322e6808aab57a1c9406074224c4cd0ea92fa196"
+source = "git+https://github.com/jazware/vlpds?rev=8b97e8347f96228d4004a20a5629bd5b78466ab6#8b97e8347f96228d4004a20a5629bd5b78466ab6"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4467,6 +4467,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "foldhash 0.2.0",
  "futures",
  "hdrhistogram",
  "hyper",

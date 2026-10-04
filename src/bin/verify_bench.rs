@@ -67,6 +67,9 @@ enum Cmd {
         /// Events per host to replay from before the live head.
         #[arg(long, default_value_t = 5000)]
         back: i64,
+        /// Replay from this seq instead (one host).
+        #[arg(long)]
+        cursor: Option<i64>,
         #[arg(long)]
         out: PathBuf,
         #[arg(long)]
@@ -135,12 +138,13 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Hunt {
             hosts,
             back,
+            cursor,
             out,
             keys,
             plc,
             rate,
             secs,
-        } => hunt(hosts, back, &out, &keys, &plc, rate, secs).await,
+        } => hunt(hosts, back, cursor, &out, &keys, &plc, rate, secs).await,
         Cmd::Profile {
             frames,
             keys,
@@ -310,6 +314,7 @@ async fn head_seq(host: &str) -> anyhow::Result<i64> {
 async fn hunt(
     hosts: Vec<String>,
     back: i64,
+    from: Option<i64>,
     out: &PathBuf,
     keys_path: &PathBuf,
     plc: &str,
@@ -331,7 +336,10 @@ async fn hunt(
         let tx = tx.clone();
         tokio::spawn(async move {
             let r: anyhow::Result<()> = async {
-                let cursor = head_seq(&host).await? - back;
+                let cursor = match from {
+                    Some(c) => c,
+                    None => head_seq(&host).await? - back,
+                };
                 let url = format!(
                     "wss://{host}/xrpc/com.atproto.sync.subscribeRepos?cursor={}",
                     cursor.max(0)
@@ -358,7 +366,10 @@ async fn hunt(
     let mut saved = Vec::new();
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    while let Ok(Some((host, f))) = tokio::time::timeout_at(deadline, rx.recv()).await {
+    // timeout_at polls the receiver first, so a busy stream never times out
+    while tokio::time::Instant::now() < deadline
+        && let Ok(Some((host, f))) = tokio::time::timeout_at(deadline, rx.recv()).await
+    {
         *counts.entry(format!("{host} frames")).or_default() += 1;
         let reason = match event::parse(f.clone(), &limits) {
             Err(r) => Some(format!("parse:{}", r.reason())),
