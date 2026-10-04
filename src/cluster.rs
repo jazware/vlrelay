@@ -209,12 +209,12 @@ struct Gate {
     idle: Notify,
 }
 
-struct Pass<'a> {
-    gate: &'a Gate,
+struct Pass {
+    gate: Arc<Gate>,
     shards: Vec<ShardId>,
 }
 
-impl Drop for Pass<'_> {
+impl Drop for Pass {
     fn drop(&mut self) {
         let mut m = self.gate.inflight.lock();
         for s in &self.shards {
@@ -232,14 +232,14 @@ impl Drop for Pass<'_> {
 
 impl Gate {
     /// The subset of `shards` being served, held open until the pass drops.
-    fn enter(&self, shards: &HashSet<ShardId>) -> (Pass<'_>, HashSet<ShardId>) {
+    fn enter(self: &Arc<Self>, shards: &HashSet<ShardId>) -> (Pass, HashSet<ShardId>) {
         let serving = self.serving.read();
         let mut m = self.inflight.lock();
         let ok: HashSet<ShardId> = shards.iter().filter(|s| serving.contains(s)).copied().collect();
         for s in &ok {
             *m.entry(*s).or_default() += 1;
         }
-        (Pass { gate: self, shards: ok.iter().copied().collect() }, ok)
+        (Pass { gate: self.clone(), shards: ok.iter().copied().collect() }, ok)
     }
 
     /// Stops serving `shards` and waits until nothing for them is in flight.
@@ -258,6 +258,45 @@ impl Gate {
             notified.await;
         }
     }
+}
+
+/// Runs `batch` through `stage` for the DIDs whose shard is being served,
+/// holding their shards open until the stage answers; the rest answer
+/// `NotOwner`.
+async fn gated_apply(
+    gate: Arc<Gate>,
+    stage: Arc<dyn DidStage>,
+    layout: Arc<Layout>,
+    batch: Vec<Forwarded>,
+) -> Vec<StageResult> {
+    let shards: Vec<ShardId> = batch.iter().map(|e| layout.shard_of(&e.did)).collect();
+    let wanted: HashSet<ShardId> = shards.iter().copied().collect();
+    let (_pass, ok) = gate.enter(&wanted);
+    let mut out: Vec<Option<StageResult>> = vec![None; batch.len()];
+    let mut idx = Vec::new();
+    let mut mine = Vec::new();
+    for (i, (ev, s)) in batch.into_iter().zip(shards).enumerate() {
+        if ok.contains(&s) {
+            idx.push(i);
+            mine.push(ev);
+        } else {
+            out[i] = Some(Err(StageError::NotOwner));
+        }
+    }
+    if !mine.is_empty() {
+        let n = mine.len();
+        let rs = stage.apply(mine).await;
+        if rs.len() != n {
+            for i in idx {
+                out[i] = Some(Err(StageError::Unavailable("stage answered the wrong count".into())));
+            }
+        } else {
+            for (i, r) in idx.into_iter().zip(rs) {
+                out[i] = Some(r);
+            }
+        }
+    }
+    out.into_iter().map(|r| r.unwrap_or(Err(StageError::NotOwner))).collect()
 }
 
 /// Inside a supervisor's stop timeout, and before our watchdog's fail-stop
@@ -284,7 +323,7 @@ pub struct ClusterNode {
     host_handler: RwLock<Option<Arc<dyn HostHandler>>>,
     key_hook: RwLock<Option<KeyHook>>,
     on_lost: Mutex<Option<LostHook>>,
-    gate: Gate,
+    gate: Arc<Gate>,
     /// Our log stream ends (the node is leaving or crashed).
     pub(crate) closed: Arc<AtomicBool>,
     halted: AtomicBool,
@@ -415,7 +454,7 @@ impl ClusterNode {
                 host_handler: RwLock::new(None),
                 key_hook: RwLock::new(None),
                 on_lost: Mutex::new(None),
-                gate: Gate::default(),
+                gate: Arc::default(),
                 closed: Arc::new(AtomicBool::new(false)),
                 halted: AtomicBool::new(false),
                 stop: Arc::new(AtomicBool::new(false)),
@@ -610,34 +649,16 @@ impl ClusterNode {
         let Some(stage) = stage.filter(|_| !self.halted.load(Ordering::Acquire)) else {
             return batch.iter().map(|_| Err(StageError::Unavailable("no stage".into()))).collect();
         };
-        let shards: Vec<ShardId> = batch.iter().map(|e| layout.shard_of(&e.did)).collect();
-        let wanted: HashSet<ShardId> = shards.iter().copied().collect();
-        let (_pass, ok) = self.gate.enter(&wanted);
-        let mut out: Vec<Option<StageResult>> = vec![None; batch.len()];
-        let mut idx = Vec::new();
-        let mut mine = Vec::new();
-        for (i, (ev, s)) in batch.into_iter().zip(shards).enumerate() {
-            if ok.contains(&s) {
-                idx.push(i);
-                mine.push(ev);
-            } else {
-                out[i] = Some(Err(StageError::NotOwner));
-            }
+        let n = batch.len();
+        // A task of its own holds the gate pass for as long as the stage
+        // runs: a caller dropped mid-batch (a peer request abandoned) would
+        // otherwise drop the pass while the detached stage still appends,
+        // and a close would take the shard from under it.
+        let task = tokio::spawn(gated_apply(self.gate.clone(), stage, layout, batch));
+        match task.await {
+            Ok(r) => r,
+            Err(e) => vec![Err(StageError::Unavailable(format!("stage task: {e}"))); n],
         }
-        if !mine.is_empty() {
-            let n = mine.len();
-            let rs = stage.apply(mine).await;
-            if rs.len() != n {
-                for i in idx {
-                    out[i] = Some(Err(StageError::Unavailable("stage answered the wrong count".into())));
-                }
-            } else {
-                for (i, r) in idx.into_iter().zip(rs) {
-                    out[i] = Some(r);
-                }
-            }
-        }
-        out.into_iter().map(|r| r.unwrap_or(Err(StageError::NotOwner))).collect()
     }
 
     /// Tells every live peer these DIDs' signing keys changed, so their key

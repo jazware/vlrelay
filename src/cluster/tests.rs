@@ -652,3 +652,46 @@ async fn a_core_its_peers_cannot_reach_steps_down() {
     let cc = c.node.cluster.as_ref().unwrap();
     assert!(!cc.joined() && cc.owned().is_empty(), "a core its peers can't reach doesn't join");
 }
+
+/// Answers once released, after saying it started.
+struct HeldStage {
+    started: Arc<Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl DidStage for HeldStage {
+    async fn apply(&self, batch: Vec<Forwarded>) -> Vec<StageResult> {
+        self.started.notify_one();
+        let _ = self.release.acquire().await;
+        batch.iter().map(|_| Ok(Outcome::Duplicate)).collect()
+    }
+}
+
+/// A caller dropped mid-batch (a peer's request abandoned) must not end
+/// the batch's gate pass while the stage still runs: a close then took the
+/// shard from under a detached append.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_caller_keeps_its_shard_open_until_the_stage_answers() {
+    let (store, ca, applied) = (Store::memory(None), Ca::new(), Arc::new(Applied::default()));
+    let n = spawn(&store, &ca, "solo", Role::Core, &applied).await;
+    let ev = fwd(1, 1);
+    eventually("the DID's shard is served", Duration::from_secs(10), || n.node.owns_did(&ev.did)).await;
+    let shard = n.node.layout().unwrap().shard_of(&ev.did);
+    let (started, release) = (Arc::new(Notify::new()), Arc::new(tokio::sync::Semaphore::new(0)));
+    n.node.set_stage(Arc::new(forward::Detached::new(
+        Arc::new(HeldStage { started: started.clone(), release: release.clone() }),
+        64,
+    )));
+    let node = n.node.clone();
+    let caller = tokio::spawn(async move { node.apply_local(vec![ev]).await });
+    started.notified().await;
+    caller.abort();
+    let _ = caller.await;
+    let gate = n.node.gate.clone();
+    let closing = tokio::spawn(async move { gate.close(&[shard]).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!closing.is_finished(), "the close waits for the detached batch");
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), closing).await.expect("the close finishes").unwrap();
+}
