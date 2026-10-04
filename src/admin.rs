@@ -260,6 +260,9 @@ pub struct DomainRule {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum RuleEffect {
     Ban,
+    /// Admitted when requestCrawl is allow-list only, and not counted
+    /// against the new-hosts-per-day budget.
+    Allow,
     Tier {
         tier: String,
     },

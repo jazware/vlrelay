@@ -833,6 +833,7 @@ impl Sim {
                 }
                 RuleEffect::Tier { tier } => h.tier = tier.clone(),
                 RuleEffect::Throttle { events_per_sec } => h.throttle = Some(*events_per_sec),
+                RuleEffect::Allow => {}
             }
         }
         n
