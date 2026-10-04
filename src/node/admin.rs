@@ -1,7 +1,8 @@
 //! The operator API over the node's real state: hosts and their actions,
 //! consumers, the overview's numbers and account lookups and takedowns.
-//! Domain rules, policy, cases and the cluster view still come from the
-//! simulation until the policy and cluster workstreams provide them.
+//! Policy, domain rules and cases go to the policy engine's admin half; the
+//! cluster view still comes from the simulation until the cluster
+//! workstream provides it.
 
 use super::Node;
 use super::metrics::HostSeries as Series;
@@ -17,6 +18,7 @@ use std::sync::Arc;
 
 pub struct NodeAdmin {
     pub node: Arc<Node>,
+    pub policy: Arc<crate::policy::admin::PolicyAdmin>,
     pub demo: Arc<Demo>,
 }
 
@@ -377,10 +379,10 @@ impl AdminSource for NodeAdmin {
     }
 
     async fn domain_rules(&self) -> AdminResult<Vec<admin::DomainRule>> {
-        self.demo.domain_rules().await
+        self.policy.domain_rules().await
     }
     async fn create_domain_rule(&self, rule: admin::DomainRuleInput, by: &str) -> AdminResult<admin::DomainRule> {
-        self.demo.create_domain_rule(rule, by).await
+        self.policy.create_domain_rule(rule, by).await
     }
     async fn update_domain_rule(
         &self,
@@ -388,19 +390,19 @@ impl AdminSource for NodeAdmin {
         rule: admin::DomainRuleInput,
         by: &str,
     ) -> AdminResult<admin::DomainRule> {
-        self.demo.update_domain_rule(id, rule, by).await
+        self.policy.update_domain_rule(id, rule, by).await
     }
     async fn delete_domain_rule(&self, id: u64, by: &str) -> AdminResult<()> {
-        self.demo.delete_domain_rule(id, by).await
+        self.policy.delete_domain_rule(id, by).await
     }
     async fn policy(&self) -> AdminResult<admin::PolicyDoc> {
-        self.demo.policy().await
+        self.policy.policy().await
     }
     async fn update_policy(&self, update: admin::PolicyUpdate, by: &str) -> AdminResult<admin::PolicyDoc> {
-        self.demo.update_policy(update, by).await
+        self.policy.update_policy(update, by).await
     }
     async fn policy_audit(&self) -> AdminResult<Vec<admin::PolicyAudit>> {
-        self.demo.policy_audit().await
+        self.policy.policy_audit().await
     }
 
     async fn consumers(&self) -> AdminResult<Vec<admin::Consumer>> {
@@ -436,7 +438,9 @@ impl AdminSource for NodeAdmin {
     }
 
     async fn accounts(&self, q: admin::AccountQuery) -> AdminResult<Vec<admin::Account>> {
-        let Some(q) = q.q.filter(|s| !s.is_empty()) else { return Ok(Vec::new()) };
+        let Some(q) = q.q.filter(|s| !s.is_empty()) else {
+            return Ok(Vec::new());
+        };
         if q.starts_with("did:") {
             return match self.account_view(&q).await {
                 Ok(a) => Ok(vec![a]),
@@ -461,12 +465,12 @@ impl AdminSource for NodeAdmin {
     }
 
     async fn cases(&self, q: admin::CaseQuery) -> AdminResult<Vec<admin::Case>> {
-        self.demo.cases(q).await
+        self.policy.cases(q).await
     }
     async fn case(&self, id: u64) -> AdminResult<admin::Case> {
-        self.demo.case(id).await
+        self.policy.case(id).await
     }
     async fn update_case(&self, id: u64, update: admin::CaseUpdate, by: &str) -> AdminResult<admin::Case> {
-        self.demo.update_case(id, update, by).await
+        self.policy.update_case(id, update, by).await
     }
 }

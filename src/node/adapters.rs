@@ -225,7 +225,12 @@ impl LogReplay {
 
 #[async_trait::async_trait]
 impl ReplaySource for LogReplay {
-    async fn tail(&self, log_id: &str, shard: ShardId, after: Option<u64>) -> anyhow::Result<Vec<(u64, Vec<StateDelta>)>> {
+    async fn tail(
+        &self,
+        log_id: &str,
+        shard: ShardId,
+        after: Option<u64>,
+    ) -> anyhow::Result<Vec<(u64, Vec<StateDelta>)>> {
         let from = after.map_or(0, |a| a + 1);
         let t = self.read(log_id, from).await?;
         let mut out = Vec::new();

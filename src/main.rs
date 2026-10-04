@@ -102,7 +102,8 @@ async fn run(a: Args) -> anyhow::Result<()> {
     let store = if a.memory {
         vlpds::store::Store::memory(None)
     } else {
-        let need = |v: &Option<String>, f: &str| v.clone().ok_or_else(|| anyhow::anyhow!("{f} is required without --memory"));
+        let need =
+            |v: &Option<String>, f: &str| v.clone().ok_or_else(|| anyhow::anyhow!("{f} is required without --memory"));
         let cfg = vlpds::store::S3Config {
             endpoint: need(&a.s3_endpoint, "--s3-endpoint")?,
             bucket: need(&a.s3_bucket, "--s3-bucket")?,
@@ -143,7 +144,12 @@ async fn run(a: Args) -> anyhow::Result<()> {
     }
     if let Some(token) = a.admin_token.clone().filter(|t| !t.is_empty()) {
         let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
-        let src = Arc::new(NodeAdmin { node: node.clone(), demo: vlrelay::admin::demo::Demo::start(42) });
+        let engine =
+            vlrelay::policy::Engine::new(node.store.clone(), &a.node_id, Arc::new(vlrelay::policy::FixedNodes::new(1)));
+        engine.spawn_refresher();
+        let hosts: Arc<dyn vlrelay::state::HostStore> = node.state.clone();
+        let policy = Arc::new(vlrelay::policy::admin::PolicyAdmin::new(engine, hosts));
+        let src = Arc::new(NodeAdmin { node: node.clone(), policy, demo: vlrelay::admin::demo::Demo::start(42) });
         app = app.merge(vlrelay::admin::app(src, token, ui));
     }
     let app = app.layer(middleware::map_response(server_header));

@@ -272,12 +272,8 @@ impl DidOwner for LocalOwner {
         metrics::STAGE_CPU.with_label_values(&["apply"]).inc_by(t0.elapsed().as_micros() as u64);
         match r {
             Ok(Applied::Append(a)) => {
-                let meta = EventMeta {
-                    did: c.did,
-                    host: c.host,
-                    upstream_seq: c.upstream_seq,
-                    shard: a.ticket.shard.0,
-                };
+                let meta =
+                    EventMeta { did: c.did, host: c.host, upstream_seq: c.upstream_seq, shard: a.ticket.shard.0 };
                 let ev = seq::Event {
                     meta,
                     frame: Box::new(Spliced { frame: c.frame, span: c.span }),
@@ -493,8 +489,7 @@ impl Node {
         let mut explicit = HashMap::new();
         let mut cli_hosts = Vec::new();
         for h in &cfg.hosts {
-            let host = upstream::normalize_hostname(h, cfg.dev_mode)
-                .map_err(|e| anyhow::anyhow!("--host {h}: {e}"))?;
+            let host = upstream::normalize_hostname(h, cfg.dev_mode).map_err(|e| anyhow::anyhow!("--host {h}: {e}"))?;
             let base = if h.starts_with("http://") || h.starts_with("ws://") {
                 anyhow::ensure!(cfg.dev_mode, "--host {h}: plain http needs --dev-mode");
                 format!("http://{}", host.0)
@@ -860,7 +855,7 @@ impl Node {
                 }
             }
             metrics::ACK_PENDING.set(snap.pending as i64);
-            if self.replayed.lock().len() > 0 && self.started_ms + 600_000 < upstream::host::now_ms() as i64 {
+            if !self.replayed.lock().is_empty() && self.started_ms + 600_000 < upstream::host::now_ms() as i64 {
                 self.replayed.lock().clear();
             }
         }
@@ -896,10 +891,8 @@ impl Node {
                 r.iter().map(|(h, x)| (h.clone(), x.total)).collect()
             };
             let (p50, p99) = self.ttf.roll();
-            let lat = (
-                self.log.stats.latency_us.load(Ordering::Relaxed),
-                self.log.stats.events.load(Ordering::Relaxed),
-            );
+            let lat =
+                (self.log.stats.latency_us.load(Ordering::Relaxed), self.log.stats.events.load(Ordering::Relaxed));
             let lag_ms = if lat.1 > prev_lat.1 {
                 (lat.0 - prev_lat.0) as f64 / (lat.1 - prev_lat.1) as f64 / 1000.0
             } else {

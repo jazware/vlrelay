@@ -69,6 +69,15 @@ vlrelay --listen 127.0.0.1:2980 \
 
 The e2e checks the relay's `--help` for `--listen` and `--host`. Until both show up it prints `SKIP relay` and checks the upstreams against themselves instead, which still exercises the network, the load and the checker.
 
+The relay implements the contract (`src/main.rs`, pipeline in `src/node.rs`). Its other flags:
+
+- `--admin-token T` turns on `/admin` (the dashboard, from `--ui-dir` or this tree's `ui/dist`) and its API. Without it there's no `/admin`.
+- `--dev-mode` allows `ws://`, IPs, localhost and ports. An `http://` `--host` or a loopback `--plc-url` turns it on by itself.
+- `--did-shards N` (4) is the number of DID state shards, each a SlateDB. `--retention H` (72) is the log's replay window in hours.
+- `--lanes N` (64) and `--ingest-threads N` (cores, at most 16) size the pipeline. `--did-lookups-per-sec` (50) is the DID document budget.
+
+One listener serves `GET /xrpc/_health` (`{"version"}`), `subscribeRepos`, the sync API (`listRepos`, `getRepoStatus`, `getLatestCommit`, `listHosts`, `getHostStatus`), `requestCrawl` (with `--crawl`), `/admin` and Prometheus `/metrics`. Every response carries `Server: vlrelay/… (atproto-relay)`, so other relays won't crawl it. The relay's own series are `vlrelay_*`: events in by kind, accepted by kind, out, rejected by reason, duplicates by where they were caught, time to firehose and time to durable (histograms), time per pipeline stage, durable lag, hosts by status, consumers. vlpds's firehose and process series come with them.
+
 ## e2e_check
 
 `e2e_check` subscribes to each upstream's own `subscribeRepos` and to the relay's, and matches events across them:
@@ -106,7 +115,45 @@ A 25 s run of that matched 195 of 196 commits, with p50 ~140 ms and p99 ~1.3 s f
 just e2e [--duration 60] [--rate 50] [--accounts 30]     # KEEP=1 leaves the network up
 ```
 
-`tests/e2e/run.sh` builds the relay, `e2e_check` and `devnet`, runs `dev-up`, seeds, starts the relay (or skips it, as above), starts the checker, then the load, and tears it all down. Logs and `report.json` go to `dev/state/e2e/`, copied to `$TMPDIR/vlrelay-e2e-last` before teardown. A 30 s run at 100 writes/s takes ~52 s end to end with a warm build.
+`tests/e2e/run.sh` builds the relay, `e2e_check` and `devnet`, runs `dev-up`, seeds, starts the relay (or skips it, as above), starts the checker, then the load, and tears it all down. Logs, `report.json` and the relay's `vlrelay_*` metrics (`metrics.txt`) go to `dev/state/e2e/`, copied to `$TMPDIR/vlrelay-e2e-last` before teardown. A 30 s run at 100 writes/s takes ~52 s end to end with a warm build.
+
+Two more flags:
+
+- `--bucket` runs the relay on the dev MinIO (`:2990`, a new prefix per run) instead of `--memory`.
+- `--restart-at S` kill -9s the relay S seconds into the load and starts it again on the same prefix. It implies `--bucket`. The checker's relay socket reconnects with its last cursor, so a gap or a duplicate across the restart fails the run.
+
+### Results
+
+Measured on the Mac (M-series, 14 cores), dev build (the relay crate at opt-level 0, dependencies at 2), three upstreams (two vlpds and the reference PDS).
+
+| Run | Events | Missing | Extra | Reordered | Dups | Upstream → relay p50 / p90 / p99 / max |
+|---|---|---|---|---|---|---|
+| `--duration 30 --rate 50`, memory | 1,658 | 0 | 0 | 0 | 0 | 27 / 29 / 31 / 39 ms |
+| `--duration 60 --rate 400 --accounts 60 --bucket` | 24,223 | 0 | 0 | 0 | 0 | 17 / 28 / 30 / 36 ms |
+| `--duration 60 --rate 50 --restart-at 20` | 3,168 | 0 | 0 | 0 | 0 | 29 / 32 / 265 / 869 ms |
+
+The floor is the 25 ms linger plus a MinIO PUT. Each run covers every event type: `#commit`, `#sync` (on reactivation), `#identity` (handle changes) and `#account` (deactivations).
+
+In the restart run, the relay was back serving 1 s after the kill. It replayed 113 state deltas from the dead log in 0.6 s, and each upstream resumed from its last durable cursor. The upstreams then re-sent 112 events that were already in the log past those cursors. The relay dropped all of them (`vlrelay_events_duplicate_total{at="restart_log"}`), so the checker, resuming from its own cursor, saw no gap and no duplicate. The p99 is the events caught in the kill.
+
+Time per event in each stage, from `vlrelay_stage_busy_us_total` over the 400/s run (dev build, so upper bounds): strict parse 10 µs, verify (hashes, signature, MST inversion) 46 µs, apply (the DID owner's state step) 20 µs.
+
+### Against real PDSes
+
+`scripts/prodcmp.sh [SECONDS]` runs vlRelay locally (`--memory`, 127.0.0.1) against the same three PDSes the reference work used (amanita, eurosky.social, blacksky.app), with plain `--host` and no requestCrawl. It runs two checkers over the same window, one against vlRelay and one against `wss://bsky.network`, so both latencies are measured under the same conditions.
+
+Use `--scope all` for vlRelay, since it carries only those hosts, and `--scope seen` for production. With `seen`, an event that reaches the relay stream before the checker's own PDS socket has named the DID is counted out of scope, and then counted missing when the PDS copy arrives. vlRelay beats the checker's PDS sockets often enough (~1,250 relay-first events in 10 minutes) that the first run reported 221 commits missing that vlRelay had in fact emitted.
+
+10 minutes, 2026-10-04 ~10:33Z, ~14 events/s, 1,938 DIDs:
+
+| | Commits matched | Missing | Extra | Reordered | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|---|---|---|
+| vlRelay (local, dev build) | 8,283 of 8,285 | 1 | 0 | 0 | 32 ms | 109 ms | 290 ms | 884 ms |
+| bsky.network | 8,198 | 62 (scope artifact) | 0 | 0 | 97 ms | 183 ms | 361 ms | 3.0 s |
+
+The run before it (`--scope seen` for both) gave vlRelay p50 32 ms, p90 175 ms, p99 559 ms against production's 104, 275 and 755 ms. Production's baseline in `reference-notes.md` is ~90 ms p50 and ~590 ms p99. The tails are mostly PDS burstiness that both relays see, and vlRelay sits on the same machine as the checker, so this measures pipeline delay, not network distance.
+
+Rejects on real traffic over the two runs (~16k events): one `bad_op` from eurosky.social in the second, which is the one missing commit. The first had 2 `bad_op`, 2 `commit_rev_mismatch`, 2 `prev_data_mismatch` (each followed by `desynchronized` drops for that account until a `#sync`) and 1 `wrong_host`. There was no `missing_record_block`. `bad_op` is the strict parse rejecting an op (most likely a record path that `valid_record_path` refuses), where indigo is lenient. The verify workstream should look at the frame.
 
 ## benchbox
 
