@@ -282,6 +282,8 @@ pub struct ClusterNode {
     stop: Arc<AtomicBool>,
     host_nudge: Arc<Notify>,
     leaving_peers: Mutex<HashMap<String, Instant>>,
+    /// Our advertised peer address answered our last probe (`reach_loop`).
+    self_reachable: AtomicBool,
 }
 
 impl ClusterNode {
@@ -382,6 +384,7 @@ impl ClusterNode {
             });
         }
         serve.firehose.spawn_merger(rx);
+        let no_transport = http.is_none();
         let node = Arc::new_cyclic(|me: &Weak<ClusterNode>| {
             let forwarder = (opts.role == Role::Core)
                 .then(|| Forwarder::start(opts.forward.clone(), Arc::new(NodeRoute(me.clone()))));
@@ -408,6 +411,7 @@ impl ClusterNode {
                 stop: Arc::new(AtomicBool::new(false)),
                 host_nudge: Arc::new(Notify::new()),
                 leaving_peers: Mutex::new(HashMap::new()),
+                self_reachable: AtomicBool::new(no_transport),
             }
         });
         let _ = log_owner.set(Arc::downgrade(&node));
@@ -912,20 +916,27 @@ async fn reach_loop(me: Weak<ClusterNode>) {
     };
     let timeout = (window / 3).clamp(Duration::from_millis(200), Duration::from_secs(1));
     let mut failing_since: Option<Instant> = None;
+    let mut first = true;
     loop {
-        tokio::time::sleep(every).await;
+        if !std::mem::take(&mut first) {
+            tokio::time::sleep(every).await;
+        }
         let Some(n) = me.upgrade() else { return };
         if n.stop.load(Ordering::Acquire) {
             return;
         }
         let Some(c) = n.cluster.clone() else { return };
-        // alone, nobody needs to reach us; not joined, we hold nothing
-        if c.peers().is_empty() || !c.joined() || !n.lease_valid() {
+        // alone, nobody needs to reach us
+        if c.peers().is_empty() {
+            n.self_reachable.store(true, Ordering::Release);
             failing_since = None;
             continue;
         }
-        if n.reachable(timeout).await {
-            if failing_since.take().is_some() {
+        let ok = n.reachable(timeout).await;
+        n.self_reachable.store(ok, Ordering::Release);
+        // not joined (`may_join` holds it meanwhile), we hold nothing
+        if ok || !c.joined() || !n.lease_valid() {
+            if failing_since.take().is_some() && ok {
                 tracing::info!("our peer address answers again");
             }
             continue;
@@ -1122,6 +1133,16 @@ impl ShardHost for ClusterNode {
 
     fn follow_floors(&self) -> BTreeMap<String, i64> {
         self.followers.floors()
+    }
+
+    /// A restart after a step-down would join and take shards only to give
+    /// them up a TTL later: it waits until its peers can reach it.
+    fn may_join(&self) -> bool {
+        let reachable = self.self_reachable.load(Ordering::Acquire);
+        if !reachable {
+            tracing::info!(addr = %self.opts.addr, "not joining yet: our advertised peer address doesn't answer");
+        }
+        reachable
     }
 
     async fn refused(&self, addr: &str) -> bool {
