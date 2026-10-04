@@ -258,7 +258,9 @@ impl Node {
             rx,
         )?;
 
-        cluster.set_stage(Arc::new(crate::cluster::forward::Detached(Arc::new(Stage(glue.clone())))));
+        use crate::cluster::forward::Detached;
+        let stage = Detached::new(Arc::new(Stage(glue.clone())), Detached::<Stage>::DEFAULT_MAX_EVENTS);
+        cluster.set_stage(Arc::new(stage));
         cluster.set_did_shards(Arc::new(Shards(glue.clone())));
         cluster.set_host_handler(Arc::new(Upstreams { node: Arc::downgrade(&node) }));
         let id = identity.clone();

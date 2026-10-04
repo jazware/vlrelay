@@ -82,14 +82,36 @@ pub trait DidStage: Send + Sync + 'static {
 /// in-flight entry unresolved, and every later copy of the event, a
 /// duplicate waiting on it, answers "the duplicated event isn't durable"
 /// until its forward gives up (chaos kill9, minio-errors, crash-loop).
-pub struct Detached<S>(pub Arc<S>);
+///
+/// A caller that gives up retries, and its abandoned batch runs on: against
+/// a stuck stage those would pile up without bound. Past `max_events` in
+/// detached batches a new batch is answered `Unavailable` at once.
+pub struct Detached<S> {
+    stage: Arc<S>,
+    room: Arc<tokio::sync::Semaphore>,
+}
+
+impl<S> Detached<S> {
+    pub const DEFAULT_MAX_EVENTS: usize = 65_536;
+
+    pub fn new(stage: Arc<S>, max_events: usize) -> Detached<S> {
+        Detached { stage, room: Arc::new(tokio::sync::Semaphore::new(max_events.max(1))) }
+    }
+}
 
 #[async_trait::async_trait]
 impl<S: DidStage> DidStage for Detached<S> {
     async fn apply(&self, batch: Vec<Forwarded>) -> Vec<StageResult> {
         let n = batch.len();
-        let stage = self.0.clone();
-        match tokio::spawn(async move { stage.apply(batch).await }).await {
+        let Ok(permit) = self.room.clone().try_acquire_many_owned(n.max(1) as u32) else {
+            return vec![Err(StageError::Unavailable("stage busy".into())); n];
+        };
+        let stage = self.stage.clone();
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            stage.apply(batch).await
+        });
+        match task.await {
             Ok(r) => r,
             Err(e) => vec![Err(StageError::Unavailable(format!("stage task: {e}"))); n],
         }
@@ -875,13 +897,19 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_caller_does_not_cancel_the_stage() {
         let inner = Arc::new(Claims { held: Mutex::new(HashMap::new()), durable: tokio::sync::Notify::new() });
-        let stage = Detached(inner.clone());
+        let stage = Detached::new(inner.clone(), 2);
         let call = stage.apply(vec![ev("did:a", 1)]);
         assert!(tokio::time::timeout(Duration::from_millis(50), call).await.is_err(), "dropped mid-batch");
         assert_eq!(inner.held.lock().get("did:a"), Some(&false));
-        inner.durable.notify_one();
+        // abandoned batches still count: past the bound a retry is turned away
+        let again = stage.apply(vec![ev("did:b", 2)]);
+        assert!(tokio::time::timeout(Duration::from_millis(50), again).await.is_err());
+        let busy = stage.apply(vec![ev("did:c", 3)]).await;
+        assert_eq!(busy, vec![Err(StageError::Unavailable("stage busy".into()))]);
+        inner.durable.notify_waiters();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(inner.held.lock().get("did:a"), Some(&true), "the batch ran to its end");
+        assert_eq!(inner.held.lock().get("did:b"), Some(&true));
     }
 
     #[tokio::test]
