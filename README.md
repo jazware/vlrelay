@@ -4,7 +4,7 @@ vlRelay is an atproto relay whose only durable state is an object store. It subs
 checks every event against sync 1.1, and serves one combined firehose from as many nodes as you
 run, all on one S3, R2, GCS or MinIO bucket.
 
-![The vlRelay dashboard's overview: events in and out, time to firehose, rejects, hosts and consumers](docs/assets/dashboard-overview.jpg)
+![The vlRelay dashboard's overview on real traffic: one core of a three-node cluster reading ten Bluesky and independent PDSes, with events in and out, time to firehose, rejects, hosts and consumers](docs/assets/dashboard-real-overview.jpg)
 
 It's built from the parts of [vlpds](https://github.com/jazware/vlpds) that worked: its log, leases, firehose merger,
 SlateDB state and peer TLS. Consumers see a normal relay. indigo's Go consumers, `goat` and
@@ -43,6 +43,11 @@ Jetstream read it unchanged.
   → [Compatibility](docs/compat.md)
 
 Archival mode (a full mirror of every repo, for getRepo) is designed but still in progress.
+
+The overview at the top is real traffic, from the [shadow run](docs/shadow.md) against ten PDSes.
+The demo backend's simulated 5,000-host relay shows the busy end of the hosts page:
+
+![The hosts page on the demo backend: thousands of hosts by events per second, with tiers, error rates and throttles](docs/assets/dashboard-hosts.jpg)
 
 ## Quickstart
 
