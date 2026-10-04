@@ -20,14 +20,16 @@
 //!
 //! What this module adds is the relay's wiring: one-node startup (fence the
 //! earlier logs, start above their seqs, follow our own log), the axum
-//! route, and the retention loop.
+//! route, the retention loop, and the client address behind a proxy
+//! ([`real_ip`]) that the per-IP limits key on.
 
 use crate::seq::{self, LogConfig, NodeLog};
 use axum::extract::{ConnectInfo, Query, Request, State};
+use axum::middleware::Next;
 use axum::response::Response;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -262,8 +264,88 @@ struct SubscribeParams {
     cursor: Option<i64>,
 }
 
+/// The client's address as [`real_ip`] found it, set on requests from a
+/// trusted proxy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientIp(pub IpAddr);
+
+/// The address per-IP limits key on: [`ClientIp`] when a trusted proxy
+/// named one, else the socket's peer.
+pub fn client_ip(ext: &axum::http::Extensions) -> Option<IpAddr> {
+    ext.get::<ClientIp>().map(|c| c.0).or_else(|| ext.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_canonical()))
+}
+
+/// An address block, `10.0.0.0/8` or `fd00::/8` (a bare address is one host).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cidr {
+    net: IpAddr,
+    bits: u8,
+}
+
+impl std::str::FromStr for Cidr {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Cidr, String> {
+        let (a, b) = s.trim().split_once('/').map_or((s.trim(), None), |(a, b)| (a, Some(b)));
+        let net: IpAddr = a.parse().map_err(|_| format!("{s:?}: not an address"))?;
+        let max = if net.is_ipv4() { 32 } else { 128 };
+        let bits = match b {
+            Some(b) => b.parse::<u8>().ok().filter(|n| *n <= max).ok_or_else(|| format!("{s:?}: bad prefix length"))?,
+            None => max,
+        };
+        Ok(Cidr { net, bits })
+    }
+}
+
+impl Cidr {
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let mask = |bits: u8, width: u32| if bits == 0 { 0 } else { u128::MAX << (width - bits as u32) };
+        match (self.net, ip.to_canonical()) {
+            (IpAddr::V4(n), IpAddr::V4(a)) => {
+                let m = mask(self.bits, 32) as u32;
+                u32::from(n) & m == u32::from(a) & m
+            }
+            (IpAddr::V6(n), IpAddr::V6(a)) => {
+                let m = mask(self.bits, 128);
+                u128::from(n) & m == u128::from(a) & m
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The client behind `peer`: when the peer is a trusted proxy, the
+/// rightmost `X-Forwarded-For` address that isn't one. Addresses left of
+/// it are the client's to write, so they're never believed.
+pub fn forwarded_client(peer: IpAddr, xff: &[&str], trusted: &[Cidr]) -> IpAddr {
+    let peer = peer.to_canonical();
+    if !trusted.iter().any(|c| c.contains(peer)) {
+        return peer;
+    }
+    let mut last = peer;
+    for part in xff.iter().rev().flat_map(|h| h.rsplit(',')) {
+        let Ok(ip) = part.trim().parse::<IpAddr>() else { return last };
+        let ip = ip.to_canonical();
+        if !trusted.iter().any(|c| c.contains(ip)) {
+            return ip;
+        }
+        last = ip;
+    }
+    last
+}
+
+/// Middleware for `--trusted-proxy`: sets [`ClientIp`] from
+/// `X-Forwarded-For` on requests whose peer is one of `trusted`.
+pub async fn real_ip(State(trusted): State<Arc<Vec<Cidr>>>, mut req: Request, next: Next) -> Response {
+    if let Some(peer) = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()) {
+        let xff: Vec<&str> = req.headers().get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).collect();
+        let ip = forwarded_client(peer, &xff, &trusted);
+        req.extensions_mut().insert(ClientIp(ip));
+    }
+    next.run(req).await
+}
+
 async fn subscribe_repos(State(s): State<Arc<Serve>>, Query(q): Query<SubscribeParams>, req: Request) -> Response {
-    let client = req.extensions().get::<ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip());
+    let client = client_ip(req.extensions());
     let ua = req.headers().get(axum::http::header::USER_AGENT).map(|v| String::from_utf8_lossy(v.as_bytes()));
     let ua = ua.map(|u| u.chars().take(USER_AGENT_MAX).collect()).unwrap_or_default();
     let ip = client.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
@@ -353,8 +435,30 @@ pub async fn start_single_node(
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use std::net::SocketAddr;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    /// Behind a proxy every consumer's socket comes from the proxy, so the
+    /// per-IP cap keys on X-Forwarded-For, believed only from the proxies
+    /// named in --trusted-proxy, rightmost untrusted entry first.
+    #[test]
+    fn forwarded_for_is_believed_only_from_trusted_proxies() {
+        let trusted: Vec<Cidr> = vec!["10.0.0.0/8".parse().unwrap(), "fd00::/8".parse().unwrap()];
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let f = |peer: &str, xff: &[&str]| forwarded_client(ip(peer), xff, &trusted);
+        // not from a proxy: the header is the client's own
+        assert_eq!(f("203.0.113.9", &["198.51.100.1"]), ip("203.0.113.9"));
+        // from a proxy: the rightmost address it didn't add, not a spoofed leftmost one
+        assert_eq!(f("10.1.2.3", &["1.1.1.1, 198.51.100.7, 10.9.9.9"]), ip("198.51.100.7"));
+        assert_eq!(f("10.1.2.3", &["1.1.1.1", "198.51.100.7"]), ip("198.51.100.7"));
+        assert_eq!(f("::ffff:10.1.2.3", &["198.51.100.7"]), ip("198.51.100.7"));
+        assert_eq!(f("fd00::1", &["2001:db8::5"]), ip("2001:db8::5"));
+        // no header, or garbage: the nearest address we have
+        assert_eq!(f("10.1.2.3", &[]), ip("10.1.2.3"));
+        assert_eq!(f("10.1.2.3", &["junk, 10.4.4.4"]), ip("10.4.4.4"));
+        assert!("10.0.0.0/33".parse::<Cidr>().is_err());
+        assert!("0.0.0.0/0".parse::<Cidr>().unwrap().contains(ip("8.8.8.8")));
+        assert!(!"192.168.1.0/24".parse::<Cidr>().unwrap().contains(ip("192.168.2.1")));
+    }
 
     /// A consumer shows up with its address and user agent, and a kick
     /// disconnects it while it's idle (nothing is emitted) and forgets it.

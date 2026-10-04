@@ -13,6 +13,7 @@ entrypoint ([Deploy](deploy.md#the-image)).
 | Flag | Env | Default | What |
 |---|---|---|---|
 | `--listen <LISTEN>` | `VLRELAY_LISTEN` | `127.0.0.1:2980` | Serves subscribeRepos, the sync API, requestCrawl, /admin and /metrics |
+| `--trusted-proxy <TRUSTED_PROXIES>` | `VLRELAY_TRUSTED_PROXIES` |  | Proxies whose `X-Forwarded-For` names the client (CIDRs, repeatable or comma-separated): per-IP limits key on its rightmost address that isn't one of these. Other peers' headers are ignored |
 | `--admin-token <ADMIN_TOKEN>` | `VLRELAY_ADMIN_TOKEN` |  | Turns on /admin (dashboard and API) with this token |
 | `--ui-dir <UI_DIR>` |  |  | A built dashboard (`ui/dist`); default: this tree's, if built |
 

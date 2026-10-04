@@ -86,6 +86,11 @@ struct Args {
     /// A built dashboard (`ui/dist`); default: this tree's, if built.
     #[arg(long)]
     ui_dir: Option<PathBuf>,
+    /// Proxies whose `X-Forwarded-For` names the client (CIDRs, repeatable
+    /// or comma-separated): per-IP limits key on its rightmost address that
+    /// isn't one of these. Other peers' headers are ignored.
+    #[arg(long = "trusted-proxy", env = "VLRELAY_TRUSTED_PROXIES", value_delimiter = ',')]
+    trusted_proxies: Vec<vlrelay::serve::Cidr>,
     /// Allows plain ws://, IPs, localhost and ports for upstreams and DID
     /// documents. Implied by an http:// --host or a loopback --plc-url.
     #[arg(long)]
@@ -316,7 +321,7 @@ async fn run(a: Args) -> anyhow::Result<()> {
         app = app.merge(vlrelay::admin::app(src, token.clone(), ui));
         app = app.merge(vlrelay::archive::admin::router(node.state.clone(), token));
     }
-    let app = app.layer(middleware::map_response(server_header));
+    let app = with_real_ip(app.layer(middleware::map_response(server_header)), &a.trusted_proxies);
 
     let listener = tokio::net::TcpListener::bind(a.listen).await?;
     tracing::info!(addr = %a.listen, log = %node.log.log_id, dev_mode, "vlrelay listening");
@@ -408,7 +413,7 @@ async fn run_follower(
         let fa = vlrelay::node::peer_admin::FollowerAdmin::start(node.clone());
         app = app.merge(vlrelay::node::peer_admin::follower_router(fa, token));
     }
-    let app = app.layer(middleware::map_response(server_header));
+    let app = with_real_ip(app.layer(middleware::map_response(server_header)), &a.trusted_proxies);
     let listener = tokio::net::TcpListener::bind(a.listen).await?;
     tracing::info!(addr = %a.listen, role = ?setup.role, "vlrelay listening");
     let server =
@@ -467,4 +472,11 @@ mod tests {
         }
         assert_eq!(default_did_shards(None), 4);
     }
+}
+
+fn with_real_ip(app: axum::Router, trusted: &[vlrelay::serve::Cidr]) -> axum::Router {
+    if trusted.is_empty() {
+        return app;
+    }
+    app.layer(middleware::from_fn_with_state(Arc::new(trusted.to_vec()), vlrelay::serve::real_ip))
 }

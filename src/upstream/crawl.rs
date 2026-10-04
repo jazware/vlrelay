@@ -14,7 +14,7 @@
 use super::host::{HostnameError, Tier, normalize_hostname};
 use super::{Manager, client};
 use crate::types::Host;
-use axum::extract::{ConnectInfo, FromRequest, Request, State};
+use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -22,7 +22,7 @@ use axum::{Json, Router};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -368,8 +368,8 @@ impl Drop for Unmark<'_> {
 }
 
 async fn handle(State(c): State<Arc<Crawler>>, req: Request) -> Response {
-    if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>()
-        && !c.take_ip(addr.ip())
+    if let Some(ip) = crate::serve::client_ip(req.extensions())
+        && !c.take_ip(ip)
     {
         return (
             StatusCode::TOO_MANY_REQUESTS,

@@ -153,6 +153,12 @@ vlRelay serves plain HTTP. Put a TLS proxy (Caddy, nginx, a cloud load balancer)
   no reason to.
 - Proxy the websocket without buffering, and with an idle timeout of a minute or more.
 - The peer port (`2979`) belongs on the private network only.
+- Name the proxy with `--trusted-proxy <CIDR,...>` (or `VLRELAY_TRUSTED_PROXIES`), and have it
+  append the client's address to `X-Forwarded-For`. Per-IP limits (consumers per IP, requestCrawl
+  calls per minute) key on that header's rightmost address that isn't a trusted proxy, and only
+  for requests whose peer is one. Without the flag every consumer behind the proxy counts as the
+  proxy's address, and they share one per-IP cap. Don't list addresses clients can connect from
+  directly: their `X-Forwarded-For` would be believed.
 
 ## Shutting down and upgrading
 

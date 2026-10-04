@@ -8,7 +8,7 @@ import re
 import sys
 
 SECTIONS = [
-    ("Serving", "", ["listen", "admin-token", "ui-dir"]),
+    ("Serving", "", ["listen", "trusted-proxy", "admin-token", "ui-dir"]),
     (
         "Bucket",
         "Without `--memory`, the four `--s3-*` values are required. Every node of a cluster uses the same "
