@@ -1422,17 +1422,30 @@ impl DidShards for Shards {
         let g = &self.0;
         let committed = g.committed.load(Ordering::Acquire);
         let mut out = Vec::new();
+        // A failed close fail-stops the node (vlpds never releases a shard
+        // it couldn't close), so one bucket error must not end it: retry
+        // while the lease holds, within a TTL for the lot (the leave's budget).
+        let deadline = Instant::now() + g.cluster.lease_ttl();
+        let valid = || g.cluster.lease_valid();
         for id in shards {
             let r = async {
                 g.clean.lock().remove(&id);
-                g.checkpoint_shard(id, committed).await?;
+                retry_until(deadline, valid, "checkpointing a closing DID shard", || g.checkpoint_shard(id, committed))
+                    .await?;
                 g.markers.lock().remove(&id);
-                g.state.close_shard(id).await?;
                 // The whole set, not only what our marker doesn't cover: a
                 // reshard child of this shard replays none of our log, so it
                 // gets its set from here. A plain next owner gets a superset.
-                let _g = g.dedupe.order.lock().await;
-                g.dedupe.write(id, g.recent.all(id.0)).await?;
+                // Written while the shard is still open, so a write that
+                // never lands leaves nothing half closed; the order lock is
+                // held through the close, or a checkpoint tick could
+                // overwrite it with the inherited entries alone.
+                let _order = g.dedupe.order.lock().await;
+                retry_until(deadline, valid, "writing a closing DID shard's dedupe set", || {
+                    g.dedupe.write(id, g.recent.all(id.0))
+                })
+                .await?;
+                g.state.close_shard(id).await?;
                 // the next owner deletes the object: what we wrote is no
                 // guide to what's there if the shard comes back
                 g.dedupe.written.lock().remove(&id);
@@ -1805,6 +1818,27 @@ impl crate::sync_api::SyncSource for ClusterSync {
     }
 }
 
+/// Runs `f` until it succeeds, backing off from 50 ms, while `valid()` and
+/// another try can start before `deadline`. The last error otherwise.
+async fn retry_until<F, Fut>(deadline: Instant, valid: impl Fn() -> bool, what: &str, mut f: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let mut wait = Duration::from_millis(50);
+    loop {
+        match f().await {
+            Ok(()) => return Ok(()),
+            Err(e) if valid() && Instant::now() + wait < deadline => {
+                tracing::warn!("{what} failed (retrying in {} ms): {e:#}", wait.as_millis());
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1836,6 +1870,46 @@ mod tests {
         u.end(1, f);
         assert_eq!(marker(committed, [None, u.min(1)]), Some(20));
         assert!(u.0.lock().is_empty());
+    }
+
+    /// One failed bucket write while closing a DID shard used to fail-stop
+    /// the node: the close retries within its budget, while the lease holds.
+    #[tokio::test]
+    async fn a_closing_shards_writes_are_retried_within_the_budget() {
+        let tries = std::sync::atomic::AtomicU32::new(0);
+        let flaky = || async {
+            match tries.fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => anyhow::bail!("503 slow down"),
+                _ => Ok(()),
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        retry_until(deadline, || true, "test", flaky).await.unwrap();
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+
+        let started = Instant::now();
+        let r = retry_until(
+            Instant::now() + Duration::from_millis(300),
+            || true,
+            "test",
+            || async { anyhow::bail!("down") },
+        )
+        .await;
+        assert!(r.is_err() && started.elapsed() < Duration::from_millis(400), "gives up at the deadline");
+
+        tries.store(0, Ordering::SeqCst);
+        let r = retry_until(
+            deadline,
+            || false,
+            "test",
+            || async {
+                tries.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("down")
+            },
+        )
+        .await;
+        assert!(r.is_err());
+        assert_eq!(tries.load(Ordering::SeqCst), 1, "no retries once the lease lapsed");
     }
 
     #[test]

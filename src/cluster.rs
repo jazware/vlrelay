@@ -645,6 +645,10 @@ impl ClusterNode {
         self.cluster.as_ref().is_some_and(|c| c.lease_valid()) && !self.halted.load(Ordering::Acquire)
     }
 
+    pub fn lease_ttl(&self) -> Duration {
+        self.opts.ttl
+    }
+
     pub fn lease_check(&self) -> Option<LeaseCheck> {
         let c = self.cluster.clone()?;
         Some(Arc::new(move || c.lease_valid()))
