@@ -13,7 +13,7 @@ SECTIONS = [
         "Bucket",
         "Without `--memory`, the four `--s3-*` values are required. Every node of a cluster uses the same "
         "bucket and `--prefix`.",
-        ["memory", "s3-endpoint", "s3-bucket", "s3-access-key", "s3-secret-key", "s3-region", "prefix"],
+        ["memory", "s3-endpoint", "s3-bucket", "s3-access-key", "s3-secret-key", "s3-region", "s3-unsigned-payload", "prefix"],
     ),
     (
         "Upstreams and identity",

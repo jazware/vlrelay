@@ -28,6 +28,7 @@ Without `--memory`, the four `--s3-*` values are required. Every node of a clust
 | `--s3-access-key <S3_ACCESS_KEY>` | `VLRELAY_S3_ACCESS_KEY` |  | Access key id |
 | `--s3-secret-key <S3_SECRET_KEY>` | `VLRELAY_S3_SECRET_KEY` |  | Secret access key |
 | `--s3-region <S3_REGION>` | `VLRELAY_S3_REGION` | `auto` | The bucket's region |
+| `--s3-unsigned-payload <S3_UNSIGNED_PAYLOAD>` | `VLRELAY_S3_UNSIGNED_PAYLOAD` |  | Send PUT bodies as SigV4 UNSIGNED-PAYLOAD instead of hashing each one (default: on for an https endpoint, where TLS covers the body) [possible values: true, false] |
 | `--prefix <PREFIX>` | `VLRELAY_PREFIX` | `vlrelay` | Key prefix in the bucket: one relay per prefix |
 
 ## Upstreams and identity
