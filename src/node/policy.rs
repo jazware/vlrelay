@@ -232,6 +232,7 @@ impl PolicyHooks {
     ) {
         let _ = self.manager.set(Arc::downgrade(manager));
         manager.set_policy_source(self.clone());
+        self.ban_refusals(manager);
         crawler.set_admission(self.clone());
         self.state.set_account_gate(self.clone());
         let e = self.engine.clone();
@@ -306,6 +307,27 @@ impl PolicyHooks {
     /// The operator throttle on a host (events/s), as last synced.
     pub fn throttle(&self, host: &str) -> Option<f64> {
         self.cache.lock().get(host).and_then(|s| s.throttle_eps)
+    }
+
+    fn ban_refusals(self: &Arc<Self>, manager: &Manager) {
+        let me = Arc::downgrade(self);
+        manager.set_on_refused(Arc::new(move |host: &Host, why: &str| {
+            let (Some(me), host, why) = (me.upgrade(), host.0.clone(), why.to_string()) else { return };
+            tokio::spawn(async move { me.ban_refused(&host, &why).await });
+        }));
+    }
+
+    /// Bans a host the upstream refused for good, through the same audited
+    /// action an operator's ban takes, so it shows as banned and an unban
+    /// is how to retry it.
+    async fn ban_refused(&self, host: &str, why: &str) {
+        let action = crate::admin::HostAction::Ban { reason: format!("refused at connect: {why}") };
+        if let Err(e) = self.admin.host_action(host, action, "vlrelay").await {
+            tracing::warn!(host, "banning a refused upstream failed: {e:?}");
+        }
+        if let Err(e) = self.refresh_host(host).await {
+            tracing::warn!(host, "applying a refused upstream's ban: {e:#}");
+        }
     }
 
     /// Re-reads one host's record and applies it to its socket now.
@@ -914,6 +936,44 @@ mod tests {
         hooks.refresh_host(&h.0).await.unwrap();
         assert_eq!(m.running(), 1);
         assert_eq!(m.host(&h).unwrap().record.tier, upstream::Tier::Default);
+        m.shutdown().await.unwrap();
+    }
+
+    /// An upstream that says it's a relay is refused once and banned through
+    /// the operator's ban action (so listHosts says `banned` and the action
+    /// is on the record), and never dialed again.
+    #[tokio::test]
+    async fn a_relay_upstream_is_banned_not_retried() {
+        let (hooks, state) = setup().await;
+        let h = crate::upstream::client::tests::ws_server(Some("indigo-relay/v0.0.0 (atproto-relay)")).await;
+        add_host(&state, &h.0, Tier::Default).await;
+        hooks.load().await.unwrap();
+        let mut cfg = upstream::UpstreamConfig::new(true);
+        cfg.endpoint = Arc::new(|h: &Host| format!("http://{}", h.0));
+        cfg.backoff_base = Duration::from_millis(10);
+        let store: Arc<dyn upstream::HostStore> = Arc::new(upstream::MemHostStore::default());
+        let (m, _rx) = Manager::new(cfg, store, None);
+        m.set_policy_source(hooks.clone());
+        let _ = hooks.manager.set(Arc::downgrade(&m));
+        hooks.ban_refusals(&m);
+        m.start().await.unwrap();
+        m.admit(&h, upstream::Tier::Default).await.unwrap();
+        let t = Instant::now();
+        loop {
+            let rec = state.get_host(&h.0).await.unwrap().unwrap();
+            if rec.tier == Tier::Banned {
+                assert_eq!(rec.lexicon_status(), "banned");
+                let actions = PolicyAdmin::host_actions(&rec);
+                assert!(matches!(&actions[..], [a] if a.by == "vlrelay"), "{actions:?}");
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(5), "not banned");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(m.running(), 0);
+        let e = m.host(&h).unwrap().record;
+        assert_eq!((e.tier, e.errors.connect), (upstream::Tier::Banned, 1));
         m.shutdown().await.unwrap();
     }
 }

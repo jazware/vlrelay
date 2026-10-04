@@ -31,7 +31,13 @@ pub(crate) struct HostTask {
     pub kick: Arc<Notify>,
     /// Cuts a backoff short (a requestCrawl for a known host).
     pub wake: Arc<Notify>,
+    pub on_refused: Option<super::OnRefused>,
 }
+
+/// A host we won't subscribe to however often we retry (it's a relay).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Refused(pub String);
 
 /// Why a connection ended, and so how long to wait before the next.
 enum End {
@@ -93,8 +99,17 @@ impl HostTask {
                     end
                 }
                 Ok(Err(e)) => {
-                    tracing::debug!(host = %self.entry.host.0, "connect failed: {e:#}");
                     self.entry.count_error(|c| c.connect += 1);
+                    if let Some(Refused(why)) = e.downcast_ref::<Refused>() {
+                        // permanent: ban it (as indigo does) rather than retry forever
+                        tracing::warn!(host = %self.entry.host.0, "upstream refused for good: {why}");
+                        self.entry.set_tier(super::Tier::Banned);
+                        if let Some(f) = &self.on_refused {
+                            f(&self.entry.host, why);
+                        }
+                        break;
+                    }
+                    tracing::debug!(host = %self.entry.host.0, "connect failed: {e:#}");
                     End::Failed
                 }
                 Err(_) => {
@@ -128,11 +143,8 @@ impl HostTask {
 
     async fn read(&mut self, mut ws: Socket, skip_cursor: &mut bool) -> (End, bool) {
         let cfg = self.cfg.clone();
-        let mut limiter = HostLimiter::new(
-            &self.entry.limits(&cfg.limits),
-            self.entry.limits_gen(),
-            std::time::Instant::now(),
-        );
+        let mut limiter =
+            HostLimiter::new(&self.entry.limits(&cfg.limits), self.entry.limits_gen(), std::time::Instant::now());
         let mut last_rx = Instant::now();
         let mut ping = tokio::time::interval_at(Instant::now() + cfg.ping_interval, cfg.ping_interval);
         let mut got_frames = false;
@@ -341,7 +353,7 @@ pub(crate) async fn connect(cfg: &UpstreamConfig, host: &Host, cursor: Option<i6
     let (ws, resp) =
         tokio_tungstenite::client_async_tls_with_config(req, stream, Some(ws_cfg), Some(connector)).await?;
     if let Some(server) = relay_server(resp.headers()) {
-        anyhow::bail!("refusing {url}: it's a relay (Server: {server}), not a PDS");
+        return Err(Refused(format!("it's a relay (Server: {server}), not a PDS")).into());
     }
     Ok(ws)
 }
@@ -367,7 +379,7 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -385,7 +397,7 @@ mod tests {
     }
 
     /// A websocket server on loopback answering every upgrade with `server`.
-    async fn ws_server(server: Option<&'static str>) -> Host {
+    pub(crate) async fn ws_server(server: Option<&'static str>) -> Host {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         tokio::spawn(async move {

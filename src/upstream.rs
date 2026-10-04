@@ -9,7 +9,7 @@
 //! drops whatever was still queued and replays from the acked cursor, so
 //! downstream sees each event at least once and never a gap.
 
-mod client;
+pub(crate) mod client;
 pub mod crawl;
 pub mod fair;
 pub mod frame;
@@ -138,7 +138,12 @@ pub struct Manager {
     background: Mutex<Vec<JoinHandle<()>>>,
     filter: Mutex<Option<HostFilter>>,
     policy: parking_lot::RwLock<Option<Arc<dyn PolicySource>>>,
+    on_refused: parking_lot::RwLock<Option<OnRefused>>,
 }
+
+/// Called once when a host is refused for good (`client::Refused`): its
+/// task has stopped, and the hook records the ban.
+pub type OnRefused = Arc<dyn Fn(&Host, &str) + Send + Sync>;
 
 impl Manager {
     /// Returns the manager and the receiving end of its single output
@@ -162,8 +167,13 @@ impl Manager {
             background: Mutex::new(Vec::new()),
             filter: Mutex::new(None),
             policy: parking_lot::RwLock::new(None),
+            on_refused: parking_lot::RwLock::new(None),
         };
         (Arc::new(m), rx)
+    }
+
+    pub fn set_on_refused(&self, f: OnRefused) {
+        *self.on_refused.write() = Some(f);
     }
 
     pub fn config(&self) -> &UpstreamConfig {
@@ -272,6 +282,7 @@ impl Manager {
             stop: stop_rx,
             kick: kick.clone(),
             wake: wake.clone(),
+            on_refused: self.on_refused.read().clone(),
         };
         let join = tokio::spawn(task.run());
         tasks.insert(entry.host.clone(), Running { stop: stop_tx, kick, wake, queue, join });
