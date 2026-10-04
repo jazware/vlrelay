@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Empty, ErrorNotice, Loading, PageHead, Panel, Spinner } from '../components/ui'
 import { InlineConfirm, Live, SeverityPill } from '../components/relay'
-import { api, enc, errText, type Case, type CaseStatus, type Severity } from '../lib/api'
+import { api, ApiError, enc, errText, type Case, type CaseDetail as CaseDetailT, type CaseEvidence, type CaseStatus, type Severity } from '../lib/api'
 import { fmtNum, fmtTime, relTime, short } from '../lib/format'
 import { useAction } from '../lib/hooks'
 import { Link, navigate, useSearch } from '../lib/router'
@@ -24,10 +24,73 @@ export function CaseStatusPill({ status }: { status: CaseStatus }) {
 }
 
 /** Observed against threshold, in the threshold's own unit. */
-export function fmtObserved(c: Case): string {
+export function fmtObserved(c: Pick<Case, 'kind' | 'observed' | 'threshold'>): string {
   if (c.kind === 'reject-ratio') return `${(c.observed * 100).toFixed(0)}% / ${(c.threshold * 100).toFixed(0)}%`
   const d = c.kind === 'account-rate' ? 1 : 0
   return `${fmtNum(c.observed, d)} / ${fmtNum(c.threshold, d)}`
+}
+
+const fmtWindow = (s: number) => (s % 3600 === 0 ? `${s / 3600} h` : s % 60 === 0 ? `${s / 60} min` : `${s} s`)
+const fmtSignal = (v: number) => (Number.isInteger(v) ? fmtNum(v) : Math.abs(v) < 1 ? v.toFixed(3) : fmtNum(v, 2))
+
+/** The trips folded into a case, each with every signal's value for the host at that moment. */
+function Evidence({ id, kind }: { id: number; kind: string }) {
+  const [missing, setMissing] = useState(false)
+  const l = useApi<CaseDetailT>(`cases/${id}/evidence`, undefined, missing ? undefined : 10000)
+  useEffect(() => {
+    if (l.error instanceof ApiError && l.error.status === 404) setMissing(true)
+  }, [l.error])
+  if (missing) return null
+  const d = l.data
+  const rows: CaseEvidence[] = d ? [...d.evidence].reverse() : []
+  const title = d ? `Evidence: ${fmtNum(d.trips)} trip${d.trips === 1 ? '' : 's'}` : 'Evidence'
+  const shown = d && d.trips > d.evidence.length ? `The newest ${fmtNum(d.evidence.length)} of ${fmtNum(d.trips)} trips, newest first.` : 'Each time the threshold tripped, newest first.'
+  return (
+    <Panel title={title} desc={d && rows.length > 0 ? shown : undefined} flush>
+      <ErrorNotice error={l.error} />
+      {!d ? (
+        l.error ? null : <Loading />
+      ) : rows.length === 0 ? (
+        <p className="muted small audit-empty">No measurements recorded for this case.</p>
+      ) : (
+        <div className="table-wrap">
+          <table className="data compact evidence">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th className="num">Observed / threshold</th>
+                <th className="num">Window</th>
+                <th>Node</th>
+                <th>Signals</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((e, i) => (
+                <tr key={`${e.atMs}-${i}`}>
+                  <td className="nowrap" title={fmtTime(e.atMs)}>
+                    {relTime(e.atMs)}
+                  </td>
+                  <td className="num mono">{fmtObserved({ kind, observed: e.observed, threshold: e.threshold })}</td>
+                  <td className="num">{fmtWindow(e.windowSecs)}</td>
+                  <td>{e.node}</td>
+                  <td className="wrap-cell">
+                    {e.detail && <div className="small evidence-detail">{e.detail}</div>}
+                    <div className="signals">
+                      {Object.entries(e.signals).map(([k, v]) => (
+                        <span key={k} className="signal mono">
+                          {k}={fmtSignal(v)}
+                        </span>
+                      ))}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Panel>
+  )
 }
 
 export function Cases() {
@@ -303,6 +366,7 @@ export function CaseDetail({ id }: { id: number }) {
           </Panel>
         </div>
       </div>
+      <Evidence id={c.id} kind={c.kind} />
     </>
   )
 }

@@ -176,6 +176,11 @@ pub struct HostEntry {
     admitted_ms: u64,
     errors: Mutex<ErrorCounters>,
     dirty: AtomicBool,
+    /// Limits from the policy engine, in place of the tier's defaults.
+    limits: Mutex<Option<super::limits::TierLimits>>,
+    /// Bumped on every tier or limit change; the host task retunes its
+    /// buckets when it sees a new one.
+    limits_gen: AtomicU64,
 }
 
 impl HostEntry {
@@ -194,6 +199,25 @@ impl HostEntry {
             admitted_ms: r.admitted_ms,
             errors: Mutex::new(r.errors.clone()),
             dirty: AtomicBool::new(false),
+            limits: Mutex::new(None),
+            limits_gen: AtomicU64::new(0),
+        }
+    }
+
+    /// The limits the host task enforces.
+    pub fn limits(&self, defaults: &super::limits::Limits) -> super::limits::TierLimits {
+        (*self.limits.lock()).unwrap_or_else(|| defaults.for_tier(self.tier()))
+    }
+
+    pub fn limits_gen(&self) -> u64 {
+        self.limits_gen.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_limits(&self, l: Option<super::limits::TierLimits>) {
+        let mut cur = self.limits.lock();
+        if *cur != l {
+            *cur = l;
+            self.limits_gen.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -202,7 +226,9 @@ impl HostEntry {
     }
 
     pub(crate) fn set_tier(&self, t: Tier) {
-        self.tier.store(t.to_u8(), Ordering::Relaxed);
+        if self.tier.swap(t.to_u8(), Ordering::Relaxed) != t.to_u8() {
+            self.limits_gen.fetch_add(1, Ordering::AcqRel);
+        }
         self.dirty.store(true, Ordering::Relaxed);
     }
 

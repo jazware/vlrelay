@@ -1,54 +1,46 @@
 //! The operator API over the node's real state: hosts and their actions,
 //! consumers, the overview's numbers and account lookups and takedowns.
-//! Policy, domain rules and cases go to the policy engine's admin half; the
-//! cluster view still comes from the simulation until the cluster
-//! workstream provides it.
+//! Policy, domain rules, cases and host tier actions go to the policy
+//! engine's admin half (`node::policy`). The cluster view still comes from
+//! the simulation until the cluster workstream provides it.
 
 use super::Node;
 use super::metrics::HostSeries as Series;
+use super::policy::PolicyHooks;
 use crate::admin::{self, AdminError, AdminResult, AdminSource, RejectReason, demo::Demo};
+use crate::policy::admin::PolicyAdmin;
 use crate::seq::EventMeta;
 use crate::state::{AccountStatus, Upstream};
 use crate::types::Host;
 use crate::upstream::{HostStatus, HostView, Tier};
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap};
-use std::net::IpAddr;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub struct NodeAdmin {
     pub node: Arc<Node>,
-    pub policy: Arc<crate::policy::admin::PolicyAdmin>,
+    pub policy: Arc<PolicyHooks>,
     pub demo: Arc<Demo>,
+    /// (when, open cases): the overview polls every second or two, and a
+    /// count is a bucket listing.
+    open_cases: Mutex<Option<(Instant, u32)>>,
 }
 
-/// subscribeRepos clients by address, as the route saw them connect. The
-/// firehose's per-address count says which are still connected.
-#[derive(Default)]
-pub struct Consumers {
-    seen: Mutex<HashMap<IpAddr, Seen>>,
-}
+const OPEN_CASES_TTL: Duration = Duration::from_secs(10);
 
-struct Seen {
-    id: u64,
-    user_agent: String,
-    since_ms: i64,
-    cursor: Option<i64>,
-}
-
-impl Consumers {
-    pub fn connected(&self, ip: IpAddr, user_agent: &str, cursor: Option<i64>, live: usize) {
-        let mut m = self.seen.lock();
-        let n = m.len() as u64;
-        let now = crate::upstream::host::now_ms() as i64;
-        let e = m.entry(ip).or_insert_with(|| Seen { id: n + 1, user_agent: String::new(), since_ms: now, cursor });
-        // a fresh streak when nothing from this address was connected
-        if live == 0 {
-            e.since_ms = now;
-            e.cursor = cursor;
-        }
-        e.user_agent = user_agent.chars().take(200).collect();
+impl NodeAdmin {
+    pub fn new(node: Arc<Node>, policy: Arc<PolicyHooks>, demo: Arc<Demo>) -> NodeAdmin {
+        NodeAdmin { node, policy, demo, open_cases: Mutex::new(None) }
     }
+
+    fn admin(&self) -> &PolicyAdmin {
+        &self.policy.admin
+    }
+}
+
+fn internal(e: impl std::fmt::Display) -> AdminError {
+    AdminError::Internal(anyhow::anyhow!("{e}"))
 }
 
 pub fn host_status_label(h: &HostView) -> &'static str {
@@ -110,8 +102,8 @@ impl NodeAdmin {
                 .then_some(h.record.last_connected_ms.map(|m| m as i64))
                 .flatten(),
             lag_ms: 0.0,
-            throttle: None,
-            rule: None,
+            throttle: self.policy.throttle(&h.record.hostname),
+            rule: self.policy.limits(&h.record.hostname).and_then(|l| l.rule),
             node: self.node.cfg.node_id.clone(),
         }
     }
@@ -135,6 +127,25 @@ impl NodeAdmin {
         let dash = self.node.dash.lock();
         let rejects = self.node.rejects.lock();
         Ok(self.row(&h, dash.hosts.get(&k), rejects.get(&k).map_or(0, |r| r.total)))
+    }
+
+    async fn open_case_count(&self) -> u32 {
+        if let Some((at, n)) = *self.open_cases.lock()
+            && at.elapsed() < OPEN_CASES_TTL
+        {
+            return n;
+        }
+        match self.policy.engine.cases.list(None).await {
+            Ok(cs) => {
+                let n = cs.iter().filter(|c| c.is_open()).count() as u32;
+                *self.open_cases.lock() = Some((Instant::now(), n));
+                n
+            }
+            Err(e) => {
+                tracing::warn!("listing cases: {e:#}");
+                0
+            }
+        }
     }
 
     async fn account_view(&self, did: &str) -> AdminResult<admin::Account> {
@@ -167,11 +178,13 @@ impl NodeAdmin {
             host: self.node.state.host_name(rec.host).map(|h| h.to_string()).unwrap_or_default(),
             status: status_str(status).into(),
             upstream_status: upstream.into(),
-            takedown: rec.relay_takedown.then(|| admin::Takedown {
-                at_ms: 0,
-                by: "admin".into(),
-                reason: String::new(),
-            }),
+            takedown: match rec.relay_takedown {
+                false => None,
+                true => Some(match self.policy.engine.takedowns.latest(did).await {
+                    Ok(Some(t)) if t.takedown => admin::Takedown { at_ms: t.at_ms, by: t.by, reason: t.reason },
+                    _ => admin::Takedown { at_ms: 0, by: "admin".into(), reason: String::new() },
+                }),
+            },
             rev: rec.chain.map(|c| c.rev.to_string()).unwrap_or_default(),
             last_seq: 0,
             last_event_ms: 0,
@@ -184,7 +197,11 @@ impl NodeAdmin {
 
     /// Writes the takedown flag, then announces the new status on the
     /// firehose with an `#account` the relay makes itself.
-    async fn set_takedown(&self, did: &str, takedown: bool) -> AdminResult<admin::Account> {
+    async fn set_takedown(&self, did: &str, takedown: bool, by: &str, reason: &str) -> AdminResult<admin::Account> {
+        if self.node.state.get(did).await.map_err(internal)?.is_none() {
+            return Err(AdminError::NotFound(format!("no account {did}")));
+        }
+        self.policy.engine.takedowns.record(did, takedown, by, reason).await?;
         let st = self
             .node
             .state
@@ -210,6 +227,7 @@ fn status_str(s: AccountStatus) -> &'static str {
 
 impl AdminSource for NodeAdmin {
     async fn overview(&self) -> AdminResult<admin::Overview> {
+        let open_cases = self.open_case_count().await;
         let rows = self.rows();
         let mut by_status: BTreeMap<admin::HostStatus, u32> = BTreeMap::new();
         for r in &rows {
@@ -263,7 +281,7 @@ impl AdminSource for NodeAdmin {
             time_to_firehose_p99_ms: last.ttf_p99_ms,
             log_durability_lag_ms: last.durable_lag_ms,
             last_seq: self.node.log.last_durable_seq.load(std::sync::atomic::Ordering::Acquire),
-            open_cases: 0,
+            open_cases,
             top_hosts: top,
             history: h,
         })
@@ -297,9 +315,30 @@ impl AdminSource for NodeAdmin {
     async fn host(&self, host: &str) -> AdminResult<admin::HostDetail> {
         let row = self.host_row(host)?;
         let k = Host(host.to_string());
-        let tier = self.node.manager.host(&k).map(|h| h.record.tier).unwrap_or(Tier::Default);
-        let l = self.node.manager.config().limits.for_tier(tier);
-        let eps = if l.events_per_sec.is_finite() { l.events_per_sec } else { 0.0 };
+        let rec = self.policy.hosts.get_host(host).await?;
+        let (limits, actions) = match &rec {
+            Some(r) => (self.admin().host_limits(r), PolicyAdmin::host_actions(r)),
+            None => (
+                admin::TierLimits {
+                    events_per_sec: 0.0,
+                    events_per_hour: 0,
+                    events_per_day: 0,
+                    max_accounts: 0,
+                    new_accounts_per_hour: 0,
+                },
+                Vec::new(),
+            ),
+        };
+        let open_cases = match self.policy.engine.cases.list(None).await {
+            Ok(cs) => cs.iter().filter(|c| c.host == host && c.is_open()).map(|c| c.id).collect(),
+            Err(e) => {
+                tracing::warn!("listing cases: {e:#}");
+                Vec::new()
+            }
+        };
+        let now = crate::upstream::host::now_ms() as i64;
+        let new_accounts_per_hour =
+            self.policy.engine.signals.snapshot(host, None, now).get("new-accounts").copied().unwrap_or(0.0);
         let (rejects_by_reason, recent_rejects) = {
             let r = self.node.rejects.lock();
             match r.get(&k) {
@@ -339,50 +378,37 @@ impl AdminSource for NodeAdmin {
         };
         Ok(admin::HostDetail {
             row,
-            limits: admin::TierLimits {
-                events_per_sec: eps,
-                events_per_hour: (eps * 3600.0) as u64,
-                events_per_day: (eps * 86400.0) as u64,
-                max_accounts: 0,
-                new_accounts_per_hour: 0,
-            },
-            new_accounts_per_hour: 0.0,
+            limits,
+            new_accounts_per_hour,
             rejects_by_reason,
             recent_rejects,
             series,
-            actions: Vec::new(),
-            open_cases: Vec::new(),
+            actions,
+            open_cases,
         })
     }
 
-    async fn host_action(&self, host: &str, action: admin::HostAction, _by: &str) -> AdminResult<admin::HostRow> {
+    async fn host_action(&self, host: &str, action: admin::HostAction, by: &str) -> AdminResult<admin::HostRow> {
         let k = Host(host.to_string());
-        let m = &self.node.manager;
-        if m.host(&k).is_none() {
+        if self.node.manager.host(&k).is_none() {
             return Err(AdminError::NotFound(format!("unknown host {host}")));
         }
-        let set = |t: Tier| async move { m.set_tier(&k, t).await.map_err(AdminError::Internal) };
         match action {
-            admin::HostAction::SetTier { tier } => {
-                let t = Tier::parse(&tier).ok_or_else(|| AdminError::BadRequest(format!("unknown tier {tier}")))?;
-                set(t).await?
-            }
-            admin::HostAction::Suspend { .. } => set(Tier::Suspended).await?,
-            admin::HostAction::Ban { .. } => set(Tier::Banned).await?,
-            admin::HostAction::Unban => set(Tier::Default).await?,
-            admin::HostAction::Reconnect => m.kick(&Host(host.to_string())),
-            admin::HostAction::Throttle { .. } => {
-                return Err(AdminError::BadRequest("per-host throttles come with the policy engine".into()));
+            admin::HostAction::Reconnect => self.node.manager.kick(&k),
+            a => {
+                self.admin().host_action(host, a, by).await?;
+                // the socket follows now, not at the sync loop's next pass
+                self.policy.refresh_host(host).await?;
             }
         }
         self.host_row(host)
     }
 
     async fn domain_rules(&self) -> AdminResult<Vec<admin::DomainRule>> {
-        self.policy.domain_rules().await
+        self.admin().domain_rules().await
     }
     async fn create_domain_rule(&self, rule: admin::DomainRuleInput, by: &str) -> AdminResult<admin::DomainRule> {
-        self.policy.create_domain_rule(rule, by).await
+        self.admin().create_domain_rule(rule, by).await
     }
     async fn update_domain_rule(
         &self,
@@ -390,47 +416,87 @@ impl AdminSource for NodeAdmin {
         rule: admin::DomainRuleInput,
         by: &str,
     ) -> AdminResult<admin::DomainRule> {
-        self.policy.update_domain_rule(id, rule, by).await
+        self.admin().update_domain_rule(id, rule, by).await
     }
     async fn delete_domain_rule(&self, id: u64, by: &str) -> AdminResult<()> {
-        self.policy.delete_domain_rule(id, by).await
+        self.admin().delete_domain_rule(id, by).await
     }
     async fn policy(&self) -> AdminResult<admin::PolicyDoc> {
-        self.policy.policy().await
+        self.admin().policy().await
     }
     async fn update_policy(&self, update: admin::PolicyUpdate, by: &str) -> AdminResult<admin::PolicyDoc> {
-        self.policy.update_policy(update, by).await
+        self.admin().update_policy(update, by).await
     }
     async fn policy_audit(&self) -> AdminResult<Vec<admin::PolicyAudit>> {
-        self.policy.policy_audit().await
+        self.admin().policy_audit().await
+    }
+    async fn full_policy(&self) -> AdminResult<admin::FullPolicyDoc> {
+        Ok(full_doc(&self.admin().full_policy().await))
+    }
+    async fn update_full_policy(&self, u: admin::FullPolicyUpdate, by: &str) -> AdminResult<admin::FullPolicyDoc> {
+        let body: crate::policy::PolicyBody =
+            serde_json::from_value(u.policy).map_err(|e| AdminError::BadRequest(format!("policy: {e}")))?;
+        let d = self.admin().update_full_policy(u.base_version, body, &u.note, by).await?;
+        Ok(full_doc(&d))
+    }
+    async fn domain_rules_audit(&self) -> AdminResult<Vec<admin::PolicyAudit>> {
+        Ok(self
+            .admin()
+            .domain_rules_audit()
+            .await?
+            .into_iter()
+            .map(|a| admin::PolicyAudit { version: a.version, at_ms: a.at_ms, by: a.by, note: a.note, changes: a.changes })
+            .collect())
+    }
+
+    async fn case_detail(&self, id: u64) -> AdminResult<admin::CaseDetail> {
+        let c = self.admin().case_detail(id).await?;
+        Ok(admin::CaseDetail {
+            case: c.to_wire(),
+            trips: c.trips,
+            evidence: c
+                .evidence
+                .into_iter()
+                .map(|e| admin::CaseEvidence {
+                    at_ms: e.at_ms,
+                    observed: e.observed,
+                    threshold: e.threshold,
+                    window_secs: e.window_secs,
+                    node: e.node,
+                    detail: e.detail,
+                    signals: e.signals,
+                })
+                .collect(),
+        })
     }
 
     async fn consumers(&self) -> AdminResult<Vec<admin::Consumer>> {
-        let fh = &self.node.serve.firehose;
-        let head = fh.last_emitted.load(std::sync::atomic::Ordering::Acquire);
-        let seen = self.node.consumers.seen.lock();
-        let mut out: Vec<admin::Consumer> = seen
-            .iter()
-            .filter(|(ip, _)| fh.connections_from(**ip) > 0)
-            .map(|(ip, s)| admin::Consumer {
-                id: s.id,
-                ip: format!("{ip} ({} connections)", fh.connections_from(*ip)),
-                user_agent: s.user_agent.clone(),
+        Ok(self
+            .node
+            .serve
+            .consumers()
+            .into_iter()
+            .map(|c| admin::Consumer {
+                id: c.id,
+                ip: c.ip.to_string(),
+                user_agent: c.user_agent,
                 node: self.node.cfg.node_id.clone(),
-                connected_since_ms: s.since_ms,
-                cursor: head,
-                lag_ms: 0.0,
-                events_per_sec: 0.0,
-                bytes_per_sec: 0.0,
-                backfilling: s.cursor.is_some_and(|c| c < head),
+                connected_since_ms: c.connected_since_ms,
+                cursor: c.last_seq,
+                lag_ms: c.lag_ms,
+                events_per_sec: c.events_per_sec,
+                bytes_per_sec: c.bytes_per_sec,
+                backfilling: c.backfilling,
             })
-            .collect();
-        out.sort_by_key(|c| c.id);
-        Ok(out)
+            .collect())
     }
 
-    async fn kick_consumer(&self, _id: u64, _by: &str) -> AdminResult<()> {
-        Err(AdminError::BadRequest("kicking a consumer isn't wired to the firehose yet".into()))
+    async fn kick_consumer(&self, id: u64, by: &str) -> AdminResult<()> {
+        if !self.node.serve.kick(id) {
+            return Err(AdminError::NotFound(format!("no connected consumer {id}")));
+        }
+        tracing::info!(target: "vlrelay::audit", consumer = id, by, "consumer kicked");
+        Ok(())
     }
 
     async fn cluster(&self) -> AdminResult<admin::ClusterView> {
@@ -448,29 +514,52 @@ impl AdminSource for NodeAdmin {
                 Err(e) => Err(e),
             };
         }
-        // handles aren't indexed; a DID prefix pages through listRepos
-        Ok(Vec::new())
+        // Handles come from the DID documents the identity cache holds: every
+        // account with recent traffic. An exact handle first, then a prefix.
+        let mut ids = self.node.identity.find_handle(&q, 100);
+        if ids.is_empty() && !q.ends_with('*') {
+            ids = self.node.identity.find_handle(&format!("{q}*"), 100);
+        }
+        let mut out = Vec::new();
+        for id in ids {
+            match self.account_view(&id.did).await {
+                Ok(a) => out.push(a),
+                Err(AdminError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
     }
 
     async fn account(&self, did: &str) -> AdminResult<admin::Account> {
         self.account_view(did).await
     }
 
-    async fn takedown(&self, did: &str, _reason: String, _by: &str) -> AdminResult<admin::Account> {
-        self.set_takedown(did, true).await
+    async fn takedown(&self, did: &str, reason: String, by: &str) -> AdminResult<admin::Account> {
+        self.set_takedown(did, true, by, &reason).await
     }
 
-    async fn untakedown(&self, did: &str, _by: &str) -> AdminResult<admin::Account> {
-        self.set_takedown(did, false).await
+    async fn untakedown(&self, did: &str, by: &str) -> AdminResult<admin::Account> {
+        self.set_takedown(did, false, by, "").await
     }
 
     async fn cases(&self, q: admin::CaseQuery) -> AdminResult<Vec<admin::Case>> {
-        self.policy.cases(q).await
+        self.admin().cases(q).await
     }
     async fn case(&self, id: u64) -> AdminResult<admin::Case> {
-        self.policy.case(id).await
+        self.admin().case(id).await
     }
     async fn update_case(&self, id: u64, update: admin::CaseUpdate, by: &str) -> AdminResult<admin::Case> {
-        self.policy.update_case(id, update, by).await
+        self.admin().update_case(id, update, by).await
+    }
+}
+
+fn full_doc(d: &crate::policy::Stored<crate::policy::PolicyBody>) -> admin::FullPolicyDoc {
+    admin::FullPolicyDoc {
+        version: d.version,
+        updated_at_ms: d.updated_at_ms,
+        updated_by: d.updated_by.clone(),
+        note: d.note.clone(),
+        policy: serde_json::to_value(&d.body).unwrap_or_default(),
     }
 }

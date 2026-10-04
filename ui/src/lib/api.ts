@@ -102,7 +102,7 @@ export type HostDetail = {
   openCases: number[]
 }
 
-export type RuleEffect = { kind: 'ban' } | { kind: 'tier'; tier: string } | { kind: 'throttle'; eventsPerSec: number }
+export type RuleEffect = { kind: 'ban' } | { kind: 'allow' } | { kind: 'tier'; tier: string } | { kind: 'throttle'; eventsPerSec: number }
 export type DomainRule = { id: number; pattern: string; effect: RuleEffect; note: string; createdAtMs: number; createdBy: string; matches: number }
 export type DomainRuleInput = { pattern: string; effect: RuleEffect; note: string }
 
@@ -116,6 +116,9 @@ export type SpamThresholds = {
 export type Policy = { tiers: Record<string, TierLimits>; defaultTier: string; spam: SpamThresholds }
 export type PolicyDoc = { version: number; policy: Policy; updatedAtMs: number; updatedBy: string }
 export type PolicyAudit = { version: number; atMs: number; by: string; note: string; changes: string[] }
+/** The engine's whole policy document; `policy` is its PolicyBody, which the API doesn't type. */
+export type FullPolicyDoc = { version: number; updatedAtMs: number; updatedBy: string; note: string; policy: Record<string, unknown> }
+export type FullPolicyUpdate = { baseVersion: number; policy: unknown; note: string }
 
 export type Consumer = {
   id: number
@@ -183,6 +186,16 @@ export type Case = {
   autoAction: string | null
   notes: { atMs: number; by: string; text: string }[]
 }
+export type CaseEvidence = {
+  atMs: number
+  observed: number
+  threshold: number
+  windowSecs: number
+  node: string
+  detail?: string
+  signals: Record<string, number>
+}
+export type CaseDetail = Case & { trips: number; evidence: CaseEvidence[] }
 
 // ---------------------------------------------------------------- token
 

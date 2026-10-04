@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import type { HostStatus, RejectReason, Severity } from '../lib/api'
+import type { HostStatus, PolicyAudit, RejectReason, Severity } from '../lib/api'
+import { fmtTime, relTime } from '../lib/format'
 import { Spinner } from './ui'
 
 // ---------------------------------------------------------------- pills
@@ -177,6 +178,46 @@ export function Live({ at, error, every }: { at?: number; error?: unknown; every
       <i aria-hidden="true" />
       {stale ? 'Not updating' : `Live, every ${every / 1000} s`}
     </span>
+  )
+}
+
+/** A versioned object's audit log (policy, domain rules), newest first. */
+export function AuditTable({ rows }: { rows: PolicyAudit[] }) {
+  return (
+    <div className="table-wrap">
+      <table className="data audit">
+        <thead>
+          <tr>
+            <th>Version</th>
+            <th>When</th>
+            <th>By</th>
+            <th>Note</th>
+            <th>Changes</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((a) => (
+            <tr key={a.version}>
+              <td className="mono">v{a.version}</td>
+              <td className="nowrap" title={fmtTime(a.atMs)}>
+                {relTime(a.atMs)}
+              </td>
+              <td>{a.by}</td>
+              <td className="wrap-cell">{a.note || <span className="muted">—</span>}</td>
+              <td>
+                <ul className="changes">
+                  {a.changes.map((c, i) => (
+                    <li key={i} className="mono">
+                      {c}
+                    </li>
+                  ))}
+                </ul>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   )
 }
 

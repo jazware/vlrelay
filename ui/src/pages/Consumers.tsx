@@ -1,6 +1,6 @@
 import { Fragment, useMemo, useState } from 'react'
 import { InlineConfirm, Live, Tile } from '../components/relay'
-import { ErrorNotice, Loading, Panel } from '../components/ui'
+import { ErrorNotice, Loading, Notice, Panel } from '../components/ui'
 import type { Consumer } from '../lib/api'
 import { api, errText } from '../lib/api'
 import { fmtBytes, fmtNum, fmtSi, fmtTime, relTime } from '../lib/format'
@@ -18,6 +18,7 @@ export function Consumers() {
   const [kick, setKick] = useState<number | null>(null)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<unknown>()
+  const [kicked, setKicked] = useState<string>()
 
   const rows = useMemo(() => {
     const n = q.trim().toLowerCase()
@@ -52,6 +53,9 @@ export function Consumers() {
     setErr(undefined)
     try {
       await api(`consumers/${kick}/kick`, { method: 'POST' })
+      const c = all.find((x) => x.id === kick)
+      setKicked(c ? `${c.ip} (${c.userAgent || 'no user agent'})` : `consumer ${kick}`)
+      if (sel === kick) setSel(null)
       setKick(null)
       l.reload()
     } catch (e) {
@@ -68,6 +72,14 @@ export function Consumers() {
         <Live at={l.at} error={l.error} every={POLL} />
       </div>
       <ErrorNotice error={l.error} />
+      {kicked && (
+        <Notice kind="ok">
+          Kicked <span className="mono">{kicked}</span>.{' '}
+          <button type="button" className="btn sm quiet" onClick={() => setKicked(undefined)}>
+            Dismiss
+          </button>
+        </Notice>
+      )}
       <div className="tiles">
         <Tile k="Connected" v={fmtNum(all.length)} sub={`${fmtNum(live.length)} live, ${fmtNum(backfilling)} replaying`} />
         <Tile k="Bytes out per second" v={fmtBytes(bytes)} />
@@ -101,11 +113,11 @@ export function Consumers() {
                 <Fragment key={c.id}>
                   <tr className={`link${c.id === sel ? ' sel' : ''}`} onClick={() => setSel(c.id)}>
                     <td className="mono">{c.ip}</td>
-                    <td className="muted">{c.userAgent}</td>
+                    <td className="muted">{c.userAgent || '—'}</td>
                     <td>{c.node}</td>
                     <td>{c.backfilling ? <span className="pill amber">replaying</span> : <span className="pill accent">live</span>}</td>
                     <td className={`num ${lagClass(c.lagMs)}`}>{fmtLag(c.lagMs)}</td>
-                    <td className="num mono muted">{c.cursor}</td>
+                    <td className="num mono muted">{c.cursor > 0 ? c.cursor : '—'}</td>
                     <td className="num">{fmtSi(c.eventsPerSec)}</td>
                     <td className="num">{fmtBytes(c.bytesPerSec)}</td>
                     <td className="num muted" title={fmtTime(c.connectedSinceMs)}>

@@ -4,7 +4,7 @@
 use super::fair::HostQueue;
 use super::frame::{Peek, peek};
 use super::host::{HostEntry, HostStatus};
-use super::limits::HostLimiter;
+use super::limits::{HostLimiter, TokenBucket};
 use super::{CursorSource, UpstreamConfig};
 use crate::types::{Host, UpstreamFrame};
 use futures::{SinkExt, StreamExt};
@@ -46,10 +46,29 @@ impl HostTask {
     pub async fn run(mut self) {
         let mut attempt: u32 = 0;
         let mut skip_cursor = false;
+        let reconnects = |e: &HostEntry, cfg: &UpstreamConfig| e.limits(&cfg.limits).reconnects_per_hour;
+        let mut dials = TokenBucket::windowed(reconnects(&self.entry, &self.cfg), 3_600.0, std::time::Instant::now());
+        let mut dials_gen = self.entry.limits_gen();
         loop {
             // a dropped manager closes the channel without sending true
             if *self.stop.borrow() || self.stop.has_changed().is_err() {
                 break;
+            }
+            let g = self.entry.limits_gen();
+            if g != dials_gen {
+                dials_gen = g;
+                let per_hour = reconnects(&self.entry, &self.cfg);
+                let (rate, burst) = if per_hour > 0.0 { (per_hour / 3_600.0, per_hour) } else { (f64::INFINITY, 1.0) };
+                dials.retune(rate, burst, std::time::Instant::now());
+            }
+            let owed = dials.take(1.0, std::time::Instant::now());
+            if owed > Duration::ZERO {
+                self.entry.set_status(HostStatus::Backoff);
+                tokio::select! {
+                    _ = tokio::time::sleep(owed) => {}
+                    _ = self.stop.changed() => {}
+                }
+                continue;
             }
             let cursor = if skip_cursor { None } else { self.cursor.durable_cursor(&self.entry.host) };
             skip_cursor = false;
@@ -109,7 +128,11 @@ impl HostTask {
 
     async fn read(&mut self, mut ws: Socket, skip_cursor: &mut bool) -> (End, bool) {
         let cfg = self.cfg.clone();
-        let mut limiter = HostLimiter::new(self.entry.tier(), &cfg.limits, std::time::Instant::now());
+        let mut limiter = HostLimiter::new(
+            &self.entry.limits(&cfg.limits),
+            self.entry.limits_gen(),
+            std::time::Instant::now(),
+        );
         let mut last_rx = Instant::now();
         let mut ping = tokio::time::interval_at(Instant::now() + cfg.ping_interval, cfg.ping_interval);
         let mut got_frames = false;
@@ -210,7 +233,12 @@ impl HostTask {
             self.entry.bytes.fetch_add(len as u64, Ordering::Relaxed);
             let frame = UpstreamFrame { host: self.entry.host.clone(), upstream_seq, frame: data };
 
-            let pause = limiter.take(self.entry.tier(), &cfg.limits, len, std::time::Instant::now());
+            let now = std::time::Instant::now();
+            let g = self.entry.limits_gen();
+            if g != limiter.generation() {
+                limiter.retune(&self.entry.limits(&cfg.limits), g, now);
+            }
+            let pause = limiter.take(len, now);
             let full = self.queue.len() >= self.queue_capacity_hint();
             if pause > Duration::ZERO || full {
                 self.entry.set_status(HostStatus::Throttled);

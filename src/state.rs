@@ -17,10 +17,10 @@ pub mod record;
 pub mod shard;
 
 pub use apply::{
-    Accepted, ApplyConfig, Applied, Chain, ChainError, ChangeKind, CommitClaim, EventKind, Identity, IdentityError,
+    AccountGate, Accepted, ApplyConfig, Applied, Chain, ChainError, ChangeKind, CommitClaim, EventKind, Identity, IdentityError,
     IdentitySource, Incoming, Reject, StateDelta, StubChain,
 };
-pub use host::{Conn, HostCounts, HostPage, HostRecord, HostStore, Tier};
+pub use host::{Conn, HostCounts, HostPage, HostRecord, HostStore, HostUpdate, Tier};
 pub use record::{AccountStatus, ChainState, HostKey, Record, SigningKey, Upstream};
 pub use shard::{ShardState, Ticket};
 
@@ -75,6 +75,7 @@ pub struct StateStore<C: Chain = StubChain> {
     shards: RwLock<HashMap<ShardId, Arc<ShardState>>>,
     host_names: RwLock<HashMap<HostKey, Arc<str>>>,
     host_counts: Mutex<HashMap<HostKey, HostCounts>>,
+    gate: RwLock<Option<Arc<dyn AccountGate>>>,
 }
 
 impl<C: Chain> StateStore<C> {
@@ -94,7 +95,18 @@ impl<C: Chain> StateStore<C> {
             shards: Default::default(),
             host_names: Default::default(),
             host_counts: Default::default(),
+            gate: Default::default(),
         }
+    }
+
+    /// The policy's say on new accounts. Without one every account is
+    /// created active.
+    pub fn set_account_gate(&self, gate: Arc<dyn AccountGate>) {
+        *self.gate.write() = Some(gate);
+    }
+
+    pub(crate) fn account_gate(&self) -> Option<Arc<dyn AccountGate>> {
+        self.gate.read().clone()
     }
 
     pub fn set_layout(&self, layout: Vec<ShardRange>) {
@@ -205,6 +217,10 @@ impl<C: Chain> StateStore<C> {
         let Some(cur) = s.load(did).await? else { return Ok(None) };
         let mut rec = (*cur).clone();
         rec.relay_takedown = takedown;
+        // lifting a takedown is how an operator also lifts a relay throttle
+        if !takedown {
+            rec.relay_throttled = false;
+        }
         let st = rec.status();
         s.stage_unlogged(did, rec);
         s.flush_unlogged().await?;
@@ -310,7 +326,7 @@ impl<C: Chain> StateStore<C> {
 
     /// Serializes read-modify-writes of one host's record; the per-DID
     /// stripes double as host stripes (hostnames and DIDs never collide).
-    async fn update_host(
+    async fn modify_host(
         &self,
         hostname: &str,
         create: bool,
@@ -351,7 +367,7 @@ impl<C: Chain> HostStore for StateStore<C> {
     async fn checkpoint_cursors(&self, cursors: &[(String, i64)]) -> anyhow::Result<()> {
         let mut touched: HashMap<ShardId, Arc<ShardState>> = HashMap::new();
         for (h, seq) in cursors {
-            if let Some(s) = self.update_host(h, false, |r| r.cursor = r.cursor.max(*seq)).await? {
+            if let Some(s) = self.modify_host(h, false, |r| r.cursor = r.cursor.max(*seq)).await? {
                 touched.insert(s.id, s);
             }
         }
@@ -366,7 +382,7 @@ impl<C: Chain> HostStore for StateStore<C> {
             if c.is_zero() {
                 continue;
             }
-            self.update_host(h, true, |r| {
+            self.modify_host(h, true, |r| {
                 r.account_count += c.accounts;
                 r.events += c.events;
                 r.failed_checks += c.failed_checks;
@@ -375,6 +391,16 @@ impl<C: Chain> HostStore for StateStore<C> {
             .await?;
         }
         Ok(())
+    }
+
+    async fn update_host(&self, hostname: &str, f: HostUpdate<'_>) -> anyhow::Result<Option<HostRecord>> {
+        let s = self.shard_for(hostname)?;
+        let _g = s.lock_did(hostname).await;
+        let cur = self.read_host(&s, hostname).await?;
+        let Some(rec) = f(cur) else { return Ok(None) };
+        anyhow::ensure!(rec.hostname == hostname, "update_host({hostname}) returned {}", rec.hostname);
+        self.write_host(&s, &rec).await?;
+        Ok(Some(rec))
     }
 
     async fn list_hosts(&self, cursor: Option<&str>, limit: usize) -> anyhow::Result<HostPage> {

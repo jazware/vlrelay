@@ -268,6 +268,10 @@ pub struct Record {
     pub upstream: Upstream,
     /// An operator takedown on this relay; outlives anything upstream says.
     pub relay_takedown: bool,
+    /// Created past its host's account cap or the cluster's new-account
+    /// budget (indigo's `host-throttled`): its commits are dropped until an
+    /// operator lifts it. An upstream `#account` doesn't clear it.
+    pub relay_throttled: bool,
     pub desync: Option<DesyncReason>,
     pub key: Option<SigningKey>,
     /// Unix seconds; 0 means stale (re-resolve before trusting it).
@@ -288,6 +292,7 @@ impl Record {
             chain: None,
             upstream: Upstream::Active,
             relay_takedown: false,
+            relay_throttled: false,
             desync: None,
             key: None,
             fetched_at: 0,
@@ -301,6 +306,9 @@ impl Record {
     pub fn status(&self) -> AccountStatus {
         if self.relay_takedown {
             return AccountStatus::Takendown;
+        }
+        if self.relay_throttled {
+            return AccountStatus::Throttled;
         }
         match self.upstream {
             Upstream::Active => {}
@@ -319,6 +327,7 @@ impl Record {
     /// dropped. Desynchronized and throttled accounts still exist upstream.
     pub fn drops_commits(&self) -> bool {
         self.relay_takedown
+            || self.relay_throttled
             || matches!(
                 self.upstream,
                 Upstream::Takendown | Upstream::Suspended | Upstream::Deleted | Upstream::Deactivated | Upstream::Inactive
@@ -338,6 +347,9 @@ impl Record {
         }
         if self.key.is_some() {
             flags |= F_KEY;
+        }
+        if self.relay_throttled {
+            flags |= F_THROTTLED;
         }
         if self.relay_takedown {
             flags |= F_TAKEDOWN;
@@ -408,6 +420,7 @@ impl Record {
             chain,
             upstream,
             relay_takedown: flags & F_TAKEDOWN != 0,
+            relay_throttled: flags & F_THROTTLED != 0,
             desync,
             key,
             fetched_at: v[0],
@@ -425,6 +438,7 @@ const F_PDS: u8 = 2;
 const F_PDS_IS_HOST: u8 = 4;
 const F_KEY: u8 = 8;
 const F_TAKEDOWN: u8 = 16;
+const F_THROTTLED: u8 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("corrupt state record")]

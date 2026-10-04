@@ -35,6 +35,7 @@ lazy!(DURABLE_LAG: IntGauge = register_int_gauge!("vlrelay_durable_lag_ms", "Mea
 lazy!(HOSTS: IntGaugeVec = register_int_gauge_vec!("vlrelay_hosts", "Upstream hosts by status", &["status"]));
 lazy!(CONSUMERS: IntGauge = register_int_gauge!("vlrelay_consumers", "Connected subscribeRepos consumers"));
 lazy!(ACK_PENDING: IntGauge = register_int_gauge!("vlrelay_ack_pending", "Upstream events read but not yet durable, rejected or skipped"));
+lazy!(ACCOUNTS_THROTTLED: IntCounterVec = register_int_counter_vec!("vlrelay_accounts_throttled_total", "New accounts created throttled by policy, by why (host_cap, host_rate, cluster_budget)", &["why"]));
 lazy!(LANE_QUEUED: IntGauge = register_int_gauge!("vlrelay_lane_queued", "Events queued in front of the pipeline lanes"));
 
 /// Marks the time from when a frame arrived to when the merger emitted it.

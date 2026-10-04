@@ -349,6 +349,29 @@ pub struct PolicyAudit {
     pub changes: Vec<String>,
 }
 
+/// The whole policy document (tier limits, transitions, spam thresholds,
+/// cluster budgets, consumer limits, crawl rules), for the raw editor. The
+/// body is the engine's `PolicyBody` as JSON, so this type doesn't track it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullPolicyDoc {
+    pub version: u64,
+    pub updated_at_ms: i64,
+    pub updated_by: String,
+    #[serde(default)]
+    pub note: String,
+    pub policy: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullPolicyUpdate {
+    pub base_version: u64,
+    pub policy: serde_json::Value,
+    #[serde(default)]
+    pub note: String,
+}
+
 // ---------------------------------------------------------------- consumers
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -455,6 +478,33 @@ pub enum CaseStatus {
     Acknowledged,
     Resolved,
     Dismissed,
+}
+
+/// One trip folded into a case: what was measured and every signal's
+/// count for the same host (and DID) at that moment.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaseEvidence {
+    pub at_ms: i64,
+    pub observed: f64,
+    pub threshold: f64,
+    pub window_secs: u32,
+    pub node: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub signals: BTreeMap<String, f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaseDetail {
+    #[serde(flatten)]
+    pub case: Case,
+    /// Trips folded into this case, including the first.
+    pub trips: u32,
+    /// The newest trips, oldest first.
+    pub evidence: Vec<CaseEvidence>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -570,6 +620,19 @@ pub trait AdminSource: Send + Sync + 'static {
         by: &str,
     ) -> impl Future<Output = AdminResult<PolicyDoc>> + Send;
     fn policy_audit(&self) -> impl Future<Output = AdminResult<Vec<PolicyAudit>>> + Send;
+    fn full_policy(&self) -> impl Future<Output = AdminResult<FullPolicyDoc>> + Send {
+        async { Err(AdminError::NotFound("this relay has no full policy document".into())) }
+    }
+    fn update_full_policy(
+        &self,
+        _update: FullPolicyUpdate,
+        _by: &str,
+    ) -> impl Future<Output = AdminResult<FullPolicyDoc>> + Send {
+        async { Err(AdminError::NotFound("this relay has no full policy document".into())) }
+    }
+    fn domain_rules_audit(&self) -> impl Future<Output = AdminResult<Vec<PolicyAudit>>> + Send {
+        async { Ok(Vec::new()) }
+    }
 
     fn consumers(&self) -> impl Future<Output = AdminResult<Vec<Consumer>>> + Send;
     fn kick_consumer(&self, id: u64, by: &str) -> impl Future<Output = AdminResult<()>> + Send;
@@ -588,6 +651,12 @@ pub trait AdminSource: Send + Sync + 'static {
 
     fn cases(&self, q: CaseQuery) -> impl Future<Output = AdminResult<Vec<Case>>> + Send;
     fn case(&self, id: u64) -> impl Future<Output = AdminResult<Case>> + Send;
+    fn case_detail(&self, id: u64) -> impl Future<Output = AdminResult<CaseDetail>> + Send {
+        async move {
+            let case = self.case(id).await?;
+            Ok(CaseDetail { case, trips: 1, evidence: Vec::new() })
+        }
+    }
     fn update_case(
         &self,
         id: u64,
@@ -628,6 +697,11 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
             get(policy::<S>).put(update_policy::<S>),
         )
         .route("/admin/api/policy/audit", get(policy_audit::<S>))
+        .route(
+            "/admin/api/policy/full",
+            get(full_policy::<S>).put(update_full_policy::<S>),
+        )
+        .route("/admin/api/domain-rules/audit", get(rules_audit::<S>))
         .route("/admin/api/consumers", get(consumers::<S>))
         .route("/admin/api/consumers/{id}/kick", post(kick::<S>))
         .route("/admin/api/cluster", get(cluster::<S>))
@@ -643,6 +717,7 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
             "/admin/api/cases/{id}",
             get(case::<S>).post(update_case::<S>),
         )
+        .route("/admin/api/cases/{id}/evidence", get(case_detail::<S>))
         .route_layer(middleware::from_fn_with_state(ctx.clone(), auth::<S>))
         .with_state(ctx)
 }
@@ -736,6 +811,24 @@ async fn update_policy<S: AdminSource>(
 }
 async fn policy_audit<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Vec<PolicyAudit>>> {
     Ok(Json(c.src.policy_audit().await?))
+}
+async fn full_policy<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<FullPolicyDoc>> {
+    Ok(Json(c.src.full_policy().await?))
+}
+async fn update_full_policy<S: AdminSource>(
+    State(c): Ax<S>,
+    Json(u): Json<FullPolicyUpdate>,
+) -> AdminResult<Json<FullPolicyDoc>> {
+    Ok(Json(c.src.update_full_policy(u, BY).await?))
+}
+async fn rules_audit<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Vec<PolicyAudit>>> {
+    Ok(Json(c.src.domain_rules_audit().await?))
+}
+async fn case_detail<S: AdminSource>(
+    State(c): Ax<S>,
+    Path(id): Path<u64>,
+) -> AdminResult<Json<CaseDetail>> {
+    Ok(Json(c.src.case_detail(id).await?))
 }
 async fn consumers<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Vec<Consumer>>> {
     Ok(Json(c.src.consumers().await?))

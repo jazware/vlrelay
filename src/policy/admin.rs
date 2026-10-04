@@ -446,27 +446,41 @@ impl PolicyAdmin {
                 ));
             }
         };
-        let mut rec = self
+        let entry = serde_json::to_value(HostActionRecord {
+            at_ms: now_ms(),
+            by: by.to_string(),
+            action,
+        })
+        .map_err(anyhow::Error::from)?;
+        let mut outcome: Option<Result<Tier, String>> = None;
+        let out = &mut outcome;
+        let written = self
             .hosts
-            .get_host(host)
-            .await?
-            .ok_or_else(|| AdminError::NotFound(format!("no host {host}")))?;
-        let from = rec.tier;
-        tiers::apply_manual(&mut rec, &m, crate::state::now_secs())
-            .map_err(AdminError::BadRequest)?;
-        let mut st = tiers::host_policy(&rec);
-        st.actions.push(
-            serde_json::to_value(HostActionRecord {
-                at_ms: now_ms(),
-                by: by.to_string(),
-                action,
-            })
-            .map_err(anyhow::Error::from)?,
-        );
-        let drop = st.actions.len().saturating_sub(tiers::ACTIONS_KEPT);
-        st.actions.drain(..drop);
-        tiers::set_host_policy(&mut rec, &st);
-        self.hosts.put_host(&rec).await?;
+            .update_host(
+                host,
+                Box::new(move |cur| {
+                    let mut rec = cur?;
+                    let from = rec.tier;
+                    if let Err(e) = tiers::apply_manual(&mut rec, &m, crate::state::now_secs()) {
+                        *out = Some(Err(e));
+                        return None;
+                    }
+                    let mut st = tiers::host_policy(&rec);
+                    st.actions.push(entry);
+                    let drop = st.actions.len().saturating_sub(tiers::ACTIONS_KEPT);
+                    st.actions.drain(..drop);
+                    tiers::set_host_policy(&mut rec, &st);
+                    *out = Some(Ok(from));
+                    Some(rec)
+                }),
+            )
+            .await?;
+        let from = match outcome {
+            None => return Err(AdminError::NotFound(format!("no host {host}"))),
+            Some(Err(e)) => return Err(AdminError::BadRequest(e)),
+            Some(Ok(from)) => from,
+        };
+        let rec = written.ok_or_else(|| AdminError::NotFound(format!("no host {host}")))?;
         tracing::info!(
             target: "vlrelay::audit",
             host,

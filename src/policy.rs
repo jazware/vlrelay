@@ -16,6 +16,7 @@ pub mod driver;
 pub mod rules;
 pub mod signals;
 pub mod store;
+pub mod takedowns;
 pub mod tiers;
 
 #[cfg(test)]
@@ -126,6 +127,7 @@ pub struct Engine {
     new_accounts: budget::Bucket,
     new_hosts: budget::DailyCounter,
     pub cases: cases::CaseStore,
+    pub takedowns: takedowns::Takedowns,
     /// The last load error, while the newest object is rejected.
     pub last_error: Mutex<Option<String>>,
 }
@@ -146,6 +148,7 @@ impl Engine {
             rules_obj: Versioned::new(store.clone(), RULES_PATH, RULES_AUDIT),
             new_hosts: budget::DailyCounter::new(store.clone(), NEW_HOSTS_PATH),
             cases: cases::CaseStore::new(store.clone()),
+            takedowns: takedowns::Takedowns::new(store.clone()),
             store,
             node: node.to_string(),
             seen: Default::default(),

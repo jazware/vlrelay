@@ -256,7 +256,15 @@ async fn rate_limit_pauses_reads() {
     let fan = Fan::spawn().await;
     fan.set("flood", HostSpec::rate(f64::INFINITY, 200));
     let mut cfg = fan_config(&fan);
-    cfg.limits.new = TierLimits { events_per_sec: 500.0, bytes_per_sec: f64::INFINITY, burst_secs: 0.2, weight: 1 };
+    cfg.limits.new = TierLimits {
+        events_per_sec: 500.0,
+        bytes_per_sec: f64::INFINITY,
+        burst_secs: 0.2,
+        weight: 1,
+        events_per_hour: 0.0,
+        events_per_day: 0.0,
+        reconnects_per_hour: 0.0,
+    };
     let (m, mut rx) = Manager::new(cfg, Arc::new(MemHostStore::default()), None);
     m.start().await.unwrap();
     let h = Host("flood.fan.test".into());

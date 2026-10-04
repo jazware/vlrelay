@@ -93,6 +93,14 @@ pub trait IdentitySource: Send + Sync {
     async fn resolve(&self, did: &str, fresh: bool) -> Result<Option<Identity>, IdentityError>;
 }
 
+/// The policy engine's decision on a DID the relay hasn't seen before.
+pub trait AccountGate: Send + Sync {
+    /// Called once per new account, after its host checked out. False:
+    /// create it throttled (the host is at its account cap, or the
+    /// cluster's new-account budget is spent).
+    fn admit_account(&self, host: &str, did: &str) -> bool;
+}
+
 pub enum EventKind<V> {
     Commit(V),
     Sync { rev: Tid, commit: Cid, data: Cid },
@@ -354,10 +362,20 @@ impl<C: Chain> StateStore<C> {
             }
             Err(e) => return Err(e),
         }
+        if new_account
+            && let Some(g) = self.account_gate()
+            && !g.admit_account(&ev.host.0, ev.did)
+        {
+            rec.relay_throttled = true;
+        }
 
         let kind = match &ev.kind {
             EventKind::Commit(v) => {
                 if rec.drops_commits() {
+                    // kept, so the next event doesn't count as a new account again
+                    if new_account {
+                        shard.stage_unlogged(ev.did, rec.clone());
+                    }
                     return Err(Reject::Inactive(rec.status()));
                 }
                 let minute = ev.now / 60;
@@ -388,6 +406,9 @@ impl<C: Chain> StateStore<C> {
             }
             EventKind::Sync { rev, commit, data } => {
                 if rec.drops_commits() {
+                    if new_account {
+                        shard.stage_unlogged(ev.did, rec.clone());
+                    }
                     return Err(Reject::Inactive(rec.status()));
                 }
                 rec.chain = Some(ChainState { rev: *rev, commit: *commit, data: *data });

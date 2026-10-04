@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { ErrorNotice, Empty, Loading, Panel, Spinner } from '../components/ui'
-import { InlineConfirm, Live, TierPill } from '../components/relay'
-import { api, errText, type DomainRule, type DomainRuleInput, type PolicyDoc, type RuleEffect } from '../lib/api'
+import { AuditTable, InlineConfirm, Live, TierPill } from '../components/relay'
+import { api, errText, type DomainRule, type DomainRuleInput, type PolicyAudit, type PolicyDoc, type RuleEffect } from '../lib/api'
 import { fmtNum, fmtTime, relTime } from '../lib/format'
 import { useAction } from '../lib/hooks'
 import { Link } from '../lib/router'
@@ -23,6 +23,12 @@ const baseDomain = (p: string) => (p.startsWith('*.') ? p.slice(2) : p)
 
 function EffectPill({ e }: { e: RuleEffect }) {
   if (e.kind === 'ban') return <span className="pill danger">ban</span>
+  if (e.kind === 'allow')
+    return (
+      <span className="pill accent" title="Admitted when requestCrawl is allow-list only; doesn't count against the new-hosts-per-day budget">
+        allow
+      </span>
+    )
   if (e.kind === 'tier')
     return (
       <span className="effect">
@@ -43,7 +49,8 @@ const draftOf = (r?: DomainRule, tier = 'probation'): Draft => ({
 })
 
 function inputOf(d: Draft): DomainRuleInput {
-  const effect: RuleEffect = d.kind === 'ban' ? { kind: 'ban' } : d.kind === 'tier' ? { kind: 'tier', tier: d.tier } : { kind: 'throttle', eventsPerSec: Number(d.eps) }
+  const effect: RuleEffect =
+    d.kind === 'ban' || d.kind === 'allow' ? { kind: d.kind } : d.kind === 'tier' ? { kind: 'tier', tier: d.tier } : { kind: 'throttle', eventsPerSec: Number(d.eps) }
   return { pattern: d.pattern.trim().toLowerCase(), effect, note: d.note.trim() }
 }
 
@@ -59,6 +66,7 @@ function EffectInputs({ d, set, tiers }: { d: Draft; set: (d: Draft) => void; ti
     <>
       <select value={d.kind} onChange={(e) => set({ ...d, kind: e.target.value as Kind })} aria-label="Effect">
         <option value="ban">Ban</option>
+        <option value="allow">Allow</option>
         <option value="tier">Set tier</option>
         <option value="throttle">Throttle</option>
       </select>
@@ -79,6 +87,7 @@ function EffectInputs({ d, set, tiers }: { d: Draft; set: (d: Draft) => void; ti
 export function Rules() {
   const l = useApi<DomainRule[]>('domain-rules', undefined, 5000)
   const pol = useApi<PolicyDoc>('policy')
+  const audit = useApi<PolicyAudit[]>('domain-rules/audit', undefined, 10000)
   const tiers = Object.keys(pol.data?.policy.tiers ?? { trusted: 0, standard: 0, probation: 0 })
   const [add, setAdd] = useState<Draft>(draftOf())
   const [tried, setTried] = useState(false)
@@ -87,6 +96,7 @@ export function Rules() {
     setAdd(draftOf())
     setTried(false)
     l.reload()
+    audit.reload()
   })
   const addErr = draftError(add)
   const rules = l.data
@@ -98,7 +108,8 @@ export function Rules() {
         <Live at={l.at} error={l.error} every={5000} />
       </div>
       <p className="muted small">
-        A rule applies to a hostname, or with <code>*.</code> to a domain and every subdomain. It takes effect on matching hosts when saved, and on new hosts as they're crawled.
+        A rule applies to a hostname, or with <code>*.</code> to a domain and every subdomain. It takes effect on matching hosts when saved, and on new hosts as they're crawled. <b>Allow</b> admits a host
+        even when requestCrawl is allow-list only, without spending the new-hosts-per-day budget.
       </p>
       <Panel title="Add a rule">
         <form
@@ -150,13 +161,31 @@ export function Rules() {
               </thead>
               <tbody>
                 {rules.map((r) => (
-                  <RuleRow key={r.id} r={r} tiers={tiers} reload={l.reload} />
+                  <RuleRow
+                    key={r.id}
+                    r={r}
+                    tiers={tiers}
+                    reload={() => {
+                      l.reload()
+                      audit.reload()
+                    }}
+                  />
                 ))}
               </tbody>
             </table>
           </div>
         </Panel>
       )}
+      <Panel title="History" desc="Every add, edit and delete, newest first." flush>
+        <ErrorNotice error={audit.error} />
+        {!audit.data ? (
+          audit.error ? null : <Loading />
+        ) : audit.data.length === 0 ? (
+          <p className="muted small audit-empty">No rule changes recorded.</p>
+        ) : (
+          <AuditTable rows={audit.data} />
+        )}
+      </Panel>
     </>
   )
 }

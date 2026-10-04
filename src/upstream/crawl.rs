@@ -93,7 +93,17 @@ impl CrawlPolicy {
     }
 }
 
+/// requestCrawl admission by the policy engine, in place of the
+/// [`CrawlPolicy`] rules and hourly budget: crawl switch, bans, allow-list
+/// mode, the starting tier and the cluster's daily new-host budget.
+#[async_trait::async_trait]
+pub trait Admission: Send + Sync + 'static {
+    /// The tier to start the host at (ignored for a known host).
+    async fn admit(&self, host: &Host) -> Result<Tier, CrawlError>;
+}
+
 pub struct Crawler {
+    admission: parking_lot::RwLock<Option<Arc<dyn Admission>>>,
     manager: Arc<Manager>,
     policy: parking_lot::RwLock<CrawlPolicy>,
     /// Admission times in the last hour, plus reservations for probes in flight.
@@ -110,6 +120,8 @@ pub enum CrawlError {
     Busy,
     Unreachable(String),
     Internal(String),
+    /// Refused by the policy, with a message fit for the caller.
+    Refused(String),
 }
 
 impl IntoResponse for CrawlError {
@@ -130,6 +142,7 @@ impl IntoResponse for CrawlError {
                 (StatusCode::BAD_REQUEST, "InvalidRequest", format!("host check failed: {m}"))
             }
             CrawlError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", m),
+            CrawlError::Refused(m) => (StatusCode::BAD_REQUEST, "InvalidRequest", m),
         };
         (status, Json(serde_json::json!({"error": error, "message": message}))).into_response()
     }
@@ -145,11 +158,16 @@ const HOUR: Duration = Duration::from_secs(3600);
 impl Crawler {
     pub fn new(manager: Arc<Manager>, policy: CrawlPolicy) -> Arc<Crawler> {
         Arc::new(Crawler {
+            admission: parking_lot::RwLock::new(None),
             manager,
             policy: parking_lot::RwLock::new(policy),
             admitted: Mutex::new(VecDeque::new()),
             probing: Mutex::new(HashSet::new()),
         })
+    }
+
+    pub fn set_admission(&self, a: Arc<dyn Admission>) {
+        *self.admission.write() = Some(a);
     }
 
     pub fn set_policy(&self, p: CrawlPolicy) {
@@ -170,6 +188,10 @@ impl Crawler {
     pub async fn request_crawl(&self, hostname: &str) -> Result<bool, CrawlError> {
         let dev = self.manager.config().dev_mode;
         let host = normalize_hostname(hostname, dev).map_err(CrawlError::InvalidHost)?;
+        let admission = self.admission.read().clone();
+        if let Some(a) = admission {
+            return self.request_crawl_with(&host, a.as_ref()).await;
+        }
         let policy = self.policy();
         let verdict = policy.verdict(&host);
         if verdict == Verdict::Banned {
@@ -203,6 +225,23 @@ impl Crawler {
             return Err(e);
         }
         self.manager.admit(&host, Tier::New).await.map_err(|e| CrawlError::Internal(format!("{e:#}")))
+    }
+
+    async fn request_crawl_with(&self, host: &Host, a: &dyn Admission) -> Result<bool, CrawlError> {
+        let probe_timeout = Duration::from_secs(self.policy().probe_timeout_secs.max(1));
+        if self.manager.registry().get(host).is_some() {
+            // a known host is still checked: a ban added since must hold
+            a.admit(host).await?;
+            self.manager.wake(host);
+            return Ok(false);
+        }
+        if !self.probing.lock().insert(host.clone()) {
+            return Err(CrawlError::Busy);
+        }
+        let _probing = Unmark(&self.probing, host.clone());
+        let tier = a.admit(host).await?;
+        self.probe(host, probe_timeout).await?;
+        self.manager.admit(host, tier).await.map_err(|e| CrawlError::Internal(format!("{e:#}")))
     }
 
     fn reserve(&self, per_hour: u32) -> Result<Instant, CrawlError> {

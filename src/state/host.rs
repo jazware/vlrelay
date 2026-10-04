@@ -103,6 +103,10 @@ impl HostCounts {
     }
 }
 
+/// An atomic edit of one host record: gets the current record (None if
+/// there isn't one) and returns what to write (None: write nothing).
+pub type HostUpdate<'a> = Box<dyn FnOnce(Option<HostRecord>) -> Option<HostRecord> + Send + 'a>;
+
 pub struct HostPage {
     pub hosts: Vec<HostRecord>,
     pub cursor: Option<String>,
@@ -122,4 +126,18 @@ pub trait HostStore: Send + Sync {
     async fn add_counts(&self, counts: &[(String, HostCounts)]) -> anyhow::Result<()>;
     /// Ordered by (slot, hostname); the cursor is the last hostname.
     async fn list_hosts(&self, cursor: Option<&str>, limit: usize) -> anyhow::Result<HostPage>;
+    /// Read-modify-write under the host's lock, so the policy driver, an
+    /// operator action, the registry flush and the counter flush each change
+    /// only their own fields. Returns the record written, if any. The
+    /// default isn't atomic; stores that can lock should override it.
+    async fn update_host(&self, hostname: &str, f: HostUpdate<'_>) -> anyhow::Result<Option<HostRecord>> {
+        let cur = self.get_host(hostname).await?;
+        match f(cur) {
+            Some(rec) => {
+                self.put_host(&rec).await?;
+                Ok(Some(rec))
+            }
+            None => Ok(None),
+        }
+    }
 }

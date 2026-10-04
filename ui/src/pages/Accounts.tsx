@@ -94,7 +94,7 @@ export function Accounts() {
       {!l.data ? (
         l.error ? null : <Loading />
       ) : rows.length === 0 ? (
-        <Empty title="No accounts match">Search by a full DID to look up any account the relay has seen.</Empty>
+        <Empty title="No accounts match">Search by a full DID or a handle to look up any account the relay has seen.</Empty>
       ) : (
         <Panel flush>
           <div className="table-wrap">

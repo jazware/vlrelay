@@ -254,8 +254,13 @@ pub struct IdentityCache<F: Fetch = HttpFetch> {
     /// DID -> (when the fetch began, its shared result).
     inflight: Mutex<HashMap<String, (Instant, Flight)>>,
     budget: Mutex<Bucket>,
+    /// The cluster's share of PLC lookups for this node, on top of `budget`.
+    gate: parking_lot::RwLock<Option<BudgetGate>>,
     pub stats: Stats,
 }
+
+/// Takes one lookup from an outside budget; false when it's spent.
+pub type BudgetGate = Arc<dyn Fn() -> bool + Send + Sync>;
 
 impl<F: Fetch> IdentityCache<F> {
     pub fn new(fetcher: F, opts: Options) -> IdentityCache<F> {
@@ -268,8 +273,41 @@ impl<F: Fetch> IdentityCache<F> {
             opts,
             entries: Default::default(),
             inflight: Default::default(),
+            gate: Default::default(),
             stats: Stats::default(),
         }
+    }
+
+    pub fn set_budget_gate(&self, gate: BudgetGate) {
+        *self.gate.write() = Some(gate);
+    }
+
+    /// Cached documents whose handle is `q`, or starts with it when `q`
+    /// ends in `*`. A scan: for the operator API, not the hot path.
+    pub fn find_handle(&self, q: &str, limit: usize) -> Vec<Arc<Identity>> {
+        let q = q.trim().trim_start_matches('@').to_ascii_lowercase();
+        let (prefix, q) = match q.strip_suffix('*') {
+            Some(p) => (true, p.to_string()),
+            None => (false, q),
+        };
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let e = self.entries.lock();
+        let mut out: Vec<Arc<Identity>> = e
+            .values()
+            .filter_map(|x| x.v.as_ref().ok())
+            .filter(|id| {
+                id.handle.as_deref().is_some_and(|h| {
+                    let h = h.to_ascii_lowercase();
+                    if prefix { h.starts_with(&q) } else { h == q }
+                })
+            })
+            .take(limit)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.handle.cmp(&b.handle));
+        out
     }
 
     /// The cached outcome, if fresh. No I/O.
@@ -371,6 +409,17 @@ impl<F: Fetch> IdentityCache<F> {
         if let Err(e) = self.spend_budget().await {
             self.stats.over_budget.fetch_add(1, Ordering::Relaxed);
             return Err(e);
+        }
+        let gate = self.gate.read().clone();
+        if let Some(g) = gate {
+            let t0 = Instant::now();
+            while !g() {
+                if t0.elapsed() >= self.opts.max_budget_wait {
+                    self.stats.over_budget.fetch_add(1, Ordering::Relaxed);
+                    return Err(LookupError::OverBudget);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         }
         self.stats.fetches.fetch_add(1, Ordering::Relaxed);
         let doc = self.fetcher.fetch(did).await?;

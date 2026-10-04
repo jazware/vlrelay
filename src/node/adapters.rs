@@ -133,26 +133,36 @@ impl<C: Chain> upstream::HostStore for StateHosts<C> {
         })
     }
 
+    /// The registry's tier only seeds a new record: after that the policy
+    /// engine owns it (operator actions, the driver's throttles), and the
+    /// registry follows the record, never the other way round.
     fn put(&self, records: Vec<upstream::HostRecord>) -> upstream::host::StoreFuture<'_, ()> {
         Box::pin(async move {
             for r in &records {
-                let mut rec = match self.0.get_host(&r.hostname).await? {
-                    Some(rec) => rec,
-                    None => state::HostRecord::new(&r.hostname, tier_to_state(r.tier), state::now_secs()),
-                };
-                rec.tier = tier_to_state(r.tier);
-                rec.conn = match r.status {
+                let conn = match r.status {
                     HostStatus::Active | HostStatus::Throttled => state::Conn::Active,
                     HostStatus::Idle => state::Conn::Idle,
                     HostStatus::Connecting | HostStatus::Backoff => state::Conn::Offline,
                 };
-                let x = UpstreamExtra {
+                let x = serde_json::to_value(UpstreamExtra {
                     admitted_ms: r.admitted_ms,
                     last_connected_ms: r.last_connected_ms,
                     errors: r.errors.clone(),
-                };
-                rec.extra.insert("upstream".into(), serde_json::to_value(x)?);
-                self.0.put_host(&rec).await?;
+                })?;
+                let tier = tier_to_state(r.tier);
+                let hostname = r.hostname.clone();
+                self.0
+                    .update_host(
+                        &r.hostname,
+                        Box::new(move |cur| {
+                            let mut rec =
+                                cur.unwrap_or_else(|| state::HostRecord::new(&hostname, tier, state::now_secs()));
+                            rec.conn = conn;
+                            rec.extra.insert("upstream".into(), x);
+                            Some(rec)
+                        }),
+                    )
+                    .await?;
             }
             // every row, cursor or not: checkpoint_cursors flushes the
             // memtable of each shard it touches, and nothing else does

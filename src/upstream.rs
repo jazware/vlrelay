@@ -16,7 +16,7 @@ pub mod frame;
 pub mod host;
 pub mod limits;
 
-pub use crawl::{CrawlPolicy, Crawler, DomainAction, DomainRule};
+pub use crawl::{Admission, CrawlError, CrawlPolicy, Crawler, DomainAction, DomainRule};
 pub use host::{
     ErrorCounters, HostEntry, HostRecord, HostStatus, HostStore, HostView, HostnameError, MemHostStore, Registry, Tier,
     normalize_hostname,
@@ -95,6 +95,23 @@ pub trait CursorSource: Send + Sync + 'static {
     fn on_future_cursor(&self, _host: &Host) {}
 }
 
+/// What the policy engine says about one host. The tier is what the host
+/// runs as after domain rules; `limits` replaces the tier's defaults (the
+/// manager keeps the fair-queue weight of the tier).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostPolicy {
+    pub tier: Tier,
+    pub connect: bool,
+    pub limits: Option<TierLimits>,
+}
+
+/// The policy engine, as the manager sees it. It owns host tiers: the
+/// registry follows it and doesn't persist tiers of its own.
+pub trait PolicySource: Send + Sync + 'static {
+    /// None: no opinion yet (the registry's tier and default limits apply).
+    fn host_policy(&self, host: &Host) -> Option<HostPolicy>;
+}
+
 struct RegistryCursor(Arc<Registry>);
 
 impl CursorSource for RegistryCursor {
@@ -120,6 +137,7 @@ pub struct Manager {
     tasks: Mutex<HashMap<Host, Running>>,
     background: Mutex<Vec<JoinHandle<()>>>,
     filter: Mutex<Option<HostFilter>>,
+    policy: parking_lot::RwLock<Option<Arc<dyn PolicySource>>>,
 }
 
 impl Manager {
@@ -143,6 +161,7 @@ impl Manager {
             tasks: Mutex::new(HashMap::new()),
             background: Mutex::new(Vec::new()),
             filter: Mutex::new(None),
+            policy: parking_lot::RwLock::new(None),
         };
         (Arc::new(m), rx)
     }
@@ -153,6 +172,49 @@ impl Manager {
 
     pub fn registry(&self) -> &Arc<Registry> {
         &self.registry
+    }
+
+    /// Hands host tiers and limits to the policy engine. Set it before
+    /// [`Manager::start`] so no host connects against the policy.
+    pub fn set_policy_source(&self, p: Arc<dyn PolicySource>) {
+        *self.policy.write() = Some(p);
+    }
+
+    /// Copies the policy's view of the host onto its entry and says whether
+    /// it should have a socket.
+    fn follow_policy(&self, e: &HostEntry) -> bool {
+        let p = self.policy.read().clone();
+        match p.and_then(|p| p.host_policy(&e.host)) {
+            Some(hp) => {
+                e.set_tier(hp.tier);
+                e.set_limits(hp.limits.map(|mut l| {
+                    l.weight = self.cfg.limits.for_tier(hp.tier).weight;
+                    l
+                }));
+                hp.connect
+            }
+            None => e.tier().connects(),
+        }
+    }
+
+    /// Applies the policy's current view of `host`: tier and limits on the
+    /// running socket, and a disconnect or a connect when that flips.
+    pub async fn apply_policy(self: &Arc<Self>, host: &Host) {
+        let Some(e) = self.registry.get(host) else { return };
+        let connect = self.follow_policy(&e);
+        if !connect {
+            if let Some(j) = self.stop_host(host) {
+                tracing::info!(host = %host.0, tier = e.tier().as_str(), "upstream disconnected by policy");
+                let _ = j.await;
+            }
+            return;
+        }
+        if let Some(r) = self.tasks.lock().get(host) {
+            r.queue.set_weight(self.cfg.limits.for_tier(e.tier()).weight);
+        }
+        if self.out.lock().is_none() {
+            self.spawn_host(e);
+        }
     }
 
     /// Loads the registry and connects every host whose tier connects.
@@ -176,7 +238,7 @@ impl Manager {
         }));
         drop(bg);
         for e in self.registry.all() {
-            if e.tier().connects() {
+            if self.follow_policy(&e) {
                 self.spawn_host(e);
             }
         }
@@ -238,7 +300,7 @@ impl Manager {
         }
         if self.out.lock().is_none() {
             for e in self.registry.all() {
-                if e.tier().connects() {
+                if self.follow_policy(&e) {
                     self.spawn_host(e);
                 }
             }
@@ -270,7 +332,7 @@ impl Manager {
     /// manager is running. Returns whether it was new.
     pub async fn admit(self: &Arc<Self>, host: &Host, tier: Tier) -> anyhow::Result<bool> {
         let (e, new) = self.registry.admit(host, tier).await?;
-        if self.out.lock().is_none() && e.tier().connects() {
+        if self.follow_policy(&e) && self.out.lock().is_none() {
             self.spawn_host(e);
         }
         Ok(new)

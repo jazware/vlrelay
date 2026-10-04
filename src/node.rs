@@ -41,6 +41,7 @@ pub mod acks;
 pub mod adapters;
 pub mod admin;
 pub mod metrics;
+pub mod policy;
 
 use crate::event::{self, Kind, SeqSpan};
 use crate::identity::{HttpFetch, Identity, IdentityCache, LookupError};
@@ -86,6 +87,11 @@ pub struct NodeConfig {
     pub checkpoint_interval: Duration,
     pub identity: crate::identity::Options,
     pub upstream_limits: upstream::Limits,
+    /// Enforced when set (`node::policy`); without it hosts run at their
+    /// tier's default limits and nothing is counted.
+    pub policy: Option<policy::PolicyEngine>,
+    /// The tier a `--host` upstream starts at the first time it's seen.
+    pub cli_host_tier: Tier,
 }
 
 impl NodeConfig {
@@ -105,6 +111,8 @@ impl NodeConfig {
             checkpoint_interval: Duration::from_secs(5),
             identity: crate::identity::Options::default(),
             upstream_limits: upstream::Limits::default(),
+            policy: None,
+            cli_host_tier: Tier::Trusted,
         }
     }
 }
@@ -377,7 +385,7 @@ pub struct Node {
     pub ttf: Arc<Ttf>,
     pub dash: Mutex<Dash>,
     pub rejects: Mutex<HashMap<Host, HostRejects>>,
-    pub consumers: admin::Consumers,
+    pub policy: Option<Arc<policy::PolicyHooks>>,
     /// (host, upstream seq) pairs already in an earlier log past the host's
     /// durable cursor: the replay after a restart drops them.
     replayed: Mutex<HashMap<Host, HashSet<i64>>>,
@@ -507,6 +515,11 @@ impl Node {
         ucfg.flush_interval = Duration::from_secs(3600);
         let (manager, rx) = Manager::new(ucfg, Arc::new(StateHosts(state.clone())), None);
         let crawler = upstream::Crawler::new(manager.clone(), upstream::CrawlPolicy::default());
+        let hooks = cfg.policy.as_ref().map(|p| policy::PolicyHooks::new(p.0.clone(), state.clone(), cfg.dev_mode));
+        if let Some(h) = &hooks {
+            h.install(&manager, &crawler, &identity);
+            h.load().await?;
+        }
 
         let ttf = Arc::new(Ttf::default());
         let local = LocalOwner::start(state.clone(), log.clone(), ttf.clone());
@@ -541,7 +554,7 @@ impl Node {
             ttf,
             dash: Mutex::new(Dash::default()),
             rejects: Mutex::new(HashMap::new()),
-            consumers: admin::Consumers::default(),
+            policy: hooks.clone(),
             replayed: Mutex::new(replayed),
             lanes: lane_tx,
             ingest: ingest_handle.clone(),
@@ -561,7 +574,10 @@ impl Node {
             tracing::info!(host = %h.record.hostname, acked = ?h.record.acked_seq, tier = h.record.tier.as_str(), "upstream resumes");
         }
         for h in cli_hosts {
-            manager.admit(&h, Tier::Trusted).await?;
+            manager.admit(&h, cfg.cli_host_tier).await?;
+        }
+        if let Some(h) = &hooks {
+            h.spawn();
         }
         Ok(node)
     }
@@ -648,6 +664,9 @@ impl Node {
             match self.owner.submit(checked).await {
                 Submitted::Appended(rx) => {
                     metrics::EVENTS_ACCEPTED.with_label_values(&[kind]).inc();
+                    if let Some(p) = &self.policy {
+                        p.on_accepted(&host.0, &did, kind);
+                    }
                     let node = self.clone();
                     tokio::spawn(async move {
                         // a failed log fail-stops the process (on_fatal): no ack
@@ -769,6 +788,9 @@ impl Node {
 
     fn reject(&self, host: &Host, did: &str, useq: i64, r: Rejection) {
         metrics::EVENTS_REJECTED.with_label_values(&[r.reason]).inc();
+        if let Some(p) = &self.policy {
+            p.on_reject(&host.0, did, r.reason, &r.detail);
+        }
         tracing::debug!(host = %host.0, did, useq, reason = r.reason, "rejected: {}", r.detail);
         let mut m = self.rejects.lock();
         let h = m.entry(host.clone()).or_default();

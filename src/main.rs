@@ -1,8 +1,7 @@
 //! vlRelay: the single-node relay (docs/devloop.md "The e2e contract").
 
-use axum::extract::{ConnectInfo, Request};
 use axum::http::{HeaderValue, header};
-use axum::middleware::{self, Next};
+use axum::middleware;
 use axum::response::Response;
 use clap::Parser;
 use std::net::SocketAddr;
@@ -45,6 +44,10 @@ struct Args {
     /// Accept com.atproto.sync.requestCrawl.
     #[arg(long)]
     crawl: bool,
+    /// The tier a --host upstream starts at the first time it's seen.
+    /// After that its record's tier holds (operators, auto-throttle).
+    #[arg(long, default_value = "trusted")]
+    host_tier: String,
     /// Turns on /admin (dashboard and API) with this token.
     #[arg(long, env = "VLRELAY_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
@@ -125,6 +128,12 @@ async fn run(a: Args) -> anyhow::Result<()> {
         cfg.ingest_threads = n.max(1);
     }
     cfg.hosts = a.hosts.clone();
+    cfg.cli_host_tier = vlrelay::upstream::Tier::parse(&a.host_tier)
+        .filter(|t| t.connects())
+        .ok_or_else(|| anyhow::anyhow!("--host-tier {}: one of trusted, default, new, throttled", a.host_tier))?;
+    // one node: the cluster's budgets are all this node's
+    let live = Arc::new(vlrelay::policy::FixedNodes::new(1));
+    cfg.policy = Some(vlrelay::node::policy::PolicyEngine(vlrelay::policy::Engine::new(store.clone(), &a.node_id, live)));
     cfg.identity.lookups_per_sec = a.did_lookups_per_sec;
     cfg.identity.burst = (a.did_lookups_per_sec * 2.0).max(1.0);
     if dev_mode {
@@ -137,19 +146,15 @@ async fn run(a: Args) -> anyhow::Result<()> {
     let mut app = axum::Router::new()
         .route("/xrpc/_health", axum::routing::get(health))
         .route("/metrics", axum::routing::get(|| async { vlpds::metrics::render() }))
-        .merge(node.serve.router().route_layer(middleware::from_fn_with_state(node.clone(), track_consumer)))
+        .merge(node.serve.router())
         .merge(vlrelay::sync_api::router(node.state.clone()));
     if a.crawl {
         app = app.merge(node.crawler.router());
     }
     if let Some(token) = a.admin_token.clone().filter(|t| !t.is_empty()) {
         let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
-        let engine =
-            vlrelay::policy::Engine::new(node.store.clone(), &a.node_id, Arc::new(vlrelay::policy::FixedNodes::new(1)));
-        engine.spawn_refresher();
-        let hosts: Arc<dyn vlrelay::state::HostStore> = node.state.clone();
-        let policy = Arc::new(vlrelay::policy::admin::PolicyAdmin::new(engine, hosts));
-        let src = Arc::new(NodeAdmin { node: node.clone(), policy, demo: vlrelay::admin::demo::Demo::start(42) });
+        let policy = node.policy.clone().expect("the relay always runs the policy engine");
+        let src = Arc::new(NodeAdmin::new(node.clone(), policy, vlrelay::admin::demo::Demo::start(42)));
         app = app.merge(vlrelay::admin::app(src, token, ui));
     }
     let app = app.layer(middleware::map_response(server_header));
@@ -181,22 +186,4 @@ async fn server_header(mut r: Response) -> Response {
         HeaderValue::from_static(concat!("vlrelay/", env!("CARGO_PKG_VERSION"), " (atproto-relay)")),
     );
     r
-}
-
-async fn track_consumer(
-    axum::extract::State(node): axum::extract::State<Arc<Node>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>().cloned() {
-        let ua = req.headers().get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-        let cursor = req
-            .uri()
-            .query()
-            .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("cursor=")))
-            .and_then(|c| c.parse().ok());
-        let live = node.serve.firehose.connections_from(addr.ip());
-        node.consumers.connected(addr.ip(), &ua, cursor, live);
-    }
-    next.run(req).await
 }

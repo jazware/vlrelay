@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ErrorNotice, Loading, Notice, Panel } from '../components/ui'
-import { InlineConfirm, Live, TierPill } from '../components/relay'
-import { api, ApiError, errText, type Policy as PolicyT, type PolicyAudit, type PolicyDoc, type SpamThresholds, type TierLimits } from '../lib/api'
+import { AuditTable, InlineConfirm, Live, TierPill } from '../components/relay'
+import { api, ApiError, errText, type FullPolicyDoc, type Policy as PolicyT, type PolicyAudit, type PolicyDoc, type SpamThresholds, type TierLimits } from '../lib/api'
 import { fmtTime, relTime } from '../lib/format'
 import { useAction } from '../lib/hooks'
 import { useApi } from '../lib/useApi'
@@ -379,48 +379,184 @@ export function Policy() {
         </Panel>
       )}
 
+      <AdvancedPolicy
+        onSaved={() => {
+          // the form shares the version counter: an untouched form follows the save, an edited one gets the newer-version warning
+          if (!dirty)
+            api<PolicyDoc>('policy')
+              .then((doc) => {
+                setBase(doc)
+                setDraft(draftOf(doc.policy))
+              })
+              .catch(() => undefined)
+          l.reload()
+          audit.reload()
+        }}
+      />
+
       <Panel title="Audit log" flush>
         <ErrorNotice error={audit.error} />
-        {!audit.data ? (
-          <Loading />
-        ) : (
-          <div className="table-wrap">
-            <table className="data audit">
-              <thead>
-                <tr>
-                  <th>Version</th>
-                  <th>When</th>
-                  <th>By</th>
-                  <th>Note</th>
-                  <th>Changes</th>
-                </tr>
-              </thead>
-              <tbody>
-                {audit.data.map((a) => (
-                  <tr key={a.version}>
-                    <td className="mono">v{a.version}</td>
-                    <td className="nowrap" title={fmtTime(a.atMs)}>
-                      {relTime(a.atMs)}
-                    </td>
-                    <td>{a.by}</td>
-                    <td className="wrap-cell">{a.note || <span className="muted">—</span>}</td>
-                    <td>
-                      <ul className="changes">
-                        {a.changes.map((c) => (
-                          <li key={c} className="mono">
-                            {c}
-                          </li>
-                        ))}
-                      </ul>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
+        {!audit.data ? <Loading /> : <AuditTable rows={audit.data} />}
       </Panel>
     </>
+  )
+}
+
+const pretty = (v: unknown) => JSON.stringify(v, null, 2)
+
+/** The engine's whole policy document as JSON, for settings the form above doesn't cover. Hidden on relays without one (404). */
+function AdvancedPolicy({ onSaved }: { onSaved: () => void }) {
+  const [missing, setMissing] = useState(false)
+  const l = useApi<FullPolicyDoc>('policy/full', undefined, missing ? undefined : 10000)
+  const [open, setOpen] = useState(false)
+  const [base, setBase] = useState<FullPolicyDoc>()
+  const [text, setText] = useState('')
+  const [note, setNote] = useState('')
+  const [confirm, setConfirm] = useState(false)
+  const [conflict, setConflict] = useState<string>()
+  const [saved, setSaved] = useState<number>()
+
+  useEffect(() => {
+    if (l.error instanceof ApiError && l.error.status === 404) setMissing(true)
+  }, [l.error])
+  useEffect(() => {
+    if (l.data && !base) {
+      setBase(l.data)
+      setText(pretty(l.data.policy))
+    }
+  }, [l.data, base])
+
+  const parsed = useMemo((): { ok: true; v: unknown } | { ok: false; err: string } => {
+    try {
+      return { ok: true, v: JSON.parse(text) }
+    } catch (e) {
+      return { ok: false, err: errText(e) }
+    }
+  }, [text])
+  const changes = useMemo(() => (base && parsed.ok ? diffJson(base.policy, parsed.v) : []), [base, parsed])
+  const notObject = parsed.ok && (typeof parsed.v !== 'object' || parsed.v === null || Array.isArray(parsed.v))
+
+  const save = useAction(async () => {
+    if (!base || !parsed.ok) return
+    try {
+      const doc = await api<FullPolicyDoc>('policy/full', { method: 'PUT', body: { baseVersion: base.version, policy: parsed.v, note: note.trim() } })
+      setBase(doc)
+      setText(pretty(doc.policy))
+      setNote('')
+      setConfirm(false)
+      setSaved(doc.version)
+      l.reload()
+      onSaved()
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        setConflict(e.message)
+        setConfirm(false)
+        return
+      }
+      throw e
+    }
+  })
+
+  const reloadLatest = () => {
+    setBase(undefined)
+    setConflict(undefined)
+    setConfirm(false)
+    setSaved(undefined)
+    l.reload()
+  }
+
+  if (missing || (!l.data && !l.error)) return null
+  const newer = base && l.data && l.data.version > base.version
+  const dirty = changes.length > 0
+
+  return (
+    <Panel
+      title="Advanced"
+      desc="The whole policy document: per-tier limits beyond the ones above, tier transitions, spam actions, cluster budgets, consumer limits and crawl settings. Saved and versioned like the form above."
+      actions={
+        <button type="button" className="btn sm" aria-expanded={open} onClick={() => setOpen(!open)}>
+          {open ? 'Hide' : 'Edit JSON'}
+        </button>
+      }
+    >
+      {!open ? (
+        base ? (
+          <p className="muted small">
+            <span className="mono">v{base.version}</span>, updated <span title={fmtTime(base.updatedAtMs)}>{relTime(base.updatedAtMs)}</span> by {base.updatedBy}
+            {base.note && <> ({base.note})</>}.{dirty && ` ${changes.length} unsaved change${changes.length === 1 ? '' : 's'}.`}
+          </p>
+        ) : (
+          <ErrorNotice error={l.error} />
+        )
+      ) : !base ? (
+        <ErrorNotice error={l.error} />
+      ) : (
+        <>
+          {saved !== undefined && !dirty && <Notice kind="ok">Saved as version {saved}.</Notice>}
+          {conflict && (
+            <Notice kind="err">
+              <p>
+                <b>Someone else saved first.</b> {conflict}
+              </p>
+              <button type="button" className="btn sm" onClick={reloadLatest}>
+                Reload latest (discards your edits)
+              </button>
+            </Notice>
+          )}
+          {newer && !conflict && (
+            <Notice kind="warn">
+              <p>
+                Version {l.data!.version} was saved by {l.data!.updatedBy} {relTime(l.data!.updatedAtMs)}. You're editing version {base.version}, so saving will be refused.
+              </p>
+              <button type="button" className="btn sm" onClick={reloadLatest}>
+                Reload latest{dirty ? ' (discards your edits)' : ''}
+              </button>
+            </Notice>
+          )}
+          <textarea
+            className={`policy-json${parsed.ok && !notObject ? '' : ' invalid'}`}
+            value={text}
+            onChange={(e) => {
+              setText(e.target.value)
+              setConfirm(false)
+            }}
+            spellCheck={false}
+            aria-label="Policy document (JSON)"
+            rows={24}
+          />
+          {!parsed.ok && <div className="field-err">Not valid JSON: {parsed.err}</div>}
+          {notObject && <div className="field-err">The policy document must be a JSON object</div>}
+          {dirty && (
+            <div className="diff policy-json-diff" role="list">
+              {changes.map((c) => (
+                <div key={c} role="listitem" className="mono small">
+                  {c}
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="policy-json-save">
+            <input type="text" value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note for the audit log (why)" aria-label="Note" />
+            <button type="button" className="btn sm" disabled={!dirty && parsed.ok} onClick={() => setText(pretty(base.policy))}>
+              Discard
+            </button>
+            <button type="button" className="btn sm primary" disabled={!dirty || !parsed.ok || notObject || confirm} onClick={() => setConfirm(true)}>
+              Save as version {base.version + 1}
+            </button>
+          </div>
+          <InlineConfirm
+            open={confirm}
+            action="Save policy"
+            busy={save.busy}
+            error={save.error ? errText(save.error) : undefined}
+            onConfirm={() => save.run()}
+            onCancel={() => setConfirm(false)}
+          >
+            Apply {changes.length} change{changes.length === 1 ? '' : 's'} on every node. The relay validates the whole document and refuses it with a reason if anything is off.
+          </InlineConfirm>
+        </>
+      )}
+    </Panel>
   )
 }
 

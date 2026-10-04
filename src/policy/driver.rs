@@ -15,7 +15,7 @@ use super::doc::{SpamAction, tier_name};
 use super::signals::Trip;
 use super::tiers::{self, Obs};
 use crate::admin::Severity;
-use crate::state::{HostRecord, HostStore};
+use crate::state::HostStore;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -94,23 +94,32 @@ impl Driver {
         }
     }
 
-    /// Steps one host and writes it if anything changed.
-    async fn step_host(
-        &self,
-        mut rec: HostRecord,
-        obs: &Obs,
-        now: u32,
-        report: &mut Report,
-    ) -> anyhow::Result<()> {
+    /// Steps one host and writes it if anything changed. The step runs on
+    /// the record as it is under the host's lock, so a counter flush or an
+    /// operator action landing meanwhile isn't overwritten.
+    async fn step_host(&self, hostname: &str, obs: &Obs, now: u32, report: &mut Report) -> anyhow::Result<()> {
         let p = self.engine.snapshot().policy.body.clone();
-        let st = tiers::host_policy(&rec);
-        let Some(ch) = tiers::step(rec.tier, rec.first_seen, &st, obs, &p, now) else {
+        let mut moved: Option<(crate::state::Tier, tiers::Change)> = None;
+        let out = &mut moved;
+        let written = self
+            .hosts
+            .update_host(
+                hostname,
+                Box::new(move |cur| {
+                    let mut rec = cur?;
+                    let st = tiers::host_policy(&rec);
+                    let ch = tiers::step(rec.tier, rec.first_seen, &st, obs, &p, now)?;
+                    let from = rec.tier;
+                    rec.tier = ch.tier;
+                    tiers::set_host_policy(&mut rec, &ch.state);
+                    *out = Some((from, ch));
+                    Some(rec)
+                }),
+            )
+            .await?;
+        let (Some(rec), Some((from, ch))) = (written, moved) else {
             return Ok(());
         };
-        let from = rec.tier;
-        rec.tier = ch.tier;
-        tiers::set_host_policy(&mut rec, &ch.state);
-        self.hosts.put_host(&rec).await?;
         report.written += 1;
         if let Some(reason) = ch.reason {
             tracing::info!(
@@ -155,13 +164,13 @@ impl Driver {
                 tracing::warn!(host = %t.host, did = ?t.did, rule = t.rule.name(), observed = t.observed, threshold = t.threshold, "spam threshold crossed");
             }
             let mut auto_action = None;
-            if throttles && let Some(rec) = self.hosts.get_host(&t.host).await? {
+            if throttles {
                 let obs = Obs {
                     spam_trip: Some(t.rule.name().to_string()),
                     ..Default::default()
                 };
                 let before = report.moved.len();
-                self.step_host(rec, &obs, now, report).await?;
+                self.step_host(&t.host, &obs, now, report).await?;
                 if report.moved.len() > before {
                     auto_action = Some("throttled".to_string());
                 }
@@ -222,7 +231,7 @@ impl Driver {
                     },
                     None => Obs::default(),
                 };
-                self.step_host(rec, &obs, now, &mut report).await?;
+                self.step_host(&rec.hostname, &obs, now, &mut report).await?;
             }
             match page.cursor {
                 Some(c) => cursor = Some(c),

@@ -18,6 +18,15 @@ pub struct TierLimits {
     pub burst_secs: f64,
     /// Share of the fair queue relative to other tiers.
     pub weight: u32,
+    /// Caps over longer windows (indigo's hourly and daily host limits),
+    /// each a bucket as deep as the cap. 0: none.
+    #[serde(default)]
+    pub events_per_hour: f64,
+    #[serde(default)]
+    pub events_per_day: f64,
+    /// Dials per hour, so a flapping host can't keep a task busy. 0: none.
+    #[serde(default)]
+    pub reconnects_per_hour: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -38,6 +47,9 @@ impl Default for Limits {
             bytes_per_sec: mb * 1e6,
             burst_secs: 5.0,
             weight,
+            events_per_hour: 0.0,
+            events_per_day: 0.0,
+            reconnects_per_hour: 0.0,
         };
         Limits {
             trusted: t(10_000.0, 100.0, 8),
@@ -51,7 +63,15 @@ impl Default for Limits {
 impl Limits {
     /// No limit and equal weights, for tests that measure something else.
     pub fn unlimited() -> Limits {
-        let u = TierLimits { events_per_sec: f64::INFINITY, bytes_per_sec: f64::INFINITY, burst_secs: 1.0, weight: 1 };
+        let u = TierLimits {
+            events_per_sec: f64::INFINITY,
+            bytes_per_sec: f64::INFINITY,
+            burst_secs: 1.0,
+            weight: 1,
+            events_per_hour: 0.0,
+            events_per_day: 0.0,
+            reconnects_per_hour: 0.0,
+        };
         Limits { trusted: u, default: u, new: u, throttled: u }
     }
 
@@ -80,6 +100,26 @@ impl TokenBucket {
         TokenBucket { rate, burst, tokens: burst, last: now }
     }
 
+    /// A bucket for `per_window` per `window_secs`, as deep as the window's
+    /// allowance; 0 means no limit.
+    pub fn windowed(per_window: f64, window_secs: f64, now: Instant) -> TokenBucket {
+        let (rate, burst) = windowed(per_window, window_secs);
+        TokenBucket::new(rate, burst, now)
+    }
+
+    /// New rate and depth, keeping what the bucket holds (or owes), so a
+    /// policy change doesn't hand a host a fresh burst.
+    pub fn retune(&mut self, rate: f64, burst: f64, now: Instant) {
+        self.take(0.0, now);
+        self.rate = rate;
+        self.burst = burst.max(1.0);
+        if !self.rate.is_infinite() {
+            self.tokens = self.tokens.min(self.burst);
+        } else {
+            self.tokens = self.burst;
+        }
+    }
+
     /// Takes `n` and returns how long until the bucket is out of debt.
     pub fn take(&mut self, n: f64, now: Instant) -> Duration {
         if self.rate.is_infinite() {
@@ -96,29 +136,56 @@ impl TokenBucket {
     }
 }
 
-/// A host's two buckets, rebuilt when its tier changes.
+fn windowed(per_window: f64, window_secs: f64) -> (f64, f64) {
+    if per_window > 0.0 && per_window.is_finite() {
+        (per_window / window_secs, per_window)
+    } else {
+        (f64::INFINITY, 1.0)
+    }
+}
+
+/// A host's buckets, retuned in place when its limits change (a tier move,
+/// a policy edit, an operator throttle) so the socket stays up.
 pub(crate) struct HostLimiter {
-    tier: Tier,
+    generation: u64,
     events: TokenBucket,
     bytes: TokenBucket,
+    hour: TokenBucket,
+    day: TokenBucket,
 }
 
 impl HostLimiter {
-    pub fn new(tier: Tier, limits: &Limits, now: Instant) -> HostLimiter {
-        let l = limits.for_tier(tier);
+    pub fn new(l: &TierLimits, generation: u64, now: Instant) -> HostLimiter {
         HostLimiter {
-            tier,
+            generation,
             events: TokenBucket::new(l.events_per_sec, l.events_per_sec * l.burst_secs, now),
             bytes: TokenBucket::new(l.bytes_per_sec, l.bytes_per_sec * l.burst_secs, now),
+            hour: TokenBucket::windowed(l.events_per_hour, 3_600.0, now),
+            day: TokenBucket::windowed(l.events_per_day, 86_400.0, now),
         }
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn retune(&mut self, l: &TierLimits, generation: u64, now: Instant) {
+        self.generation = generation;
+        self.events.retune(l.events_per_sec, l.events_per_sec * l.burst_secs, now);
+        self.bytes.retune(l.bytes_per_sec, l.bytes_per_sec * l.burst_secs, now);
+        let (r, b) = windowed(l.events_per_hour, 3_600.0);
+        self.hour.retune(r, b, now);
+        let (r, b) = windowed(l.events_per_day, 86_400.0);
+        self.day.retune(r, b, now);
+    }
+
     /// The pause owed for one frame of `len` bytes.
-    pub fn take(&mut self, tier: Tier, limits: &Limits, len: usize, now: Instant) -> Duration {
-        if tier != self.tier {
-            *self = HostLimiter::new(tier, limits, now);
-        }
-        self.events.take(1.0, now).max(self.bytes.take(len as f64, now))
+    pub fn take(&mut self, len: usize, now: Instant) -> Duration {
+        self.events
+            .take(1.0, now)
+            .max(self.bytes.take(len as f64, now))
+            .max(self.hour.take(1.0, now))
+            .max(self.day.take(1.0, now))
     }
 }
 
@@ -150,11 +217,29 @@ mod tests {
     fn oversize_frame_pays_its_bytes() {
         let t0 = Instant::now();
         let limits = Limits::default();
-        let mut l = HostLimiter::new(Tier::New, &limits, t0);
+        let mut l = HostLimiter::new(&limits.for_tier(Tier::New), 0, t0);
         // 1 MB/s with 5 s of burst: a 6 MB frame owes ~1 s
-        let w = l.take(Tier::New, &limits, 6_000_000, t0);
+        let w = l.take(6_000_000, t0);
         assert!((w.as_secs_f64() - 1.0).abs() < 0.01, "{w:?}");
-        // a tier change starts fresh buckets
-        assert_eq!(l.take(Tier::Trusted, &limits, 1000, t0), Duration::ZERO);
+        // a retune keeps the debt: a higher byte rate pays it off sooner
+        l.retune(&limits.for_tier(Tier::Trusted), 1, t0);
+        let w = l.take(1000, t0);
+        assert!(w > Duration::ZERO && w < Duration::from_millis(20), "{w:?}");
+    }
+
+    #[test]
+    fn hourly_cap_holds_past_the_per_second_burst() {
+        let t0 = Instant::now();
+        let l = TierLimits { events_per_hour: 100.0, ..Limits::unlimited().default };
+        let mut h = HostLimiter::new(&l, 0, t0);
+        for _ in 0..100 {
+            assert_eq!(h.take(10, t0), Duration::ZERO);
+        }
+        // the 101st waits for a 36 s refill
+        let w = h.take(10, t0);
+        assert!((w.as_secs_f64() - 36.0).abs() < 0.1, "{w:?}");
+        // lifting the cap (0 = none) clears the wait
+        h.retune(&Limits::unlimited().default, 1, t0);
+        assert_eq!(h.take(10, t0), Duration::ZERO);
     }
 }
