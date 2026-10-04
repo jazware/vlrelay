@@ -451,7 +451,15 @@ impl ClusterNode {
     /// Called once if this node must stop (its lease lapsed or its log was
     /// fenced). Without one it logs and goes inert.
     pub fn on_lost(&self, f: LostHook) {
-        *self.on_lost.lock() = Some(f);
+        // lost while starting (a log that failed before the node finished
+        // joining): the hook runs now, or the node would live on inert
+        let mut hook = self.on_lost.lock();
+        if self.halted.load(Ordering::Acquire) {
+            drop(hook);
+            f("lost before the hook was set");
+            return;
+        }
+        *hook = Some(f);
     }
 
     /// Starts the control plane: DID shard steps, host shard steps,
