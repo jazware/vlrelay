@@ -611,7 +611,9 @@ impl Stage {
             };
             let shard = g.state.shard_id_of_slot(vlpds::slots::slot_of(&f.did)).0;
             let dedupe = !matches!(m.kind, CheckedKind::Commit(_)) && f.upstream_seq > 0;
-            if dedupe && !g.recent.claim(&f.host, f.upstream_seq, shard, g.log.next_ordinal.load(Ordering::Acquire)) {
+            if dedupe
+                && !g.recent.claim(&f.host, f.upstream_seq, &f.did, shard, g.log.next_ordinal.load(Ordering::Acquire))
+            {
                 metrics::EVENTS_DUPLICATE.with_label_values(&["cluster_recent"]).inc();
                 out.push((i, Ok(Outcome::Duplicate)));
                 continue;
@@ -630,7 +632,7 @@ impl Stage {
             let r = g.local.submit(c).await;
             let unclaim = || {
                 if dedupe {
-                    g.recent.release(&f.host, f.upstream_seq);
+                    g.recent.release(&f.host, f.upstream_seq, &f.did);
                 }
             };
             match r {
@@ -661,10 +663,10 @@ impl Stage {
                 Ok(Ok(d)) if g.cluster.lease_valid() => {
                     g.committed.fetch_max(d.ordinal + 1, Ordering::AcqRel);
                     if dedupe {
-                        g.recent.settle(&host, useq, d.ordinal);
+                        g.recent.settle(&host, useq, &did, d.ordinal);
                     }
                     if identity {
-                        changed_keys.push(did);
+                        changed_keys.push(did.clone());
                     }
                     Ok(Outcome::Appended(d.seqs.first().copied().unwrap_or(0)))
                 }
@@ -673,7 +675,7 @@ impl Stage {
                 Err(_) => Err(StageError::Unavailable("log closed".into())),
             };
             if r.is_err() && dedupe {
-                g.recent.release(&host, useq);
+                g.recent.release(&host, useq, &did);
             }
             out.push((i, r));
         }
@@ -696,32 +698,57 @@ pub struct Recent {
 #[derive(Clone, Copy)]
 struct Ent {
     shard: u32,
+    /// [`did_key`] of the event's DID: a host whose sequence restarted
+    /// (FutureCursor) reuses seqs, and a reused seq is almost always
+    /// another DID's event, which must not be dropped as a replay.
+    did: u64,
     /// Our log's ordinal (a lower bound until settled); None: replayed from
     /// another log.
     ordinal: Option<u64>,
     at: Instant,
 }
 
+/// FNV-1a: stable across processes and versions, since the dedupe set is
+/// persisted and read back by another node.
+pub fn did_key(did: &str) -> u64 {
+    did.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+}
+
 impl Recent {
-    /// False if this (host, seq) is already here: a replay.
-    pub fn claim(&self, host: &Host, useq: i64, shard: u32, floor: u64) -> bool {
+    /// False if this (host, seq) is already here for this DID: a replay.
+    pub fn claim(&self, host: &Host, useq: i64, did: &str, shard: u32, floor: u64) -> bool {
+        let did = did_key(did);
         let mut m = self.m.lock();
         let seqs = m.entry(host.clone()).or_default();
-        if seqs.contains_key(&useq) {
+        if seqs.get(&useq).is_some_and(|e| e.did == did) {
             return false;
         }
-        seqs.insert(useq, Ent { shard, ordinal: Some(floor), at: Instant::now() });
+        seqs.insert(useq, Ent { shard, did, ordinal: Some(floor), at: Instant::now() });
         true
     }
 
-    pub fn settle(&self, host: &Host, useq: i64, ordinal: u64) {
-        if let Some(e) = self.m.lock().get_mut(host).and_then(|s| s.get_mut(&useq)) {
+    fn get_mut<'a>(
+        m: &'a mut HashMap<Host, BTreeMap<i64, Ent>>,
+        host: &Host,
+        useq: i64,
+        did: &str,
+    ) -> Option<&'a mut Ent> {
+        m.get_mut(host).and_then(|s| s.get_mut(&useq)).filter(|e| e.did == did_key(did))
+    }
+
+    pub fn settle(&self, host: &Host, useq: i64, did: &str, ordinal: u64) {
+        if let Some(e) = Self::get_mut(&mut self.m.lock(), host, useq, did) {
             e.ordinal = Some(ordinal);
         }
     }
 
-    pub fn release(&self, host: &Host, useq: i64) {
+    /// Only this DID's claim: after a sequence restart the seq may already
+    /// belong to another DID's event.
+    pub fn release(&self, host: &Host, useq: i64, did: &str) {
         let mut m = self.m.lock();
+        if Self::get_mut(&mut m, host, useq, did).is_none() {
+            return;
+        }
         if let Some(s) = m.get_mut(host) {
             s.remove(&useq);
             if s.is_empty() {
@@ -730,9 +757,10 @@ impl Recent {
         }
     }
 
-    pub fn replayed(&self, host: &Host, useq: i64, shard: u32) {
+    pub fn replayed(&self, host: &Host, useq: i64, did: u64, shard: u32) {
         self.m.lock().entry(host.clone()).or_default().entry(useq).or_insert(Ent {
             shard,
+            did,
             ordinal: None,
             at: Instant::now(),
         });
@@ -889,7 +917,7 @@ impl Shards {
                         .and_then(|d| StateDelta::decode(d).ok())
                         .is_some_and(|d| d.kind == state::ChangeKind::Commit);
                     if !commit {
-                        g.recent.replayed(&e.meta.host, e.meta.upstream_seq, id.0);
+                        g.recent.replayed(&e.meta.host, e.meta.upstream_seq, did_key(&e.meta.did), id.0);
                     }
                 }
             }
@@ -1305,16 +1333,35 @@ mod tests {
     fn recent_dedupes_until_the_cursor_passes() {
         let r = Recent::default();
         let h = Host("pds.test".into());
-        assert!(r.claim(&h, 10, 0, 5));
-        assert!(!r.claim(&h, 10, 0, 5));
-        r.settle(&h, 10, 7);
-        r.replayed(&h, 12, 1);
+        assert!(r.claim(&h, 10, "did:a", 0, 5));
+        assert!(!r.claim(&h, 10, "did:a", 0, 5));
+        r.settle(&h, 10, "did:a", 7);
+        r.replayed(&h, 12, did_key("did:b"), 1);
         assert_eq!(r.min_ordinal(0), Some(7));
         assert_eq!(r.min_ordinal(1), None);
         r.prune(&HashMap::from([(h.clone(), 10)]), Duration::from_secs(60));
-        assert!(r.claim(&h, 10, 0, 5), "past the cursor: forgotten");
-        assert!(!r.claim(&h, 12, 1, 5));
-        r.release(&h, 10);
+        assert!(r.claim(&h, 10, "did:a", 0, 5), "past the cursor: forgotten");
+        assert!(!r.claim(&h, 12, "did:b", 1, 5));
+        r.release(&h, 10, "did:a");
         assert_eq!(r.len(), 1);
+    }
+
+    /// The FutureCursor gap: a host whose sequence restarts reuses seqs the
+    /// set still holds. Another DID's event at a held seq is new, and
+    /// releasing it mustn't drop the held entry or the reverse.
+    #[test]
+    fn recent_tells_a_restarted_sequence_from_a_replay() {
+        let r = Recent::default();
+        let h = Host("pds.test".into());
+        assert!(r.claim(&h, 5, "did:old", 0, 1));
+        r.settle(&h, 5, "did:old", 1);
+        assert!(r.claim(&h, 5, "did:new", 0, 2), "a reused seq for another DID is not a replay");
+        assert!(!r.claim(&h, 5, "did:new", 0, 2), "the same DID at that seq again is");
+        r.release(&h, 5, "did:old");
+        assert_eq!(r.len(), 1, "releasing the old DID leaves the new claim");
+        r.settle(&h, 5, "did:old", 9);
+        assert_eq!(r.min_ordinal(0), Some(2), "settling the old DID doesn't touch the new claim");
+        r.replayed(&h, 6, did_key("did:x"), 0);
+        assert!(r.claim(&h, 6, "did:y", 0, 3));
     }
 }
