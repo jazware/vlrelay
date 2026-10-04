@@ -36,6 +36,7 @@ lazy!(STAGE_CPU: IntCounterVec = register_int_counter_vec!("vlrelay_stage_busy_u
 lazy!(DURABLE_LAG: IntGauge = register_int_gauge!("vlrelay_durable_lag_ms", "Mean append -> durable time over the last second"));
 lazy!(HOSTS: IntGaugeVec = register_int_gauge_vec!("vlrelay_hosts", "Upstream hosts by status", &["status"]));
 lazy!(CONSUMERS: IntGauge = register_int_gauge!("vlrelay_consumers", "Connected subscribeRepos consumers"));
+lazy!(IDENTITY_CACHE: IntGauge = register_int_gauge!("vlrelay_identity_cache_entries", "DID documents in the identity cache"));
 lazy!(ACK_PENDING: IntGauge = register_int_gauge!("vlrelay_ack_pending", "Upstream events read but not yet durable, rejected or skipped"));
 lazy!(ACCOUNTS_THROTTLED: IntCounterVec = register_int_counter_vec!("vlrelay_accounts_throttled_total", "New accounts created throttled by policy, by why (host_cap)", &["why"]));
 lazy!(ACCOUNTS_DEFERRED: IntCounterVec = register_int_counter_vec!("vlrelay_accounts_deferred_total", "Events of new accounts dropped while a new-account budget was spent, by which (host_rate, cluster_budget)", &["why"]));

@@ -1116,6 +1116,7 @@ impl Node {
                 metrics::PLC_EXPORT.with_label_values(&["caught_up"]).set(s.caught_up.load(Ordering::Relaxed) as i64);
                 metrics::PLC_EXPORT.with_label_values(&["newest"]).set((s.newest_ms.load(Ordering::Relaxed) / 1000) as i64);
             }
+            metrics::IDENTITY_CACHE.set(self.identity.len() as i64);
             let mut by_status: HashMap<&'static str, i64> = HashMap::new();
             for h in &hosts {
                 *by_status.entry(admin::host_status_label(h)).or_default() += 1;
