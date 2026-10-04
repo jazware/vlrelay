@@ -457,6 +457,10 @@ impl ClusterNode {
                 });
                 let me = Arc::downgrade(self);
                 tokio::spawn(async move { host_loop(me).await });
+                if self.http.is_some() {
+                    let me = Arc::downgrade(self);
+                    tokio::spawn(async move { reach_loop(me).await });
+                }
                 let me = Arc::downgrade(self);
                 let every = self.opts.checkpoint_every;
                 tokio::spawn(async move {
@@ -683,6 +687,20 @@ impl ClusterNode {
         futures::future::join_all(sends).await;
     }
 
+    /// Whether our advertised peer address answers a hello (as a peer's
+    /// would) within `timeout`.
+    async fn reachable(&self, timeout: Duration) -> bool {
+        let Some(http) = &self.http else { return true };
+        http.post(format!("{}{}", self.opts.addr.trim_end_matches('/'), peer::HELLO))
+            .header(peer::TOKEN_HEADER, &self.opts.internal_token)
+            .json(&peer::HelloIn { node_id: self.node_id.clone() })
+            .timeout(timeout)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .is_ok()
+    }
+
     /// Asks every peer to fence our log; true once one did.
     async fn peers_fence(&self, log_id: &str) -> bool {
         use futures::StreamExt;
@@ -880,6 +898,62 @@ async fn host_loop(me: Weak<ClusterNode>) {
         let _ = tokio::time::timeout(every, nudge.notified()).await;
     }
 }
+
+/// Peer reachability (docs/cluster.md, "Reachability"). Membership is the
+/// bucket lease, so a core its peers can't reach (a dead or blackholed
+/// peer port) would hold its shards for the whole partition: every event
+/// for its DIDs waits. Each core probes its own advertised address, the
+/// path its peers use; failing for a TTL, it hands its shards over (a
+/// planned leave, bounded by a TTL) and fail-stops.
+async fn reach_loop(me: Weak<ClusterNode>) {
+    let (every, window) = match me.upgrade() {
+        Some(n) => (n.opts.renew_every, n.opts.ttl),
+        None => return,
+    };
+    let timeout = (window / 3).clamp(Duration::from_millis(200), Duration::from_secs(1));
+    let mut failing_since: Option<Instant> = None;
+    loop {
+        tokio::time::sleep(every).await;
+        let Some(n) = me.upgrade() else { return };
+        if n.stop.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(c) = n.cluster.clone() else { return };
+        // alone, nobody needs to reach us; not joined, we hold nothing
+        if c.peers().is_empty() || !c.joined() || !n.lease_valid() {
+            failing_since = None;
+            continue;
+        }
+        if n.reachable(timeout).await {
+            if failing_since.take().is_some() {
+                tracing::info!("our peer address answers again");
+            }
+            continue;
+        }
+        let since = *failing_since.get_or_insert_with(Instant::now);
+        tracing::warn!(failing_ms = since.elapsed().as_millis() as u64, addr = %n.opts.addr, "our advertised peer address doesn't answer");
+        if since.elapsed() < window {
+            continue;
+        }
+        STEP_DOWNS.inc();
+        tracing::error!(addr = %n.opts.addr, "peers can't reach us for a TTL: handing our shards over and stepping down");
+        match tokio::time::timeout(window, n.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("stepping down: leave failed: {e:#}"),
+            Err(_) => tracing::warn!("stepping down: leave timed out"),
+        }
+        n.lost_now("unreachable by peers: stepped down");
+        return;
+    }
+}
+
+static STEP_DOWNS: std::sync::LazyLock<prometheus::IntCounter> = std::sync::LazyLock::new(|| {
+    prometheus::register_int_counter!(
+        "vlrelay_cluster_step_downs_total",
+        "Times this node left because its own advertised peer address stopped answering"
+    )
+    .unwrap()
+});
 
 struct NodeRoute(Weak<ClusterNode>);
 
