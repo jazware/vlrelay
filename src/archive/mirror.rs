@@ -145,11 +145,14 @@ const IDLE_DEPTH: usize = 3;
 /// The shard's in-memory side of its mirrors: the trees of repos with
 /// uncommitted commits (so the next commit builds on them), and each
 /// ticket's rows until its log entry is durable.
+/// A ticket's account and its mirror rows.
+type TicketRows = (Arc<str>, Vec<Mutation>);
+
 #[derive(Default)]
 pub struct ShardMirror {
     slots: Mutex<HashMap<Arc<str>, Slot>>,
     tick: std::sync::atomic::AtomicU64,
-    by_ticket: Mutex<HashMap<u64, (Arc<str>, Vec<Mutation>)>>,
+    by_ticket: Mutex<HashMap<u64, TicketRows>>,
 }
 
 impl ShardMirror {

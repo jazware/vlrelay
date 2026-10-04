@@ -162,7 +162,7 @@ async fn get_repo_inner<C: Chain>(
         .map_err(|_| XrpcError::unavailable("Overloaded", "too many repo exports in progress; retry shortly"))?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
     let (did, stall) = (Arc::<str>::from(did.as_str()), r.stall);
-    let served = r.state.archive().map(|a| a.clone());
+    let served = r.state.archive().cloned();
     tokio::spawn(async move {
         let _slot = slot;
         let t0 = std::time::Instant::now();
