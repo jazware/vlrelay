@@ -68,7 +68,7 @@ The cause was the log. A segment seals on linger (25 ms) or at 8 MiB. Past ~40k/
 
 The first 75k and 100k runs also tripped on the harness. During warmup, while 100k cold DIDs resolved, the relay fell more than 1 s behind. fakepds then dropped it (`--lag-secs 1`) and its 256 MB replay ring couldn't cover the reconnect. The resulting gaps desynchronized 1.2M of the accounts' chains (`desynchronized` rejects). Production PDSes keep far more replay than that. The bench now runs the fleet with `--lag-secs 60 --replay-mb 1024`.
 
-## Iteration 1: PUT parallelism, jemalloc, lane acks (403d95a9)
+## Iteration 1: PUT parallelism, jemalloc, lane acks (79f01b0f)
 
 Changes:
 
@@ -98,7 +98,7 @@ At 100k, MinIO is the wall. benchbox's disk (`dm-0`) was 99% busy writing ~260 M
 
 An attempt to move MinIO to tmpfs, with a pruner that deletes log segments older than 10 s (`MINIO_TMPFS=1`), didn't work inside the 40 GB budget. At 33k it gave the cleanest numbers of the session: TTF p50 32 ms and p99 50 ms, durable lag 26 ms, PUT p50 6 ms. At 75k it filled 8 GB during warmup, and then MinIO stalled under its cgroup's memory pressure. The knob stays in `perf.sh` for a box with more RAM.
 
-## Iteration 2: metrics and hashing (5330fa86)
+## Iteration 2: metrics and hashing (6c74eb3e)
 
 The 75k profile after iteration 1:
 
@@ -136,7 +136,7 @@ Past ~85k the wall is MinIO again: its PUT p50 doubles to ~410 ms. With MinIO's 
 | 100k | 32 | 103.7k | 0.6 s / 13 s | 7.41 | behind (committer) |
 | 125k | 16 | 92.7k | 20 s / 31 s | 6.99 | behind |
 
-## Iteration 3: 32 PUTs in flight, TTF tracker per batch
+## Iteration 3: 32 PUTs in flight, TTF tracker per batch (9d82e46b)
 
 Changes:
 
@@ -173,9 +173,43 @@ The library tests pass, `log_serve` passes, and the e2e passes both with the buc
 
 Rejects were 0 at every step that kept up, and `e2e_check` found no missing, reordered or duplicated events. The "extra" count of 0-5 is events in flight at the window's edges. Steps that fell behind show missing and extra events, because the relay's stream is 10-30 s behind the checker's window. They also show some "out of order" events (11-993, only in those steps). That is most likely the checker pairing `#identity` and `#account` events by occurrence count from different start points. Those events carry no rev, so the count is all it has to pair them by. It's worth confirming with a longer settle.
 
+## Iteration 4: a committer per DID shard (8de2eb86)
+
+This iteration is rebased on the policy and cluster wiring (236cac3f).
+
+Changes:
+
+- `LocalOwner` runs one committer per DID shard, picked by shard id modulo the count (`--did-shards`, 4 here). A DID's events all land in one shard, so they reach one committer in the order they were applied. Each committer still waits for its tickets in log order and commits before it answers the lane. The ack tracker is unchanged, so a host cursor still only passes contiguous events that are durable and committed. A checkpoint now reads the oldest in-progress batch across all the committers (`committing_since_us()`).
+- Fewer clock reads per event:
+  - the ack tracker takes the dispatch timestamp instead of reading the clock again, and no longer clones the host name per event;
+  - the identity stage's end time doubles as the verify stage's start;
+  - the committer and the sequencer read the clock once per batch.
+- On a cache miss, the host stage seeds the DID document cache from the DID's state record. That needs this node to hold the record, and the key there to have been resolved within the cache's TTL. A key that then fails a signature is refreshed as before. The seeded entry has no handle, so the admin views show none for it until the next `#identity` or refresh. In the restart e2e, after the kill -9, all but ~5 of ~2,370 identity stages finished under 0.5 ms, so the restarted node wasn't going back to PLC for every DID.
+
+The bench needed a change too. The policy wiring's account gate allows 6,000 new accounts a minute across the cluster, and every one of the fleet's 100k DIDs is a new account to a fresh relay. So the first post-rebase runs deferred almost everything. `perf.sh` now starts the relay with `--admin-token perf` and lifts the new-account budgets, caps and the PLC lookup budget through `PUT /admin/api/policy/full` before the warmup.
+
+100k offered, MinIO with O_DIRECT off, against iteration 3:
+
+| Build | Accepted/s | Committed/s | Durable p50 | Ack backlog | TTF p50 / p99 | CPU (of 8) |
+|---|---|---|---|---|---|---|
+| Iteration 3, one committer | 103.6k | 84.8k | 9.7 s | 1.0M | 2.9 s / 11.8 s | 7.43 |
+| Iteration 4, 4 committers | 101.5k | 101.7k | 225 ms | 19k | 3.3 s / 11.3 s | 7.31 |
+
+The committer is no longer a limit. Commits keep pace with intake, the time to durable is back to the PUT plus linger, and host cursors keep moving. The time to firehose at 100k is still seconds, though. At 7.3 of 8 cores the node runs at its CPU ceiling, and it carries the backlog from warmup, while the fleet's bursts run ~5% over the offered rate. Only one 100k step fit before the 06:10 PT batch window, so the 90k and 110k steps weren't rerun on this build.
+
+Tests on this build:
+
+| Test | Result |
+|---|---|
+| Lib tests | 107 passed |
+| `just e2e`, 60 s at 400/s with the bucket | PASS |
+| `just e2e`, with the restart | PASS |
+| `just e2e-policy` | PASS |
+| `just e2e-cluster --duration 60` | PASS |
+
 ## The per-node ceiling
 
-One node with 8 pinned cores sustains ~94k events/s, every event checked, with the time to firehose at p50 ~190 ms and p99 under 0.7 s, 0 rejects and a clean e2e. That's 2.8x the 33k/s target. Its peak intake is ~104k/s, but there the committer falls behind and the CPU is at 7.4 of 8 cores.
+One node with 8 pinned cores sustains ~94k events/s, every event checked, with the time to firehose at p50 ~190 ms and p99 under 0.7 s, 0 rejects and a clean e2e. That's 2.8x the 33k/s target. With a committer per shard it takes ~101k/s with commits keeping pace. There it uses 7.3 of 8 cores, and latency grows with any backlog. So the ceiling is now the CPU.
 
 - **CPU** costs ~70-72 µs per event, linear in the rate:
 
@@ -187,7 +221,7 @@ One node with 8 pinned cores sustains ~94k events/s, every event checked, with t
   | Dispatch, parse, apply and the lane | ~7 |
 
   8 cores give ~110k/s with no headroom.
-- **The committer** is the first serial stage to give out, at ~90-95k/s. Spreading it over shards, without the regressions above, is the next step for the ceiling.
+- **The committer** gave out at ~90-95k/s while it was one task. A committer per shard (iteration 4) took it off the list.
 - **Time to firehose** is linger plus PUT. At 33k it's ~50 ms p50 and ~100 ms p99 on disk MinIO. With the bucket in RAM it was 32 / 50 ms. Above ~50k/s a segment seals on size, not linger, and its PUT takes 100-400 ms on this MinIO, so the p50 climbs to ~150-200 ms at 75-90k. S3's PUT latency for a few MB is lower and flatter. That needs measuring on S3.
 - **The target**, 33k/s per node, takes ~2.5 of the 8 cores, with p99 ~100 ms and 0 rejects.
 
@@ -215,9 +249,8 @@ So a node serving many consumers wants a fan-out tier (replicas or edges), not m
 
 ## Not done, next
 
-- **The committer.** See iteration 3. Per-shard committers, each with its own ordered queue, would split the work. Each shard's tickets are already independent, and the lane's ack is per event.
+- **CPU.** The ceiling now. Verify is about half of it, then the main runtime (upstream sockets, sequencer, SlateDB) and zstd.
 - **Per-lane batching into the log.** Each event is still its own `log.submit` with its own oneshot, and its own boxed future in the committer. In the profile, these channel and future costs are under 1%, so they were left alone. Batching per lane would mean a `DidOwner::submit_batch` with a looping default, so the cluster's seam keeps its per-event contract.
-- **Seeding the identity cache from state.** A restarted node resolves every DID again at `--did-lookups-per-sec` (50 by default). The state record has the key and the PDS's `HostKey`, and could seed `IdentityCache` on a miss. This bench starts cold every time, so it doesn't show the cost.
-- **The clock.** `clock_gettime` is 3% of samples, mostly per-event `Instant::now` for stage timers and acks. One timestamp per event, passed along, would cover most of them.
+- **The clock.** Iteration 4 removed about 5 of the ~15 clock reads per event. What's left is mostly the stage timers, the upstream client's per-frame `last_rx` and its rate limiter. These weren't profiled again.
 - **SigV4 payload hashing.** Each PUT hashes its body (1.5%). object_store's unsigned payload would skip that. It's a vlpds `Store` setting.
 - **Compression.** zstd level 1 is ~15% of the node's CPU. Lower levels trade bucket bytes for CPU. That's a cost decision, so it wasn't changed here.
