@@ -11,7 +11,7 @@ publish = false
 # crypto, MST, CAR and DID resolution. Factored into shared crates once the
 # relay settles which pieces it needs.
 # the public vlpds at the commit this one was exported against
-vlpds = { git = "https://github.com/jazware/vlpds", rev = "2778ca6a58d5c5ba19133072dc9e6f703cdd1ab0" }
+vlpds = { git = "https://github.com/jazware/vlpds", rev = "671b6e01193b8c1d00342b4b9236340415c7db83" }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws", "macros", "http2"] }

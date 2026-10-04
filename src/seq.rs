@@ -67,6 +67,8 @@ pub const DEFAULT_MAX_SEGMENT_BYTES: usize = 8 << 20;
 pub const DEFAULT_MAX_SEGMENT_EVENTS: usize = 65_536;
 pub const DEFAULT_INFLIGHT: usize = 4;
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(72 * 3600);
+/// Durable batches a peer stream may fall behind by before it's dropped.
+const LIVE_BATCHES: usize = 4096;
 
 /// The key of the one mutation each relay entry carries.
 pub const META_KEY: &[u8] = b"relay/meta";
@@ -196,6 +198,10 @@ pub struct LogConfig {
     /// Every seq this log assigns is above this.
     pub seq_floor: i64,
     pub lease_ok: Option<LeaseCheck>,
+    /// A log idle this long PUTs an empty segment carrying a fresh seq, so
+    /// followers that only read the bucket (replicas) see its watermark
+    /// move. None: never (a log nobody follows from the bucket alone).
+    pub idle_heartbeat: Option<Duration>,
 }
 
 impl LogConfig {
@@ -210,6 +216,7 @@ impl LogConfig {
             hedge_after: Duration::from_secs(2),
             seq_floor: nodelog::seq_floor(vlpds::tid::now_micros()),
             lease_ok: None,
+            idle_heartbeat: None,
         }
     }
 }
@@ -261,7 +268,13 @@ pub struct NodeLog {
     /// Last durable ordinal (u64::MAX = none yet).
     pub durable_ordinal: Arc<AtomicU64>,
     pub last_durable_seq: Arc<AtomicI64>,
+    /// The ordinal the next sealed segment gets: a lower bound on any entry
+    /// appended from now on (a cluster span starts here).
+    pub next_ordinal: Arc<AtomicU64>,
     pub stats: Arc<LogStats>,
+    /// Durable batches as they finalize, for peers streaming this log
+    /// (`cluster::follow`). A lagging receiver catches up from the bucket.
+    live: tokio::sync::broadcast::Sender<Arc<LogBatch>>,
     task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -279,8 +292,10 @@ impl NodeLog {
         let failed = Arc::new(parking_lot::Mutex::new(None));
         let durable_ordinal = Arc::new(AtomicU64::new(u64::MAX));
         let last_durable_seq = Arc::new(AtomicI64::new(cfg.seq_floor));
+        let next_ordinal = Arc::new(AtomicU64::new(0));
         let stats = Arc::new(LogStats::default());
         let log_id: Arc<str> = cfg.log_id.clone().into();
+        let (live, _) = tokio::sync::broadcast::channel(LIVE_BATCHES);
         let seq = Sequencer {
             store,
             log_id: log_id.clone(),
@@ -290,7 +305,9 @@ impl NodeLog {
             failed: failed.clone(),
             durable_ordinal: durable_ordinal.clone(),
             last_durable_seq: last_durable_seq.clone(),
+            next_ordinal: next_ordinal.clone(),
             stats: stats.clone(),
+            live: live.clone(),
             on_fatal,
         };
         let task = tokio::spawn(seq.run(rx));
@@ -301,7 +318,9 @@ impl NodeLog {
             failed,
             durable_ordinal,
             last_durable_seq,
+            next_ordinal,
             stats,
+            live,
             task: parking_lot::Mutex::new(Some(task)),
         })
     }
@@ -328,6 +347,16 @@ impl NodeLog {
 
     pub fn failed(&self) -> Option<LogError> {
         self.failed.lock().clone()
+    }
+
+    /// Every durable batch from now on, in ordinal order.
+    pub fn live(&self) -> tokio::sync::broadcast::Receiver<Arc<LogBatch>> {
+        self.live.subscribe()
+    }
+
+    /// True once nothing appended is still waiting to be durable.
+    pub fn idle(&self) -> bool {
+        self.wm.idle()
     }
 
     /// Stops dead, as a crash would: nothing queued or in flight is acked,
@@ -362,7 +391,9 @@ struct Sequencer {
     failed: Arc<parking_lot::Mutex<Option<LogError>>>,
     durable_ordinal: Arc<AtomicU64>,
     last_durable_seq: Arc<AtomicI64>,
+    next_ordinal: Arc<AtomicU64>,
     stats: Arc<LogStats>,
+    live: tokio::sync::broadcast::Sender<Arc<LogBatch>>,
     on_fatal: Option<OnFatal>,
 }
 
@@ -373,11 +404,19 @@ struct Open {
     /// (ack, seqs for it, enqueued)
     acks: Vec<(Ack, Vec<i64>, Instant)>,
     opened: Option<Instant>,
+    /// An empty segment that only moves the watermark.
+    heartbeat: bool,
 }
 
 impl Open {
     fn new(log_id: &str) -> Open {
-        Open { seg: SegmentBuilder::for_log(log_id), frames: Vec::new(), acks: Vec::new(), opened: None }
+        Open {
+            seg: SegmentBuilder::for_log(log_id),
+            frames: Vec::new(),
+            acks: Vec::new(),
+            opened: None,
+            heartbeat: false,
+        }
     }
 
     fn push(&mut self, wm: &Watermark, p: Pending) {
@@ -401,6 +440,7 @@ struct Sealed {
     acks: Vec<(Ack, Vec<i64>, Instant)>,
     last_seq: i64,
     stored_bytes: usize,
+    heartbeat: bool,
 }
 
 /// Aborts a spawned upload when the sequencer drops it (a halt).
@@ -441,7 +481,12 @@ impl Sequencer {
         let mut open = Open::new(&self.log_id);
         let mut inflight: FuturesOrdered<AbortOnDrop> = FuturesOrdered::new();
         let mut closed = false;
+        let mut last_sealed = Instant::now();
         loop {
+            let heartbeat_at = match self.cfg.idle_heartbeat {
+                Some(h) if inflight.is_empty() && open.opened.is_none() && !closed => Some(last_sealed + h),
+                _ => None,
+            };
             let full = open.seg.len() >= self.cfg.max_segment_bytes || open.frames.len() >= self.cfg.max_segment_events;
             let linger_at = open.opened.map(|t| t + self.cfg.linger);
             let can_seal_later = inflight.len() < k && linger_at.is_some() && !full;
@@ -498,6 +543,13 @@ impl Sequencer {
                     None => closed = true,
                 },
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(linger_at.unwrap_or_else(Instant::now))), if can_seal_later => {}
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(heartbeat_at.unwrap_or_else(Instant::now))), if heartbeat_at.is_some() => {
+                    let seq = self.wm.assign();
+                    open.seg.first_seq = seq;
+                    open.seg.last_seq = seq;
+                    open.heartbeat = true;
+                    open.opened = Some(Instant::now() - self.cfg.linger);
+                }
             }
             let failed = self.failed.lock().clone();
             if let Some(e) = failed {
@@ -522,15 +574,25 @@ impl Sequencer {
                 }
                 let last_seq = o.seg.last_seq;
                 // an empty segment (a close marker): nothing to PUT, ack in order
-                let data = if o.frames.is_empty() {
+                let data = if o.frames.is_empty() && !o.heartbeat {
                     Bytes::new()
                 } else {
                     Bytes::from(o.seg.seal(&self.log_id, ordinal, prefix_end))
                 };
                 let empty = data.is_empty();
-                let sealed = Sealed { ordinal, data, frames: o.frames, acks: o.acks, last_seq, stored_bytes: 0 };
+                let sealed = Sealed {
+                    ordinal,
+                    data,
+                    frames: o.frames,
+                    acks: o.acks,
+                    last_seq,
+                    stored_bytes: 0,
+                    heartbeat: o.heartbeat,
+                };
+                last_sealed = Instant::now();
                 if !empty {
                     ordinal += 1;
+                    self.next_ordinal.store(ordinal, Ordering::Release);
                 }
                 let (store, log_id, hedge, stats) =
                     (self.store.clone(), self.log_id.clone(), self.cfg.hedge_after, self.stats.clone());
@@ -559,11 +621,15 @@ impl Sequencer {
     }
 
     fn finalize(&mut self, s: Sealed) {
-        if !s.frames.is_empty() {
+        if !s.frames.is_empty() || s.heartbeat {
             let events: Vec<(i64, Bytes)> = s.frames.iter().map(|(seq, r)| (*seq, s.data.slice(r.clone()))).collect();
             // to the merger before the watermark moves: it reads the
             // watermark first, then drains (firehose.rs)
-            let _ = self.out.send(LogBatch { log_id: self.log_id.clone(), ordinal: s.ordinal, events });
+            let batch = LogBatch { log_id: self.log_id.clone(), ordinal: s.ordinal, events };
+            if self.live.receiver_count() > 0 {
+                let _ = self.live.send(Arc::new(batch.clone()));
+            }
+            let _ = self.out.send(batch);
             self.wm.set_durable(s.last_seq);
             self.durable_ordinal.store(s.ordinal, Ordering::Release);
             self.last_durable_seq.store(s.last_seq, Ordering::Release);
@@ -572,7 +638,8 @@ impl Sequencer {
             self.stats.bytes.fetch_add(s.data.len() as u64, Ordering::Relaxed);
             self.stats.stored_bytes.fetch_add(s.stored_bytes as u64, Ordering::Relaxed);
         }
-        let ordinal = if s.frames.is_empty() { self.durable_ordinal.load(Ordering::Acquire) } else { s.ordinal };
+        let ordinal =
+            if s.frames.is_empty() && !s.heartbeat { self.durable_ordinal.load(Ordering::Acquire) } else { s.ordinal };
         for (ack, seqs, enq) in s.acks {
             self.stats.latency_us.fetch_add(enq.elapsed().as_micros() as u64, Ordering::Relaxed);
             let _ = ack.send(Ok(Durable { seqs, ordinal }));
@@ -631,14 +698,18 @@ async fn upload(
                     Ok(b) if b == data => return Ok(()),
                     Ok(b) => {
                         let why = match segment::parse(b, false, None) {
-                            Ok(LogObject::Fence { by }) => format!("fenced by {by} at ordinal {ordinal}"),
+                            Ok(LogObject::Fence { by }) => {
+                                format!("fenced by {by} at ordinal {ordinal}")
+                            }
                             _ => format!("ordinal {ordinal} taken by another writer"),
                         };
                         return Err(LogError::Fenced(why));
                     }
                     // S3 answers 409 on conditional-write races too (our own hedge)
                     Err(object_store::Error::NotFound { .. }) => {}
-                    Err(e) => tracing::warn!(log_id, ordinal, "reading a conflicting segment failed: {e}"),
+                    Err(e) => {
+                        tracing::warn!(log_id, ordinal, "reading a conflicting segment failed: {e}")
+                    }
                 }
             }
             Err(e) => tracing::warn!(log_id, ordinal, "segment PUT failed, retrying: {e}"),
@@ -938,6 +1009,33 @@ mod tests {
         let mut direct = Vec::new();
         f.finish(big, &mut direct);
         assert_eq!(out, direct);
+    }
+
+    /// An idle log's heartbeats are real segments (dense ordinals, a seq in
+    /// the header) with no entries, and move its watermark.
+    #[tokio::test]
+    async fn idle_heartbeats_move_the_watermark() {
+        let store = Store::memory(None);
+        let mut cfg = LogConfig::new("hb");
+        cfg.linger = Duration::from_millis(2);
+        cfg.idle_heartbeat = Some(Duration::from_millis(20));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let log = NodeLog::start(store.clone(), cfg, tx, None);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let (free, fenced) = nodelog::first_free(&store, "hb").await.unwrap();
+        assert!(free >= 2 && !fenced, "{free}");
+        let mut last = 0;
+        for ord in 0..free {
+            let Head::Segment(h) = nodelog::read_head(&store, "hb", ord).await.unwrap() else { panic!("{ord}") };
+            assert!(h.last_seq > last);
+            last = h.last_seq;
+            assert_eq!(read_segment(&store, "hb", ord).await.unwrap().unwrap().len(), 0);
+        }
+        let b = rx.recv().await.unwrap();
+        assert!(b.events.is_empty());
+        assert!(log.last_durable_seq.load(Ordering::Acquire) >= last);
+        let d = log.append(Vec::new()).await.unwrap();
+        assert!(d.seqs.is_empty());
     }
 
     #[test]

@@ -32,6 +32,10 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
+/// Which hosts this node subscribes to. A cluster narrows it to the hosts
+/// in the host shards this node owns; a single node takes every host.
+pub type HostFilter = Arc<dyn Fn(&Host) -> bool + Send + Sync>;
+
 /// Base URL for a host (`https://{host}` in production); the client turns
 /// it into the `wss://` subscribeRepos URL.
 pub type EndpointFn = Arc<dyn Fn(&Host) -> String + Send + Sync>;
@@ -115,6 +119,7 @@ pub struct Manager {
     out: Mutex<Option<mpsc::Sender<UpstreamFrame>>>,
     tasks: Mutex<HashMap<Host, Running>>,
     background: Mutex<Vec<JoinHandle<()>>>,
+    filter: Mutex<Option<HostFilter>>,
 }
 
 impl Manager {
@@ -137,6 +142,7 @@ impl Manager {
             out: Mutex::new(Some(tx)),
             tasks: Mutex::new(HashMap::new()),
             background: Mutex::new(Vec::new()),
+            filter: Mutex::new(None),
         };
         (Arc::new(m), rx)
     }
@@ -177,7 +183,14 @@ impl Manager {
         Ok(())
     }
 
+    fn wanted(&self, host: &Host) -> bool {
+        self.filter.lock().as_ref().is_none_or(|f| f(host))
+    }
+
     fn spawn_host(&self, entry: Arc<HostEntry>) {
+        if !self.wanted(&entry.host) {
+            return;
+        }
         let mut tasks = self.tasks.lock();
         if let Some(r) = tasks.get(&entry.host)
             && !r.join.is_finished()
@@ -206,6 +219,51 @@ impl Manager {
         let r = self.tasks.lock().remove(host)?;
         let _ = r.stop.send(true);
         Some(r.join)
+    }
+
+    /// Narrows the hosts this manager subscribes to: stops the sockets of
+    /// hosts the filter drops (their registry rows flushed, so the acked
+    /// cursors are written) and connects the known hosts it adds, after
+    /// reloading the registry for rows another node admitted. Returns the
+    /// hosts it stopped.
+    pub async fn set_filter(self: &Arc<Self>, filter: HostFilter) -> anyhow::Result<Vec<Host>> {
+        *self.filter.lock() = Some(filter.clone());
+        let dropped: Vec<Host> = self.tasks.lock().keys().filter(|h| !filter(h)).cloned().collect();
+        let joins: Vec<_> = dropped.iter().filter_map(|h| self.stop_host(h)).collect();
+        for j in joins {
+            let _ = j.await;
+        }
+        if let Err(e) = self.registry.load().await {
+            tracing::warn!("reloading the host registry failed: {e:#}");
+        }
+        if self.out.lock().is_none() {
+            for e in self.registry.all() {
+                if e.tier().connects() {
+                    self.spawn_host(e);
+                }
+            }
+        }
+        self.registry.flush().await?;
+        Ok(dropped)
+    }
+
+    /// Applies every filter `rx` publishes until the manager is dropped.
+    pub fn follow_filter(self: &Arc<Self>, mut rx: tokio::sync::watch::Receiver<HostFilter>) {
+        let me = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            loop {
+                let f = rx.borrow_and_update().clone();
+                let Some(m) = me.upgrade() else { return };
+                if let Err(e) = m.set_filter(f).await {
+                    tracing::warn!("applying the host filter failed: {e:#}");
+                }
+                drop(m);
+                if rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+        self.background.lock().push(task);
     }
 
     /// Registers `host` at `tier` unless it's known, and connects it if the

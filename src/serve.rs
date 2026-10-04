@@ -142,7 +142,8 @@ pub struct Started {
 /// One-node startup. Every log already in the bucket is an earlier
 /// incarnation of this node, so it's fenced (a zombie writer fails its next
 /// PUT), and the new log's seqs start above everything it holds. The new
-/// log's id is `cfg.log_id`; its floor is raised as needed.
+/// log's id is `cfg.log_id`; its floor is raised as needed. A prefix with
+/// cluster leases is refused: those logs aren't ours to fence.
 pub async fn start_single_node(
     store: Store,
     mut cfg: LogConfig,
@@ -150,6 +151,18 @@ pub async fn start_single_node(
     runtime: Option<tokio::runtime::Handle>,
     on_fatal: Option<seq::OnFatal>,
 ) -> anyhow::Result<Started> {
+    // fencing every log would kill a cluster's live nodes
+    {
+        use futures::StreamExt;
+        let nodes = object_store::path::Path::from(format!("{}/nodes", store.prefix));
+        if let Some(m) = store.raw.list(Some(&nodes)).next().await {
+            let m = m?;
+            anyhow::bail!(
+                "this prefix holds cluster node leases ({}): start it as a cluster node (cluster::ClusterNode)",
+                m.location
+            );
+        }
+    }
     let recovered = seq::fence_all(&store, &cfg.log_id).await?;
     // The firehose's start floor is the clock, and backfill serves only
     // events at or below it. An earlier log with seqs past the clock (a
