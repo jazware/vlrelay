@@ -11,6 +11,10 @@ use vlpds::state as vs;
 
 const NOW: u32 = 1_800_000_000;
 
+/// The process-wide MST node cache is content-addressed, and synthetic repos
+/// share subtrees: the test that empties it to force reads runs alone.
+static NODE_CACHE_USE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 struct NoResolver;
 
 #[async_trait::async_trait]
@@ -151,6 +155,7 @@ async fn export(s: &ShardState, did: &str, generation: u64, head: vlpds::state::
 
 #[tokio::test]
 async fn live_commits_apply_to_the_stored_tree() {
+    let _cache = NODE_CACHE_USE.read().await;
     let (st, a, id) = store(true).await;
     let did = plc(1);
     id.set(&did, "pds.a", 1);
@@ -198,6 +203,7 @@ impl ReplaySource for Frames {
 
 #[tokio::test]
 async fn replay_rebuilds_the_mirror() {
+    let _cache = NODE_CACHE_USE.read().await;
     let (st, a, id) = store(true).await;
     let did = plc(2);
     id.set(&did, "pds.a", 1);
@@ -242,6 +248,7 @@ async fn replay_rebuilds_the_mirror() {
 
 #[tokio::test]
 async fn bootstrap_applies_commits_that_arrived_meanwhile() {
+    let _cache = NODE_CACHE_USE.read().await;
     let (st, a, id) = store(true).await;
     let did = plc(3);
     id.set(&did, "pds.a", 1);
@@ -281,6 +288,7 @@ async fn bootstrap_applies_commits_that_arrived_meanwhile() {
 
 #[tokio::test]
 async fn a_corrupt_mirror_is_refetched_not_trusted() {
+    let _cache = NODE_CACHE_USE.write().await;
     let (st, a, id) = store(true).await;
     let did = plc(4);
     id.set(&did, "pds.a", 1);
@@ -314,6 +322,7 @@ async fn a_corrupt_mirror_is_refetched_not_trusted() {
 
 #[tokio::test]
 async fn a_broken_chain_queues_a_fetch_that_heals_the_account() {
+    let _cache = NODE_CACHE_USE.read().await;
     let (st, a, id) = store(true).await;
     let did = plc(5);
     id.set(&did, "pds.a", 1);
@@ -358,6 +367,7 @@ async fn a_broken_chain_queues_a_fetch_that_heals_the_account() {
 
 #[tokio::test]
 async fn switching_off_and_takedowns_delete_in_the_background() {
+    let _cache = NODE_CACHE_USE.read().await;
     let (st, a, id) = store(true).await;
     let (d1, d2) = (plc(6), plc(7));
     let mut accts = Vec::new();
@@ -413,6 +423,7 @@ async fn switching_off_and_takedowns_delete_in_the_background() {
 
 #[tokio::test]
 async fn reads_follow_the_account_status() {
+    let _cache = NODE_CACHE_USE.read().await;
     use tower::ServiceExt;
     let (st, a, id) = store(true).await;
     let did = plc(8);
@@ -466,6 +477,7 @@ async fn reads_follow_the_account_status() {
 
 #[tokio::test]
 async fn fetches_over_http_from_the_pds() {
+    let _cache = NODE_CACHE_USE.read().await;
     let id = MapIdentity::new();
     let did = plc(9);
     id.set(&did, "pds.a", 1);
@@ -534,6 +546,7 @@ async fn bootstrap_one(a: Arc<Archive>, st: Arc<StateStore>, did: String, key: c
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn bench_archival() {
+    let _cache = NODE_CACHE_USE.read().await;
     let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
     let (n, recs, commits) = (env("REPOS", 200), env("RECORDS", 300), env("COMMITS", 20));
     let mut accts: Vec<Acct> = (0..n).map(|i| Acct::new(&plc(10_000 + i as u64), 100 + i as u64, recs)).collect();
