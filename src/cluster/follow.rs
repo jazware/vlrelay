@@ -8,8 +8,10 @@
 //! its fence and retiring.
 //!
 //! Core and edge nodes follow over mTLS. A replica has no peer certificate,
-//! so its followers only read the bucket: a segment shows up one poll after
-//! its PUT, and an idle log holds the replica's merge until its next segment.
+//! so its followers only read the bucket ([`follow_bucket`]): a window of
+//! concurrent GETs past the last segment delivered, so a slow bucket costs
+//! one round trip of lag rather than one per segment, and an idle log holds
+//! the replica's merge until its next (heartbeat) segment.
 //!
 //! Core nodes learn about a joiner through its greeting (vlpds's join
 //! protocol makes the joiner wait until every core node follows its log).
@@ -137,22 +139,21 @@ impl Followers {
             if Some(&l.log_id) == self.own_log.as_ref() || f.contains_key(&l.log_id) {
                 continue;
             }
-            let (addr, tls): (Arc<dyn Fn() -> Option<String> + Send + Sync>, _) = match &self.http {
+            let fl = match &self.http {
                 Some(http) => {
                     let (map, id) = (self.live.clone(), l.log_id.clone());
-                    (Arc::new(move || map.read().get(&id).cloned()), http.ws_connector(&l.node_id))
+                    remote::follow_log(
+                        &l.log_id,
+                        &self.fh,
+                        self.store.clone(),
+                        Arc::new(move || map.read().get(&id).cloned()),
+                        self.token.clone(),
+                        self.merger_tx.clone(),
+                        http.ws_connector(&l.node_id),
+                    )
                 }
-                None => (Arc::new(|| None), None),
+                None => follow_bucket(&l.log_id, &self.fh, self.store.clone(), self.merger_tx.clone()),
             };
-            let fl = remote::follow_log(
-                &l.log_id,
-                &self.fh,
-                self.store.clone(),
-                addr,
-                self.token.clone(),
-                self.merger_tx.clone(),
-                tls,
-            );
             tracing::info!(log_id = %l.log_id, node = %l.node_id, floor = fl.floor, "following log");
             f.insert(l.log_id.clone(), fl);
         }
@@ -181,6 +182,128 @@ impl Followers {
             f.stop.store(true, Ordering::Release);
         }
     }
+}
+
+/// GETs in flight per log while a replica catches up.
+const BUCKET_WINDOW_MAX: usize = 32;
+/// Caught up: the next segment and the one after (a PUT pipeline lands
+/// them out of order) every poll.
+const BUCKET_WINDOW_MIN: usize = 2;
+const BUCKET_POLL: Duration = Duration::from_millis(20);
+/// A log's next segment missing this long: check whether retention pruned
+/// past it (a LIST, so not every poll).
+const BUCKET_PRUNE_CHECK: Duration = Duration::from_secs(5);
+
+/// A replica's follower of one log, from the bucket alone. Segments are
+/// read through a window of concurrent GETs that doubles while every one
+/// lands and drops back once the next is missing, and delivered strictly in
+/// ordinal order up to the first missing one or the fence (vlpds's
+/// `remote::catch_up` reads one GET, then a LIST, per segment).
+pub fn follow_bucket(
+    log_id: &str,
+    fh: &Firehose,
+    store: Store,
+    merger_tx: mpsc::UnboundedSender<LogBatch>,
+) -> Follower {
+    let log_id: Arc<str> = log_id.into();
+    let (floor, watermark) = fh.add_remote(&log_id);
+    let f = Follower {
+        log_id: log_id.clone(),
+        floor,
+        watermark,
+        stop: Arc::new(AtomicBool::new(false)),
+        done: Arc::new(AtomicBool::new(false)),
+    };
+    let (wm, stop, done) = (f.watermark.clone(), f.stop.clone(), f.done.clone());
+    tokio::spawn(async move {
+        let mut next = loop {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            match vlpds::backfill::seek(&store, &log_id, floor).await {
+                Ok(n) => break n,
+                Err(e) => {
+                    tracing::warn!(%log_id, "finding where to follow a log from: {e:#}");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        };
+        let mut window = BUCKET_WINDOW_MIN;
+        let mut missing_since: Option<Instant> = None;
+        while !stop.load(Ordering::Acquire) {
+            match bucket_window(&store, &log_id, next, window).await {
+                Err(e) => {
+                    tracing::warn!(%log_id, ordinal = next, "reading a log from the bucket: {e:#}");
+                    window = BUCKET_WINDOW_MIN;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Ok((objs, fenced)) => {
+                    let got = objs.len();
+                    for (h, entries) in objs {
+                        let _ = merger_tx.send(LogBatch {
+                            log_id: log_id.clone(),
+                            ordinal: next,
+                            events: vlpds::segment::events(entries),
+                        });
+                        wm.fetch_max(h.last_seq, Ordering::AcqRel);
+                        next += 1;
+                    }
+                    if fenced {
+                        done.store(true, Ordering::Release);
+                        return;
+                    }
+                    if got == window {
+                        window = (window * 2).min(BUCKET_WINDOW_MAX);
+                        missing_since = None;
+                        continue;
+                    }
+                    window = BUCKET_WINDOW_MIN;
+                    if got > 0 {
+                        missing_since = None;
+                    }
+                    let since = *missing_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= BUCKET_PRUNE_CHECK {
+                        missing_since = None;
+                        match vlpds::backfill::first_ordinal(&store, &log_id).await {
+                            // retention deleted it (we are a whole window behind)
+                            Ok(Some(first)) if first > next => {
+                                tracing::warn!(%log_id, from = next, to = first, "log pruned ahead of its follower; skipping");
+                                next = first;
+                                continue;
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(%log_id, "listing a log: {e:#}"),
+                        }
+                    }
+                    tokio::time::sleep(BUCKET_POLL).await;
+                }
+            }
+        }
+    });
+    f
+}
+
+/// Up to `n` segments from `from` on, read concurrently, cut at the first
+/// one missing; true if that one is the log's fence.
+async fn bucket_window(
+    store: &Store,
+    log_id: &str,
+    from: u64,
+    n: usize,
+) -> anyhow::Result<(Vec<(vlpds::segment::SegHeader, Vec<vlpds::segment::SegEntry>)>, bool)> {
+    use futures::StreamExt;
+    let mut reads = futures::stream::iter(from..from + n as u64)
+        .map(|ord| vlpds::nodelog::read_object(store, log_id, ord))
+        .buffered(n);
+    let mut out = Vec::new();
+    while let Some(r) = reads.next().await {
+        match r? {
+            Some(vlpds::segment::LogObject::Segment(h, entries)) => out.push((h, entries)),
+            Some(vlpds::segment::LogObject::Fence { .. }) => return Ok((out, true)),
+            None => break,
+        }
+    }
+    Ok((out, false))
 }
 
 struct Seen {
