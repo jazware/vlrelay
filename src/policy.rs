@@ -75,6 +75,9 @@ pub struct AdmitRequest<'a> {
     pub by_admin: bool,
     /// The host's record, if the relay already knows it.
     pub existing: Option<&'a HostRecord>,
+    /// Decide without spending the daily budget (a spent one still refuses):
+    /// requestCrawl's check before its probe.
+    pub dry_run: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -440,7 +443,14 @@ impl Engine {
             _ => crawl.initial_tier,
         };
         let counted = !req.by_admin && !allowed;
-        if counted {
+        if counted && req.dry_run {
+            let limit = snap.policy.body.cluster.new_hosts_per_day;
+            match self.new_hosts.read(now_ms()).await {
+                Ok(n) if n >= limit => return Admit::Reject(RejectHost::DailyLimit { limit }),
+                Ok(_) => {}
+                Err(e) => return Admit::Reject(RejectHost::Store(e.to_string())),
+            }
+        } else if counted {
             let limit = snap.policy.body.cluster.new_hosts_per_day;
             match self.new_hosts.spend(limit, now_ms()).await {
                 Ok(budget::Spend::Spent(_)) => {}

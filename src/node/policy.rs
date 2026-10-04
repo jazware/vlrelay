@@ -560,12 +560,12 @@ impl state::AccountGate for PolicyHooks {
 
 #[async_trait::async_trait]
 impl Admission for PolicyHooks {
-    async fn admit(&self, host: &Host) -> Result<upstream::Tier, CrawlError> {
+    async fn admit(&self, host: &Host, spend: bool) -> Result<upstream::Tier, CrawlError> {
         let existing = self.hosts.get_host(&host.0).await.map_err(|e| CrawlError::Internal(format!("{e:#}")))?;
         // the engine takes indigo's hostname rules, which refuse the IPs and
         // ports a dev network runs on
         let dev_local = self.dev_mode && policy::rules::parse_hostname(&host.0).is_err();
-        let req = AdmitRequest { hostname: &host.0, by_admin: dev_local, existing: existing.as_ref() };
+        let req = AdmitRequest { hostname: &host.0, by_admin: dev_local, existing: existing.as_ref(), dry_run: !spend };
         match self.engine.admit_host(&req).await {
             Admit::Admit { tier, .. } => Ok(tier_to_upstream(tier)),
             Admit::Reject(r) => Err(match r {
@@ -965,10 +965,21 @@ mod tests {
         let admit = |h: &str| {
             let h = Host(h.to_string());
             let hooks = hooks.clone();
-            async move { hooks.admit(&h).await }
+            async move { hooks.admit(&h, true).await }
+        };
+        let check = |h: &str| {
+            let h = Host(h.to_string());
+            let hooks = hooks.clone();
+            async move { hooks.admit(&h, false).await }
         };
         assert_eq!(admit("x.spam.example").await, Err(CrawlError::HostBanned));
+        assert_eq!(check("x.spam.example").await, Err(CrawlError::HostBanned));
+        // the check before a probe spends nothing
+        for _ in 0..3 {
+            assert_eq!(check("zero.example").await, Ok(upstream::Tier::New));
+        }
         assert_eq!(admit("one.example").await, Ok(upstream::Tier::New));
+        assert_eq!(check("two.example").await, Err(CrawlError::Budget));
         assert_eq!(admit("two.example").await, Err(CrawlError::Budget));
         // trusted domains skip the budget and start trusted
         assert_eq!(admit("morel.us-east.host.bsky.network").await, Ok(upstream::Tier::Trusted));

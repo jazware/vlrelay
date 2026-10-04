@@ -505,14 +505,7 @@ async fn for_host_and_admission_apply_rules_and_budgets() {
 
     let admit = |h: &'static str, by_admin| {
         let e = e.clone();
-        async move {
-            e.admit_host(&AdmitRequest {
-                hostname: h,
-                by_admin,
-                existing: None,
-            })
-            .await
-        }
+        async move { e.admit_host(&AdmitRequest { hostname: h, by_admin, existing: None, dry_run: false }).await }
     };
     assert!(matches!(
         admit("https://x.spam.example", false).await,
@@ -573,6 +566,7 @@ async fn for_host_and_admission_apply_rules_and_budgets() {
             hostname: "three.example",
             by_admin: false,
             existing: Some(&known),
+            dry_run: false,
         })
         .await;
     assert!(matches!(
@@ -589,6 +583,7 @@ async fn for_host_and_admission_apply_rules_and_budgets() {
             hostname: "three.example",
             by_admin: false,
             existing: Some(&banned),
+            dry_run: false,
         })
         .await;
     assert!(matches!(r, Admit::Reject(RejectHost::Banned { .. })));

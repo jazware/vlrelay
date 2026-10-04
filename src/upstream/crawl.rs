@@ -5,18 +5,24 @@
 //! spend a per-hour budget so a spammer can't register thousands of hosts in
 //! one go; hosts on the allow list (exact name or an allow domain rule) skip
 //! the budget. Domain ban rules refuse a whole suffix at once.
+//!
+//! The budget is spent after the probe, so names that don't answer can't use
+//! it up, and the bans are checked again then. A hostname whose probe failed
+//! is refused for [`FAILED_FOR`] without another probe, and each client IP
+//! gets [`PER_IP_PER_MIN`] requests a minute.
 
 use super::host::{HostnameError, Tier, normalize_hostname};
 use super::{Manager, client};
 use crate::types::Host;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, FromRequest, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -98,9 +104,18 @@ impl CrawlPolicy {
 /// mode, the starting tier and the cluster's daily new-host budget.
 #[async_trait::async_trait]
 pub trait Admission: Send + Sync + 'static {
-    /// The tier to start the host at (ignored for a known host).
-    async fn admit(&self, host: &Host) -> Result<Tier, CrawlError>;
+    /// The tier to start the host at (ignored for a known host). With
+    /// `spend` false nothing is counted: the check before a probe.
+    async fn admit(&self, host: &Host, spend: bool) -> Result<Tier, CrawlError>;
 }
+
+/// A hostname whose probe failed is refused this long without another.
+pub const FAILED_FOR: Duration = Duration::from_secs(600);
+const FAILED_MAX: usize = 10_000;
+/// requestCrawl calls per client IP per minute. A PDS asks on start and
+/// every few hours, not more.
+pub const PER_IP_PER_MIN: u32 = 10;
+const IPS_MAX: usize = 100_000;
 
 pub struct Crawler {
     admission: parking_lot::RwLock<Option<Arc<dyn Admission>>>,
@@ -108,6 +123,10 @@ pub struct Crawler {
     policy: parking_lot::RwLock<CrawlPolicy>,
     /// Admission times in the last hour, plus reservations for probes in flight.
     admitted: Mutex<VecDeque<Instant>>,
+    /// Hostnames whose probe failed: when, and why.
+    failed: Mutex<HashMap<Host, (Instant, String)>>,
+    /// Per client IP: the minute's start and its calls.
+    per_ip: Mutex<HashMap<IpAddr, (Instant, u32)>>,
     probing: Mutex<HashSet<Host>>,
 }
 
@@ -162,6 +181,8 @@ impl Crawler {
             manager,
             policy: parking_lot::RwLock::new(policy),
             admitted: Mutex::new(VecDeque::new()),
+            failed: Mutex::new(HashMap::new()),
+            per_ip: Mutex::new(HashMap::new()),
             probing: Mutex::new(HashSet::new()),
         })
     }
@@ -215,9 +236,10 @@ impl Crawler {
             return Err(CrawlError::Busy);
         }
         let _probing = Unmark(&self.probing, host.clone());
+        self.recently_failed(&host)?;
         let reserved = verdict != Verdict::Allowed;
         let slot = if reserved { Some(self.reserve(policy.new_hosts_per_hour)?) } else { None };
-        let probe = self.probe(&host, Duration::from_secs(policy.probe_timeout_secs.max(1))).await;
+        let probe = self.probe_noting(&host, Duration::from_secs(policy.probe_timeout_secs.max(1))).await;
         if let Err(e) = probe {
             if let Some(s) = slot {
                 self.release(s);
@@ -231,17 +253,65 @@ impl Crawler {
         let probe_timeout = Duration::from_secs(self.policy().probe_timeout_secs.max(1));
         if self.manager.registry().get(host).is_some() {
             // a known host is still checked: a ban added since must hold
-            a.admit(host).await?;
+            a.admit(host, false).await?;
             self.manager.wake(host);
             return Ok(false);
         }
+        self.recently_failed(host)?;
         if !self.probing.lock().insert(host.clone()) {
             return Err(CrawlError::Busy);
         }
         let _probing = Unmark(&self.probing, host.clone());
-        let tier = a.admit(host).await?;
-        self.probe(host, probe_timeout).await?;
+        a.admit(host, false).await?;
+        self.probe_noting(host, probe_timeout).await?;
+        // spends the budget, and sees a ban added during the probe
+        let tier = a.admit(host, true).await?;
         self.manager.admit(host, tier).await.map_err(|e| CrawlError::Internal(format!("{e:#}")))
+    }
+
+    fn recently_failed(&self, host: &Host) -> Result<(), CrawlError> {
+        let mut f = self.failed.lock();
+        match f.get(host) {
+            Some((at, why)) if at.elapsed() < FAILED_FOR => Err(CrawlError::Unreachable(format!("{why} (cached)"))),
+            Some(_) => {
+                f.remove(host);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    async fn probe_noting(&self, host: &Host, timeout: Duration) -> Result<(), CrawlError> {
+        let r = self.probe(host, timeout).await;
+        if let Err(CrawlError::Unreachable(why)) = &r {
+            let mut f = self.failed.lock();
+            if f.len() >= FAILED_MAX {
+                f.retain(|_, (at, _)| at.elapsed() < FAILED_FOR);
+            }
+            if f.len() < FAILED_MAX {
+                f.insert(host.clone(), (Instant::now(), why.clone()));
+            }
+        }
+        r
+    }
+
+    /// Counts one call from `ip`; false past [`PER_IP_PER_MIN`].
+    pub fn take_ip(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let minute = Duration::from_secs(60);
+        let mut m = self.per_ip.lock();
+        if m.len() >= IPS_MAX && !m.contains_key(&ip) {
+            m.retain(|_, (t, _)| now.duration_since(*t) < minute);
+            if m.len() >= IPS_MAX {
+                return false;
+            }
+        }
+        let e = m.entry(ip).or_insert((now, 0));
+        if now.duration_since(e.0) >= minute {
+            *e = (now, 0);
+        }
+        e.1 += 1;
+        e.1 <= PER_IP_PER_MIN
     }
 
     fn reserve(&self, per_hour: u32) -> Result<Instant, CrawlError> {
@@ -297,8 +367,17 @@ impl Drop for Unmark<'_> {
     }
 }
 
-async fn handle(State(c): State<Arc<Crawler>>, body: Option<Json<CrawlBody>>) -> Response {
-    let Some(Json(body)) = body else {
+async fn handle(State(c): State<Arc<Crawler>>, req: Request) -> Response {
+    if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>()
+        && !c.take_ip(addr.ip())
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "RateLimitExceeded", "message": "too many requestCrawl calls"})),
+        )
+            .into_response();
+    }
+    let Ok(Json(body)) = Json::<CrawlBody>::from_request(req, &()).await else {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "InvalidRequest", "message": "body must be {\"hostname\": ...}"})),
@@ -327,7 +406,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Admission for Refuse {
-        async fn admit(&self, _host: &Host) -> Result<Tier, CrawlError> {
+        async fn admit(&self, _host: &Host, _spend: bool) -> Result<Tier, CrawlError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             self.1.clone()
         }
@@ -347,6 +426,43 @@ mod tests {
         assert_eq!(banned.0.load(Ordering::SeqCst), 2);
         c.set_admission(Arc::new(Refuse(AtomicUsize::new(0), Ok(Tier::New))));
         assert_eq!(c.request_crawl("known.example.com").await, Ok(false));
+    }
+
+    /// Records each admission call, admitting at tier new.
+    #[derive(Default)]
+    struct Count(Mutex<Vec<bool>>);
+
+    #[async_trait::async_trait]
+    impl Admission for Count {
+        async fn admit(&self, _host: &Host, spend: bool) -> Result<Tier, CrawlError> {
+            self.0.lock().push(spend);
+            Ok(Tier::New)
+        }
+    }
+
+    /// A name that doesn't answer spends nothing of the new-host budget, and
+    /// asking again within FAILED_FOR doesn't probe it again.
+    #[tokio::test]
+    async fn a_failed_probe_spends_no_budget_and_is_remembered() {
+        let (m, _rx) = Manager::new(UpstreamConfig::new(true), Arc::new(MemHostStore::default()), None);
+        let c = Crawler::new(m, CrawlPolicy { probe_timeout_secs: 1, ..Default::default() });
+        let count = Arc::new(Count::default());
+        c.set_admission(count.clone());
+        let r = c.request_crawl("127.0.0.1:1").await;
+        assert!(matches!(&r, Err(CrawlError::Unreachable(_))), "{r:?}");
+        assert_eq!(*count.0.lock(), vec![false]);
+        let r = c.request_crawl("127.0.0.1:1").await;
+        assert!(matches!(&r, Err(CrawlError::Unreachable(m)) if m.contains("cached")), "{r:?}");
+        assert_eq!(*count.0.lock(), vec![false]);
+    }
+
+    #[test]
+    fn requests_per_ip_are_capped() {
+        let (m, _rx) = Manager::new(UpstreamConfig::new(false), Arc::new(MemHostStore::default()), None);
+        let c = Crawler::new(m, CrawlPolicy::default());
+        let (a, b): (IpAddr, IpAddr) = ("192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap());
+        assert_eq!((0..PER_IP_PER_MIN + 5).filter(|_| c.take_ip(a)).count(), PER_IP_PER_MIN as usize);
+        assert!(c.take_ip(b));
     }
 
     #[test]
