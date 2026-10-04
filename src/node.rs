@@ -27,6 +27,15 @@
 //! events finish out of order across lanes, so its cursor only moves past
 //! a seq once every earlier one is done ([`acks::Tracker`]).
 //!
+//! Replays keep that order. Each host socket is an epoch. When a cluster
+//! forward gives up on an event, its socket is fenced (`forward::Fence`):
+//! nothing more from it reaches a DID owner, the host is kicked, and the
+//! new socket replays everything past the cursor, in order. The ack tracker
+//! only counts the newest socket's copies.
+//!
+//! Memory: every frame read carries an `upstream::flow` permit until it's
+//! done, and a host (or the node) at its in-flight cap isn't read.
+//!
 //! The DID owner sits behind a trait so that the cluster can put a peer on
 //! the other side: the lane's contract is "submit in order per DID, get told
 //! when it's durable".

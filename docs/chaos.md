@@ -7,6 +7,7 @@ just chaos list
 just chaos kill9                      # or: tests/chaos/chaos.sh kill9 [--duration 100] [--rate 50] [--fake-rate 200]
 VLRELAY_BIN=/path/to/old/vlrelay just chaos zombie   # the same scenario on another build
 CHAOS_BASE=4150 just chaos minio-errors              # another port block, beside a running one
+CHAOS_PROFILE=dev-release just chaos soak --duration 3000   # optimized relay, as on benchbox
 ```
 
 ## The setup
@@ -119,27 +120,79 @@ What the runs found along the way, each fixed before the numbers above: the firs
 
 Still open from these runs:
 
-- One `crash-loop` run and one `gc-pause` run had a forward give up after 20 s with "the duplicated event isn't durable" (30 events of 3 DIDs, and 1): the DID owner's in-flight append that a duplicate waits on didn't resolve within its 10 s, twice. The rerun of `crash-loop` and the last `gc-pause` had none, and neither did either base run, so whether one of these changes makes it likelier is open. It's the robust-pipeline workstream's ground (`node/cluster.rs` Stage, kick-and-replay).
+- One `crash-loop` run and one `gc-pause` run had a forward give up after 20 s with "the duplicated event isn't durable" (30 events of 3 DIDs, and 1). Found in round 2 (below): a stage cancelled mid-batch left the DID's in-flight entry unresolved. Fixed by `forward::Detached`.
 - The worst per-crash stall in `crash-loop` has a 15-32 s tail in both builds: crashes every 6 s land while the previous victim is rejoining and shards are moving back.
 - Cores and edges still catch a log up from the bucket with vlpds's one-GET-per-segment `catch_up` on every stream reconnect; the replica's window would fit there too (vlpds code).
 - `partition-peer`: the few events held on the cores until the heal (above). A follower that can't reach a live log's stream never falls back to the bucket while the lease is live (vlpds `remote::follow_log`); that fallback would fix this and the symmetric-partition stall.
 - A step-down is a fail-stop and a restart. Under an asymmetric link (we reach our own address, peers don't) the lease still rules.
 
+## Round 2: robust-pipeline
+
+The soak's death spiral and open issues 1, 2, 8 (backpressure) and 9, plus what the reruns turned up. Each is its own commit.
+
+| Fix | What | Commit |
+|---|---|---|
+| **Per-socket epochs and fences** (issue 2) | Each host socket is an epoch. When a forward gives up, the forwarder trips the socket's `forward::Fence` before it answers: the DID's later events in the batch give up with it, and nothing else from that socket is sent (`ForwardError::Fenced`). The lanes drop fenced jobs before verifying them. The host is kicked once per socket (`Manager::kick_epoch`) and the new socket replays everything past the cursor, in order. The forwarder also looks an owner up once per DID per pass, so an owner appearing mid-pass can't send a DID's later event ahead of an unrouted earlier one. The ack tracker is per socket: a new socket settles what the old one left at or below its resume cursor and ignores the old socket's late acks. (Before this, a failed entry at or below a cursor handed over by another node pinned the cursor for good.) A host handed to another node is fenced here once its in-flight wait ends. | 1989702c |
+| **In-flight caps** (issue 8, first half) | Every frame read takes an `upstream::flow` permit that rides with it until it's durable and committed, a duplicate, rejected or dropped. A host at 8,192 frames or 64 MiB in flight, or any host while the node is at 32,768 or 384 MiB, stops reading its socket. Replays come through the same socket path. Metrics: `vlrelay_upstream_inflight_{events,bytes}`, `_paused_hosts`, `_pauses_total{cap}`, `_host_inflight_events_max`. The admin's host views carry each host's `inflight_events`, `inflight_bytes` and `paused`. Flags: `--host-inflight-events/-mb`, `--inflight-events/-mb`. | f65cec9e |
+| **FutureCursor replays from 0** (issue 1) | See the trade-off below. | ac5338bc |
+| **Lease plane** (issue 9) | vlpds `ClusterConfig::lease_plane`: the renew loop and the watchdog run on a one-thread runtime of their own, and the lease PUT goes through a second object-store client, whose connections are driven on that runtime. Renewals asked for elsewhere (a step's keepalive, the join, the drain) are handed to the plane's loop, because a renewal on a starved runtime held the renew lock across its late answer and starved the plane too (830e62e8). The public listener runs on the subscriber runtime, so a storm's accepts stay off the pipeline and peer RPC.  | fd3ba1fe, 830e62e8 |
+| **The DID-owner stage runs detached** | A peer's forward dropped mid-batch (its forwarder abandoned a hung owner, or the peer died) cancelled `apply_did` between an append and its durability. The DID's in-flight entry never resolved, so every later copy (a duplicate) answered "the duplicated event isn't durable" until its forward gave up, again and again: 2,071 give-ups and a 78 s stall in one `minio-errors` run, 25 s in `kill9`, and the 30-39 give-ups robust-cluster saw in `crash-loop`. Every stage runs under `forward::Detached`, which spawns each batch as its own task. | 09051108, fcae163c |
+| **PLC trouble is waited out** | `identity_unavailable` after ~2 s of failed lookups was a rejection, so it was acked and lost, and the account's next commit failed prevData. 58 of them made up one `minio-errors` run's acked-but-lost. Lookups now retry for 30 s. The lane holds meanwhile, and the in-flight caps turn that into backpressure. | 1bcd8747 |
+| **A seq whose copies all failed is a first sighting** | A `#sync` that restates the head is appended only on a first sighting. The replay of a fenced `#sync` counted as a replay of a copy that never landed, and was dropped (one `minio-errors` run, one event). | 66c942c5 |
+| **A node lost while starting exits** | A core restarting into hung bucket requests lost its lease inside `start_cluster`, before `on_lost` was set, and lived on inert. | 04b12e7d |
+
+Harness: a raised fd limit (the fault proxy ran out of fds within minutes under Linux's default 1024, which voided the first benchbox soak: 77455d5c), `CHAOS_PROFILE` (`dev-release` for soaks), `CHAOS_NO_BUILD`, `RELAY_EXTRA`, a 16 MiB lag bound in `consumers`, `vlpds_firehose_disconnects` in the metric dumps, `e2e_check` telling a restarted sequence from a replay (4b2a075d), and the e2e scripts honouring `DEV_STATE` (b0a0d23f).
+
+### FutureCursor: replay from 0
+
+A host answers our cursor with `FutureCursor` when its sequence restarted below it: a PDS whose sequencer was wiped, or one restored from a backup. indigo marks the host idle and stops (docs/reference-notes.md). Resuming live, as we did, skips whatever the host emitted between its restart and our reconnect, and every account touched then desynchronizes on its next commit.
+
+The relay now resets the host's cursor to 0 and reconnects from there, so the host replays its new sequence from its first event:
+
+- Wiped sequencer, same repos: the replay is exactly the window we missed. Commits apply in order.
+- Restored from backup: the replay goes back over history we already have. Commits are dropped by rev (`stale`, answered as duplicates). `#identity`, `#account` and `#sync` are caught by the restart dedupe while their (host, seq, DID) is still held (until the host's checkpoint passes it, at most 15 minutes). Older ones are emitted again. They restate state, so a consumer sees a repeat, not a wrong state.
+- The cost is one full replay of the host's window, which the in-flight caps bound in memory.
+
+The alternative, marking the affected accounts for resync, needs to know which accounts the gap touched, which we can't know without the missing events. A non-archival relay would wait for each account's next `#sync`, which may never come. An archival one would re-fetch every account of the host. Replaying from 0 loses nothing the host still has, and the resync path stays as the fallback for what it doesn't have (`OutdatedCursor`).
+
+The cursor stays 0 through further reconnects and takeovers until acks move it. The old sequence's late acks no longer count, so they can't push the cursor back up. A `FutureCursor` in answer to cursor 0 is a broken host: it backs off.
+
+### Results
+
+Mac, dev build, same setup as above, one scenario at a time (load 40-100 from other agents). "Round 1" is the "after" column above.
+
+| Scenario | Round 1 | Round 2 |
+|---|---|---|
+| minio-errors | 29 missing / 0 lost; 0 / 0; 166 / 170 | five runs: 0 / 0 four times, 1 / 1 once (the `#sync` fixed by 66c942c5). 0 out of order in all five. Worst latency after the second heal is still 33-40 s (open issue 3) |
+| upstream-restart | fail: 4,604 missing on every stream | pass: 0 missing, 0 rejections, 3 restarts followed |
+| consumers | fail: 59 missing, 10 node exits | pass, twice: 0 missing, 0 exits, worst latency 1.2-1.4 s, 107 connects/s. 22 slow consumers dropped as `too_slow` at a 16 MiB bound |
+| kill9 | 5.0, 2.9, 4.7 s | 4.9, 3.7, 3.7 s (another run 4.9, 5.1, 14 s on a busier machine) |
+| zombie | 5.8-6.9 s; the zombie fail-stops on waking | 5.2 s for the 12 s stop, 4.5 s for the 9 s one; only the zombie exits |
+
+Before the stage ran detached, `kill9` showed a 25 s stall and a bystander exit in `zombie`; both are gone in the reruns. Two cores of two different clusters lapsed in the same instant once, from a stall of the whole Mac. With a 3 s TTL that's expected.
+
+`just e2e` and `just e2e-cluster --duration 60` pass (on their own port block): 3,164 events matched with p50 27 ms on the single node; 3,171 matched and identical on all five cluster streams, with a 2.15 s worst pause after the kill -9.
+
+SOAK_TBD
+
 ## Found, not fixed (for the lead)
 
 These cross into code other workstreams own (node.rs pipeline internals, upstream, the merge, vlpds membership), or they're design decisions.
 
-1. **A FutureCursor reconnect loses the restart window, then desynchronizes the host's accounts** (upstream). On FutureCursor the client resumes live (`skip_cursor`). Everything the host emitted between its restart and the reconnect is skipped, so each affected account's next commit fails `prev_data_mismatch`, the account is marked desynchronized, and every later commit is rejected until a `#sync`. `upstream-restart`: 4,604 of host 0's events missing on every stream, 6,116 `desynchronized` rejections. fakepds has no `getRepo`, so nothing resyncs. The options: reconnect from cursor 0 after FutureCursor (right for a wiped PDS whose window starts at the restart; a PDS restored from backup would replay history, where commits are caught by rev but `#identity`/`#account` would repeat), or resync desynchronized accounts from `getRepo`. The second is needed anyway. Separately, an old-sequence ack landing after the reset pushes `acked_seq` back up (it's `fetch_max`), so the next reconnect gets FutureCursor again. The report's acked-but-lost count is inflated for this scenario because the checkpoint it compares with is from the old sequence.
-2. **Kick-and-replay reorders a DID's events** (node.rs pipeline: the lanes and acks). When a forward gives up (20 s, no owner), the host owner fails the ack and kicks the socket, and the host replays from its cursor. Later events of the same DID that were already past the socket's queue still go ahead. The DID owner then sees N+1 before N: `prev_data_mismatch`, desynchronized, and every later commit is rejected (and acked, so the checker shows those as acked-but-lost). After the fixes, `minio-errors` still lost 29 events across 5 accounts this way, with 26 out of order. A fix holds every later in-flight event of the host (or at least of that DID) when one fails, or treats a mismatch from a host that was just kicked as retryable instead of desynchronizing.
+1. ~~**A FutureCursor reconnect loses the restart window, then desynchronizes the host's accounts.**~~ Fixed in round 2 (below): the host replays its new sequence from cursor 0, and old-sequence acks no longer count. `upstream-restart` passes. Resyncing desynchronized accounts from `getRepo` on a non-archival relay is still open (it waits for the next `#sync`).
+2. ~~**Kick-and-replay reorders a DID's events.**~~ Fixed in round 2: a give-up fences its host socket, and the replay brings everything again in order. `minio-errors`: 0 out of order and 0 acked-but-lost in 4 of 5 runs (the fifth lost one `#sync`, fixed since).
 3. **Fixed** (robust-cluster pass, above). **One slow bucket path stalls the whole firehose** (the merge). 300-1,500 ms of latency on one core's bucket path stalled every stream for 16.4 s, until that core lost its lease and died. The merge waits on every live log's watermark, so the slowest core sets everyone's latency. A core whose segment PUTs stay past some bound should drain itself or give up its lease. A bucket blackhole (`node-bucket-hang`) is cleaner: the lease lapses and it's over in ~4.7 s.
 4. **Fixed** (robust-cluster pass). **A core its peers can't reach keeps its shards** (vlpds membership). Membership is the bucket lease, so a core whose peer port is blackholed or refusing, but which still reaches the bucket, stays live. Events for its DIDs waited out the whole partition: 20.2 s for a 20 s blackhole and 15.9 s for 15 s of refusals. Nothing was lost. Peer reachability could feed liveness (the `refused` probe already does on a dead port), or a node could drop its lease when it sees its forwards failing.
 5. **Fixed** (robust-cluster pass). **A pause between ~1.8 s and the TTL kills a node that nobody replaced.** With TTL 3 s, renewals every 0.6 s and 0.6 s of skew, a SIGSTOP of 2.8 s (0.9×TTL) lapsed the lease locally, the node fail-stopped on waking (`lapsed before renewal`), and the restart cost a 6.6 s stall, where riding out the pause would have cost 2.8 s. At the default 10 s TTL the window is ~6-10 s, which is GC-pause and VM-migration territory. vlpds could CAS-renew a lapsed lease if nobody fenced the log yet, instead of fail-stopping. That's safe only if peers fence before taking shards, which they do.
 6. **Any core pause stalls every stream.** Each core merges every log, so a paused core's log holds the merge until its lease lapses and it's fenced. A 1.6 s SIGSTOP showed up as a 1.6 s stall on all five streams. This is by design, but it's the cost of the total order: TTL + skew bounds the stall for any hung node.
 7. **Fixed** (robust-cluster pass; push to replicas is still M5). **The replica falls far behind under bucket latency.** With 100-500 ms per request it lagged 24 s (cores 3.5 s) and took the whole fault window to come back: it polls LIST + GET per segment. Push to replicas (M5) would fix it.
-8. **Second half fixed** (robust-cluster pass: histories trim to one span). **Catch-up has no backpressure, and takeovers slow down as shard histories grow** (node.rs, cluster). This is the soak's death spiral, described below. It's the top item.
-9. **Consumer load starves lease renewal.** A reconnect storm (57-74 connects/s, half replaying from cursor 0) on a loaded machine delayed renewals past the 3 s TTL, and cores fail-stopped (`lapsed past takeover`): 3 exits before the fixes, 10 after. Renewal should run where serving can't starve it, such as a dedicated thread or runtime. Slow consumers (1 KB/s) weren't dropped within 40 s at ~1 MB/s of stream, so each holds up to its lag bound in memory.
+8. ~~**Catch-up has no backpressure, and takeovers slow down as shard histories grow.**~~ Fixed: in-flight caps (round 2) and one-span shard histories (the robust-cluster pass). The round 2 soak ran on a build without the trim (below).
+9. ~~**Consumer load starves lease renewal.**~~ Fixed in round 2: renewals run on their own runtime and bucket client, and the public listener on the subscriber runtime. `consumers`: 0 node exits at 107 connects/s (10 before). Slow consumers are dropped at the lag bound (128 MiB by default; `--max-lag-mb` sets it on a dev network); the scenario sets 16 MiB and the nodes logged 22 `too_slow` drops in its 40 s. The script's slow readers don't see the close: the relay closes after the error frame, but a reader taking 1 KB/s has megabytes of kernel buffer to drain first.
 10. **Fixed** (robust-cluster pass). **A planned leave can fail under load.** The shutdown's fence-scan has a 3 s control-plane timeout. In the soak it timed out and the core exited 1 without fencing, which turned a SIGTERM into a crash.
 11. **Redundant retention on every core, edge/replica clock assumption, idle heartbeats.** Untouched (docs/cluster.md). The clock-skew scenario needs a shim first (above).
+12. **PLC trouble past 30 s still loses events.** The host stage now retries a failing DID lookup for 30 s, then rejects `identity_unavailable`, which is acked, and the account's next commit fails prevData. Holding the event (fail it, fence, replay later) would lose nothing, but one DID whose document never resolves would then hold its host's cursor for good. That needs a policy: a per-(host, seq) retry budget, or a parked-events queue that doesn't hold the cursor.
+13. **Recovery after hung bucket connections is slow.** In every `minio-errors` run the worst latency after the second heal (20% hung connections) was 33-40 s, with one core fail-stopping ~20 s into the fault. A hung segment PUT waits out object_store's 30 s request timeout while the merge waits on that log's watermark (issue 3). A shorter timeout on segment PUTs, with the hedge, would bound it.
+14. **`OutdatedCursor` isn't acted on.** When a host's window no longer reaches our cursor we log the `#info` and take what comes; the accounts with gaps desynchronize on their next commit and wait for a `#sync`. An archival relay could queue the host's accounts for a re-fetch right away.
 
 ## The soak
 
