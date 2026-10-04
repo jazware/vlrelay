@@ -44,7 +44,7 @@ Locally, `just e2e-cluster` runs three cores, an edge and a replica (docs/devloo
 
 ### Restart dedupe in a cluster
 
-A single node drops what an upstream replays past its durable cursor by reading its own log's tail. In a cluster the host owner can't read the DID owner's log, so the DID owner does it. Commits need nothing: the chain catches a replay by its rev. For `#identity`, `#account` and `#sync`, the DID owner keeps the (host, upstream seq) of each one it appended (`Recent`) until the host's checkpointed cursor in `hostck/` has passed it, and answers a second copy as a duplicate. A copy is claimed before it's applied, so two host owners sending it at once (a zombie) can't both append it.
+A single node drops what an upstream replays past its durable cursor by reading its own log's tail. In a cluster the host owner can't read the DID owner's log, so the DID owner does it. Commits need nothing: the chain catches a replay by its rev. For `#identity`, `#account` and `#sync`, the DID owner keeps the (host, upstream seq) of each one it appended (`Recent`) until the host's checkpointed cursor in `hostck/` has passed it, and answers a second copy as a duplicate. Only a host with no checkpoint yet ages its entries out (15 minutes). A host whose sequence restarted (a new generation in `hostck/`) loses its entries at the next tick: they belong to the old sequence. A copy is claimed before it's applied, so two host owners sending it at once (a zombie) can't both append it.
 
 The set survives the DID owner's crash or handoff because the applied marker it writes for its own log never passes an entry still in the set. The shard's next owner replays from that marker, and while replaying it puts the non-commit entries back in the set.
 
@@ -242,7 +242,7 @@ The log already refuses to PUT or ack once the lease lapses (the cluster sets `l
 |---|---|---|
 | `nodes/`, `writers/`, `assign/`, `cluster/version` | vlpds `Cluster` | leases, writer bytes, DID shard assignments, layout |
 | `assign-hosts/` | `cluster::hosts` | host shard layout and assignments |
-| `hostck/` | `cluster::hosts` | upstream cursors per host shard |
+| `hostck/` | `cluster::hosts` | upstream cursors per host shard, each with its sequence generation (bumped on FutureCursor, so a stale owner's cursor of the old sequence can't win the max). Taking a host shard replaces the node's cursors with these |
 | `hosts/` | `node::cluster::BucketHosts` | host records (the registry) per host shard |
 | `log/{log_id}/` | `seq::NodeLog` | each core node's log, fenced at its end |
 | `dedupe/{did shard}/{log_id}` | `node::cluster::DedupeStore` | a DID shard owner's inherited restart-dedupe entries, while it has any |
