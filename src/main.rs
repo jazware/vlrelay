@@ -90,9 +90,10 @@ struct Args {
     /// documents. Implied by an http:// --host or a loopback --plc-url.
     #[arg(long)]
     dev_mode: bool,
-    /// DID state shards (SlateDB instances).
-    #[arg(long, default_value_t = 4)]
-    did_shards: u32,
+    /// DID state shards (SlateDB instances). Default: 4 on one node, 24 in
+    /// a cluster. Only read when the bucket has no DID layout yet.
+    #[arg(long)]
+    did_shards: Option<u32>,
     /// How long the log keeps events for cursor replay, in hours.
     #[arg(long, default_value_t = 72)]
     retention: u64,
@@ -206,7 +207,8 @@ async fn run(a: Args) -> anyhow::Result<()> {
     cfg.log_inflight = a.log_inflight;
     cfg.max_segment_bytes = a.max_segment_mb << 20;
     vlpds::segment::set_compression_level(a.log_compression);
-    cfg.did_shards = a.did_shards.max(1);
+    let role = a.role.or(a.cluster.then_some(vlrelay::cluster::Role::Core));
+    cfg.did_shards = a.did_shards.unwrap_or(default_did_shards(role)).max(1);
     cfg.retention = Duration::from_secs(a.retention.max(1) * 3600);
     if (a.retention_secs.is_some() || a.max_lag_mb.is_some()) && !dev_mode {
         anyhow::bail!("--retention-secs and --max-lag-mb are for dev networks (--dev-mode)");
@@ -223,7 +225,6 @@ async fn run(a: Args) -> anyhow::Result<()> {
     cfg.cli_host_tier = vlrelay::upstream::Tier::parse(&a.host_tier)
         .filter(|t| t.connects())
         .ok_or_else(|| anyhow::anyhow!("--host-tier {}: one of trusted, default, new, throttled", a.host_tier))?;
-    let role = a.role.or(a.cluster.then_some(vlrelay::cluster::Role::Core));
     // a cluster splits the policy's budgets over its live core nodes
     let cores = Arc::new(vlrelay::node::cluster::LiveCores::default());
     let live: Arc<dyn vlrelay::policy::LiveNodes> = match role {
@@ -406,4 +407,39 @@ async fn server_header(mut r: Response) -> Response {
         HeaderValue::from_static(concat!("vlrelay/", env!("CARGO_PKG_VERSION"), " (atproto-relay)")),
     );
     r
+}
+
+/// Cores take at most `ceil(shards / live cores)` DID shards each, so 4
+/// shards over 3 cores can leave one core with none. 24 splits evenly over
+/// 2, 3, 4, 6 and 8 cores and leaves none empty at 5 (5/5/5/5/4); at 7 or
+/// 9+ the last core can still come up empty, so size --did-shards to the
+/// cluster there.
+fn default_did_shards(role: Option<vlrelay::cluster::Role>) -> u32 {
+    match role {
+        None => 4,
+        Some(_) => 24,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cluster_default_did_shards_leave_no_core_idle() {
+        let shards = default_did_shards(Some(vlrelay::cluster::Role::Core));
+        for cores in [2u32, 3, 4, 5, 6, 8] {
+            // the greedy fill: each core takes up to its fair share in turn
+            let fair = shards.div_ceil(cores);
+            let mut left = shards;
+            let mut min = u32::MAX;
+            for _ in 0..cores {
+                let take = fair.min(left);
+                left -= take;
+                min = min.min(take);
+            }
+            assert!(min > 0, "{shards} shards over {cores} cores leaves one with none");
+        }
+        assert_eq!(default_did_shards(None), 4);
+    }
 }

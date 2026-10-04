@@ -73,7 +73,7 @@ The relay implements the contract (`src/main.rs`, pipeline in `src/node.rs`). It
 
 - `--admin-token T` turns on `/admin` (the dashboard, from `--ui-dir` or this tree's `ui/dist`) and its API. Without it there's no `/admin`.
 - `--dev-mode` allows `ws://`, IPs, localhost and ports. An `http://` `--host` or a loopback `--plc-url` turns it on by itself.
-- `--did-shards N` (4) is the number of DID state shards, each a SlateDB. `--retention H` (72) is the log's replay window in hours.
+- `--did-shards N` (4 alone, 24 in a cluster) is the number of DID state shards, each a SlateDB. `--retention H` (72) is the log's replay window in hours.
 - `--lanes N` (64) and `--ingest-threads N` (cores, at most 16) size the pipeline. `--did-lookups-per-sec` (50) is the DID document budget.
 
 One listener serves `GET /xrpc/_health` (`{"version"}`), `subscribeRepos`, the sync API (`listRepos`, `getRepoStatus`, `getLatestCommit`, `listHosts`, `getHostStatus`), `requestCrawl` (with `--crawl`), `/admin` and Prometheus `/metrics`. Every response carries `Server: vlrelay/… (atproto-relay)`, so other relays won't crawl it. The relay's own series are `vlrelay_*`: events in by kind, accepted by kind, out, rejected by reason, duplicates by where they were caught, time to firehose and time to durable (histograms), time per pipeline stage, durable lag, hosts by status, consumers. vlpds's firehose and process series come with them.

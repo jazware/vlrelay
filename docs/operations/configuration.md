@@ -71,7 +71,7 @@ Time to firehose is about linger plus one segment PUT. Above ~50k events/s segme
 
 | Flag | Env | Default | What |
 |---|---|---|---|
-| `--did-shards <DID_SHARDS>` |  | `4` | DID state shards (SlateDB instances) |
+| `--did-shards <DID_SHARDS>` |  |  | DID state shards (SlateDB instances). Default: 4 on one node, 24 in a cluster. Only read when the bucket has no DID layout yet |
 | `--lanes <LANES>` |  | `64` | Pipeline lanes; a DID always maps to the same one |
 | `--ingest-threads <INGEST_THREADS>` |  |  | Threads verifying events (default: the core count, at most 16) |
 

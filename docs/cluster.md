@@ -13,7 +13,7 @@ Single-node mode (no `--cluster`/`--role`) is still the default and unchanged. A
 | `--peer-tls-dir DIR` | | `ca.crt`, `{node-id}.crt`, `{node-id}.key`, as `vlpds admin tls ca` / `issue` write them. With `--dev-mode` they're created as needed (vlpds's `dev_files`). Core and edge. |
 | `--internal-token T` | | Shared secret on every peer request. Core and edge. |
 | `--lease-ttl-ms MS` | 10000 | Node lease TTL. Renewal and skew are a fifth of it each. |
-| `--did-shards N`, `--host-shards N` | 4, 64 | Only used when the bucket has no layout yet. |
+| `--did-shards N`, `--host-shards N` | 4 alone or 24 in a cluster, 64 | Only used when the bucket has no layout yet. |
 
 Every node of a cluster points at the same bucket and `--prefix`. A replica needs only read credentials and no TLS or token. `--host` and `--crawl` work on any core node: the host registry is in the bucket, so a host admitted anywhere is admitted everywhere and connects on whichever node owns its host shard (within a checkpoint tick, 2 s).
 

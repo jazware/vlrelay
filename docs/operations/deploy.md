@@ -122,6 +122,11 @@ Nodes reload changed certificate files without a restart. vlpds's
 renewal and CA rotation, and it's the same here.
 
 `--did-shards` and `--host-shards` only matter the first time a cluster starts on an empty prefix.
+Each core takes at most its fair share, `ceil(shards / cores)`, so a shard count that doesn't spread
+can leave a core with no DID state, and then everything it reads is forwarded (4 shards over 3
+cores went 2/2/0 on the [shadow run](../shadow.md)). The cluster default of 24 splits evenly over 2,
+3, 4, 6 and 8 cores and leaves none empty at 5. For 7 cores or more than 8, pick a multiple of the
+core count you expect.
 After that the layout in the bucket wins.
 
 ### Edges and replicas
