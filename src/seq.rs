@@ -222,6 +222,10 @@ pub fn new_log_id(node: &str) -> String {
 
 type Ack = oneshot::Sender<Result<Durable, LogError>>;
 
+/// Runs once when the log fails for good (fenced, or its lease lapsed):
+/// where `main` fail-stops.
+pub type OnFatal = Box<dyn FnOnce(&LogError) + Send>;
+
 struct Pending {
     events: Vec<Event>,
     ack: Ack,
@@ -268,7 +272,7 @@ impl NodeLog {
         store: Store,
         cfg: LogConfig,
         out: mpsc::UnboundedSender<LogBatch>,
-        on_fatal: Option<Box<dyn FnOnce(&LogError) + Send>>,
+        on_fatal: Option<OnFatal>,
     ) -> Arc<NodeLog> {
         let wm = Arc::new(Watermark::new(cfg.writer, cfg.seq_floor));
         let (tx, rx) = mpsc::channel(16 * 1024);
@@ -359,7 +363,7 @@ struct Sequencer {
     durable_ordinal: Arc<AtomicU64>,
     last_durable_seq: Arc<AtomicI64>,
     stats: Arc<LogStats>,
-    on_fatal: Option<Box<dyn FnOnce(&LogError) + Send>>,
+    on_fatal: Option<OnFatal>,
 }
 
 /// Events being gathered into the next segment.
@@ -454,7 +458,10 @@ impl Sequencer {
                             return;
                         }
                     };
-                    prefix_end = sealed.ordinal + 1;
+                    // a close marker holds the next ordinal without writing it
+                    if !sealed.data.is_empty() {
+                        prefix_end = sealed.ordinal + 1;
+                    }
                     let res = res.and_then(|()| match &self.cfg.lease_ok {
                         Some(ok) if !ok() => Err(LogError::LeaseLapsed),
                         _ => Ok(()),
@@ -503,11 +510,11 @@ impl Sequencer {
                 || open.frames.len() >= self.cfg.max_segment_events
                 || closed;
             if inflight.len() < k && open.opened.is_some() && due {
-                if let Some(ok) = &self.cfg.lease_ok {
-                    if !ok() {
-                        self.fail(LogError::LeaseLapsed);
-                        continue;
-                    }
+                if let Some(ok) = &self.cfg.lease_ok
+                    && !ok()
+                {
+                    self.fail(LogError::LeaseLapsed);
+                    continue;
                 }
                 let o = std::mem::replace(&mut open, Open::new(&self.log_id));
                 if inflight.is_empty() {
@@ -515,7 +522,11 @@ impl Sequencer {
                 }
                 let last_seq = o.seg.last_seq;
                 // an empty segment (a close marker): nothing to PUT, ack in order
-                let data = if o.frames.is_empty() { Bytes::new() } else { Bytes::from(o.seg.seal(&self.log_id, ordinal, prefix_end)) };
+                let data = if o.frames.is_empty() {
+                    Bytes::new()
+                } else {
+                    Bytes::from(o.seg.seal(&self.log_id, ordinal, prefix_end))
+                };
                 let empty = data.is_empty();
                 let sealed = Sealed { ordinal, data, frames: o.frames, acks: o.acks, last_seq, stored_bytes: 0 };
                 if !empty {
@@ -654,10 +665,10 @@ pub async fn fence(store: &Store, log_id: &str, by: &str) -> anyhow::Result<(u64
             }
         }
         let mut last = 0;
-        if free > 0 {
-            if let Head::Segment(h) = nodelog::read_head(store, log_id, free - 1).await? {
-                last = h.last_seq;
-            }
+        if free > 0
+            && let Head::Segment(h) = nodelog::read_head(store, log_id, free - 1).await?
+        {
+            last = h.last_seq;
         }
         return Ok((free, last));
     }
@@ -713,7 +724,9 @@ pub async fn read_segment(store: &Store, log_id: &str, ordinal: u64) -> anyhow::
                         .iter()
                         .find(|m| &m.key[..] == META_KEY)
                         .and_then(|m| EventMeta::decode(m.val.as_deref()?, e.shard.0))
-                        .ok_or_else(|| anyhow::anyhow!("segment {log_id}/{ordinal}: entry {} has no relay meta", e.seq))?;
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("segment {log_id}/{ordinal}: entry {} has no relay meta", e.seq)
+                        })?;
                     Ok(Logged { seq: e.seq, meta, frame: e.frame })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()
@@ -753,20 +766,25 @@ pub async fn prune(store: &Store, reporter: &str, window: Duration, max_deletes:
     let mut doomed: Vec<(Path, i64)> = Vec::new();
     for log_id in vlpds::backfill::list_logs(store).await? {
         let prefix = Path::from(format!("{}/log/{}", store.prefix, log_id));
+        // Keys list in ordinal order, so the first page holds the oldest
+        // segments. Reading only that much keeps a pass at one LIST per log
+        // however long the log is.
+        let room = max_deletes.saturating_sub(doomed.len());
         let mut ords: Vec<u64> = Vec::new();
-        let mut list = store.raw.list(Some(&prefix));
+        let mut list = store.raw.list(Some(&prefix)).take(room + 1);
         while let Some(m) = list.next().await {
             if let Some(o) = m?.location.filename().and_then(|f| f.strip_suffix(".seg")).and_then(|f| f.parse().ok()) {
                 ords.push(o);
             }
         }
-        ords.sort_unstable();
-        for (i, &ord) in ords.iter().enumerate() {
-            // the newest object stays: a live log's last segment, or a dead
-            // log's fence
-            if i + 1 == ords.len() || doomed.len() >= max_deletes {
-                break;
-            }
+        // The newest object stays (a live log's last segment, or a dead
+        // log's fence). It's the last one listed unless the page was cut.
+        if ords.len() <= room {
+            ords.pop();
+        } else {
+            ords.truncate(room);
+        }
+        for ord in ords {
             match nodelog::read_head(store, &log_id, ord).await? {
                 Head::Segment(h) if h.last_seq < cutoff => {
                     doomed.push((nodelog::segment_path(store, &log_id, ord), h.last_seq))

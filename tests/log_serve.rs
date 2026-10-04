@@ -200,6 +200,22 @@ async fn crash_restart_drops_unacked_replays_acked_never_reuses_seqs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_drains_then_fences() {
+    let store = store();
+    let (st, _) = start(&store, "h", |c, _| c.linger = Duration::from_millis(200)).await;
+    let a = st.log.submit(batch(0, 20, 100)).await;
+    let b = st.log.submit(batch(20, 20, 100)).await;
+    st.log.close(&store).await.unwrap();
+    let (a, b) = (a.await.unwrap(), b.await.unwrap());
+    assert!(a.seqs.last() < b.seqs.first());
+    assert!(st.log.append(batch(40, 1, 100)).await.is_err());
+    let (free, fenced) = vlpds::nodelog::first_free(&store, &st.log.log_id).await.unwrap();
+    assert!(fenced);
+    assert_eq!(seq::read_log(&store, &st.log.log_id, 0).await.unwrap().len(), 40);
+    assert_eq!(free, b.ordinal + 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_writer_fences_the_first() {
     let store = store();
     let fatal = Arc::new(parking_lot::Mutex::new(None));
@@ -247,8 +263,11 @@ async fn outdated_and_future_cursors() {
     }
     let last = *all.last().unwrap();
     // a zero window prunes everything but each log's newest object
+    let p = seq::prune(&store, &st.log.log_id, Duration::ZERO, 3).await.unwrap();
+    assert_eq!(p.deleted, 3);
     let p = seq::prune(&store, &st.log.log_id, Duration::ZERO, 1000).await.unwrap();
-    assert_eq!(p.deleted, 9);
+    assert_eq!(p.deleted, 6);
+    assert_eq!(seq::prune(&store, &st.log.log_id, Duration::ZERO, 1000).await.unwrap().deleted, 0);
     let got = read_until(addr, Some(0), last).await;
     assert_eq!(got[0], Got::Info("OutdatedCursor".into()));
     assert_eq!(seqs(&got), all[90..].to_vec());

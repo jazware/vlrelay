@@ -143,11 +143,12 @@ async fn subscriber(addr: SocketAddr, stats: Arc<SubStats>, sample: bool, stop: 
         stats.events.fetch_add(1, Ordering::Relaxed);
         stats.bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
         n += 1;
-        if sample && n % 16 == 0 {
-            if let Some(s) = seq::frame_seq(&b) {
-                let now = vlpds::tid::now_micros() as i64;
-                stats.delays.lock().push((now - (s >> 8)) as f64 / 1000.0);
-            }
+        if sample
+            && n.is_multiple_of(16)
+            && let Some(s) = seq::frame_seq(&b)
+        {
+            let now = vlpds::tid::now_micros() as i64;
+            stats.delays.lock().push((now - (s >> 8)) as f64 / 1000.0);
         }
     }
 }
@@ -155,7 +156,12 @@ async fn subscriber(addr: SocketAddr, stats: Arc<SubStats>, sample: bool, stop: 
 fn main() {
     let a = Args::parse();
     vlpds::segment::set_compression_level(a.zstd);
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(8).thread_name("relay").enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .thread_name("relay")
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(run(a));
 }
 
@@ -177,7 +183,12 @@ async fn run(a: Args) {
     // subscribers on their own runtime, so their CPU isn't counted as serving
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sub_stats = Arc::new(SubStats::default());
-    let client_rt = tokio::runtime::Builder::new_multi_thread().worker_threads(a.client_threads).thread_name("client").enable_all().build().unwrap();
+    let client_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(a.client_threads)
+        .thread_name("client")
+        .enable_all()
+        .build()
+        .unwrap();
     for i in 0..a.subscribers {
         client_rt.spawn(subscriber(addr, sub_stats.clone(), i == 0, stop.clone()));
     }
@@ -214,9 +225,14 @@ async fn run(a: Args) {
                 }
                 let evs: Vec<Event> = (0..a.batch)
                     .map(|j| {
-                        let k = (i as usize * a.batch + j + p) % templates.len();
+                        let k = (p * templates.len() / a.producers + i as usize * a.batch + j) % templates.len();
                         Event {
-                            meta: EventMeta { did: format!("did:plc:{k:024}"), host: Host("pds.bench".into()), upstream_seq: i as i64, shard: 0 },
+                            meta: EventMeta {
+                                did: format!("did:plc:{k:024}"),
+                                host: Host("pds.bench".into()),
+                                upstream_seq: i as i64,
+                                shard: 0,
+                            },
                             frame: Box::new(templates[k].clone()),
                         }
                     })

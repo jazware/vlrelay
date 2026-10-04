@@ -102,13 +102,18 @@ impl Serve {
 
     /// Prunes every log past the retention window, every interval.
     pub fn spawn_retention(self: &Arc<Self>, reporter: String) {
+        if self.cfg.retention_interval.is_zero() {
+            return;
+        }
         let s = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(s.cfg.retention_interval);
             loop {
                 tick.tick().await;
                 match seq::prune(&s.store, &reporter, s.cfg.retention, 10_000).await {
-                    Ok(p) if p.deleted > 0 => tracing::info!(deleted = p.deleted, pruned_seq = p.pruned_seq, "log retention"),
+                    Ok(p) if p.deleted > 0 => {
+                        tracing::info!(deleted = p.deleted, pruned_seq = p.pruned_seq, "log retention")
+                    }
                     Ok(_) => {}
                     Err(e) => tracing::warn!("log retention failed: {e:#}"),
                 }
@@ -143,7 +148,7 @@ pub async fn start_single_node(
     mut cfg: LogConfig,
     serve: ServeConfig,
     runtime: Option<tokio::runtime::Handle>,
-    on_fatal: Option<Box<dyn FnOnce(&seq::LogError) + Send>>,
+    on_fatal: Option<seq::OnFatal>,
 ) -> anyhow::Result<Started> {
     let recovered = seq::fence_all(&store, &cfg.log_id).await?;
     // The firehose's start floor is the clock, and backfill serves only
@@ -164,5 +169,6 @@ pub async fn start_single_node(
     let log = NodeLog::start(store, cfg, tx, on_fatal);
     srv.follow_local(&log);
     srv.firehose.spawn_merger(rx);
+    srv.spawn_retention(log.log_id.to_string());
     Ok(Started { log, serve: srv, recovered })
 }
