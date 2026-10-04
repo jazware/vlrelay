@@ -308,6 +308,13 @@ impl LocalOwner {
     }
 }
 
+/// DID-owner rejections that mean "not now": the event isn't acked but
+/// replayed (single node) or retried by the forwarder (cluster). Acking one
+/// loses the event, and the account's next commit fails prevData.
+pub(crate) fn owner_retryable(reason: &str) -> bool {
+    matches!(reason, "identity_unavailable" | "store" | "not_owner")
+}
+
 fn state_rejection(e: &state::Reject) -> Rejection {
     use state::Reject as R;
     let reason = match e {
@@ -345,9 +352,15 @@ impl DidOwner for LocalOwner {
             };
             let ev = Incoming { did: &c.did, host: &c.host, now: state::now_secs(), kind };
             match self.state.apply_with_frame(ev, Some(&c.frame)).await {
-                Err(e) if e.retryable() && tries < 3 => {
+                // PLC trouble gets the host stage's patience: past it the
+                // event is replayed, which costs a reconnect
+                Err(e)
+                    if e.retryable()
+                        && (tries < 3
+                            || matches!(e, state::Reject::Identity(_)) && t0.elapsed() < IDENTITY_PATIENCE) =>
+                {
                     tries += 1;
-                    tokio::time::sleep(Duration::from_millis(100 << (2 * tries))).await;
+                    tokio::time::sleep(Duration::from_millis(100 << (2 * tries.min(3)))).await;
                 }
                 r => break r,
             }
@@ -898,6 +911,14 @@ impl Node {
                 Submitted::Duplicate => {
                     metrics::EVENTS_DUPLICATE.with_label_values(&["state"]).inc();
                     self.finish(&host, useq, epoch, None);
+                }
+                Submitted::Rejected(r) if owner_retryable(r.reason) => {
+                    tracing::warn!(host = %host.0, did, useq, reason = r.reason, "replaying from the host: {}", r.detail);
+                    // the DID's later events from this socket must not land
+                    // ahead of it: the fenced socket's lanes drop them
+                    self.fence(&host, epoch).trip();
+                    self.acks.fail(&host, useq, epoch);
+                    self.manager.kick_epoch(&host, epoch);
                 }
                 Submitted::Rejected(r) => {
                     self.reject(&host, &did, useq, r);

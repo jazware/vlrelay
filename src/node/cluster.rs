@@ -633,7 +633,7 @@ fn decode_meta(did: &str, mut r: Bytes) -> anyhow::Result<Meta> {
 fn retryable(reason: &str) -> Option<StageError> {
     match reason {
         "not_owner" => Some(StageError::NotOwner),
-        "store" => Some(StageError::Unavailable("state store".into())),
+        r if super::owner_retryable(r) => Some(StageError::Unavailable(r.into())),
         _ => None,
     }
 }
@@ -1756,6 +1756,17 @@ mod tests {
     /// Another committer committed ordinal 20 while shard 1's append at
     /// ordinal 10 or later waits on its own: shard 1's marker stays below
     /// it, the other shards' move to what's committed.
+    #[test]
+    fn temporary_owner_rejections_are_retried_not_acked() {
+        assert!(matches!(retryable("not_owner"), Some(StageError::NotOwner)));
+        for r in ["identity_unavailable", "store"] {
+            assert!(matches!(retryable(r), Some(StageError::Unavailable(_))), "{r}");
+        }
+        for r in ["stale", "desynchronized", "prev_data_mismatch", "rate_limited", "no_identity"] {
+            assert!(retryable(r).is_none(), "{r}");
+        }
+    }
+
     #[test]
     fn a_marker_stays_below_its_shards_uncommitted_appends() {
         let u = Uncommitted::default();
