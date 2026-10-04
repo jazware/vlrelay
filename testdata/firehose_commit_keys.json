@@ -1,0 +1,7 @@
+{
+  "_source": "plc.directory /log/audit: the #atproto key each DID had when its commit in vlpds/testdata/shrike/firehose_commits was signed (Feb 2025)",
+  "did:plc:6hy5p6rm3zlcdephqssc2p76": "did:key:zQ3shQKrVD2bzxqAqhawWyK3LkKGbWAi3E1fAfQnJ35V1ZWke",
+  "did:plc:sxtoas2sxjv6gh2bibdg3g4b": "did:key:zQ3shgZYVQvtTA5t2PpZgkgtWWWHayQWkVSJ4ja1uGg1fDM97",
+  "did:plc:2bpboeb6wt2wtvqpgvggjml6": "did:key:zQ3shVPQDT6tSfWnNSV472cBGTZSJVQvER8KP4RhCS8j1pLZu",
+  "did:plc:vixizgjuwef5ovmixqxalfup": "did:key:zQ3shPQJYswJBgcC4nKx9zpm5QS7q6vtMo9Ezgy1LcAwvCmXW"
+}

@@ -21,7 +21,7 @@ lru = "0.12"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] }
 slatedb = { version = "0.17", features = ["aws", "wal_disable", "zstd", "lz4"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
@@ -36,12 +36,17 @@ hdrhistogram = "7"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
-tokio-tungstenite = { version = "0.26", features = ["__rustls-tls"] }
+tokio-tungstenite = { version = "0.26", features = ["__rustls-tls", "rustls-tls-webpki-roots"] }
 webpki-roots = "1"
 # relay log and serving (src/seq.rs, src/serve.rs)
 object_store = { version = "0.14", features = ["aws"] }
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+# signature verification (src/verify.rs): crates and features vlpds already builds
+secp256k1 = { version = "0.30", features = ["global-context"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+ring = "0.17"
+bs58 = "0.5"
 
 [[bin]]
 name = "vlrelay"
@@ -59,6 +64,8 @@ path = "src/bin/devnet.rs"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# differential tests against a second atproto implementation, as vlpds does
+shrike = { version = "=0.7.0", default-features = false, features = ["syntax", "cbor", "crypto", "mst", "repo", "car", "sync"] }
 
 [patch.crates-io]
 slatedb = { git = "https://github.com/jazware/slatedb", rev = "2a79077e0da057c4673137195409edfe7bb673c4" }

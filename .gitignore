@@ -6,3 +6,4 @@ ui/dist/
 !src/bin/
 # dev/up.sh: pids, logs, accounts
 dev/state/
+testdata/live/
