@@ -18,7 +18,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 crate="$(cd "$here/../.." && pwd)"
 cd "$crate"
 
-scenarios="baseline kill9 term double-crash crash-loop zombie gc-pause minio-latency minio-errors minio-pause node-bucket-hang partition-peer isolate upstream-faults upstream-restart consumers clock-skew soak"
+scenarios="baseline kill9 term double-crash crash-loop term-bucket zombie gc-pause minio-latency minio-errors minio-pause node-bucket-hang partition-peer isolate upstream-faults upstream-restart consumers clock-skew soak"
 scenario=${1:-}
 [ -n "$scenario" ] && shift || true
 if [ -z "$scenario" ] || [ "$scenario" = list ]; then
@@ -243,6 +243,13 @@ case $scenario in
     # 20 kill -9s in a row, a random core every 6 s: every takeover adds a
     # span to the shards' histories unless the new owner trims them
     for n in $(seq 1 20); do at $((f0 + (n - 1) * 6)); kill9 "$(rand_core)"; done ;;
+  term-bucket)
+    # a planned leave whose own bucket path is broken: it can't fence its
+    # log, so it asks a peer to (then the same leave with the path slow)
+    at $f0; k=$(busiest 1 2 3); mark bucket-refuse "n$k"; fault "s3n$k" '{"refuse":true}'; down_for "$k" 10 term
+    at $((f0 + 10)); mark heal all; heal_all
+    at $((f0 + 35)); k=$(busiest 1 2 3); mark bucket-latency "n$k"; fault "s3n$k" '{"latency":[1000,3000]}'; down_for "$k" 10 term
+    at $((f0 + 45)); mark heal all; heal_all ;;
   zombie)
     # SIGSTOP well past TTL + skew: peers take its shards; on SIGCONT it must
     # neither emit nor ack, and should fail-stop (the supervisor restarts it)
