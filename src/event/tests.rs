@@ -55,6 +55,35 @@ fn route_agrees_with_parse() {
     }
 }
 
+/// An `#identity` with a stray `repo` (it sorts after `did`) used to route
+/// by `repo` while parse read `did`: the DID owner of one account applied
+/// another's event.
+#[test]
+fn route_reads_the_kinds_did_key() {
+    use vlpds::cbor::{write_map_head, write_text, write_uint};
+    let mut f = Vec::new();
+    write_map_head(&mut f, 2);
+    write_text(&mut f, "t");
+    write_text(&mut f, "#identity");
+    write_text(&mut f, "op");
+    write_uint(&mut f, 1);
+    write_map_head(&mut f, 4);
+    write_text(&mut f, "did");
+    write_text(&mut f, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa");
+    write_text(&mut f, "seq");
+    write_uint(&mut f, 5);
+    write_text(&mut f, "repo");
+    write_text(&mut f, "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz");
+    write_text(&mut f, "time");
+    write_text(&mut f, "2026-01-01T00:00:00Z");
+    let f = Bytes::from(f);
+    let r = route(&f, MAX_FRAME_BYTES).unwrap();
+    assert_eq!(r.did, Some("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"));
+    if let Ok(e) = parse(f.clone(), &Limits::default()) {
+        assert_eq!(r.did, e.did());
+    }
+}
+
 #[test]
 fn seq_splice_round_trips() {
     for f in all_kinds() {

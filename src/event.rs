@@ -138,12 +138,10 @@ pub fn route(frame: &[u8], max_frame_bytes: usize) -> Result<Routing<'_>, Reject
         let key = text(frame, &mut i).ok_or(Reject::BadFrame)?;
         let at = i;
         match key {
-            b"repo" | b"did"
-                if matches!(
-                    kind,
-                    Kind::Commit | Kind::Sync | Kind::Identity | Kind::Account
-                ) =>
-            {
+            // the key parse reads for the kind: a frame carrying both must
+            // route by the DID it's checked and applied as
+            b"repo" if kind == Kind::Commit => r.did = Some(text_str(frame, &mut i)?),
+            b"did" if matches!(kind, Kind::Sync | Kind::Identity | Kind::Account) => {
                 r.did = Some(text_str(frame, &mut i)?);
             }
             b"seq" => {
