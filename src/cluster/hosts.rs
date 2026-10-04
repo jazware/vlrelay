@@ -91,19 +91,32 @@ pub trait HostHandler: Send + Sync + 'static {
 /// Upstream cursors in the bucket, one object per host shard. Only a
 /// shard's owner writes it, but a zombie owner may still be writing, so
 /// every write merges by max under a CAS.
+///
+/// Each host's cursor carries the generation of its sequence, bumped when
+/// the host restarted it (FutureCursor). The max only merges cursors of one
+/// generation: a node that still holds a cursor of the old sequence (one
+/// that owned the host before another node saw the restart) can't push the
+/// stored cursor back up into it, and taking a shard replaces what we held
+/// with what's stored.
 pub struct Checkpoints {
     store: Store,
     /// Read when a shard was taken (and our own writes since).
     cursors: RwLock<HashMap<Host, i64>>,
+    /// The sequence generation each cursor in `cursors` belongs to.
+    gens: RwLock<HashMap<Host, u64>>,
     /// Hosts that restarted their sequence (FutureCursor): their next write
-    /// replaces the stored cursor instead of taking the max.
+    /// starts a new generation with the cursor it carries.
     resets: Mutex<HashSet<Host>>,
     written: Mutex<HashMap<ShardId, BTreeMap<String, i64>>>,
+    /// The upstream registry, whose acked cursors a shard's take replaces.
+    pub(crate) registry: std::sync::OnceLock<Arc<crate::upstream::Registry>>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
 struct CheckpointDoc {
     cursors: BTreeMap<String, i64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    gens: BTreeMap<String, u64>,
 }
 
 impl Checkpoints {
@@ -111,8 +124,10 @@ impl Checkpoints {
         Arc::new(Checkpoints {
             store,
             cursors: Default::default(),
+            gens: Default::default(),
             resets: Default::default(),
             written: Default::default(),
+            registry: Default::default(),
         })
     }
 
@@ -131,14 +146,26 @@ impl Checkpoints {
         }
     }
 
-    /// Reads a shard's cursors into memory (taking it over).
+    /// Reads a shard's cursors into memory (taking it over). What's stored
+    /// replaces what we held, here and in the registry: while another node
+    /// owned the host its sequence may have restarted, and our old cursor
+    /// would skip the new sequence up to it.
     pub async fn load(&self, shard: ShardId) -> anyhow::Result<usize> {
         let (doc, _) = self.read(shard).await?;
-        let mut c = self.cursors.write();
+        let reg = self.registry.get();
+        let (mut c, mut g) = (self.cursors.write(), self.gens.write());
+        let mut r = self.resets.lock();
         for (h, seq) in &doc.cursors {
-            let e = c.entry(Host(h.clone())).or_insert(*seq);
-            *e = (*e).max(*seq);
+            let host = Host(h.clone());
+            if let Some(e) = reg.and_then(|reg| reg.get(&host)) {
+                e.restore_cursor(*seq);
+            }
+            r.remove(&host);
+            g.insert(host.clone(), doc.gens.get(h).copied().unwrap_or(0));
+            c.insert(host, *seq);
         }
+        drop((c, g, r));
+        self.written.lock().remove(&shard);
         Ok(doc.cursors.len())
     }
 
@@ -149,6 +176,10 @@ impl Checkpoints {
     pub fn reset(&self, host: &Host) {
         self.cursors.write().remove(host);
         self.resets.lock().insert(host.clone());
+    }
+
+    fn generation(&self, host: &Host) -> u64 {
+        self.gens.read().get(host).copied().unwrap_or(0)
     }
 
     /// Merges `cursors` into the shard's object. Skips the PUT when nothing
@@ -167,8 +198,20 @@ impl Checkpoints {
         loop {
             let (mut doc, etag) = self.read(shard).await?;
             for (h, seq) in cursors {
-                let e = doc.cursors.entry(h.0.clone()).or_insert(*seq);
-                *e = if resets.contains(h) { *seq } else { (*e).max(*seq) };
+                let (ours, stored) = (self.generation(h), doc.gens.get(&h.0).copied().unwrap_or(0));
+                if resets.contains(h) {
+                    doc.gens.insert(h.0.clone(), ours.max(stored) + 1);
+                    doc.cursors.insert(h.0.clone(), *seq);
+                } else if ours < stored {
+                    // a cursor of a sequence the host has since restarted
+                    continue;
+                } else {
+                    if ours > stored {
+                        doc.gens.insert(h.0.clone(), ours);
+                    }
+                    let e = doc.cursors.entry(h.0.clone()).or_insert(*seq);
+                    *e = (*e).max(*seq);
+                }
             }
             let mode = if etag.is_some() { if_match(etag) } else { PutMode::Create };
             let body = PutPayload::from(serde_json::to_vec(&doc)?);
@@ -180,10 +223,12 @@ impl Checkpoints {
                             r.remove(h);
                         }
                     }
-                    let mut c = self.cursors.write();
+                    let (mut c, mut g) = (self.cursors.write(), self.gens.write());
                     for (h, s) in &doc.cursors {
                         c.insert(Host(h.clone()), *s);
+                        g.insert(Host(h.clone()), doc.gens.get(h).copied().unwrap_or(0));
                     }
+                    drop((c, g));
                     self.written.lock().insert(shard, doc.cursors);
                     return Ok(true);
                 }
@@ -202,12 +247,17 @@ fn is_conflict(e: &object_store::Error) -> bool {
 /// and the checkpoint a previous owner left.
 pub struct ClusterCursors {
     pub checkpoints: Arc<Checkpoints>,
-    pub registry: std::sync::OnceLock<Arc<crate::upstream::Registry>>,
+}
+
+impl ClusterCursors {
+    pub fn set_registry(&self, r: Arc<crate::upstream::Registry>) {
+        let _ = self.checkpoints.registry.set(r);
+    }
 }
 
 impl crate::upstream::CursorSource for ClusterCursors {
     fn durable_cursor(&self, host: &Host) -> Option<i64> {
-        let local = self.registry.get().and_then(|r| r.get(host)).and_then(|e| e.acked_seq());
+        let local = self.checkpoints.registry.get().and_then(|r| r.get(host)).and_then(|e| e.acked_seq());
         local.max(self.checkpoints.get(host))
     }
 

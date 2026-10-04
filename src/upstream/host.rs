@@ -300,6 +300,15 @@ impl HostEntry {
         self.dirty.store(true, Ordering::Relaxed);
     }
 
+    /// The cursor a host shard's checkpoint holds, taken over from another
+    /// node: it replaces ours, which may belong to a sequence the host has
+    /// since restarted.
+    pub(crate) fn restore_cursor(&self, seq: i64) {
+        self.acked_seq.store(seq, Ordering::Relaxed);
+        self.received_seq.store(seq, Ordering::Relaxed);
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
     /// The current socket's epoch.
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)

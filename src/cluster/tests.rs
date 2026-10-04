@@ -695,3 +695,39 @@ async fn a_dropped_caller_keeps_its_shard_open_until_the_stage_answers() {
     release.add_permits(1);
     tokio::time::timeout(Duration::from_secs(5), closing).await.expect("the close finishes").unwrap();
 }
+
+/// Node A held host h at 1,000 when the host moved to B, whose sequence
+/// restart (FutureCursor) set the checkpoint back to 50. A's late write of
+/// its old cursor doesn't push it back up, and A taking the shard again
+/// resumes from 50, not 1,000 (which would skip the new sequence's
+/// events up to it).
+#[tokio::test]
+async fn a_restarted_sequence_survives_a_stale_owners_cursor() {
+    use crate::upstream::{MemHostStore, Registry, Tier};
+    let store = Store::memory(None);
+    let (a, b) = (hosts::Checkpoints::new(store.clone()), hosts::Checkpoints::new(store.clone()));
+    let reg = Arc::new(Registry::new(Arc::new(MemHostStore::default())));
+    let _ = a.registry.set(reg.clone());
+    let h = Host("pds.test".into());
+    let (e, _) = reg.admit(&h, Tier::Default).await.unwrap();
+    let s = ShardId(0);
+    e.ack(1000);
+    a.write(s, &[(h.clone(), 1000)]).await.unwrap();
+
+    b.load(s).await.unwrap();
+    assert_eq!(b.get(&h), Some(1000));
+    b.reset(&h);
+    b.write(s, &[(h.clone(), 50)]).await.unwrap();
+
+    a.write(s, &[(h.clone(), 1100)]).await.unwrap();
+    b.load(s).await.unwrap();
+    assert_eq!(b.get(&h), Some(50), "the stale owner's write was ignored");
+
+    a.load(s).await.unwrap();
+    assert_eq!(a.get(&h), Some(50));
+    assert_eq!(e.acked_seq(), Some(50), "the registry's cursor is the checkpoint's");
+    b.write(s, &[(h.clone(), 60)]).await.unwrap();
+    a.write(s, &[(h.clone(), 70)]).await.unwrap();
+    b.load(s).await.unwrap();
+    assert_eq!(b.get(&h), Some(70), "one generation merges by max again");
+}

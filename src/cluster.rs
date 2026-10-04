@@ -615,7 +615,7 @@ impl ClusterNode {
     /// Hand it the manager's registry once the manager exists.
     pub fn cursor_source(&self) -> Option<Arc<hosts::ClusterCursors>> {
         let ck = self.hosts.as_ref()?.checkpoints.clone();
-        Some(Arc::new(hosts::ClusterCursors { checkpoints: ck, registry: Default::default() }))
+        Some(Arc::new(hosts::ClusterCursors { checkpoints: ck }))
     }
 
     /// True while this node may ack anything as durable.

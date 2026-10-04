@@ -209,7 +209,7 @@ impl Node {
         ucfg.inflight = cfg.inflight;
         let cursors = cluster.cursor_source().expect("a core node has host checkpoints");
         let (manager, rx) = Manager::new(ucfg, hosts.clone(), Some(cursors.clone() as Arc<dyn upstream::CursorSource>));
-        let _ = cursors.registry.set(manager.registry().clone());
+        cursors.set_registry(manager.registry().clone());
         let crawler = upstream::Crawler::new(manager.clone(), upstream::CrawlPolicy::default());
         let _ = setup.cores.0.set(Arc::downgrade(&cluster));
         let hooks = cfg.policy.as_ref().map(|p| {
