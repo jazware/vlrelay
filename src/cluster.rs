@@ -252,8 +252,9 @@ impl Gate {
     }
 }
 
-/// A supervisor's stop timeout (docker's 10 s) leaves this much for it.
-const PEER_FENCE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Inside a supervisor's stop timeout, and before our watchdog's fail-stop
+/// when our lease lapsed.
+const PEER_FENCE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub type KeyHook = Arc<dyn Fn(Vec<String>) + Send + Sync>;
 pub type LostHook = Box<dyn FnOnce(&str) + Send>;
@@ -804,35 +805,52 @@ impl ClusterNode {
 
     /// A graceful leave: hands host shards over (closing sockets and
     /// checkpointing first), then vlpds's shutdown hands the DID shards
-    /// over, quiesces and fences our log, and deletes our lease.
+    /// over, quiesces and fences our log, and deletes our lease. A leave
+    /// that can't finish (our own fence failed, or our lease lapsed under
+    /// it: our bucket path is broken) asks a peer to fence our log, so
+    /// peers take over at once instead of after our lease goes quiet.
     pub async fn shutdown(self: &Arc<Self>) -> anyhow::Result<()> {
         if let (Some(c), Some(h)) = (&self.cluster, &self.hosts) {
-            // peers that still count us as a member hand host shards back
-            // to us while we hand them out
-            let host: Arc<dyn ShardHost> = self.clone();
-            c.announce_drain(&host).await;
-            self.announce_leaving(&c.log_id).await;
-            let mut members = self.members();
-            for m in members.iter_mut().filter(|m| m.node_id == self.node_id) {
-                m.draining = true;
-            }
-            if c.lease_valid() {
-                match h.step(&members).await {
-                    Ok((_, nudges)) => self.nudge_hosts(nudges).await,
-                    Err(e) => tracing::warn!("handing host shards over failed: {e:#}"),
+            let leave = async {
+                // peers that still count us as a member hand host shards back
+                // to us while we hand them out
+                let host: Arc<dyn ShardHost> = self.clone();
+                c.announce_drain(&host).await;
+                self.announce_leaving(&c.log_id).await;
+                let mut members = self.members();
+                for m in members.iter_mut().filter(|m| m.node_id == self.node_id) {
+                    m.draining = true;
                 }
-            }
-            if let Err(e) = h.checkpoint().await {
-                tracing::warn!("final host checkpoint failed: {e:#}");
-            }
-            if let Err(e) = c.shutdown(&host).await {
-                // Our shards are handed over; only the fence is missing, and
-                // without it every peer's merge waits on our watermark until
-                // our lease goes quiet. A peer's bucket path may be fine.
+                if c.lease_valid() {
+                    match h.step(&members).await {
+                        Ok((_, nudges)) => self.nudge_hosts(nudges).await,
+                        Err(e) => tracing::warn!("handing host shards over failed: {e:#}"),
+                    }
+                }
+                if let Err(e) = h.checkpoint().await {
+                    tracing::warn!("final host checkpoint failed: {e:#}");
+                }
+                c.shutdown(&host).await
+            };
+            let doomed = async {
+                let mut lapsed = 0u32;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    lapsed = if c.lease_valid() { 0 } else { lapsed + 1 };
+                    if lapsed >= 3 {
+                        return anyhow::anyhow!("our lease lapsed during the leave");
+                    }
+                }
+            };
+            let r = tokio::select! {
+                r = leave => r,
+                e = doomed => Err(e),
+            };
+            if let Err(e) = r {
                 if !self.peers_fence(&c.log_id).await {
                     return Err(e);
                 }
-                tracing::warn!("a peer fenced our log after our own fence failed ({e:#}): left");
+                tracing::warn!("a peer fenced our log after our leave failed ({e:#}): left");
             }
         }
         self.stop.store(true, Ordering::Release);
