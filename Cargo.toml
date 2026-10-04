@@ -77,14 +77,22 @@ incremental = true
 [profile.dev-release.package."*"]
 opt-level = 3
 
+# The relay crate itself at opt-level 0 with line tables: an edit in a
+# vlpds-sized crate rebuilds and links in ~4 s this way against ~45 s at
+# opt-level 1-2 (docs/devloop.md "Build speed"). Dependencies stay at 2, so
+# crypto, CBOR and the MST aren't slow in dev runs. Only this crate's
+# settings change, so switching rebuilds no dependency.
 [profile.dev]
-opt-level = 1
+opt-level = 0
+
+[profile.dev.package.vlrelay]
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2
 
 [profile.test]
-opt-level = 1
+opt-level = 0
 debug = 0
 lto = false
 codegen-units = 256

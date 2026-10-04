@@ -7,14 +7,14 @@
 # MODULE (a new pub fn with a fresh constant, so codegen and the link really
 # happen). Prints the median seconds. The module is restored afterwards.
 #
-# Env: MODULE (src/seq.rs), REPS (3), STEPS ("check build test-build"),
-# and anything cargo reads (RUSTFLAGS, CARGO_TARGET_DIR, CARGO_PROFILE_*).
+# Env: MODULE (src/seq.rs), REPS (3), STEPS ("check build test-build link-big"),
+# BUILD_ARGS (extra cargo build flags, e.g. --config ...), and anything cargo reads (RUSTFLAGS, CARGO_TARGET_DIR, CARGO_PROFILE_*).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 label=${1:-default}
 module=${MODULE:-src/seq.rs}
 reps=${REPS:-3}
-steps=${STEPS:-check build test-build}
+steps=${STEPS:-check build test-build link-big}
 backup=$(mktemp)
 cp "$module" "$backup"
 trap 'cp "$backup" "$module"; rm -f "$backup"' EXIT
@@ -23,8 +23,11 @@ now() { perl -MTime::HiRes=time -e 'printf "%.3f", time'; }
 run_step() {
   case $1 in
     check) cargo check --quiet --bin vlrelay ;;
-    build) cargo build --quiet --bin vlrelay ;;
+    build) cargo build --quiet ${BUILD_ARGS:-} --bin vlrelay ;;
     test-build) cargo test --quiet --no-run --lib 2>/dev/null ;;
+    # a full-size binary: vlpds's main.rs recompiled and everything linked,
+    # which is what an edit costs once the relay links all of vlpds
+    link-big) touch ../vlpds/src/main.rs && cargo build --quiet ${BUILD_ARGS:-} -p vlpds --bin vlpds ;;
   esac
 }
 median() { sort -n | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}'; }

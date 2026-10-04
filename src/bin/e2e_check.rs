@@ -90,9 +90,26 @@ impl Kind {
 }
 
 enum Msg {
-    Event { side: Side, src: usize, did: String, kind: Kind, base: String, rev: Option<String>, seq: i64, at: Instant },
-    Other { side: Side, src: usize, what: String },
-    Status { side: Side, src: usize, what: String },
+    Event {
+        side: Side,
+        src: usize,
+        did: String,
+        kind: Kind,
+        base: String,
+        rev: Option<String>,
+        seq: i64,
+        at: Instant,
+    },
+    Other {
+        side: Side,
+        src: usize,
+        what: String,
+    },
+    Status {
+        side: Side,
+        src: usize,
+        what: String,
+    },
 }
 
 fn subscribe_url(s: &str) -> String {
@@ -106,18 +123,26 @@ fn subscribe_url(s: &str) -> String {
     } else {
         format!("wss://{s}")
     };
-    if s.contains("/xrpc/") { s } else { format!("{s}/xrpc/com.atproto.sync.subscribeRepos") }
+    if s.contains("/xrpc/") {
+        s
+    } else {
+        format!("{s}/xrpc/com.atproto.sync.subscribeRepos")
+    }
 }
 
 fn http_origin(s: &str) -> String {
     let u = subscribe_url(s);
     let u = u.split("/xrpc/").next().unwrap_or(&u).to_string();
-    u.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1)
+    u.replacen("wss://", "https://", 1)
+        .replacen("ws://", "http://", 1)
 }
 
 /// What identifies an event across a relay, or None for frames that don't
 /// take part (#info, unknown types).
-fn classify(frame: &[u8]) -> Result<Option<(String, Kind, String, Option<String>, i64)>, String> {
+/// (did, kind, cross-relay key, rev, seq)
+type Classified = (String, Kind, String, Option<String>, i64);
+
+fn classify(frame: &[u8]) -> Result<Option<Classified>, String> {
     let (hdr, n) = ValueRef::decode_prefix(frame).map_err(|e| format!("header: {e}"))?;
     let op = match hdr.get("op") {
         Some(ValueRef::Int(i)) => *i,
@@ -135,7 +160,9 @@ fn classify(frame: &[u8]) -> Result<Option<(String, Kind, String, Option<String>
         _ => 0,
     };
     let s = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
-    let Some(did) = s("repo").or_else(|| s("did")) else { return Ok(None) };
+    let Some(did) = s("repo").or_else(|| s("did")) else {
+        return Ok(None);
+    };
     Ok(Some(match t {
         "#commit" => {
             let rev = s("rev").unwrap_or_default();
@@ -163,7 +190,13 @@ fn classify(frame: &[u8]) -> Result<Option<(String, Kind, String, Option<String>
         "#account" => {
             let active = matches!(body.get("active"), Some(ValueRef::Bool(true)));
             let status = s("status").unwrap_or_else(|| "-".into());
-            (did, Kind::Account, format!("a:{active}:{status}"), None, seq)
+            (
+                did,
+                Kind::Account,
+                format!("a:{active}:{status}"),
+                None,
+                seq,
+            )
         }
         _ => return Ok(None),
     }))
@@ -181,7 +214,11 @@ async fn subscribe(side: Side, src: usize, base: String, tx: mpsc::UnboundedSend
         let tls = tokio_tungstenite::Connector::Rustls(tls_config());
         match tokio_tungstenite::connect_async_tls_with_config(&u, None, false, Some(tls)).await {
             Ok((mut ws, _)) => {
-                let _ = tx.send(Msg::Status { side, src, what: format!("connected {u}") });
+                let _ = tx.send(Msg::Status {
+                    side,
+                    src,
+                    what: format!("connected {u}"),
+                });
                 backoff = Duration::from_millis(250);
                 while let Some(m) = ws.next().await {
                     let at = Instant::now();
@@ -192,12 +229,20 @@ async fn subscribe(side: Side, src: usize, base: String, tx: mpsc::UnboundedSend
                             continue;
                         }
                         Ok(Message::Close(f)) => {
-                            let _ = tx.send(Msg::Status { side, src, what: format!("closed: {f:?}") });
+                            let _ = tx.send(Msg::Status {
+                                side,
+                                src,
+                                what: format!("closed: {f:?}"),
+                            });
                             break;
                         }
                         Ok(_) => continue,
                         Err(e) => {
-                            let _ = tx.send(Msg::Status { side, src, what: format!("read error: {e}") });
+                            let _ = tx.send(Msg::Status {
+                                side,
+                                src,
+                                what: format!("read error: {e}"),
+                            });
                             break;
                         }
                     };
@@ -206,7 +251,19 @@ async fn subscribe(side: Side, src: usize, base: String, tx: mpsc::UnboundedSend
                             if seq > 0 {
                                 cursor = Some(seq);
                             }
-                            if tx.send(Msg::Event { side, src, did, kind, base, rev, seq, at }).is_err() {
+                            if tx
+                                .send(Msg::Event {
+                                    side,
+                                    src,
+                                    did,
+                                    kind,
+                                    base,
+                                    rev,
+                                    seq,
+                                    at,
+                                })
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -218,7 +275,11 @@ async fn subscribe(side: Side, src: usize, base: String, tx: mpsc::UnboundedSend
                 }
             }
             Err(e) => {
-                let _ = tx.send(Msg::Status { side, src, what: format!("connect {u}: {e}") });
+                let _ = tx.send(Msg::Status {
+                    side,
+                    src,
+                    what: format!("connect {u}: {e}"),
+                });
             }
         }
         tokio::time::sleep(backoff).await;
@@ -228,7 +289,9 @@ async fn subscribe(side: Side, src: usize, base: String, tx: mpsc::UnboundedSend
 
 /// Every DID an upstream hosts (com.atproto.sync.listRepos), for --scope hosted.
 async fn list_repos(origin: &str) -> anyhow::Result<Vec<String>> {
-    let c = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let c = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
     let mut out = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -243,7 +306,9 @@ async fn list_repos(origin: &str) -> anyhow::Result<Vec<String>> {
             }
         }
         match r["cursor"].as_str() {
-            Some(c) if !r["repos"].as_array().is_none_or(|a| a.is_empty()) => cursor = Some(c.to_string()),
+            Some(c) if !r["repos"].as_array().is_none_or(|a| a.is_empty()) => {
+                cursor = Some(c.to_string())
+            }
             _ => return Ok(out),
         }
     }
@@ -290,10 +355,17 @@ fn rustls_provider() {
 /// webpki roots set here rather than through a tungstenite feature: a
 /// feature change would rebuild tungstenite and, behind it, vlpds.
 fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
-    static CFG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
+    static CFG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> =
+        std::sync::OnceLock::new();
     CFG.get_or_init(|| {
-        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        std::sync::Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth())
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        std::sync::Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
     })
     .clone()
 }
@@ -333,7 +405,12 @@ async fn main() -> anyhow::Result<()> {
     let start = Instant::now();
     let warm_end = start + Duration::from_secs(args.warmup);
     let collect_end = start + Duration::from_secs(args.duration);
-    let end = collect_end + if relay_on { Duration::from_secs(args.settle) } else { Duration::ZERO };
+    let end = collect_end
+        + if relay_on {
+            Duration::from_secs(args.settle)
+        } else {
+            Duration::ZERO
+        };
 
     let mut dids: HashMap<String, DidState> = HashMap::new();
     let mut waiting: HashMap<(String, String), Waiting> = HashMap::new();
@@ -386,18 +463,35 @@ async fn main() -> anyhow::Result<()> {
             }
             Msg::Other { side, src, what } => {
                 bad_frames += 1;
-                note("bad frames", format!("{}: {what}", name(side, src)), args.show);
+                note(
+                    "bad frames",
+                    format!("{}: {what}", name(side, src)),
+                    args.show,
+                );
                 continue;
             }
-            Msg::Event { side, src, did, kind, base, rev, seq, at } => (side, src, did, kind, base, rev, seq, at),
+            Msg::Event {
+                side,
+                src,
+                did,
+                kind,
+                base,
+                rev,
+                seq,
+                at,
+            } => (side, src, did, kind, base, rev, seq, at),
         };
         if seq > 0 {
             let k = (side == Side::Up, src);
-            if let Some(&prev) = last_seq.get(&k) {
-                if seq <= prev {
-                    seq_regressions += 1;
-                    note("seq regressions", format!("{}: seq {seq} after {prev}", name(side, src)), args.show);
-                }
+            if let Some(&prev) = last_seq.get(&k)
+                && seq <= prev
+            {
+                seq_regressions += 1;
+                note(
+                    "seq regressions",
+                    format!("{}: seq {seq} after {prev}", name(side, src)),
+                    args.show,
+                );
             }
             last_seq.insert(k, seq);
         }
@@ -415,7 +509,11 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         let st = dids.entry(did.clone()).or_default();
-        let occ_map = if side == Side::Up { &mut st.up_occ } else { &mut st.relay_occ };
+        let occ_map = if side == Side::Up {
+            &mut st.up_occ
+        } else {
+            &mut st.relay_occ
+        };
         let occ = occ_map.entry(base.clone()).or_insert(0);
         let seen_before = *occ > 0;
         *occ += 1;
@@ -426,23 +524,31 @@ async fn main() -> anyhow::Result<()> {
             }
             continue;
         }
-        let key = if matches!(kind, Kind::Commit | Kind::Sync) { base.clone() } else { format!("{base}#{}", *occ - 1) };
+        let key = if matches!(kind, Kind::Commit | Kind::Sync) {
+            base.clone()
+        } else {
+            format!("{base}#{}", *occ - 1)
+        };
         let c = counts.entry(kind).or_default();
         match side {
             Side::Up => c.up += 1,
             Side::Relay => c.relay += 1,
         }
-        if side == Side::Relay {
-            if let Some(rev) = &rev {
-                if let Some(prev) = &st.relay_last_rev {
-                    // a #sync restates the current rev (e.g. on reactivation)
-                    if rev < prev || (rev == prev && kind == Kind::Commit) {
-                        rev_regressions += 1;
-                        note("rev regressions", format!("{did}: rev {rev} after {prev}"), args.show);
-                    }
+        if side == Side::Relay
+            && let Some(rev) = &rev
+        {
+            if let Some(prev) = &st.relay_last_rev {
+                // a #sync restates the current rev (e.g. on reactivation)
+                if rev < prev || (rev == prev && kind == Kind::Commit) {
+                    rev_regressions += 1;
+                    note(
+                        "rev regressions",
+                        format!("{did}: rev {rev} after {prev}"),
+                        args.show,
+                    );
                 }
-                st.relay_last_rev = Some(rev.clone());
             }
+            st.relay_last_rev = Some(rev.clone());
         }
         let pos = if side == Side::Up {
             st.up_pos += 1;
@@ -456,7 +562,11 @@ async fn main() -> anyhow::Result<()> {
         let wk = (did.clone(), key);
         match waiting.remove(&wk) {
             Some(w) if w.side != side => {
-                let (up_at, up_pos) = if side == Side::Up { (at, pos) } else { (w.at, w.pos) };
+                let (up_at, up_pos) = if side == Side::Up {
+                    (at, pos)
+                } else {
+                    (w.at, w.pos)
+                };
                 let re_at = if side == Side::Up { w.at } else { at };
                 if up_at >= warm_end {
                     let us = if re_at >= up_at {
@@ -466,7 +576,10 @@ async fn main() -> anyhow::Result<()> {
                         0
                     };
                     lat.saturating_record(us.max(1));
-                    lat_kind.entry(kind).or_insert_with(hist).saturating_record(us.max(1));
+                    lat_kind
+                        .entry(kind)
+                        .or_insert_with(hist)
+                        .saturating_record(us.max(1));
                 }
                 counts.entry(kind).or_default().matched += 1;
                 if side == Side::Relay {
@@ -482,7 +595,15 @@ async fn main() -> anyhow::Result<()> {
                 waiting.insert(wk, w);
             }
             None => {
-                waiting.insert(wk, Waiting { side, at, kind, pos });
+                waiting.insert(
+                    wk,
+                    Waiting {
+                        side,
+                        at,
+                        kind,
+                        pos,
+                    },
+                );
             }
         }
     }
@@ -504,15 +625,36 @@ async fn main() -> anyhow::Result<()> {
 
     let tot = |f: fn(&KindCounts) -> u64| counts.values().map(f).sum::<u64>();
     let (missing, extra) = (tot(|c| c.missing), tot(|c| c.extra));
-    let commit_extra = counts.get(&Kind::Commit).map_or(0, |c| c.extra) + counts.get(&Kind::Sync).map_or(0, |c| c.extra);
+    let commit_extra = counts.get(&Kind::Commit).map_or(0, |c| c.extra)
+        + counts.get(&Kind::Sync).map_or(0, |c| c.extra);
     let secs = args.duration as f64;
-    println!("e2e_check: {} upstream(s), {} relay stream(s), {secs:.0}s + {}s settle", args.upstreams.len(), args.relays.len(), if relay_on { args.settle } else { 0 });
-    println!("  {:<10} {:>9} {:>9} {:>9} {:>8} {:>8}", "kind", "upstream", "relay", "matched", "missing", "extra");
+    println!(
+        "e2e_check: {} upstream(s), {} relay stream(s), {secs:.0}s + {}s settle",
+        args.upstreams.len(),
+        args.relays.len(),
+        if relay_on { args.settle } else { 0 }
+    );
+    println!(
+        "  {:<10} {:>9} {:>9} {:>9} {:>8} {:>8}",
+        "kind", "upstream", "relay", "matched", "missing", "extra"
+    );
     for k in Kind::ALL {
         let c = counts.get(&k).copied().unwrap_or_default();
-        println!("  {:<10} {:>9} {:>9} {:>9} {:>8} {:>8}", k.name(), c.up, c.relay, c.matched, c.missing, c.extra);
+        println!(
+            "  {:<10} {:>9} {:>9} {:>9} {:>8} {:>8}",
+            k.name(),
+            c.up,
+            c.relay,
+            c.matched,
+            c.missing,
+            c.extra
+        );
     }
-    println!("  upstream rate {:.0} ev/s, DIDs {}", tot(|c| c.up) as f64 / secs, dids.len());
+    println!(
+        "  upstream rate {:.0} ev/s, DIDs {}",
+        tot(|c| c.up) as f64 / secs,
+        dids.len()
+    );
     if relay_on {
         println!(
             "  latency upstream->relay: p50 {:.2} ms  p90 {:.2} ms  p99 {:.2} ms  max {:.2} ms  (n={}, relay-first {relay_first})",
@@ -526,7 +668,9 @@ async fn main() -> anyhow::Result<()> {
             "  out of order per DID {out_of_order}, rev regressions {rev_regressions}, duplicates {duplicates}, seq regressions {seq_regressions}, out of scope {out_of_scope}, bad frames {bad_frames}"
         );
     } else {
-        println!("  (no --relay: upstreams only) seq regressions {seq_regressions}, bad frames {bad_frames}");
+        println!(
+            "  (no --relay: upstreams only) seq regressions {seq_regressions}, bad frames {bad_frames}"
+        );
     }
     let mut keys: Vec<_> = examples.keys().copied().collect();
     keys.sort();
@@ -564,7 +708,12 @@ async fn main() -> anyhow::Result<()> {
         std::fs::write(path, serde_json::to_vec_pretty(&j)?)?;
     }
 
-    let failed = relay_on && (missing > 0 || commit_extra > 0 || out_of_order > 0 || rev_regressions > 0 || duplicates > 0);
+    let failed = relay_on
+        && (missing > 0
+            || commit_extra > 0
+            || out_of_order > 0
+            || rev_regressions > 0
+            || duplicates > 0);
     let empty = tot(|c| c.up) == 0;
     if empty {
         eprintln!("e2e_check: no upstream events at all (is anything writing?)");

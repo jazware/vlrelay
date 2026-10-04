@@ -46,7 +46,6 @@ trap cleanup EXIT
 
 dev/up.sh
 mkdir -p "$out"
-hosts=$(cat dev/state/hosts)
 up_flags=$(sed 's/^/--upstream /' dev/state/hosts | tr '\n' ' ')
 "$target/devnet" seed --accounts "$accounts" $(sed 's/^/--host /' dev/state/hosts | tr '\n' ' ')
 
