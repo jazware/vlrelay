@@ -43,6 +43,17 @@ Without `--memory`, the four `--s3-*` values are required. Every node of a clust
 | `--dev-mode` |  |  | Allows plain ws://, IPs, localhost and ports for upstreams and DID documents. Implied by an http:// --host or a loopback --plc-url |
 | `--did-lookups-per-sec <DID_LOOKUPS_PER_SEC>` |  | `50` | DID document fetches per second, all DIDs together |
 
+## PLC export seeding
+
+A cold relay would resolve each of ~56M accounts once at the PLC lookup budget (about 31 h at 500/s). With `--plc-export` it reads the directory's `/export` instead and keeps each did:plc's key and PDS in its DID shard, so a cache miss costs no lookup. The cursors checkpoint to `plc/export-checkpoint.json` in the bucket, so a restart resumes; once caught up it follows the export's tail. A signature that fails against a seeded key, and every `#identity`, still resolve from PLC ([Policy](../policy.md#plc-export-seeding)).
+
+| Flag | Env | Default | What |
+|---|---|---|---|
+| `--plc-export` | `VLRELAY_PLC_EXPORT` |  | Seed DID documents from the PLC directory's /export (resumable, then follows its tail), so a cold relay doesn't resolve each account. On a cluster the lowest-named live core reads it |
+| `--plc-export-url <PLC_EXPORT_URL>` | `VLRELAY_PLC_EXPORT_URL` |  | The directory --plc-export reads (default: --plc-url) |
+| `--plc-export-rate <PLC_EXPORT_RATE>` |  | `2` | /export requests per second, all streams together |
+| `--plc-export-streams <PLC_EXPORT_STREAMS>` |  | `4` | Time windows of the export read side by side on a fresh start |
+
 ## Log
 
 Time to firehose is about linger plus one segment PUT. Above ~50k events/s segments seal on size before the linger is up ([Performance](../perf.md)).

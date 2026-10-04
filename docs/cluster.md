@@ -40,6 +40,7 @@ Locally, `just e2e-cluster` runs three cores, an edge and a replica (docs/devloo
 - The admin's cluster view (`Glue::view`) is the real cluster: members from the leases, host and DID shard owners from the assignments. Rates, consumers and hosts are filled in for this node only.
 - A checkpoint tick (2 s) re-reads `hostck/`, prunes the dedupe set, writes each open shard's applied marker for our log, flushes host counters, and reloads the registry.
 - The sync API's repo endpoints answer for the DID shards this node holds. Hosts come from the bucket.
+- With `--plc-export`, the lowest-named live core reads the PLC export and forwards each batch to the DID owners (`/internal/relay/v1/plc/apply` and `.../flush`), and a host stage that misses its DID document cache asks the DID's owner for its seed (`.../plc/pick`) before it resolves ([Policy](policy.md#plc-export-seeding)).
 
 ### Restart dedupe in a cluster
 

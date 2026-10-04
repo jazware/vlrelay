@@ -1072,6 +1072,29 @@ impl Node {
             metrics::DURABLE_LAG.set(lag_ms as i64);
             let consumers = vlpds::metrics::FIREHOSE_SUBSCRIBERS.get();
             metrics::CONSUMERS.set(consumers);
+            let st = &self.identity.stats;
+            for (k, v) in [("hit", &st.hits), ("seeded", &st.seeded), ("fetched", &st.fetches)] {
+                metrics::IDENTITY_LOOKUPS.with_label_values(&[k]).set(v.load(Ordering::Relaxed) as i64);
+            }
+            if let Some(ing) = self.plc_ingest.get() {
+                let s = &ing.stats;
+                for (k, v) in [
+                    ("requests", &s.requests),
+                    ("pages", &s.pages),
+                    ("ops", &s.ops),
+                    ("bytes", &s.bytes),
+                    ("written", &s.written),
+                    ("nullified", &s.nullified),
+                    ("invalid", &s.invalid),
+                    ("throttled", &s.throttled),
+                    ("errors", &s.errors),
+                    ("restarts", &s.restarts),
+                ] {
+                    metrics::PLC_EXPORT.with_label_values(&[k]).set(v.load(Ordering::Relaxed) as i64);
+                }
+                metrics::PLC_EXPORT.with_label_values(&["caught_up"]).set(s.caught_up.load(Ordering::Relaxed) as i64);
+                metrics::PLC_EXPORT.with_label_values(&["newest"]).set((s.newest_ms.load(Ordering::Relaxed) / 1000) as i64);
+            }
             let mut by_status: HashMap<&'static str, i64> = HashMap::new();
             for h in &hosts {
                 *by_status.entry(admin::host_status_label(h)).or_default() += 1;

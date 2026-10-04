@@ -92,6 +92,63 @@ The state host record. The policy engine writes it (operator actions through `Po
 
 `node::admin::NodeAdmin` forwards policy, domain rules, cases and every host action but `reconnect` to `PolicyAdmin`, then applies the host's new policy to its socket right away. `GET/PUT policy/full`, `GET domain-rules/audit` and `GET cases/{id}/evidence` carry the whole document, the rules' audit log and a case's evidence.
 
+## PLC export seeding
+
+`src/plc_seed.rs` and `src/plc_seed/`. With `--plc-export`, the relay reads the PLC directory's `/export` (JSON lines, 1,000 ops a request, `after=<createdAt>` cursors) and keeps, per did:plc, the latest op's `#atproto` key, its `atproto_pds` host, whether it's a tombstone, and the op's `createdAt`. A DID document cache miss then costs no PLC lookup.
+
+### Reading
+
+- History is split into `--plc-export-streams` time windows (4), each with its own cursor, read side by side. One cursor is bound by a page's round trip (0.64 s for 1,000 ops from plc.directory, measured), so windows let `--plc-export-rate` (2 requests/s, all windows together) set the pace. The last window has no end: once every other window is done and it reads a short page, it's the live tail, polled every 2 s.
+- `after` is exclusive and ops can share a millisecond across a page boundary, so a window asks from a millisecond before the newest op it read and skips the DIDs it already read at that millisecond.
+- 429 and 5xx back off (1 s doubling to 2 min, or the `Retry-After`). Errors and the pace are counted in `vlrelay_plc_export{what}`, and `vlrelay_identity_lookups{outcome="seeded"}` counts the misses it saved.
+- The cursors and per-window counts checkpoint to `plc/export-checkpoint.json` every 10 s, after the sink has flushed every entry before them to the shards (they run without a WAL). A restart re-reads at most that interval. Any sink error ends the run and the supervisor resumes from the checkpoint.
+
+### Validation
+
+Kept thin on purpose. A line must be a well-formed op of a known type (vlpds's `plc::op_type`, strict about fields) for a valid did:plc, with a parseable `createdAt`. Nullified ops are skipped (the later recovery op replaces them). A key the relay can't parse leaves the entry without one, which means "resolve". The op chain isn't checked: checking each op's signature against the previous op's rotation keys needs those keys per DID (~70 bytes more each) and the 72 h recovery-fork rules, and buys little here, since every commit is still verified against the seeded key and a failure re-resolves from PLC.
+
+### Where it's kept
+
+`0x03 ‖ slot ‖ DID` rows in the DID shard's SlateDB, beside the state records' `0x01` (so `listRepos` scans never walk them), written by the shard's owner: version, flags, `createdAt` (varint ms), the key's multicodec bytes and the PDS host. A write keeps the newer `createdAt`, so an op the export repeats or delivers late doesn't replace a newer one.
+
+In a cluster, the lowest-named live core reads the export and forwards each batch to the DID owners (`plc_seed::peer`, `POST /internal/relay/v1/plc/apply`, then `.../flush` before a checkpoint). The alternative, every owner filtering the whole stream for its slots, costs plc.directory and every node N times the requests and bytes. A leadership change can briefly leave two readers; both write the same ops, and the checkpoint at worst sends the next reader back a few seconds. A split/merge clone must project `0x03` as it must the host rows' `0x02`.
+
+### Using it
+
+The DID document cache asks its seeder on a miss, before it spends any budget (not on a forced refresh). The seeder weighs the DID's state record against its export entry (`plc_seed::choose`):
+
+| State record | Export entry | Used |
+|---|---|---|
+| resolved within the cache TTL (1 h) | none, or an older op | the record |
+| resolved within the TTL | a newer op (a tie goes to the op) | the entry |
+| none, or older than the TTL and agreeing | any age | the entry |
+| an `#identity` not resolved since (`fetched_at` 0), op older than the TTL | | resolve |
+| resolved after the op with another key or PDS, op older than the TTL | | resolve |
+| older than the TTL | none or a tombstone | resolve |
+
+A host stage that doesn't hold the DID asks the owner (`GET /internal/relay/v1/plc/pick`, 1 s timeout; a failure means resolve). An `#identity` still forces a fresh resolve, which stamps the record, so an `#identity` newer than the export wins. A signature that fails against a seeded key refreshes from PLC as before. When a write changes a DID's key or PDS (or the op is recent enough to postdate a cached copy), its owner drops the DID from its cache and tells its peers to, so a rotation the tail picks up reaches the next lookup.
+
+### Numbers
+
+`plc_seed::tests` against fakepds's fake export (`src/fakepds/export.rs`: the fleet's DIDs, one genesis op each, then appended ops; pagination and a tail like plc.directory's), one process, debug build of the relay crate:
+
+| | |
+|---|---|
+| Ingest, 100,000 DIDs in 150 pages | 2.5 s: 39,900 ops/s, 20 MB/s (the fake serves its own pages from the same process) |
+| Stored per DID | 79 bytes raw (19-byte key, value), 52 bytes in the shards' SSTs after compression |
+| Their first commits after seeding | 100,000 accepted, 0 PLC document fetches |
+| Restart after a quarter (4,996 of 20,000 ops) | resumed from both windows' cursors and read the other 15,005 (one op twice, at a millisecond boundary) |
+
+The relay isn't the limit, plc.directory is. Its pages measured 515 KB (2022 ops, legacy `create`), 711 KB (2024) and 934 KB (2026), about 0.7 KB an op, so the ~80M ops behind 56M DIDs (an estimate: ~1.4 ops a DID) are ~56 GB. Cold start at 1,000 ops a request:
+
+| `--plc-export-rate` | Cold start | Download |
+|---|---|---|
+| 1/s | 22 h | 0.7 MB/s |
+| 2/s (default) | 11 h | 1.4 MB/s |
+| 5/s | 4.4 h | 3.5 MB/s |
+
+Each request needs a window to carry it, about rate × 0.64 s of them, so 4 windows cover up to ~6/s. The windows are even in time, not in ops, so the heavy 2023-2024 windows finish last. Real accounts' PDS hosts are ~35 characters against the fake's ~15, so expect ~100 bytes raw per DID: ~5.6 GB raw, ~3 GB in SSTs for 56M. The rates plc.directory allows aren't documented; start at the default and watch `vlrelay_plc_export{what="throttled"}`.
+
 ## Spam counting
 
 Each threshold has a fixed-size Space-Saving table: `spam.trackHosts` keys per host rule (1,024) and `spam.trackAccounts` per account rule (8,192), over a sliding window. A new key replaces the lightest one and inherits its count as error, so any key above total/capacity stays in the table. Thresholds are checked against `count - error`, which never overstates a key, so churn through thousands of quiet hosts can't trip a false positive. A key trips at most once per window.
@@ -105,7 +162,7 @@ Actions are `alert` (log only), `case`, `throttle` and `throttle-and-case`. A pe
 - `engine.consumer_limits()` isn't enforced by `serve.rs` yet (connections per IP, consumers per node, the slow-consumer cutoff and the backfill limit come from vlpds's firehose options).
 - `LiveNodes` is `FixedNodes(1)`. The cluster module should pass one over its node leases.
 - A relay-throttled account stays throttled until an operator lifts it, even after its host drops below its cap.
-- A cold start resolves every account once at the PLC budget, so 56M accounts at the default 500/s take about 31 hours. Seeding from another relay's DID cache would shorten that.
+- Without `--plc-export`, a cold start resolves every account once at the PLC budget, so 56M accounts at the default 500/s take about 31 hours. With it, the export takes about 11 hours at the default 2 requests/s (below), off the lookup budget, and only did:web accounts and DIDs the export hasn't reached yet spend lookups. The export read itself can't go faster than plc.directory lets it.
 - The account cap and the per-host new-account rate are per node, so a host shard that moves starts them over from the record's count.
 - Peer nudges after a save aren't sent. Peers pick changes up within 10 s.
 - The new-hosts counter is per UTC day. indigo uses a sliding 24 h window.
