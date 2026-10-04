@@ -89,19 +89,25 @@ struct RunArgs {
     emit_threads: usize,
     #[arg(long, default_value_t = 5)]
     tick_ms: u64,
-    /// Pre-built events kept ahead of the stream, MB per process.
-    #[arg(long, default_value_t = 1024)]
-    pool_mb: usize,
+    /// Pre-built events kept ahead of the stream, MB per process (default:
+    /// room for pregen-secs of the target rate, plus a quarter).
+    #[arg(long)]
+    pool_mb: Option<usize>,
     /// Wait until this many seconds of events are pre-built before streaming.
-    #[arg(long, default_value_t = 5.0)]
+    #[arg(long, default_value_t = 2.0)]
     pregen_secs: f64,
     /// Emitted frames kept for cursor replay, MB per process.
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = 256)]
     replay_mb: usize,
+    /// How far (seconds) a subscriber may fall behind live before it gets
+    /// ConsumerTooSlow. Frames this recent stay in memory either way.
+    #[arg(long, default_value_t = 1.0)]
+    lag_secs: f64,
     #[arg(long, default_value_t = 50)]
     initial_records: usize,
-    /// Records per account above which deletes outpace creates.
-    #[arg(long, default_value_t = 200)]
+    /// Records per account above which deletes outpace creates. Memory is
+    /// ~250 bytes per record, so accounts x this bounds the trees.
+    #[arg(long, default_value_t = 100)]
     target_records: usize,
     #[arg(long, default_value_t = 5200.0)]
     size_p50: f64,
@@ -146,8 +152,13 @@ struct ConsumeArgs {
     #[command(flatten)]
     fleet: FleetArgs,
     /// http(s) or ws(s) origin of a host. Repeatable.
-    #[arg(long = "host", required = true)]
+    #[arg(long = "host")]
     hosts: Vec<String>,
+    /// Also every fleet host `first..first+count` at advertise:port-base+g.
+    #[arg(long, default_value_t = 0)]
+    count: u32,
+    #[arg(long, default_value_t = 0)]
+    first: u32,
     #[arg(long)]
     cursor: Option<i64>,
     #[arg(long, default_value_t = 30)]
@@ -201,8 +212,9 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
         faults: faults.clone(),
         weights: w.clone(),
     });
+    let pool_bytes = a.pool_mb.map_or(a.rate * a.size_p50 * 1.1 * a.pregen_secs.max(0.5) * 1.25, |m| (m << 20) as f64);
     let queues: Arc<Vec<Arc<HostQueue>>> =
-        Arc::new(w.iter().map(|x| Arc::new(HostQueue::new(((a.pool_mb << 20) as f64 * x / wsum) as usize))).collect());
+        Arc::new(w.iter().map(|x| Arc::new(HostQueue::new((pool_bytes * x / wsum) as usize))).collect());
 
     let t0 = Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
@@ -222,10 +234,13 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
     // hosts and listeners come up first, so a relay can connect early
     let ring_cap = |x: f64| ((a.replay_mb << 20) as f64 * x / wsum) as usize;
     let tick = Duration::from_millis(a.tick_ms.max(1));
-    let bcap = (60_000 / a.tick_ms.max(1)) as usize;
+    let ticks_per_s = 1000.0 / a.tick_ms.max(1) as f64;
     let mut hosts = Vec::new();
     for l in 0..a.hosts as usize {
         let g = a.host_base + l as u32;
+        // a stalled host's subscribers fall behind by the whole stall
+        let lag = a.lag_secs + faults[l].stall.map_or(0.0, |(secs, _)| secs);
+        let bcap = ((lag * ticks_per_s) as usize).max(16);
         let h = HostState::new(g, layout.clone(), faults[l].clone(), queues[l].clone(), ring_cap(w[l]), bcap);
         let addr = format!("{}:{}", a.bind, a.fleet.port_base as u32 + g);
         let lis = tokio::net::TcpListener::bind(&addr).await.map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
@@ -368,14 +383,23 @@ async fn consume(a: ConsumeArgs) -> anyhow::Result<()> {
     }
     let senders = Arc::new(senders);
     let mut tasks = Vec::new();
-    for h in &a.hosts {
+    let sizes = Arc::new(parking_lot::Mutex::new(
+        hdrhistogram::Histogram::<u64>::new_with_bounds(1, 10_000_000, 2).expect("histogram"),
+    ));
+    let mut all = a.hosts.clone();
+    all.extend((a.first..a.first + a.count).map(|g| layout.host_url(g)));
+    anyhow::ensure!(!all.is_empty(), "no hosts: --host or --count");
+    for h in &all {
         let url = match a.cursor {
             Some(c) => format!("{}?cursor={c}", ws_url(h)),
             None => ws_url(h),
         };
         let g = port_of(h).map_or(0, |p| p.saturating_sub(a.fleet.port_base) as u32);
         let (events, bytes, regress, senders) = (events.clone(), bytes.clone(), regress.clone(), senders.clone());
+        let hist = sizes.clone();
         tasks.push(tokio::spawn(async move {
+            let mut local = hdrhistogram::Histogram::<u64>::new_with_bounds(1, 10_000_000, 2).expect("histogram");
+            let mut n = 0u32;
             let (mut ws, _) = match tokio_tungstenite::connect_async(&url).await {
                 Ok(x) => x,
                 Err(e) => {
@@ -388,6 +412,12 @@ async fn consume(a: ConsumeArgs) -> anyhow::Result<()> {
                 let tokio_tungstenite::tungstenite::Message::Binary(b) = m else { continue };
                 events.fetch_add(1, Ordering::Relaxed);
                 bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
+                let _ = local.record(b.len() as u64);
+                n += 1;
+                if n % 4096 == 0 {
+                    let _ = hist.lock().add(&local);
+                    local.reset();
+                }
                 if let Ok((_, n)) = vlpds::cbor::ValueRef::decode_prefix(&b) {
                     if let Ok(body) = vlpds::cbor::ValueRef::decode(&b[n..]) {
                         if let Some(vlpds::cbor::ValueRef::Int(s)) = body.get("seq") {
@@ -427,6 +457,13 @@ async fn consume(a: ConsumeArgs) -> anyhow::Result<()> {
         "mean_bytes": if e > 0 { b / e } else { 0 },
         "seq_regressions": regress.load(Ordering::Relaxed),
     });
+    {
+        let h = sizes.lock();
+        summary["frame_bytes"] = serde_json::json!({
+            "p50": h.value_at_quantile(0.5), "p90": h.value_at_quantile(0.9),
+            "p99": h.value_at_quantile(0.99), "max": h.max(),
+        });
+    }
     drop(senders);
     if a.verify {
         let mut kinds: BTreeMap<String, u64> = BTreeMap::new();

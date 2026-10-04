@@ -244,7 +244,9 @@ pub fn run_emitter(
             e.host.queue.pop(want, &mut buf);
             e.tokens -= buf.len() as f64;
             if buf.len() < want {
+                // the generators are behind: emit what there is, owe nothing
                 e.host.starved.fetch_add((want - buf.len()) as u64, Ordering::Relaxed);
+                e.tokens = 0.0;
             }
             e.host.publish(&buf, &now);
         }
