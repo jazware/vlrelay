@@ -208,7 +208,12 @@ async fn run(a: Args) -> anyhow::Result<()> {
             }
             None => node.state.clone(),
         }))
-        .merge(vlrelay::archive::read::router(node.state.clone(), None));
+        .merge(vlrelay::archive::read::router(
+            node.state.clone(),
+            node.cluster.as_ref().map(|g| -> Arc<dyn vlrelay::archive::read::Forward> {
+                Arc::new(vlrelay::archive::wiring::PeerForward(Arc::downgrade(&g.cluster)))
+            }),
+        ));
     if a.crawl {
         app = app.merge(node.crawler.router());
     }

@@ -240,7 +240,11 @@ impl Node {
             }
         }));
         cluster.on_lost(Box::new(|why| vlpds::lifecycle::fail_stop(5, &format!("cluster: {why}"))));
-        crate::cluster::peer::spawn_listener(&cluster, peer)?;
+        crate::cluster::peer::spawn_listener_with(
+            &cluster,
+            peer,
+            crate::archive::wiring::peer_reads(node.state.clone(), cluster.internal_token().to_string()),
+        )?;
         cluster.serve.spawn_retention(log.log_id.to_string());
         cluster.run();
 

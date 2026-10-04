@@ -514,3 +514,123 @@ fn meta_round_trips() {
     }
     assert_eq!(Meta { live: Some(3), staging: Some(5), garbage: vec![7], takedown_at: 0 }.next_gen(), 8);
 }
+
+fn cpu_us() -> u64 {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    let tv = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
+    tv(ru.ru_utime) + tv(ru.ru_stime)
+}
+
+async fn bootstrap_one(a: Arc<Archive>, st: Arc<StateStore>, did: String, key: crate::verify::SigningKey, car: Bytes) {
+    let d = did.clone();
+    let f = tokio::task::spawn_blocking(move || fetch::check_car(&d, &car, &key)).await.unwrap().unwrap();
+    fetch::import(&a, &st, &did, f).await.unwrap();
+}
+
+/// Bytes per record, apply cost with archival on and off, bootstrap and
+/// getRepo throughput (docs/archival.md). Run with
+/// `cargo test --profile dev-release --lib bench_archival -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn bench_archival() {
+    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (n, recs, commits) = (env("REPOS", 200), env("RECORDS", 300), env("COMMITS", 20));
+    let mut accts: Vec<Acct> = (0..n).map(|i| Acct::new(&plc(10_000 + i as u64), 100 + i as u64, recs)).collect();
+    let cars: Vec<Bytes> = accts.iter_mut().map(|a| a.car()).collect();
+    let car_bytes: usize = cars.iter().map(|c| c.len()).sum();
+    let record_bytes: usize =
+        accts.iter().map(|a| a.repo.live.values().map(|c| a.blocks[c].len()).sum::<usize>()).sum();
+    let (st, a, id) = store(true).await;
+    for acct in &accts {
+        id.set(&acct.repo.did, "pds.a", 1);
+    }
+
+    // bootstrap: check and import, 8 at a time
+    let (t0, c0) = (std::time::Instant::now(), cpu_us());
+    let mut work = accts.iter().map(|a| (a.repo.did.clone(), a.repo.signer.public())).zip(cars.iter().cloned());
+    let mut set = tokio::task::JoinSet::new();
+    loop {
+        while set.len() < 8 {
+            let Some(((did, key), car)) = work.next() else { break };
+            set.spawn(bootstrap_one(a.clone(), st.clone(), did, key, car));
+        }
+        if set.join_next().await.is_none() {
+            break;
+        }
+    }
+    let (dt, dc) = (t0.elapsed().as_secs_f64(), cpu_us() - c0);
+    println!(
+        "bootstrap: {n} repos x {recs} records, {:.1} MB of CAR: {:.0} repos/s, {:.1} MB/s, {:.0} records/s, {:.2} ms CPU per repo",
+        car_bytes as f64 / 1e6,
+        n as f64 / dt,
+        car_bytes as f64 / 1e6 / dt,
+        (n * recs) as f64 / dt,
+        dc as f64 / 1e3 / n as f64
+    );
+    let mut sst = 0;
+    for s in st.shards() {
+        s.flush_memtable().await.unwrap();
+        sst += s.sst_bytes();
+    }
+    let total = (n * recs) as f64;
+    println!(
+        "bucket: {:.1} MB of SSTs for {} records ({:.0} B per record block): {:.0} B/record, {:.0} B/record over the block itself",
+        sst as f64 / 1e6,
+        n * recs,
+        record_bytes as f64 / total,
+        sst as f64 / total,
+        (sst as f64 - record_bytes as f64) / total
+    );
+
+    // the same commits through a store with archival on and one with it off
+    let mut evs = Vec::new();
+    for _ in 0..commits {
+        for acct in accts.iter_mut() {
+            let ops = acct.repo.mixed_ops(1);
+            let (f, c) = acct.commit(&ops);
+            evs.push((acct.repo.did.clone(), f, c));
+        }
+    }
+    let (off, _, id_off) = store(false).await;
+    for acct in &accts {
+        id_off.set(&acct.repo.did, "pds.a", 1);
+    }
+    for (label, s) in [("off", &off), ("on", &st)] {
+        let (t0, c0) = (std::time::Instant::now(), cpu_us());
+        let mut tickets = Vec::new();
+        for (did, f, c) in &evs {
+            tickets.push(apply(s, did, f, *c).await);
+            if tickets.len() == 64 {
+                s.commit(&std::mem::take(&mut tickets)).await.unwrap();
+            }
+        }
+        s.commit(&tickets).await.unwrap();
+        let (dt, dc) = (t0.elapsed().as_secs_f64(), cpu_us() - c0);
+        println!(
+            "apply, archival {label}: {} commits, {:.1} us CPU and {:.1} us wall per commit",
+            evs.len(),
+            dc as f64 / evs.len() as f64,
+            dt * 1e6 / evs.len() as f64
+        );
+    }
+    assert_eq!(a.stats.mismatches.load(Relaxed), 0);
+    assert_eq!(a.stats.applied.load(Relaxed) as usize, evs.len());
+
+    // getRepo: every repo streamed from storage, one at a time
+    let (t0, c0) = (std::time::Instant::now(), cpu_us());
+    let mut bytes = 0;
+    for acct in &accts {
+        let s = st.shard_for(&acct.repo.did).unwrap();
+        let (g, head) = mirror::live(&s.db, &acct.repo.did).await.unwrap().unwrap();
+        bytes += export(&s, &acct.repo.did, g, head).await.len();
+    }
+    let (dt, dc) = (t0.elapsed().as_secs_f64(), cpu_us() - c0);
+    println!(
+        "getRepo: {n} repos, {:.1} MB: {:.0} repos/s, {:.1} MB/s, {:.2} ms CPU per repo",
+        bytes as f64 / 1e6,
+        n as f64 / dt,
+        bytes as f64 / 1e6 / dt,
+        dc as f64 / 1e3 / n as f64
+    );
+}

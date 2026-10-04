@@ -81,13 +81,23 @@ pub fn router(node: &Arc<ClusterNode>) -> axum::Router {
 
 /// Serves [`router`] over peer mTLS on `listener`.
 pub fn spawn_listener(node: &Arc<ClusterNode>, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+    spawn_listener_with(node, listener, axum::Router::new())
+}
+
+/// [`spawn_listener`] plus routes of the node's own (archival reads
+/// forwarded to the DID owner), which check the token themselves.
+pub fn spawn_listener_with(
+    node: &Arc<ClusterNode>,
+    listener: tokio::net::TcpListener,
+    extra: axum::Router,
+) -> anyhow::Result<()> {
     let tls = node.opts.tls.as_ref().ok_or_else(|| anyhow::anyhow!("a peer listener needs peer TLS"))?;
     let opts = vlpds::server::ServeOptions {
         h2: vlpds::server::H2Profile::Peer,
         max_connections: vlpds::server::DEFAULT_MAX_CONNECTIONS,
         tls: Some(tls.server_config()),
     };
-    let r = router(node);
+    let r = router(node).merge(extra);
     tokio::spawn(async move {
         if let Err(e) = vlpds::server::serve_with(listener, r, opts).await {
             tracing::error!("peer listener exited: {e:#}");

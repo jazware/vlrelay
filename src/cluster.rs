@@ -460,6 +460,11 @@ impl ClusterNode {
         Some(NodeAddr { node_id, addr })
     }
 
+    /// The token peers present on internal routes.
+    pub fn internal_token(&self) -> &str {
+        &self.opts.internal_token
+    }
+
     pub fn owns_host(&self, host: &Host) -> bool {
         self.hosts.as_ref().is_some_and(|h| h.owns(host))
     }

@@ -79,6 +79,10 @@ e2e *args:
 e2e-policy *args:
     tests/e2e/policy.sh {{args}}
 
+# Archival e2e: archive off -> all mid-load, a forced desync, then every account's getRepo vs its PDS (tests/e2e/archival.sh)
+e2e-archival *args:
+    tests/e2e/archival.sh {{args}}
+
 # Cluster e2e: 3 core relays + an edge + a replica on one prefix, kill -9 / SIGTERM / rejoin under load (tests/e2e/cluster.sh)
 e2e-cluster *args:
     tests/e2e/cluster.sh {{args}}
