@@ -90,6 +90,8 @@ pub struct ClusterOptions {
     pub log: LogConfigTemplate,
     pub serve: ServeConfig,
     pub runtime: Option<tokio::runtime::Handle>,
+    /// Lease renewal off the request runtime (vlpds `LeasePlane`).
+    pub lease_plane: Option<vlpds::cluster::LeasePlane>,
     /// None: no peer transport (a replica, or a lone core node).
     pub tls: Option<Arc<vlpds::peer_tls::PeerTls>>,
     pub peer_connections: usize,
@@ -144,6 +146,7 @@ impl ClusterOptions {
             log: LogConfigTemplate::default(),
             serve: ServeConfig::default(),
             runtime: None,
+            lease_plane: None,
             tls: None,
             peer_connections: 2,
             internal_token: String::new(),
@@ -313,6 +316,7 @@ impl ClusterNode {
                 ttl: opts.ttl,
                 renew_every: opts.renew_every,
                 skew: opts.skew,
+                lease_plane: opts.lease_plane.clone(),
                 ..Default::default()
             };
             let cluster = Cluster::join(cc, store.clone()).await?;

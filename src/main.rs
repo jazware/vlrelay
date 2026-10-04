@@ -195,6 +195,7 @@ fn main() {
 async fn run(a: Args) -> anyhow::Result<()> {
     let loopback_plc = a.plc_url.contains("://127.") || a.plc_url.contains("://localhost");
     let dev_mode = a.dev_mode || a.hosts.iter().any(|h| h.starts_with("http://")) || loopback_plc;
+    let mut lease_store = None;
     let store = if a.memory {
         vlpds::store::Store::memory(None)
     } else {
@@ -208,6 +209,7 @@ async fn run(a: Args) -> anyhow::Result<()> {
             region: a.s3_region.clone(),
         };
         let unsigned = a.s3_unsigned_payload.unwrap_or(cfg.endpoint.starts_with("https://"));
+        lease_store = Some(vlpds::store::Store::s3_with(&cfg, &a.prefix, None, 2, unsigned)?);
         vlpds::store::Store::s3_with(&cfg, &a.prefix, None, 256, unsigned)?
     };
 
@@ -265,7 +267,7 @@ async fn run(a: Args) -> anyhow::Result<()> {
         cfg.plc_export = Some(pc);
     }
     let setup = match role {
-        Some(role) => Some(cluster_setup(&a, role, dev_mode, cores)?),
+        Some(role) => Some(cluster_setup(&a, role, dev_mode, cores, lease_store)?),
         None => None,
     };
     let node = match &setup {
@@ -318,10 +320,14 @@ async fn run(a: Args) -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(a.listen).await?;
     tracing::info!(addr = %a.listen, log = %node.log.log_id, dev_mode, "vlrelay listening");
-    let server =
-        tokio::spawn(
-            async move { axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await },
-        );
+    // Consumers (a reconnect storm's accepts and upgrades) are served on the
+    // subscriber runtime, so they can't starve the pipeline and peer RPC on
+    // this one. The tokio listener must be registered there too.
+    let listener = listener.into_std()?;
+    let server = vlpds::firehose::runtime(node.cfg.serve_threads).spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
+    });
     // the shards go first: consumers keep their sockets until the process
     // exits, then resume on another node from their cursor
     signal().await;
@@ -344,6 +350,7 @@ fn cluster_setup(
     role: vlrelay::cluster::Role,
     dev_mode: bool,
     cores: Arc<vlrelay::node::cluster::LiveCores>,
+    lease_store: Option<vlpds::store::Store>,
 ) -> anyhow::Result<vlrelay::node::cluster::ClusterSetup> {
     use vlrelay::cluster::Role;
     let advertise = a.advertise_url.clone().unwrap_or_else(|| format!("https://{}", a.peer_listen));
@@ -373,6 +380,7 @@ fn cluster_setup(
         host_shards: a.host_shards.max(1),
         checkpoint_every: Duration::from_secs(2),
         cores,
+        lease_store,
     })
 }
 

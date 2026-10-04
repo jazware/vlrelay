@@ -85,6 +85,9 @@ pub struct ClusterSetup {
     /// The policy engine's live-node count, pointed at this node's cluster
     /// once it has joined.
     pub cores: Arc<LiveCores>,
+    /// A second client on the bucket for lease renewals alone (None: the
+    /// node's store, e.g. in memory).
+    pub lease_store: Option<Store>,
 }
 
 /// Live core nodes, as the policy's cluster-wide budgets divide them: 1
@@ -112,6 +115,9 @@ impl ClusterSetup {
         o.log.linger = cfg.linger;
         o.serve = cfg.serve_config();
         o.runtime = Some(vlpds::firehose::runtime(cfg.serve_threads));
+        if self.role == Role::Core {
+            o.lease_plane = self.lease_store.clone().map(vlpds::cluster::LeasePlane::new);
+        }
         o.tls = self.tls.clone();
         o.internal_token = self.internal_token.clone();
         o
