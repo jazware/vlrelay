@@ -255,6 +255,55 @@ impl Node {
 }
 
 impl Glue {
+    /// The admin's cluster view: members from the leases, owners from the
+    /// assignments as last read. Rates and resources are this node's only;
+    /// a peer's are 0 until peers report them.
+    pub fn view(&self, node: &Node) -> crate::admin::ClusterView {
+        let c = &self.cluster;
+        let host_shards = c.hosts.as_ref().map(|h| h.owners()).unwrap_or_default();
+        let did_shards: Vec<Option<String>> = match (&c.cluster, c.layout()) {
+            (Some(cl), Some(l)) => l.ids().into_iter().map(|s| cl.owner_of(s).map(|(n, _)| n)).collect(),
+            _ => Vec::new(),
+        };
+        let count = |v: &[Option<String>], id: &str| v.iter().filter(|o| o.as_deref() == Some(id)).count() as u32;
+        let mut leases = Vec::new();
+        if let Some(cl) = &c.cluster {
+            leases.push(cl.own_lease());
+            leases.extend(cl.peers());
+        }
+        let last = node.dash.lock().history.back().cloned();
+        let nodes = leases
+            .into_iter()
+            .map(|l| {
+                let me = l.node_id == c.node_id;
+                crate::admin::NodeView {
+                    host_shards: count(&host_shards, &l.node_id),
+                    did_shards: count(&did_shards, &l.node_id),
+                    hosts: if me { node.manager.running() as u32 } else { 0 },
+                    consumers: if me { vlpds::metrics::FIREHOSE_SUBSCRIBERS.get().max(0) as u32 } else { 0 },
+                    events_in_per_sec: if me { last.as_ref().map_or(0.0, |s| s.events_in) } else { 0.0 },
+                    events_out_per_sec: if me { last.as_ref().map_or(0.0, |s| s.events_out) } else { 0.0 },
+                    log_durability_lag_ms: if me { last.as_ref().map_or(0.0, |s| s.durable_lag_ms) } else { 0.0 },
+                    reachable: !l.draining,
+                    lease_valid: if me { c.lease_valid() } else { !l.draining },
+                    lease_expires_ms: l.expires_ms as i64,
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    rev: l.rev,
+                    id: l.node_id,
+                    addr: l.addr,
+                    cpu: 0.0,
+                    mem_bytes: 0,
+                }
+            })
+            .collect();
+        crate::admin::ClusterView {
+            nodes,
+            host_shards,
+            did_shards,
+            last_seq: self.log.last_durable_seq.load(Ordering::Acquire),
+        }
+    }
+
     /// Every checkpoint interval: prune the dedupe set by the hosts'
     /// checkpointed cursors, write the DID shards' applied markers for our
     /// log, flush host counters, and pick up hosts other nodes admitted.

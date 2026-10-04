@@ -302,6 +302,12 @@ impl HostShards {
         Some((a.owner.clone()?, a.addr.clone().unwrap_or_default()))
     }
 
+    /// Each host shard's owner as last read, in layout order.
+    pub fn owners(&self) -> Vec<Option<String>> {
+        let a = self.assigns.read();
+        self.layout.ids().iter().map(|s| a.get(s).and_then(|(x, _)| x.owner.clone())).collect()
+    }
+
     fn path(&self, shard: ShardId) -> Path {
         Path::from(format!("{}/{DIR}/{}", self.store.prefix, shard.key()))
     }

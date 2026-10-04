@@ -1,8 +1,9 @@
 //! The operator API over the node's real state: hosts and their actions,
 //! consumers, the overview's numbers and account lookups and takedowns.
 //! Policy, domain rules, cases and host tier actions go to the policy
-//! engine's admin half (`node::policy`). The cluster view still comes from
-//! the simulation until the cluster workstream provides it.
+//! engine's admin half (`node::policy`). The cluster view is the real
+//! cluster on a cluster node (`node::cluster::Glue::view`) and the
+//! simulation on a single node.
 
 use super::Node;
 use super::metrics::HostSeries as Series;
@@ -500,7 +501,10 @@ impl AdminSource for NodeAdmin {
     }
 
     async fn cluster(&self) -> AdminResult<admin::ClusterView> {
-        self.demo.cluster().await
+        match &self.node.cluster {
+            Some(g) => Ok(g.view(&self.node)),
+            None => self.demo.cluster().await,
+        }
     }
 
     async fn accounts(&self, q: admin::AccountQuery) -> AdminResult<Vec<admin::Account>> {
