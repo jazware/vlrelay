@@ -177,7 +177,26 @@ Before the stage ran detached, `kill9` showed a 25 s stall and a bystander exit 
 
 `just e2e` and `just e2e-cluster --duration 60` pass, before and after the rebase (on their own port block): single node 3,164 and 2,894 events matched, p50 27 ms; cluster 3,171 and 3,045 events identical on all five streams, worst pause 2.15 and 1.95 s after the kill -9. `cargo test --lib`: 147 pass after the rebase.
 
-SOAK_TBD
+### The soak, again
+
+benchbox (Ryzen AI Max+ 395), dev-release build, `CHAOS_PROFILE=dev-release CHAOS_BASE=4600 RETENTION_H=1 SOAK_EVERY=240 RELAY_MEM_MB=2400 tests/chaos/chaos.sh soak --rate 50 --fake-rate 600 --accounts 60`, the whole harness under a systemd scope capped at 9-10 GB (the box is shared). ~700 events/s, a fault every 4 minutes. Three runs:
+
+- **Run 1** was void: the fault proxy ran out of fds (Linux's 1024) in its first minutes and every bucket and peer route hung. Fixed in the harness (a3b3e70f).
+- **Run 2**, this work without the robust-cluster pass, 41.5 of 50 minutes before the scope's OOM killer ended it.
+- **Run 3**, rebased onto the robust-cluster pass (without ef3f8c71), 29 of 47 minutes, then the same.
+
+| | Old soak (Mac, dev build) | Run 2 | Run 3 |
+|---|---|---|---|
+| Healthy stretch | 24 min | 28 min: checker backlog 12-50 events, p50 44 ms | 24 min: backlog 34-380, p50 63-90 ms |
+| Core RSS | 0.73-1.3 GB healthy, then 3.1 GB and 23 OOM kills at the 3 GB cap | 0.75-1.68 GB, never at the 2.4 GB cap | 0.45-1.13 GB until the stall; then one core at 7.3 GB (below) |
+| `ack_pending` | 27k on one core | ≤ 600 healthy; 16-24k per core after the double crash, held there by the caps (8,192 per host, 32,768 per node; 1,912 host-cap pauses) | ≤ 590 healthy; 12.2k after the stall |
+| Missing / acked-but-lost | 1.03M missing, 28,419 acked-but-lost | 0 through the healthy stretch; then 22 `prev_data_mismatch` and 38k `desynchronized` rejections on one core, all after 119 `OutdatedCursor`s | 0 through the healthy stretch; 45 `OutdatedCursor`s after the stall |
+| How it ended | death spiral, 31 min behind | cores couldn't start during 5% bucket resets (a LIST body error fails startup, exit 1, restart loop), then a double crash: 1,500 forwards gave up with "no live owner" (shard opens of 15-28 s without the trim), the hosts' 64 MB replay windows ran out (`OutdatedCursor`), and the backlog reached 460k before the scope OOM'd | after a kill -9 every core went silent for ~7 minutes (no log lines at all), one vlrelay process grew to 7.3 GB anon RSS and the scope's OOM killer took it, then fakepds (3.1 GB) |
+
+What held: memory stayed bounded through catch-up in both runs until the end, no reordering showed up (every `prev_data_mismatch` followed an `OutdatedCursor`, an upstream that no longer had the events), and the streams stayed identical. What didn't: neither run reached 45 minutes. The losses that remain come from hosts whose window ran out while the cluster couldn't keep up, which with fakepds's 64 MB window (~70 s per host at this rate) takes about a minute of trouble. A production PDS keeps days.
+
+Run 3's 7.3 GB process isn't explained. It's the one relay process that ever passed 2 GB in these runs, and `capped.sh` (which polls RSS) didn't catch it. A caller that gives up and retries while its detached batch runs on would pile up batches against a stuck stage; ef3f8c71 bounds that, but whether it was the cause is unproven. The next soak should run with the harness's checkers outside the relays' memory scope, so the scope's OOM can only mean the relays.
+
 
 ## Found, not fixed (for the lead)
 
@@ -197,6 +216,8 @@ These cross into code other workstreams own (node.rs pipeline internals, upstrea
 12. **PLC trouble past 30 s still loses events.** The host stage now retries a failing DID lookup for 30 s, then rejects `identity_unavailable`, which is acked, and the account's next commit fails prevData. Holding the event (fail it, fence, replay later) would lose nothing, but one DID whose document never resolves would then hold its host's cursor for good. That needs a policy: a per-(host, seq) retry budget, or a parked-events queue that doesn't hold the cursor.
 13. **Recovery after hung bucket connections is slow.** In every `minio-errors` run the worst latency after the second heal (20% hung connections) was 33-40 s, with one core fail-stopping ~20 s into the fault. A hung segment PUT waits out object_store's 30 s request timeout while the merge waits on that log's watermark (issue 3). A shorter timeout on segment PUTs, with the hedge, would bound it.
 14. **`OutdatedCursor` isn't acted on.** When a host's window no longer reaches our cursor we log the `#info` and take what comes; the accounts with gaps desynchronize on their next commit and wait for a `#sync`. An archival relay could queue the host's accounts for a re-fetch right away.
+15. **A relay process reached 7.3 GB in the round 2 soak** (run 3, above). Unexplained; ef3f8c71 bounds the one unbounded path this work added.
+16. **A core can't start during bucket resets.** A LIST whose response body fails isn't retried at startup, so the core exits 1 and restarts every second until the fault ends (run 2 lost a minute of two cores this way).
 
 ## The soak
 
