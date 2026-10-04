@@ -78,6 +78,8 @@ The relay implements the contract (`src/main.rs`, pipeline in `src/node.rs`). It
 
 One listener serves `GET /xrpc/_health` (`{"version"}`), `subscribeRepos`, the sync API (`listRepos`, `getRepoStatus`, `getLatestCommit`, `listHosts`, `getHostStatus`), `requestCrawl` (with `--crawl`), `/admin` and Prometheus `/metrics`. Every response carries `Server: vlrelay/… (atproto-relay)`, so other relays won't crawl it. The relay's own series are `vlrelay_*`: events in by kind, accepted by kind, out, rejected by reason, duplicates by where they were caught, time to firehose and time to durable (histograms), time per pipeline stage, durable lag, hosts by status, consumers. vlpds's firehose and process series come with them.
 
+`just e2e-archival` is the archival mode's e2e on its own ports (docs/archival.md).
+
 ## e2e_check
 
 `e2e_check` subscribes to each upstream's own `subscribeRepos` and to the relay's, and matches events across them:
