@@ -59,6 +59,7 @@ impl DidStage for LogStage {
                     shard: layout.shard_of(&f.did).0,
                 },
                 frame: Box::new(SeqSplice::parse(f.frame.clone()).unwrap()),
+                delta: None,
             });
         }
         if !events.is_empty() {
