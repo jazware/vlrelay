@@ -335,6 +335,9 @@ pub struct ClusterNode {
     leaving_peers: Mutex<HashMap<String, Instant>>,
     /// Our advertised peer address answered our last probe (`reach_loop`).
     self_reachable: AtomicBool,
+    /// Our log's longest pending append since the last lease renewal
+    /// published it (`lag_loop` samples it every 100 ms).
+    pending_peak_ms: std::sync::atomic::AtomicU64,
 }
 
 impl ClusterNode {
@@ -464,6 +467,7 @@ impl ClusterNode {
                 host_nudge: Arc::new(Notify::new()),
                 leaving_peers: Mutex::new(HashMap::new()),
                 self_reachable: AtomicBool::new(no_transport),
+                pending_peak_ms: Default::default(),
             }
         });
         let _ = log_owner.set(Arc::downgrade(&node));
@@ -1055,9 +1059,7 @@ async fn reach_loop(me: Weak<ClusterNode>) {
             // An outlier only: under a bucket slow for everyone our appends
             // wait as long as everyone's (minio-latency's 100-500 ms made a
             // core step down when it was compared with a fixed bound).
-            let mut ages = n.followers.watermark_ages();
-            ages.sort();
-            let peers = ages.get(ages.len() / 2).copied();
+            let peers = median_peer_pending_age(&c.peers());
             if peers.is_some_and(|p| age > p * OUTLIER) {
                 let since = *slow_since.get_or_insert_with(Instant::now);
                 tracing::warn!(
@@ -1114,7 +1116,9 @@ async fn lag_loop(me: Weak<ClusterNode>) {
             return;
         }
         if let Some(l) = &n.log {
-            own.observe(l.pending_age().as_secs_f64());
+            let age = l.pending_age();
+            own.observe(age.as_secs_f64());
+            n.pending_peak_ms.fetch_max(age.as_millis() as u64, Ordering::AcqRel);
         }
         for a in n.followers.watermark_ages() {
             peer.observe(a.as_secs_f64());
@@ -1122,9 +1126,19 @@ async fn lag_loop(me: Weak<ClusterNode>) {
     }
 }
 
-/// How many times the median peer log's watermark age our oldest pending
-/// append must be for our log to count as the slow one.
+/// How many times the median peer's oldest pending append our own must be
+/// for our log to count as the slow one.
 const OUTLIER: u32 = 4;
+
+/// The median of what live peers report in their leases as their own
+/// oldest pending append, each timed on its own clock. Our clock minus a
+/// peer's watermark seq would fold the clock offset between us into it.
+/// None while no peer reports one: no evidence that we're the outlier.
+fn median_peer_pending_age(peers: &[NodeLease]) -> Option<Duration> {
+    let mut ages: Vec<u64> = peers.iter().filter(|l| !l.draining).filter_map(|l| l.pending_age_ms).collect();
+    ages.sort_unstable();
+    ages.get(ages.len() / 2).map(|&ms| Duration::from_millis(ms))
+}
 
 static STEP_DOWNS: std::sync::LazyLock<prometheus::IntCounter> = std::sync::LazyLock::new(|| {
     prometheus::register_int_counter!(
@@ -1174,6 +1188,14 @@ impl forward::Route for NodeRoute {
 impl ShardHost for ClusterNode {
     fn next_ordinal(&self) -> u64 {
         self.log.as_ref().map_or(0, |l| l.next_ordinal.load(Ordering::Acquire))
+    }
+
+    /// The peak since the last renewal, not a sample: an instant between
+    /// two segment PUTs reads near zero even on a slow bucket path.
+    fn pending_age(&self) -> Option<Duration> {
+        let now = self.log.as_ref()?.pending_age();
+        let peak = Duration::from_millis(self.pending_peak_ms.swap(0, Ordering::AcqRel));
+        Some(now.max(peak))
     }
 
     fn durable_end(&self) -> u64 {

@@ -793,6 +793,36 @@ async fn a_held_did_keeps_its_shard_open() {
     assert!(n.node.hold_did(&d).is_none(), "closed: nothing to hold");
 }
 
+/// The slow-log step-down compares our oldest pending append with what our
+/// peers publish of theirs, each on its own clock, not with our clock
+/// minus their watermark (which carries the clock offset between us).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peers_publish_their_own_pending_append_age() {
+    let (store, ca, applied) = (Store::memory(None), Ca::new(), Arc::new(Applied::default()));
+    let a = spawn(&store, &ca, "node-a", Role::Core, &applied).await;
+    let b = spawn(&store, &ca, "node-b", Role::Core, &applied).await;
+    let ac = a.node.cluster.clone().unwrap();
+    eventually("a reads b's pending age from its lease", Duration::from_secs(10), || {
+        ac.peers().iter().any(|l| l.node_id == "node-b" && l.pending_age_ms.is_some())
+    })
+    .await;
+    let lease = |id: &str, ms: Option<u64>, draining: bool| {
+        let mut l = ac.own_lease();
+        (l.node_id, l.pending_age_ms, l.draining) = (id.into(), ms, draining);
+        l
+    };
+    assert_eq!(median_peer_pending_age(&[lease("x", None, false)]), None, "no reports, no evidence");
+    let peers = [
+        lease("x", Some(40), false),
+        lease("y", Some(900), false),
+        lease("z", Some(9000), true),
+        lease("w", None, false),
+    ];
+    assert_eq!(median_peer_pending_age(&peers), Some(Duration::from_millis(900)));
+    a.node.halt();
+    b.node.halt();
+}
+
 struct Hang;
 
 #[async_trait::async_trait]
