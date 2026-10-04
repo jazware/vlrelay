@@ -75,6 +75,27 @@ pub trait DidStage: Send + Sync + 'static {
     async fn apply(&self, batch: Vec<Forwarded>) -> Vec<StageResult>;
 }
 
+/// Runs each batch of a stage as a task of its own, so the caller going
+/// away mid-batch (a peer's request dropped because its forwarder moved on
+/// or the peer died, a local forward abandoned) can't cancel it. A stage
+/// cancelled between an append and its durability leaves that event's
+/// in-flight entry unresolved, and every later copy of the event, a
+/// duplicate waiting on it, answers "the duplicated event isn't durable"
+/// until its forward gives up (chaos kill9, minio-errors, crash-loop).
+pub struct Detached<S>(pub Arc<S>);
+
+#[async_trait::async_trait]
+impl<S: DidStage> DidStage for Detached<S> {
+    async fn apply(&self, batch: Vec<Forwarded>) -> Vec<StageResult> {
+        let n = batch.len();
+        let stage = self.0.clone();
+        match tokio::spawn(async move { stage.apply(batch).await }).await {
+            Ok(r) => r,
+            Err(e) => vec![Err(StageError::Unavailable(format!("stage task: {e}"))); n],
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ForwardError {
     #[error("gave up after {0:?}: {1}")]
@@ -821,6 +842,43 @@ mod tests {
         r.owner.lock().insert("did:x".into(), None);
         assert!(matches!(n1.await.unwrap(), Err(ForwardError::GaveUp(..))));
         assert!(r.applied.lock().is_empty());
+    }
+
+    /// A stage that takes a claim, then waits for durability, then settles
+    /// it: the shape of the DID owner's stage.
+    struct Claims {
+        held: Mutex<HashMap<String, bool>>,
+        durable: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl DidStage for Claims {
+        async fn apply(&self, batch: Vec<Forwarded>) -> Vec<StageResult> {
+            for e in &batch {
+                self.held.lock().insert(e.did.clone(), false);
+            }
+            self.durable.notified().await;
+            for e in &batch {
+                self.held.lock().insert(e.did.clone(), true);
+            }
+            batch.iter().map(|e| Ok(Outcome::Appended(e.upstream_seq))).collect()
+        }
+    }
+
+    /// The caller of a batch goes away between the claim and durability
+    /// (its peer died, or its forwarder moved on). Without `Detached` the
+    /// claim was never settled, and every later copy of the event waited on
+    /// it until its forward gave up.
+    #[tokio::test]
+    async fn a_dropped_caller_does_not_cancel_the_stage() {
+        let inner = Arc::new(Claims { held: Mutex::new(HashMap::new()), durable: tokio::sync::Notify::new() });
+        let stage = Detached(inner.clone());
+        let call = stage.apply(vec![ev("did:a", 1)]);
+        assert!(tokio::time::timeout(Duration::from_millis(50), call).await.is_err(), "dropped mid-batch");
+        assert_eq!(inner.held.lock().get("did:a"), Some(&false));
+        inner.durable.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(inner.held.lock().get("did:a"), Some(&true), "the batch ran to its end");
     }
 
     #[tokio::test]
