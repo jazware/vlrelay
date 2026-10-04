@@ -7,3 +7,4 @@ ui/dist/
 # dev/up.sh: pids, logs, accounts
 dev/state/
 testdata/live/
+testdata/hunt/

@@ -6,7 +6,7 @@
 //! CAR, give back `prevData`). [`check_chain`] is the stateful step, a pure
 //! function the DID owner runs against its stored [`ChainState`].
 
-use crate::event::{Action, ParsedCommit, ParsedSync, split_signed_commit};
+use crate::event::{Action, ParsedCommit, ParsedSync, RepoOp, split_signed_commit};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -416,13 +416,7 @@ pub fn check_ops(
     blocks: &HashMap<Cid, &[u8]>,
     opts: &Options,
 ) -> Result<(), Reject> {
-    if c.ops.len() > 1 {
-        let mut paths: Vec<&str> = c.ops.iter().map(|o| o.path.as_str()).collect();
-        paths.sort_unstable();
-        if paths.windows(2).any(|w| w[0] == w[1]) {
-            return Err(Reject::DuplicatePath);
-        }
-    }
+    let net = net_ops(&c.ops)?;
     if opts.require_record_blocks
         && c.ops
             .iter()
@@ -437,26 +431,121 @@ pub fn check_ops(
             _ => Ok(()),
         };
     }
-    let mut tree = Tree::load_from_blocks(blocks, data).map_err(mst_err)?;
-    for op in &c.ops {
-        let want = if op.action == Action::Delete {
-            None
-        } else {
-            op.cid
-        };
-        if tree.get(op.path.as_bytes()).map_err(mst_err)? != want {
+    // most commits are one create: undo it on the raw nodes when that's
+    // certain to agree, else (and for every reject) the tree path decides
+    if let [op] = c.ops.as_slice()
+        && op.action == Action::Create
+        && op.prev.is_none()
+        && let Some(cid) = op.cid
+        && FAST_PATH.get()
+    {
+        match vlpds::mst::single_create::undo_single_create(
+            blocks,
+            data,
+            op.path.as_bytes(),
+            cid,
+            c.prev_data.is_some(),
+        ) {
+            Some(prev) if prev == c.prev_data => return Ok(()),
+            _ => {}
+        }
+    }
+    check_ops_tree(c, data, blocks, &net)
+}
+
+/// One path's change across a commit's ops.
+struct NetOp<'a> {
+    path: &'a str,
+    /// The record before the commit, from the path's first op: its `prev`
+    /// (a create's too, which some PDSes set when a commit deletes and
+    /// re-creates a record).
+    before: Option<Cid>,
+    /// The first op is an update or delete, so `before` must be known for
+    /// the inductive proof.
+    needs_before: bool,
+    after: Option<Cid>,
+    /// The path's last op, for undoing in reverse op order: on a partial
+    /// tree, another order can need nodes the CAR leaves out.
+    last: usize,
+}
+
+/// The ops folded per path, latest last op first. A path may take several
+/// ops (a delete then a create of the same record, as applyWrites allows);
+/// each must fit the one before it (a create only of a missing record, an
+/// update or delete only of the record the last op left), else the ops
+/// contradict each other.
+fn net_ops(ops: &[RepoOp]) -> Result<Vec<NetOp<'_>>, Reject> {
+    fn start(o: &RepoOp, i: usize) -> NetOp<'_> {
+        NetOp {
+            path: o.path.as_str(),
+            before: o.prev,
+            needs_before: o.action != Action::Create,
+            after: o.cid,
+            last: i,
+        }
+    }
+    if ops.len() == 1 {
+        return Ok(vec![start(&ops[0], 0)]);
+    }
+    let mut order: Vec<usize> = (0..ops.len()).collect();
+    order.sort_by(|&a, &b| ops[a].path.cmp(&ops[b].path).then(a.cmp(&b)));
+    let mut net: Vec<NetOp<'_>> = Vec::with_capacity(ops.len());
+    for i in order {
+        let o = &ops[i];
+        match net.last_mut() {
+            Some(n) if n.path == o.path => {
+                // a create's prev, if set, is the record before the commit
+                let fits = match o.action {
+                    Action::Create => n.after.is_none(),
+                    Action::Update | Action::Delete => {
+                        n.after.is_some() && o.prev.is_none_or(|p| Some(p) == n.after)
+                    }
+                };
+                if !fits {
+                    return Err(Reject::DuplicatePath);
+                }
+                n.after = o.cid;
+                n.last = i;
+            }
+            _ => net.push(start(o, i)),
+        }
+    }
+    net.sort_unstable_by(|a, b| b.last.cmp(&a.last));
+    Ok(net)
+}
+
+thread_local! {
+    /// Off in tests that compare the fast path with the tree path.
+    static FAST_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_fast_path(on: bool) {
+    FAST_PATH.set(on);
+}
+
+fn check_ops_tree(
+    c: &ParsedCommit,
+    data: Cid,
+    blocks: &HashMap<Cid, &[u8]>,
+    net: &[NetOp<'_>],
+) -> Result<(), Reject> {
+    let mut tree = Tree::load_from_blocks(blocks, data)
+        .map_err(mst_err)?
+        .without_rollback();
+    for n in net {
+        if tree.get(n.path.as_bytes()).map_err(mst_err)? != n.after {
             return Err(Reject::OpMismatch);
         }
     }
     let Some(prev_data) = c.prev_data else {
         return Ok(());
     };
-    for op in c.ops.iter().rev() {
-        match op.action {
-            Action::Create => tree.remove(op.path.as_bytes()).map(drop),
-            Action::Update | Action::Delete => tree
-                .insert(op.path.as_bytes(), op.prev.ok_or(Reject::MissingOpPrev)?)
-                .map(drop),
+    for n in net {
+        match n.before {
+            Some(b) => tree.insert_no_proof(n.path.as_bytes(), b).map(drop),
+            None if n.needs_before => return Err(Reject::MissingOpPrev),
+            None => tree.remove_no_proof(n.path.as_bytes()).map(drop),
         }
         .map_err(mst_err)?;
     }
@@ -586,3 +675,6 @@ mod tests;
 
 #[cfg(test)]
 mod differential;
+
+#[cfg(test)]
+mod fast_tests;

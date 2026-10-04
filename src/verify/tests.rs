@@ -573,3 +573,55 @@ fn real_firehose_commits_verify() {
         }
     }
 }
+
+/// eurosky.social, Oct 2026: one commit deletes a post and re-creates it at
+/// the same path, the create carrying the old record as `prev`. indigo
+/// forwards it; we dropped it (`bad_op`), and then the account's next commit
+/// as a chain break (`prev_data_mismatch`).
+#[test]
+fn delete_then_create_on_one_path() {
+    let b = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/regress/eurosky_delete_create.bin"
+    ))
+    .unwrap();
+    let (n, rest) = b.split_at(4);
+    let n = u32::from_le_bytes(n.try_into().unwrap()) as usize;
+    let (first, rest) = rest.split_at(n);
+    let next = &rest[4..];
+    let key =
+        SigningKey::from_multibase("zQ3shgYv5ut5siX3dhNU82fg225BqaPD2XyXVNKE3isgn76HG").unwrap();
+    let c = commit_of(Bytes::copy_from_slice(first));
+    assert_eq!(c.ops.len(), 2);
+    assert_eq!(c.ops[0].path, c.ops[1].path);
+    assert_eq!(
+        (c.ops[0].action, c.ops[1].action),
+        (Action::Delete, Action::Create)
+    );
+    assert!(c.ops[1].prev.is_some());
+    let v = verify_commit(&c, &key).expect("delete + create verifies");
+    let state = check_chain(None, &v).unwrap();
+    let v2 = verify_commit(&commit_of(Bytes::copy_from_slice(next)), &key).expect("next commit");
+    check_chain(Some(&state), &v2).expect("the chain holds");
+
+    let other = Cid::dag_cbor(b"other");
+    let mut m = c.clone();
+    m.ops[0].prev = Some(other);
+    assert_eq!(verify_commit(&m, &key), Err(Reject::InversionMismatch));
+    let mut m = c.clone();
+    m.ops.remove(0);
+    assert!(
+        verify_commit(&m, &key).is_ok(),
+        "a create with prev acts as an update"
+    );
+    m.ops[0].prev = None;
+    assert_eq!(verify_commit(&m, &key), Err(Reject::InversionMismatch));
+    // ops that contradict each other on one path
+    let mut m = c.clone();
+    m.ops.swap(0, 1);
+    assert_eq!(verify_commit(&m, &key), Err(Reject::DuplicatePath));
+    let mut m = c.clone();
+    let dup = m.ops[1].clone();
+    m.ops.push(dup);
+    assert_eq!(verify_commit(&m, &key), Err(Reject::DuplicatePath));
+}

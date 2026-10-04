@@ -260,7 +260,8 @@ pub struct RepoOp {
     pub path: String,
     /// The record after the op (create/update); None for delete.
     pub cid: Option<Cid>,
-    /// The record before the op (update/delete), sync 1.1.
+    /// The record before the op (update/delete), sync 1.1. Some PDSes set it
+    /// on a create too, when the commit deleted the record first.
     pub prev: Option<Cid>,
 }
 
@@ -546,7 +547,6 @@ fn parse_op(o: &ValueRef<'_>) -> Result<RepoOp, Reject> {
     match action {
         Action::Create | Action::Update if cid.is_none() => return Err(Reject::BadOp),
         Action::Delete if cid.is_some() => return Err(Reject::BadOp),
-        Action::Create if prev.is_some() => return Err(Reject::BadOp),
         _ => {}
     }
     Ok(RepoOp {
