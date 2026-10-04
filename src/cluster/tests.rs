@@ -891,6 +891,10 @@ async fn peer_routes_are_bound_to_the_callers_certificate() {
     }
     let hello = json(serde_json::json!({ "node_id": "edge-1" }));
     assert_eq!(post("edge-1", peer::HELLO, hello).await, 200);
+    let posing = json(serde_json::json!({ "node_id": "node-b" }));
+    assert_eq!(post("edge-1", peer::HELLO, posing).await, 403, "a hello names its caller");
+    let leaving = json(serde_json::json!({ "leaving": a_log }));
+    assert_eq!(post("node-b", peer::NUDGE, leaving).await, 403, "only a node's own leave");
     // b is leased: it forwards, but may not fence a's live log
     assert_eq!(post("node-b", peer::FORWARD, batch()).await, 200);
     assert_eq!(post("node-b", peer::FENCE, fence(&a_log)).await, 403);

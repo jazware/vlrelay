@@ -33,8 +33,8 @@ Every core and edge holds the internal token and a certificate from the cluster 
 
 | Route | Who may call it |
 |---|---|
-| log stream, hello | any member (edges follow core logs, joiners greet) |
-| forward, nudge, key invalidation, peer admin, archival reads, PLC seeding | a core whose lease we list as live (draining included: a leaving node still forwards and nudges) |
+| log stream, hello | any member (edges follow core logs, joiners greet); a hello must name its caller |
+| forward, nudge, key invalidation, peer admin, archival reads, PLC seeding | a core whose lease we list as live (draining included: a leaving node still forwards and nudges); a nudge's `leaving` must be the caller's own log |
 | fence `log_id` | the node that wrote `log_id` (a leave whose own fence failed, its lease possibly lapsed), or a leased core while the bucket shows that log's lease draining, expired (by its `expires_ms`, with the skew as margin), replaced or gone |
 
 Anything else gets a 403 and counts in `vlrelay_peer_refused_total`. A core whose peers presumed it dead is refused until they list it again, which is what a zombie should get. The token is still checked on every route.

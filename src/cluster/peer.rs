@@ -213,9 +213,19 @@ async fn stream(State(n): S, h: HeaderMap, Query(q): Query<StreamQuery>, ws: Web
     ws.on_upgrade(move |ws| super::follow::serve_stream(ws, log, closed))
 }
 
-async fn hello(State(n): S, h: HeaderMap, axum::Json(inp): axum::Json<HelloIn>) -> Response {
+async fn hello(
+    State(n): S,
+    Extension(caller): Extension<PeerIdentity>,
+    h: HeaderMap,
+    axum::Json(inp): axum::Json<HelloIn>,
+) -> Response {
     if let Err(r) = authorized(&n, &h) {
         return r.into_response();
+    }
+    // a member greets as itself, or it could have us learn another's lease
+    if *caller.0 != *inp.node_id {
+        PEER_REFUSED.inc();
+        return StatusCode::FORBIDDEN.into_response();
     }
     let Some(c) = n.cluster.clone() else {
         return axum::Json(HelloOut { floor: None }).into_response();
@@ -227,13 +237,24 @@ async fn hello(State(n): S, h: HeaderMap, axum::Json(inp): axum::Json<HelloIn>) 
     }
 }
 
-async fn nudge(State(n): S, h: HeaderMap, axum::Json(inp): axum::Json<NudgeIn>) -> Response {
+async fn nudge(
+    State(n): S,
+    Extension(caller): Extension<PeerIdentity>,
+    h: HeaderMap,
+    axum::Json(inp): axum::Json<NudgeIn>,
+) -> Response {
     if let Err(r) = authorized(&n, &h) {
         return r.into_response();
     }
     if let Some(id) = inp.leaving {
+        // only a node's own leave: hosts are handed to nobody it names
+        if log_node(&id) != Some(&*caller.0) {
+            PEER_REFUSED.inc();
+            return StatusCode::FORBIDDEN.into_response();
+        }
         n.peer_leaving(id);
     }
+
     n.nudged(inp.handoffs, inp.hosts);
     StatusCode::OK.into_response()
 }
