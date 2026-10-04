@@ -307,6 +307,9 @@ impl ClusterNode {
             let cluster = Cluster::join(cc, store.clone()).await?;
             // an open replays every span of a shard's history, one log each
             cluster.set_trim_spans(1);
+            // a pause that lapsed the lease is ridden out if nobody fenced
+            // our log; the log holds meanwhile (`lapse_grace`)
+            cluster.set_revalidate(true);
             if let Some(http) = &http {
                 let c = cluster.clone();
                 http.set_registry(Arc::new(move |origin: &str| {
@@ -332,6 +335,8 @@ impl ClusterNode {
                 seq_floor: vlpds::nodelog::seq_floor(vlpds::tid::now_micros()).max(serve.firehose.position()),
                 lease_ok: Some(Arc::new(move || lease.lease_valid())),
                 idle_heartbeat: t.idle_heartbeat,
+                // vlpds's revalidation window: the watchdog fail-stops past it
+                lapse_grace: opts.skew * 2 + opts.ttl,
             };
             let owner = log_owner.clone();
             let on_fatal: crate::seq::OnFatal = Box::new(move |e| {

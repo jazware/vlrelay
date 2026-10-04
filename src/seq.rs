@@ -72,6 +72,7 @@ pub const DEFAULT_MAX_SEGMENT_EVENTS: usize = 65_536;
 /// ~85k (docs/perf.md). The bytes held are at most this many segments.
 pub const DEFAULT_INFLIGHT: usize = 32;
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(72 * 3600);
+const LEASE_HOLD_POLL: Duration = Duration::from_millis(10);
 /// Durable batches a peer stream may fall behind by before it's dropped.
 const LIVE_BATCHES: usize = 4096;
 
@@ -211,6 +212,11 @@ pub struct LogConfig {
     /// followers that only read the bucket (replicas) see its watermark
     /// move. None: never (a log nobody follows from the bucket alone).
     pub idle_heartbeat: Option<Duration>,
+    /// How long a lapsed lease holds the log (nothing sealed, nothing
+    /// acked) before it fails. A cluster that revalidates a lapsed lease
+    /// (vlpds's `Cluster::set_revalidate`) sets its revalidation window, and
+    /// fail-stops by itself if the lease is really lost. Zero: fail at once.
+    pub lapse_grace: Duration,
 }
 
 impl LogConfig {
@@ -226,6 +232,7 @@ impl LogConfig {
             seq_floor: nodelog::seq_floor(vlpds::tid::now_micros()),
             lease_ok: None,
             idle_heartbeat: None,
+            lapse_grace: Duration::ZERO,
         }
     }
 }
@@ -318,6 +325,7 @@ impl NodeLog {
             stats: stats.clone(),
             live: live.clone(),
             on_fatal,
+            lapsed_at: None,
         };
         let task = tokio::spawn(seq.run(rx));
         Arc::new(NodeLog {
@@ -404,6 +412,15 @@ struct Sequencer {
     stats: Arc<LogStats>,
     live: tokio::sync::broadcast::Sender<Arc<LogBatch>>,
     on_fatal: Option<OnFatal>,
+    /// When the lease was first seen lapsed (None while it's valid).
+    lapsed_at: Option<Instant>,
+}
+
+enum Lease {
+    Valid,
+    /// Lapsed, within `lapse_grace`: hold.
+    Hold,
+    Lapsed,
 }
 
 /// Events being gathered into the next segment.
@@ -473,6 +490,31 @@ impl std::future::Future for AbortOnDrop {
 }
 
 impl Sequencer {
+    fn lease(&mut self) -> Lease {
+        match &self.cfg.lease_ok {
+            Some(ok) if !ok() => {
+                let at = *self.lapsed_at.get_or_insert_with(Instant::now);
+                if at.elapsed() < self.cfg.lapse_grace { Lease::Hold } else { Lease::Lapsed }
+            }
+            _ => {
+                self.lapsed_at = None;
+                Lease::Valid
+            }
+        }
+    }
+
+    /// A segment landed: ack it only under a valid lease, waiting out a
+    /// lapse within the grace.
+    async fn lease_for_ack(&mut self) -> Result<(), LogError> {
+        loop {
+            match self.lease() {
+                Lease::Valid => return Ok(()),
+                Lease::Lapsed => return Err(LogError::LeaseLapsed),
+                Lease::Hold => tokio::time::sleep(LEASE_HOLD_POLL).await,
+            }
+        }
+    }
+
     fn fail(&mut self, e: LogError) {
         let mut f = self.failed.lock();
         if f.is_none() {
@@ -495,6 +537,8 @@ impl Sequencer {
         let mut inflight: FuturesOrdered<AbortOnDrop> = FuturesOrdered::new();
         let mut closed = false;
         let mut last_sealed = Instant::now();
+        // sealing is held for a lapsed lease: retry then
+        let mut retry_at: Option<Instant> = None;
         loop {
             let heartbeat_at = match self.cfg.idle_heartbeat {
                 Some(h) if inflight.is_empty() && open.opened.is_none() && !closed => Some(last_sealed + h),
@@ -502,7 +546,7 @@ impl Sequencer {
             };
             let full = open.seg.len() >= self.cfg.max_segment_bytes || open.frames.len() >= self.cfg.max_segment_events;
             let linger_at = open.opened.map(|t| t + self.cfg.linger);
-            let can_seal_later = inflight.len() < k && linger_at.is_some() && !full;
+            let can_seal_later = inflight.len() < k && linger_at.is_some() && !full && retry_at.is_none();
             tokio::select! {
                 biased;
                 r = inflight.next(), if !inflight.is_empty() => {
@@ -520,10 +564,10 @@ impl Sequencer {
                     if !sealed.data.is_empty() {
                         prefix_end = sealed.ordinal + 1;
                     }
-                    let res = res.and_then(|()| match &self.cfg.lease_ok {
-                        Some(ok) if !ok() => Err(LogError::LeaseLapsed),
-                        _ => Ok(()),
-                    });
+                    let res = match res {
+                        Ok(()) => self.lease_for_ack().await,
+                        Err(e) => Err(e),
+                    };
                     let prior = self.failed.lock().clone();
                     match (res, prior) {
                         (Ok(()), None) => self.finalize(sealed),
@@ -556,6 +600,9 @@ impl Sequencer {
                     None => closed = true,
                 },
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(linger_at.unwrap_or_else(Instant::now))), if can_seal_later => {}
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at.unwrap_or_else(Instant::now))), if retry_at.is_some() => {
+                    retry_at = None;
+                }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(heartbeat_at.unwrap_or_else(Instant::now))), if heartbeat_at.is_some() => {
                     let seq = self.wm.assign();
                     open.seg.first_seq = seq;
@@ -574,12 +621,17 @@ impl Sequencer {
                 || open.seg.len() >= self.cfg.max_segment_bytes
                 || open.frames.len() >= self.cfg.max_segment_events
                 || closed;
-            if inflight.len() < k && open.opened.is_some() && due {
-                if let Some(ok) = &self.cfg.lease_ok
-                    && !ok()
-                {
-                    self.fail(LogError::LeaseLapsed);
-                    continue;
+            if inflight.len() < k && open.opened.is_some() && due && retry_at.is_none() {
+                match self.lease() {
+                    Lease::Valid => {}
+                    Lease::Hold => {
+                        retry_at = Some(Instant::now() + LEASE_HOLD_POLL);
+                        continue;
+                    }
+                    Lease::Lapsed => {
+                        self.fail(LogError::LeaseLapsed);
+                        continue;
+                    }
                 }
                 let o = std::mem::replace(&mut open, Open::new(&self.log_id));
                 if inflight.is_empty() {
