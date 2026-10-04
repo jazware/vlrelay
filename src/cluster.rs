@@ -963,8 +963,8 @@ async fn reach_loop(me: Weak<ClusterNode>) {
         }
         let Some(c) = n.cluster.clone() else { return };
         // alone, nobody needs to reach us, nor waits on our log
+        // (`may_join` asks only with live peers, so the flag can wait)
         if c.peers().is_empty() {
-            n.self_reachable.store(true, Ordering::Release);
             (failing_since, slow_since) = (None, None);
             continue;
         }

@@ -138,7 +138,7 @@ fn opts(ca: &Ca, id: &str, role: Role, addr: &str) -> ClusterOptions {
 }
 
 async fn spawn(store: &Store, ca: &Ca, id: &str, role: Role, applied: &Arc<Applied>) -> TNode {
-    spawn_at(store, ca, id, role, applied, None).await
+    spawn_at(store, ca, id, role, applied, None, None).await
 }
 
 /// `advertise`: where peers are told to reach it (default: its listener).
@@ -148,9 +148,13 @@ async fn spawn_at(
     id: &str,
     role: Role,
     applied: &Arc<Applied>,
+    peer: Option<tokio::net::TcpListener>,
     advertise: Option<String>,
 ) -> TNode {
-    let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = match peer {
+        Some(l) => l,
+        None => tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+    };
     let addr = advertise.unwrap_or_else(|| format!("https://{}", peer.local_addr().unwrap()));
     let node = ClusterNode::start(opts(ca, id, role, &addr), store.clone()).await.unwrap();
     node.set_stage(Arc::new(LogStage { node: Arc::downgrade(&node), applied: applied.clone() }));
@@ -577,36 +581,74 @@ async fn a_failed_log_loses_the_node() {
     assert!(n.node.halted());
 }
 
-/// A core whose advertised peer address takes connections and never
-/// answers (a blackholed port in front of it): it hands its shards to the
-/// peer that can't reach it and steps down, instead of holding them for
-/// the whole partition.
+/// A TCP proxy to `to` that, once `open` is cleared, cuts every
+/// connection and holds new ones without answering (a blackholed port).
+async fn gate_proxy(to: SocketAddr, open: Arc<AtomicBool>) -> String {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("https://{}", l.local_addr().unwrap());
+    tokio::spawn(async move {
+        let conns: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::default();
+        let (o, c) = (open.clone(), conns.clone());
+        tokio::spawn(async move {
+            while o.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            for h in c.lock().drain(..) {
+                h.abort();
+            }
+        });
+        let mut held = Vec::new();
+        while let Ok((mut s, _)) = l.accept().await {
+            if !open.load(Ordering::SeqCst) {
+                held.push(s);
+                continue;
+            }
+            conns.lock().push(tokio::spawn(async move {
+                if let Ok(mut t) = tokio::net::TcpStream::connect(to).await {
+                    let _ = tokio::io::copy_bidirectional(&mut s, &mut t).await;
+                }
+            }));
+        }
+    });
+    addr
+}
+
+/// A core whose peer port goes dark once it holds shards (as the chaos
+/// partition-peer does: its own advertised address stops answering too)
+/// hands them to its peer and steps down. A core that starts dark never
+/// joins (`may_join`), so a restart can't take shards just to give them
+/// up again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_core_its_peers_cannot_reach_steps_down() {
     let (store, ca, applied) = (Store::memory(None), Ca::new(), Arc::new(Applied::default()));
     let a = spawn(&store, &ca, "node-a", Role::Core, &applied).await;
+    let total = a.node.layout().unwrap().shards.len();
     eventually("a holds every shard", Duration::from_secs(10), || {
-        a.node.cluster.as_ref().unwrap().owned().len() == a.node.layout().unwrap().shards.len()
+        a.node.cluster.as_ref().unwrap().owned().len() == total
     })
     .await;
-    let hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let hole_addr = format!("https://{}", hole.local_addr().unwrap());
-    tokio::spawn(async move {
-        let mut held = Vec::new();
-        while let Ok((s, _)) = hole.accept().await {
-            held.push(s);
-        }
-    });
-    let b = spawn_at(&store, &ca, "node-b", Role::Core, &applied, Some(hole_addr)).await;
+    let real = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let open = Arc::new(AtomicBool::new(true));
+    let front = gate_proxy(real.local_addr().unwrap(), open.clone()).await;
+    let b = spawn_at(&store, &ca, "node-b", Role::Core, &applied, Some(real), Some(front)).await;
     let lost = Arc::new(AtomicBool::new(false));
     let l = lost.clone();
     b.node.on_lost(Box::new(move |_| l.store(true, Ordering::SeqCst)));
+    eventually("b holds shards", Duration::from_secs(15), || !b.node.cluster.as_ref().unwrap().owned().is_empty())
+        .await;
+    open.store(false, Ordering::SeqCst);
     let t0 = Instant::now();
     eventually("the unreachable core stepped down", Duration::from_secs(20), || lost.load(Ordering::SeqCst)).await;
-    let total = a.node.layout().unwrap().shards.len();
     eventually("a holds every shard again", Duration::from_secs(10), || {
         a.node.cluster.as_ref().unwrap().owned().len() == total
     })
     .await;
     assert!(t0.elapsed() < Duration::from_secs(15), "took {:?}", t0.elapsed());
+
+    let real = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dark = gate_proxy(real.local_addr().unwrap(), Arc::new(AtomicBool::new(false))).await;
+    let c = spawn_at(&store, &ca, "node-c", Role::Core, &applied, Some(real), Some(dark)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let cc = c.node.cluster.as_ref().unwrap();
+    assert!(!cc.joined() && cc.owned().is_empty(), "a core its peers can't reach doesn't join");
 }
