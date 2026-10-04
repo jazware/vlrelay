@@ -64,6 +64,42 @@ fn parses_export_lines() {
     assert!(op.seed.tombstone && op.seed.identity(did).is_none());
 }
 
+/// A local PDS on plain http (the dev network's) keeps its scheme through
+/// the seed row, so the archive fetches it over http; a record's identity
+/// takes the scheme from the seed of the same host.
+#[tokio::test]
+async fn an_http_endpoint_keeps_its_scheme() {
+    let key = format!("did:key:{}", Signer::new(crate::verify::synth::Curve::K256, 1).multibase());
+    let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    let l = op_line(did, "2025-01-02T03:04:05.678Z", &key, "http://localhost:3683", false);
+    let seed = parse_line(l.as_bytes()).unwrap().seed;
+    assert_eq!((seed.pds.as_deref(), seed.pds_http), (Some("localhost:3683"), true));
+    let back = Seed::decode(&seed.encode()).unwrap();
+    assert_eq!(back, seed);
+    assert_eq!(back.identity(did).unwrap().pds.as_deref(), Some("http://localhost:3683"));
+    let l = op_line(did, "2025-01-02T03:04:05.678Z", &key, "HTTPS://pds.example.com", false);
+    let s2 = parse_line(l.as_bytes()).unwrap().seed;
+    assert_eq!(s2.identity(did).unwrap().pds.as_deref(), Some("https://pds.example.com"));
+    assert!(seed.differs(&Seed { pds_http: false, ..seed.clone() }));
+
+    let st = Arc::new(StateStore::new(
+        Store::memory(None),
+        vlpds::slots::Layout::uniform(1).shards,
+        crate::state::StubChain,
+        crate::state::tests::MapIdentity::new(),
+        ApplyConfig::default(),
+    ));
+    st.open_shard(vlpds::slots::ShardId(0), None).await.unwrap();
+    st.note_host(HostKey::of("localhost:3683"), "localhost:3683");
+    let seeds = LocalSeeds::new(st, Duration::from_secs(3600));
+    let mut rec = Record::new(HostKey::of("localhost:3683"), 1);
+    rec.pds = Some(HostKey::of("localhost:3683"));
+    rec.key = Some(KeyBytes(seed.key.clone().unwrap()));
+    let id = seeds.record_identity(did, &rec, Some(&seed)).unwrap();
+    assert_eq!(id.pds.as_deref(), Some("http://localhost:3683"));
+    assert_eq!(seeds.record_identity(did, &rec, None).unwrap().pds.as_deref(), Some("https://localhost:3683"));
+}
+
 #[test]
 fn choose_weighs_the_record_against_the_seed() {
     let ttl = 3600;
@@ -75,6 +111,7 @@ fn choose_weighs_the_record_against_the_seed() {
         tombstone: false,
         key: Some(k.clone()),
         pds: Some("pds.test".into()),
+        pds_http: false,
     };
     let rec = |fetched: u32, k: &Bytes| {
         let mut r = Record::new(HostKey::of("pds.test"), now - 100_000);
@@ -372,7 +409,8 @@ async fn an_identity_event_newer_than_the_export_wins() {
 async fn an_op_no_newer_than_the_stored_one_writes_nothing() {
     let r = rig(1, 4, export::now_ms() - 3_600_000).await;
     let did = r.plc.layout.did(0, 1);
-    let seed = |ms: u64| Seed { created_ms: ms, tombstone: false, key: None, pds: Some("pds.test".into()) };
+    let seed =
+        |ms: u64| Seed { created_ms: ms, tombstone: false, key: None, pds: Some("pds.test".into()), pds_http: false };
     assert_eq!(r.seeds.apply(vec![(did.clone(), seed(2_000))]).await.unwrap().written, 1);
     for ms in [1_000, 2_000] {
         assert_eq!(r.seeds.apply(vec![(did.clone(), seed(ms))]).await.unwrap().written, 0);

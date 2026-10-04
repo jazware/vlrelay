@@ -82,12 +82,16 @@ pub struct Seed {
     pub key: Option<Bytes>,
     /// The `atproto_pds` endpoint's host ([`identity::normalize_host`]).
     pub pds: Option<String>,
+    /// The endpoint is `http://`: the host alone would read back as https,
+    /// and a local PDS (the dev network's) serves plain http only.
+    pub pds_http: bool,
 }
 
 const VERSION: u8 = 1;
 const F_TOMBSTONE: u8 = 1;
 const F_KEY: u8 = 2;
 const F_PDS: u8 = 4;
+const F_PDS_HTTP: u8 = 8;
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("corrupt seed row")]
@@ -105,6 +109,9 @@ impl Seed {
         }
         if self.pds.is_some() {
             flags |= F_PDS;
+        }
+        if self.pds_http {
+            flags |= F_PDS_HTTP;
         }
         b.push(VERSION);
         b.push(flags);
@@ -134,7 +141,7 @@ impl Seed {
             None
         };
         let pds = if flags & F_PDS != 0 { Some(r.str().map_err(d)?.to_string()) } else { None };
-        Ok(Seed { created_ms, tombstone: flags & F_TOMBSTONE != 0, key, pds })
+        Ok(Seed { created_ms, tombstone: flags & F_TOMBSTONE != 0, key, pds, pds_http: flags & F_PDS_HTTP != 0 })
     }
 
     fn usable(&self) -> bool {
@@ -152,16 +159,23 @@ impl Seed {
             did: did.to_string(),
             signing_key: Some(k),
             signing_key_multibase: Some(mb),
-            pds: Some(format!("https://{pds}")),
+            pds: Some(self.endpoint(pds)),
             pds_host: Some(Host(pds.clone())),
             handle: None,
         })
     }
 
+    fn endpoint(&self, host: &str) -> String {
+        format!("{}://{host}", if self.pds_http { "http" } else { "https" })
+    }
+
     /// Whether a cached document made from `self` would differ from one
     /// made from `other`.
     fn differs(&self, other: &Seed) -> bool {
-        self.tombstone != other.tombstone || self.key != other.key || self.pds != other.pds
+        self.tombstone != other.tombstone
+            || self.key != other.key
+            || self.pds != other.pds
+            || self.pds_http != other.pds_http
     }
 }
 
@@ -198,7 +212,7 @@ pub fn parse_line(line: &[u8]) -> Result<ExportOp, LineError> {
     let op = v.get("operation").ok_or(LineError::Op)?;
     let ty = vlpds::plc::op_type(op, true).map_err(|_| LineError::Op)?;
     let seed = match ty {
-        vlpds::plc::OpType::Tombstone => Seed { created_ms, tombstone: true, key: None, pds: None },
+        vlpds::plc::OpType::Tombstone => Seed { created_ms, tombstone: true, key: None, pds: None, pds_http: false },
         vlpds::plc::OpType::Operation | vlpds::plc::OpType::LegacyCreate => {
             let (key, pds) = if ty == vlpds::plc::OpType::LegacyCreate {
                 (op.get("signingKey"), op.get("service"))
@@ -210,11 +224,13 @@ pub fn parse_line(line: &[u8]) -> Result<ExportOp, LineError> {
                         .and_then(|s| s.get("endpoint")),
                 )
             };
+            let pds = pds.and_then(J::as_str);
             Seed {
                 created_ms,
                 tombstone: false,
                 key: key.and_then(J::as_str).and_then(did_key_bytes),
-                pds: pds.and_then(J::as_str).and_then(identity::normalize_host).map(|h| h.0),
+                pds: pds.and_then(identity::normalize_host).map(|h| h.0),
+                pds_http: pds.is_some_and(|p| p.trim().get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://"))),
             }
         }
     };
@@ -318,20 +334,23 @@ impl<C: Chain> LocalSeeds<C> {
         Ok(match choose(rec.as_deref(), seed.as_ref(), now, self.ttl.as_secs() as u32) {
             Pick::Resolve => None,
             Pick::Seed => seed.and_then(|s| s.identity(did)),
-            Pick::Record => rec.and_then(|r| self.record_identity(did, &r)),
+            Pick::Record => rec.and_then(|r| self.record_identity(did, &r, seed.as_ref())),
         })
     }
 
-    fn record_identity(&self, did: &str, rec: &Record) -> Option<Identity> {
+    /// The record keeps only the PDS's host, so the scheme comes from the
+    /// seed when it names the same host.
+    fn record_identity(&self, did: &str, rec: &Record, seed: Option<&Seed>) -> Option<Identity> {
         let (key, pds) = (rec.key.as_ref()?, rec.pds?);
         let pds_host = self.state.host_name(pds)?;
+        let http = seed.is_some_and(|s| s.pds_http && s.pds.as_deref() == Some(&*pds_host));
         let mb = format!("z{}", bs58::encode(&key.0).into_string());
         let k = SigningKey::from_multibase(&mb).ok()?;
         Some(Identity {
             did: did.to_string(),
             signing_key: Some(k),
             signing_key_multibase: Some(mb),
-            pds: Some(format!("https://{pds_host}")),
+            pds: Some(format!("{}://{pds_host}", if http { "http" } else { "https" })),
             pds_host: Some(Host(pds_host.to_string())),
             handle: None,
         })

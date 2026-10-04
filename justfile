@@ -87,7 +87,7 @@ e2e-archival *args:
 e2e-cluster *args:
     tests/e2e/cluster.sh {{args}}
 
-# Reshard e2e: 3 cores with archival on, a DID shard split and merged under load (tests/e2e/reshard.sh)
+# Reshard e2e: 3 cores with archival and PLC seeding, a DID shard split and merged under load (tests/e2e/reshard.sh)
 e2e-reshard *args:
     tests/e2e/reshard.sh {{args}}
 

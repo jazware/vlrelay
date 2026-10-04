@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # The reshard e2e (docs/cluster.md, "Resharding"): three core relays on one
-# MinIO prefix with archival on, under load, split a DID shard and then merge
-# its two halves back through the admin API. (No --plc-export: in dev mode a
-# seeded PDS endpoint loses its http scheme, so the archive fetches the ref
-# PDS's repos over https and fails. state::tests covers the seed rows.)
+# MinIO prefix with archival on and the PLC export seeding, under load, split
+# a DID shard and then merge its two halves back through the admin API.
 #
 #   tests/e2e/reshard.sh [--duration 60] [--rate 50] [--accounts 30]
 #                        [--split-at 20] [--merge-at 35]
@@ -79,7 +77,7 @@ up_flags=$(sed 's/^/--upstream /' dev/state/hosts | tr '\n' ' ')
 
 prefix="e2e-reshard-$(date +%s)-$$"
 store="--s3-endpoint http://127.0.0.1:$MINIO_PORT --s3-bucket vlrelay --s3-access-key minioadmin --s3-secret-key minioadmin --prefix $prefix"
-common="$store --plc-url http://127.0.0.1:$PLC_PORT --linger-ms 25 --dev-mode --internal-token e2e-reshard-token --peer-tls-dir dev/state/peer-tls --lease-ttl-ms 3000 --did-shards 4 --host-shards 16 --admin-token $token"
+common="$store --plc-url http://127.0.0.1:$PLC_PORT --plc-export --linger-ms 25 --dev-mode --internal-token e2e-reshard-token --peer-tls-dir dev/state/peer-tls --lease-ttl-ms 3000 --did-shards 4 --host-shards 16 --admin-token $token"
 hosts=$(sed 's/^/--host /' dev/state/hosts | tr '\n' ' ')
 
 pub() { echo $((base + $1)); }
