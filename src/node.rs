@@ -102,6 +102,8 @@ pub struct NodeConfig {
     pub checkpoint_interval: Duration,
     pub identity: crate::identity::Options,
     pub upstream_limits: upstream::Limits,
+    /// In-flight caps on what's read from upstreams (`upstream::flow`).
+    pub inflight: upstream::flow::FlowLimits,
     /// Enforced when set (`node::policy`); without it hosts run at their
     /// tier's default limits and nothing is counted.
     pub policy: Option<policy::PolicyEngine>,
@@ -131,6 +133,7 @@ impl NodeConfig {
             checkpoint_interval: Duration::from_secs(5),
             identity: crate::identity::Options::default(),
             upstream_limits: upstream::Limits::default(),
+            inflight: upstream::flow::FlowLimits::default(),
             policy: None,
             cli_host_tier: Tier::Trusted,
             plc_export: None,
@@ -604,6 +607,7 @@ impl Node {
         let mut ucfg = UpstreamConfig::new(cfg.dev_mode);
         ucfg.endpoint = endpoint_fn(cfg.dev_mode, explicit);
         ucfg.limits = cfg.upstream_limits.clone();
+        ucfg.inflight = cfg.inflight;
         // the node's checkpoint tick flushes the registry (after it takes the
         // snapshot its applied markers depend on)
         ucfg.flush_interval = Duration::from_secs(3600);
@@ -822,7 +826,7 @@ impl Node {
         type Done = Option<(Host, i64, u64, u64)>;
         let mut acks: FuturesUnordered<futures::future::BoxFuture<'static, Done>> = FuturesUnordered::new();
         loop {
-            let job = tokio::select! {
+            let mut job = tokio::select! {
                 biased;
                 Some(done) = acks.next(), if !acks.is_empty() => {
                     if let Some((host, useq, epoch, ordinal)) = done {
@@ -836,6 +840,8 @@ impl Node {
                 },
             };
             metrics::LANE_QUEUED.dec();
+            // held until the event is done, which bounds what's in flight
+            let permit = job.frame.permit.take();
             let host = job.frame.host.clone();
             let useq = job.frame.upstream_seq;
             let epoch = job.frame.epoch;
@@ -866,6 +872,7 @@ impl Node {
                     }
                     acks.push(
                         async move {
+                            let _permit = permit;
                             // a failed log fail-stops the process (on_fatal): no ack
                             match rx.await {
                                 Ok(Ok(d)) => Some((host, useq, epoch, d.ordinal)),
@@ -887,6 +894,7 @@ impl Node {
                     let node = self.clone();
                     acks.push(
                         async move {
+                            let _permit = permit;
                             node.forwarded(rx, host, did, useq, epoch, kind).await;
                             None
                         }
@@ -1214,6 +1222,7 @@ impl Node {
             for s in ["connected", "idle", "backoff", "throttled", "suspended", "banned"] {
                 metrics::HOSTS.with_label_values(&[s]).set(by_status.get(s).copied().unwrap_or(0));
             }
+            upstream::flow::HOST_INFLIGHT_MAX.set(hosts.iter().map(|h| h.inflight_events).max().unwrap_or(0) as i64);
             let mut d = self.dash.lock();
             for h in &hosts {
                 let host = Host(h.record.hostname.clone());

@@ -111,6 +111,17 @@ struct Args {
     /// Threads verifying events (default: the core count, at most 16).
     #[arg(long)]
     ingest_threads: Option<usize>,
+    /// Upstream frames one host may have read and not yet durable; past it
+    /// (or its MB cap) the host's socket isn't read.
+    #[arg(long, default_value_t = 8192)]
+    host_inflight_events: usize,
+    #[arg(long, default_value_t = 64)]
+    host_inflight_mb: usize,
+    /// The same over every host together.
+    #[arg(long, default_value_t = 32768)]
+    inflight_events: usize,
+    #[arg(long, default_value_t = 384)]
+    inflight_mb: usize,
     /// DID document fetches per second, all DIDs together.
     #[arg(long, default_value_t = 50.0)]
     did_lookups_per_sec: f64,
@@ -221,6 +232,12 @@ async fn run(a: Args) -> anyhow::Result<()> {
     if let Some(n) = a.ingest_threads {
         cfg.ingest_threads = n.max(1);
     }
+    cfg.inflight = vlrelay::upstream::flow::FlowLimits {
+        host_events: a.host_inflight_events.max(1),
+        host_bytes: a.host_inflight_mb.max(1) << 20,
+        events: a.inflight_events.max(1),
+        bytes: a.inflight_mb.max(1) << 20,
+    };
     cfg.hosts = a.hosts.clone();
     cfg.cli_host_tier = vlrelay::upstream::Tier::parse(&a.host_tier)
         .filter(|t| t.connects())

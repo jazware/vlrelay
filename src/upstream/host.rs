@@ -173,6 +173,8 @@ pub struct HostEntry {
     pub(crate) connects: AtomicU64,
     /// The current socket's epoch (see `UpstreamFrame::epoch`).
     epoch: AtomicU64,
+    /// Frames read and not yet done.
+    pub flow: Arc<super::flow::HostFlow>,
     last_connected_ms: AtomicU64,
     account_count: AtomicU64,
     admitted_ms: u64,
@@ -201,6 +203,7 @@ impl HostEntry {
             bytes: AtomicU64::new(0),
             connects: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
+            flow: Arc::default(),
             last_connected_ms: AtomicU64::new(r.last_connected_ms.unwrap_or(0)),
             account_count: AtomicU64::new(r.account_count),
             admitted_ms: r.admitted_ms,
@@ -347,6 +350,9 @@ impl HostEntry {
             bytes: self.bytes.load(Ordering::Relaxed),
             connects: self.connects.load(Ordering::Relaxed),
             read_lag_ms: self.read_lag_ms(),
+            inflight_events: self.flow.events() as u64,
+            inflight_bytes: self.flow.bytes() as u64,
+            paused: self.flow.paused(),
         }
     }
 }
@@ -362,6 +368,11 @@ pub struct HostView {
     pub bytes: u64,
     pub connects: u64,
     pub read_lag_ms: Option<i64>,
+    /// Frames (and their bytes) read and not yet durable, rejected or dropped.
+    pub inflight_events: u64,
+    pub inflight_bytes: u64,
+    /// Not read: at its in-flight cap or the node's.
+    pub paused: bool,
 }
 
 pub struct Registry {

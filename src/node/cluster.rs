@@ -196,6 +196,7 @@ impl Node {
         let mut ucfg = UpstreamConfig::new(cfg.dev_mode);
         ucfg.endpoint = super::endpoint_fn(cfg.dev_mode, explicit);
         ucfg.limits = cfg.upstream_limits.clone();
+        ucfg.inflight = cfg.inflight;
         let cursors = cluster.cursor_source().expect("a core node has host checkpoints");
         let (manager, rx) = Manager::new(ucfg, hosts.clone(), Some(cursors.clone() as Arc<dyn upstream::CursorSource>));
         let _ = cursors.registry.set(manager.registry().clone());

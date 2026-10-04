@@ -2,6 +2,7 @@
 //! and reconnect from the durable cursor when anything goes wrong.
 
 use super::fair::HostQueue;
+use super::flow::Flow;
 use super::frame::{Peek, peek};
 use super::host::{HostEntry, HostStatus};
 use super::limits::{HostLimiter, TokenBucket};
@@ -33,6 +34,7 @@ pub(crate) struct HostTask {
     pub wake: Arc<Notify>,
     pub on_refused: Option<super::OnRefused>,
     pub on_connect: Option<ConnectFn>,
+    pub flow: Arc<Flow>,
 }
 
 /// A host we won't subscribe to however often we retry (it's a relay).
@@ -155,6 +157,17 @@ impl HostTask {
         let mut got_frames = false;
         let mut last_seq = self.entry.received_seq();
         let end = loop {
+            if !self.flow.has_room(&self.entry.flow) {
+                self.entry.set_status(HostStatus::Throttled);
+                tokio::select! {
+                    biased;
+                    _ = self.stop.changed() => break End::Stopped,
+                    _ = self.kick.notified() => break End::Kicked,
+                    _ = self.flow.wait_room(&self.entry.flow) => {}
+                }
+                self.entry.set_status(HostStatus::Active);
+                last_rx = Instant::now();
+            }
             let msg = tokio::select! {
                 biased;
                 _ = self.stop.changed() => break End::Stopped,
@@ -253,7 +266,8 @@ impl HostTask {
             let len = data.len();
             self.entry.frames.fetch_add(1, Ordering::Relaxed);
             self.entry.bytes.fetch_add(len as u64, Ordering::Relaxed);
-            let frame = UpstreamFrame { host: self.entry.host.clone(), upstream_seq, frame: data, epoch };
+            let permit = Some(self.flow.acquire(&self.entry.flow, len));
+            let frame = UpstreamFrame { host: self.entry.host.clone(), upstream_seq, frame: data, epoch, permit };
 
             let now = std::time::Instant::now();
             let g = self.entry.limits_gen();

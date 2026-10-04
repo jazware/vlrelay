@@ -12,6 +12,7 @@
 pub(crate) mod client;
 pub mod crawl;
 pub mod fair;
+pub mod flow;
 pub mod frame;
 pub mod host;
 pub mod limits;
@@ -68,6 +69,9 @@ pub struct UpstreamConfig {
     /// tungstenite's per-socket read buffer; its 128 KiB default dominates
     /// an idle connection's memory.
     pub read_buffer_bytes: usize,
+    /// Frames read and not yet done, per host and in all; a host at a cap
+    /// isn't read.
+    pub inflight: flow::FlowLimits,
 }
 
 impl UpstreamConfig {
@@ -88,6 +92,7 @@ impl UpstreamConfig {
             // the reference relay's limit on a single event
             max_frame_bytes: 5 << 20,
             read_buffer_bytes: 16 * 1024,
+            inflight: flow::FlowLimits::default(),
         }
     }
 }
@@ -145,6 +150,7 @@ pub struct Manager {
     policy: parking_lot::RwLock<Option<Arc<dyn PolicySource>>>,
     on_refused: parking_lot::RwLock<Option<OnRefused>>,
     on_connect: parking_lot::RwLock<Option<ConnectFn>>,
+    flow: Arc<flow::Flow>,
 }
 
 /// Called once when a host is refused for good (`client::Refused`): its
@@ -163,6 +169,7 @@ impl Manager {
         let cursor = cursor.unwrap_or_else(|| Arc::new(RegistryCursor(registry.clone())));
         let (tx, rx) = mpsc::channel(cfg.output_capacity.max(1));
         let fair = FairQueue::new(cfg.quantum_bytes);
+        let flow = flow::Flow::new(cfg.inflight);
         let m = Manager {
             cfg: Arc::new(cfg),
             registry,
@@ -175,6 +182,7 @@ impl Manager {
             policy: parking_lot::RwLock::new(None),
             on_refused: parking_lot::RwLock::new(None),
             on_connect: parking_lot::RwLock::new(None),
+            flow,
         };
         (Arc::new(m), rx)
     }
@@ -296,6 +304,7 @@ impl Manager {
             wake: wake.clone(),
             on_refused: self.on_refused.read().clone(),
             on_connect: self.on_connect.read().clone(),
+            flow: self.flow.clone(),
         };
         let join = tokio::spawn(task.run());
         tasks.insert(entry.host.clone(), Running { stop: stop_tx, kick, wake, queue, join });
@@ -426,6 +435,11 @@ impl Manager {
 
     pub fn queued(&self, host: &Host) -> usize {
         self.tasks.lock().get(host).map_or(0, |r| r.queue.len())
+    }
+
+    /// Frames in flight over every host.
+    pub fn inflight(&self) -> usize {
+        self.flow.events()
     }
 
     pub fn running(&self) -> usize {

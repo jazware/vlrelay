@@ -18,6 +18,8 @@ pub struct UpstreamFrame {
     pub frame: Bytes,
     /// The socket it came on: a host's epoch goes up with each connection.
     pub epoch: u64,
+    /// Counts the frame against its host's in-flight cap until dropped.
+    pub permit: Option<std::sync::Arc<crate::upstream::flow::Permit>>,
 }
 
 /// A HashMap for the per-event hot paths. SipHash was ~2% of a loaded node's
