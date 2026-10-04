@@ -171,6 +171,12 @@ pub trait DidShards: Send + Sync + 'static {
     /// Called once nothing for these shards is in flight and the log is
     /// drained: checkpoint and close.
     async fn close(&self, shards: Vec<ShardId>) -> Vec<(ShardId, anyhow::Result<()>)>;
+    /// The shard's state durably holds every span before ours (vlpds's
+    /// `ShardHost::checkpointed`): the cluster then drops them from its
+    /// history.
+    fn checkpointed(&self, _shard: ShardId) -> bool {
+        false
+    }
     fn on_layout(&self, _layout: Arc<Layout>) {}
 }
 
@@ -299,6 +305,8 @@ impl ClusterNode {
                 ..Default::default()
             };
             let cluster = Cluster::join(cc, store.clone()).await?;
+            // an open replays every span of a shard's history, one log each
+            cluster.set_trim_spans(1);
             if let Some(http) = &http {
                 let c = cluster.clone();
                 http.set_registry(Arc::new(move |origin: &str| {
@@ -910,6 +918,10 @@ impl ShardHost for ClusterNode {
         }
         let handler = self.did_shards.read().clone();
         handler.close(shards).await
+    }
+
+    fn checkpointed(&self, shard: ShardId) -> bool {
+        self.gate.serving.read().contains(&shard) && self.did_shards.read().checkpointed(shard)
     }
 
     async fn quiesce(&self) -> bool {

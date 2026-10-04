@@ -144,6 +144,9 @@ pub struct Glue {
     hostck: HostCks,
     dedupe: DedupeStore,
     markers: Mutex<HashMap<ShardId, u64>>,
+    /// Opened at their current epoch with every earlier span durable in
+    /// their state.
+    clean: Mutex<std::collections::HashSet<ShardId>>,
 }
 
 impl Node {
@@ -224,6 +227,7 @@ impl Node {
             hostck: HostCks::new(store.clone()),
             dedupe: DedupeStore::new(store.clone(), log.log_id.to_string()),
             markers: Mutex::new(HashMap::new()),
+            clean: Mutex::new(Default::default()),
         });
         let node = Node::assemble(
             cfg,
@@ -1095,6 +1099,13 @@ struct SpanTail<'a> {
     end: Option<u64>,
 }
 
+impl SpanTail<'_> {
+    /// Past `after` and inside the span.
+    fn from(&self, after: Option<u64>) -> u64 {
+        after.map_or(0, |a| a + 1).max(self.start)
+    }
+}
+
 #[async_trait::async_trait]
 impl ReplaySource for SpanTail<'_> {
     async fn tail(
@@ -1103,13 +1114,10 @@ impl ReplaySource for SpanTail<'_> {
         shard: ShardId,
         after: Option<u64>,
     ) -> anyhow::Result<Vec<(u64, Vec<StateDelta>)>> {
-        let after = match (after, self.start.checked_sub(1)) {
-            (a, None) => a,
-            (None, s) => s,
-            (Some(a), Some(s)) => Some(a.max(s)),
-        };
-        let mut v = self.replay.tail(log_id, shard, after).await?;
-        v.retain(|(o, _)| *o >= self.start && self.end.is_none_or(|e| *o < e));
+        let from = self.from(after);
+        let t = self.replay.read_span(log_id, from, self.end).await?;
+        let mut v = super::adapters::deltas_of(&t, log_id, shard, from)?;
+        v.retain(|(o, _)| self.end.is_none_or(|e| *o < e));
         Ok(v)
     }
     async fn frames(
@@ -1118,13 +1126,10 @@ impl ReplaySource for SpanTail<'_> {
         shard: ShardId,
         after: Option<u64>,
     ) -> anyhow::Result<Vec<(u64, Vec<(String, Bytes)>)>> {
-        let after = match (after, self.start.checked_sub(1)) {
-            (a, None) => a,
-            (None, s) => s,
-            (Some(a), Some(s)) => Some(a.max(s)),
-        };
-        let mut v = self.replay.frames(log_id, shard, after).await?;
-        v.retain(|(o, _)| *o >= self.start && self.end.is_none_or(|e| *o < e));
+        let from = self.from(after);
+        let t = self.replay.read_span(log_id, from, self.end).await?;
+        let mut v = super::adapters::frames_of(&t, shard, from);
+        v.retain(|(o, _)| self.end.is_none_or(|e| *o < e));
         Ok(v)
     }
 }
@@ -1143,7 +1148,7 @@ impl Shards {
             // what the earlier owner appended past its marker may come again
             // from a host whose checkpoint is behind it
             let from = before.map_or(sp.start, |b| (b + 1).max(sp.start));
-            for (ord, evs) in replay.read(&sp.log_id, from).await?.iter() {
+            for (ord, evs) in replay.read_span(&sp.log_id, from, sp.end).await?.iter() {
                 if *ord < from || sp.end.is_some_and(|e| *ord >= e) {
                     continue;
                 }
@@ -1168,8 +1173,9 @@ impl Shards {
             }
         }
         let mut inherited = 0;
-        for l in &logs {
-            for (h, useq, did) in g.dedupe.read(id, l).await? {
+        let sets = futures::future::join_all(logs.iter().map(|l| g.dedupe.read(id, l))).await;
+        for set in sets {
+            for (h, useq, did) in set? {
                 g.recent.replayed(&h, useq, did, id.0);
                 inherited += 1;
             }
@@ -1177,11 +1183,17 @@ impl Shards {
         // ours is written before any event is routed here, so a crash right
         // after this open loses nothing; then the earlier copies can go
         g.dedupe.write(id, g.recent.inherited(id.0)).await?;
-        for l in logs.into_iter().filter(|l| *l != g.dedupe.log_id) {
-            if let Err(e) = g.dedupe.delete(id, l).await {
+        let earlier: Vec<&str> = logs.into_iter().filter(|l| *l != g.dedupe.log_id).collect();
+        let deletes = futures::future::join_all(earlier.iter().map(|l| g.dedupe.delete(id, l))).await;
+        for (l, r) in earlier.iter().zip(deletes) {
+            if let Err(e) = r {
                 tracing::warn!(shard = %id, log = l, "deleting an earlier dedupe set failed: {e:#}");
             }
         }
+        // Every earlier span is in the shard's state now; once that's durable
+        // the cluster may drop them from the history (`checkpointed`), so the
+        // next open replays our span alone however many owners came before.
+        s.flush_memtable().await?;
         tracing::info!(
             shard = %id,
             spans = history.len(),
@@ -1204,6 +1216,9 @@ impl DidShards for Shards {
             let replay = &replay;
             async move {
                 let r = self.open_one(id, &history, replay).await;
+                if r.is_ok() {
+                    self.0.clean.lock().insert(id);
+                }
                 if let Err(e) = &r {
                     tracing::warn!(shard = %id, "opening DID shard failed: {e:#}");
                     let _ = self.0.state.close_shard(id).await;
@@ -1222,6 +1237,7 @@ impl DidShards for Shards {
         let mut out = Vec::new();
         for id in shards {
             let r = async {
+                g.clean.lock().remove(&id);
                 g.checkpoint_shard(id, committed).await?;
                 g.markers.lock().remove(&id);
                 g.state.close_shard(id).await
@@ -1233,6 +1249,10 @@ impl DidShards for Shards {
             out.push((id, r));
         }
         out
+    }
+
+    fn checkpointed(&self, shard: ShardId) -> bool {
+        self.0.clean.lock().contains(&shard)
     }
 
     fn on_layout(&self, layout: Arc<Layout>) {

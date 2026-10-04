@@ -18,7 +18,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 crate="$(cd "$here/../.." && pwd)"
 cd "$crate"
 
-scenarios="baseline kill9 term double-crash zombie gc-pause minio-latency minio-errors minio-pause node-bucket-hang partition-peer isolate upstream-faults upstream-restart consumers clock-skew soak"
+scenarios="baseline kill9 term double-crash crash-loop zombie gc-pause minio-latency minio-errors minio-pause node-bucket-hang partition-peer isolate upstream-faults upstream-restart consumers clock-skew soak"
 scenario=${1:-}
 [ -n "$scenario" ] && shift || true
 if [ -z "$scenario" ] || [ "$scenario" = list ]; then
@@ -239,6 +239,10 @@ case $scenario in
     at $f0; a=$(busiest 1 2 3); kill9 "$a"; sleep 2.5
     b=$(( a % 3 + 1 )); kill9 "$b"; at $((f0 + 35))
     a=$(rand_core); b=$(( a % 3 + 1 )); kill9 "$a"; sleep 1; kill9 "$b" ;;
+  crash-loop)
+    # 20 kill -9s in a row, a random core every 6 s: every takeover adds a
+    # span to the shards' histories unless the new owner trims them
+    for n in $(seq 1 20); do at $((f0 + (n - 1) * 6)); kill9 "$(rand_core)"; done ;;
   zombie)
     # SIGSTOP well past TTL + skew: peers take its shards; on SIGCONT it must
     # neither emit nor ack, and should fail-stop (the supervisor restarts it)

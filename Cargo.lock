@@ -4395,7 +4395,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vlpds"
 version = "1.0.0"
-source = "git+https://github.com/jazware/vlpds?rev=a43526f136c0d4345f5d99fe02a99f1bbb357de8#a43526f136c0d4345f5d99fe02a99f1bbb357de8"
+source = "git+https://github.com/jazware/vlpds?rev=1517601fcfd1524a67a02d4b4384c573402a993d#1517601fcfd1524a67a02d4b4384c573402a993d"
 dependencies = [
  "anyhow",
  "argon2",
