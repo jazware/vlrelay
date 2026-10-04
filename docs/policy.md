@@ -55,7 +55,7 @@ The policy state (where to recover to, last trip, trip count, operator throttle,
 
 ## Wiring
 
-`src/node/policy.rs` (`PolicyHooks`) carries the engine's decisions to the parts that enforce them and feeds it what they see. `main` builds the engine (`FixedNodes(1)` on one node; a cluster passes its own `LiveNodes`) and hands it to the node in `NodeConfig.policy`. `Node::start` installs the hooks before the upstream manager starts, so no host connects against the policy, then starts the engine's refresher, the driver and the sync loop.
+`src/node/policy.rs` (`PolicyHooks`) carries the engine's decisions to the parts that enforce them and feeds it what they see. `main` builds the engine (`FixedNodes(1)` on one node, and a cluster passes its own `LiveNodes`) and hands it to the node in `NodeConfig.policy`. `Node::start` installs the hooks before the upstream manager starts, so no host connects against the policy, then starts the engine's refresher, the driver and the sync loop.
 
 ### Who owns a host's tier
 
@@ -95,7 +95,7 @@ Actions are `alert` (log only), `case`, `throttle` and `throttle-and-case`. A pe
 ## Gaps
 
 - `engine.consumer_limits()` isn't enforced by `serve.rs` yet (connections per IP, consumers per node, the slow-consumer cutoff and the backfill limit come from vlpds's firehose options).
-- `LiveNodes` is `FixedNodes(1)`; the cluster module should pass one over its node leases.
+- `LiveNodes` is `FixedNodes(1)`. The cluster module should pass one over its node leases.
 - A relay-throttled account stays throttled until an operator lifts it, even after its host drops below its cap.
 - The account cap and the per-host new-account rate are per node, so a host shard that moves starts them over from the record's count.
 - Peer nudges after a save aren't sent. Peers pick changes up within 10 s.
