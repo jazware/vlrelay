@@ -338,8 +338,19 @@ pub(crate) async fn connect(cfg: &UpstreamConfig, host: &Host, cursor: Option<i6
         .write_buffer_size(0)
         .max_message_size(Some(cfg.max_frame_bytes))
         .max_frame_size(Some(cfg.max_frame_bytes));
-    let (ws, _) = tokio_tungstenite::client_async_tls_with_config(req, stream, Some(ws_cfg), Some(connector)).await?;
+    let (ws, resp) =
+        tokio_tungstenite::client_async_tls_with_config(req, stream, Some(ws_cfg), Some(connector)).await?;
+    if let Some(server) = relay_server(resp.headers()) {
+        anyhow::bail!("refusing {url}: it's a relay (Server: {server}), not a PDS");
+    }
     Ok(ws)
+}
+
+/// Relays mark themselves with `atproto-relay` in `Server`, and indigo bans
+/// a host that sends it. A relay's stream carries every other host's
+/// accounts, which the host authority check would refuse one event at a time.
+fn relay_server(h: &tokio_tungstenite::tungstenite::http::HeaderMap) -> Option<&str> {
+    h.get_all("server").iter().filter_map(|v| v.to_str().ok()).find(|s| s.contains("atproto-relay"))
 }
 
 fn tls_config() -> Arc<rustls::ClientConfig> {
@@ -371,5 +382,43 @@ mod tests {
             let d30 = backoff(base, max, 30);
             assert!(d30 >= max / 2 && d30 <= max);
         }
+    }
+
+    /// A websocket server on loopback answering every upgrade with `server`.
+    async fn ws_server(server: Option<&'static str>) -> Host {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let cb =
+                        |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                         mut r: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                            if let Some(v) = server {
+                                r.headers_mut().insert("server", v.parse().unwrap());
+                            }
+                            Ok(r)
+                        };
+                    let _ws = tokio_tungstenite::accept_hdr_async(s, cb).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                });
+            }
+        });
+        Host(format!("127.0.0.1:{}", addr.port()))
+    }
+
+    #[tokio::test]
+    async fn refuses_an_upstream_that_says_its_a_relay() {
+        let mut cfg = UpstreamConfig::new(true);
+        cfg.endpoint = Arc::new(|h: &Host| format!("http://{}", h.0));
+
+        let relay = ws_server(Some("indigo-relay/v0.0.0 (atproto-relay)")).await;
+        let err = connect(&cfg, &relay, None).await.err().expect("a relay upstream is refused");
+        assert!(err.to_string().contains("it's a relay"), "{err}");
+
+        let pds = ws_server(Some("vlpds/1.0")).await;
+        connect(&cfg, &pds, None).await.expect("a PDS connects");
+        let bare = ws_server(None).await;
+        connect(&cfg, &bare, Some(5)).await.expect("no Server header connects");
     }
 }
