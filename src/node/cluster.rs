@@ -459,6 +459,7 @@ fn static_reason(r: &str) -> &'static str {
         "prev_data_mismatch",
         "chain",
         "rate_limited",
+        "new_account_deferred",
         "no_identity",
         "bad_cid",
         "not_owner",
