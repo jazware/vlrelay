@@ -81,7 +81,7 @@ pub fn router(node: &Arc<ClusterNode>) -> axum::Router {
         .route(STREAM, get(stream))
         .route(HELLO, post(hello))
         .route(NUDGE, post(nudge))
-        .route(FORWARD, post(forward_batch))
+        .route(FORWARD, post(forward_batch).layer(axum::extract::DefaultBodyLimit::max(forward::MAX_BODY_BYTES)))
         .route(KEYS, post(keys))
         .route(FENCE, post(fence))
         .with_state(node.clone())

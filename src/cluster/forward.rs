@@ -81,6 +81,9 @@ pub struct ForwardConfig {
     /// Batches in flight per lane.
     pub batches: usize,
     pub max_batch: usize,
+    /// A batch stops taking events once it holds this many bytes (it
+    /// always takes one).
+    pub max_batch_bytes: usize,
     /// A lane holding fewer than `max_batch` events waits this long for more.
     pub window: Duration,
     pub lane_queue: usize,
@@ -95,12 +98,25 @@ impl Default for ForwardConfig {
             lanes: 64,
             batches: 4,
             max_batch: 512,
+            max_batch_bytes: MAX_BATCH_BYTES,
             window: Duration::from_millis(1),
             lane_queue: 4096,
             retry_budget: vlpds::forward::RETRY_BUDGET,
             rpc_timeout: Duration::from_secs(10),
         }
     }
+}
+
+/// 512 production-sized frames (~5.4 KB) are ~3 MB, past axum's 2 MB
+/// default body limit, and an owner that answers 413 is retried until the
+/// forward gives up.
+pub const MAX_BATCH_BYTES: usize = 4 << 20;
+/// The peer listener's limit for a forward: a full batch plus one more
+/// event at the largest upstream frame (`UpstreamConfig::max_frame_bytes`).
+pub const MAX_BODY_BYTES: usize = MAX_BATCH_BYTES + (6 << 20);
+
+fn wire_size(e: &Forwarded) -> usize {
+    24 + e.did.len() + e.host.0.len() + e.meta.len() + e.frame.len()
 }
 
 /// Where a DID goes, and how to get there.
@@ -189,11 +205,17 @@ async fn lane(cfg: ForwardConfig, route: Arc<dyn Route>, mut rx: mpsc::Receiver<
     loop {
         // what's held and free to go, in order
         let mut batch = Vec::new();
+        let mut bytes = 0;
         if !held.is_empty() && inflight.len() < cfg.batches.max(1) {
             let mut blocked: HashSet<String> = HashSet::new();
             let mut keep = VecDeque::new();
             for it in held.drain(..) {
-                if batch.len() < cfg.max_batch && !busy.contains_key(&it.ev.did) && !blocked.contains(&it.ev.did) {
+                if batch.len() < cfg.max_batch
+                    && bytes < cfg.max_batch_bytes
+                    && !busy.contains_key(&it.ev.did)
+                    && !blocked.contains(&it.ev.did)
+                {
+                    bytes += wire_size(&it.ev);
                     batch.push(it);
                 } else {
                     blocked.insert(it.ev.did.clone());
@@ -219,11 +241,15 @@ async fn lane(cfg: ForwardConfig, route: Arc<dyn Route>, mut rx: mpsc::Receiver<
                         open = false;
                         continue;
                     };
+                    let mut taken_bytes = wire_size(&first.ev);
                     let mut taken = vec![first];
                     let deadline = tokio::time::Instant::now() + cfg.window;
-                    while taken.len() < cfg.max_batch {
+                    while taken.len() < cfg.max_batch && taken_bytes < cfg.max_batch_bytes {
                         match tokio::time::timeout_at(deadline, rx.recv()).await {
-                            Ok(Some(it)) => taken.push(it),
+                            Ok(Some(it)) => {
+                                taken_bytes += wire_size(&it.ev);
+                                taken.push(it);
+                            }
                             Ok(None) | Err(_) => break,
                         }
                     }
@@ -377,7 +403,7 @@ async fn run_batch(cfg: &ForwardConfig, route: &dyn Route, mut pending: Vec<Item
 //           3 not owner, 4 unavailable (u16+msg)
 
 pub fn encode_batch(evs: &[Forwarded]) -> Bytes {
-    let size: usize = evs.iter().map(|e| 24 + e.did.len() + e.host.0.len() + e.meta.len() + e.frame.len()).sum();
+    let size: usize = evs.iter().map(wire_size).sum();
     let mut b = Vec::with_capacity(4 + size);
     b.put_u32(evs.len() as u32);
     for e in evs {
@@ -673,5 +699,45 @@ mod tests {
         let f = Forwarder::start(cfg, r);
         let got = f.forward(ev("did:x", 1)).await;
         assert!(matches!(got, Err(ForwardError::GaveUp(..))), "{got:?}");
+    }
+
+    /// Records each remote request's body size.
+    struct Sizes(Mutex<Vec<(usize, usize)>>);
+
+    #[async_trait::async_trait]
+    impl Route for Sizes {
+        fn owner(&self, _did: &str) -> Option<Option<String>> {
+            Some(Some("https://peer".into()))
+        }
+        async fn local(&self, batch: Vec<Forwarded>) -> Vec<StageResult> {
+            batch.iter().map(|e| Ok(Outcome::Appended(e.upstream_seq))).collect()
+        }
+        async fn remote(&self, _addr: &str, batch: Vec<Forwarded>) -> anyhow::Result<Vec<StageResult>> {
+            self.0.lock().push((batch.len(), encode_batch(&batch).len()));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok(batch.iter().map(|e| Ok(Outcome::Appended(e.upstream_seq))).collect())
+        }
+    }
+
+    /// Production-sized frames would fill a 512-event batch past the peer
+    /// listener's body limit.
+    #[tokio::test]
+    async fn batches_stay_under_the_body_limit() {
+        let r = Arc::new(Sizes(Mutex::new(Vec::new())));
+        let cfg = ForwardConfig { lanes: 1, window: Duration::from_millis(50), ..Default::default() };
+        let f = Forwarder::start(cfg, r.clone());
+        let mut waits = Vec::new();
+        for i in 0..600 {
+            let mut e = ev(&format!("did:{i}"), i);
+            e.frame = Bytes::from(vec![0u8; 20_000]);
+            waits.push(f.submit(e).await);
+        }
+        for w in waits {
+            assert!(matches!(w.await.unwrap(), Ok(Outcome::Appended(_))));
+        }
+        let sizes = r.0.lock().clone();
+        assert_eq!(sizes.iter().map(|s| s.0).sum::<usize>(), 600);
+        assert!(sizes.iter().all(|s| s.1 <= MAX_BATCH_BYTES + 20_100), "{sizes:?}");
+        assert!(sizes.iter().any(|s| s.0 > 100), "{sizes:?}");
     }
 }
