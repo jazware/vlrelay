@@ -400,6 +400,8 @@ struct Cmp {
     missing_events: Vec<serde_json::Value>,
     /// (upstream index, seq) of the Up event being handled.
     cur_from: (usize, i64),
+    /// Per --upstream: latency of matched events, and missing count.
+    by_up: HashMap<usize, (Histogram<u64>, u64)>,
 }
 
 struct Window {
@@ -437,6 +439,7 @@ impl Cmp {
             diffs: Vec::new(),
             missing_events: Vec::new(),
             cur_from: (0, 0),
+            by_up: HashMap::new(),
         }
     }
 
@@ -594,7 +597,8 @@ impl Cmp {
         let wk = (did.clone(), key);
         match self.waiting.remove(&wk) {
             Some(wt) if wt.side != side => {
-                let (up_at, up_pos) = if side == Side::Up { (at, pos) } else { (wt.at, wt.pos) };
+                let (up_at, up_pos, up) =
+                    if side == Side::Up { (at, pos, self.cur_from.0) } else { (wt.at, wt.pos, wt.from.0) };
                 let re_at = if side == Side::Up { wt.at } else { at };
                 if up_at >= w.warm_end {
                     let us = if re_at >= up_at {
@@ -609,6 +613,7 @@ impl Cmp {
                         writeln!(o, "{t} {:.1}", us as f64 / 1000.0)?;
                     }
                     self.lat_kind.entry(kind).or_insert_with(hist).saturating_record(us.max(1));
+                    self.by_up.entry(up).or_insert_with(|| (hist(), 0)).0.saturating_record(us.max(1));
                 }
                 self.counts.entry(kind).or_default().matched += 1;
                 if side == Side::Relay {
@@ -645,6 +650,7 @@ impl Cmp {
             let c = self.counts.entry(wt.kind).or_default();
             if which == "missing" {
                 c.missing += 1;
+                self.by_up.entry(wt.from.0).or_insert_with(|| (hist(), 0)).1 += 1;
                 if self.missing_events.len() < 10_000 {
                     self.missing_events.push(serde_json::json!({
                         "upstream": upstreams[wt.from.0], "seq": wt.from.1, "did": did, "key": key,
@@ -735,6 +741,14 @@ impl Cmp {
             "examples": self.examples,
             "diffs": self.diffs,
             "missing_events": self.missing_events,
+            "by_upstream": args.upstreams.iter().enumerate().map(|(i, u)| {
+                let (h, missing) = self.by_up.get(&i).map_or((None, 0), |(h, m)| (Some(h), *m));
+                serde_json::json!({
+                    "upstream": u, "matched": h.map_or(0, |h| h.len()), "missing": missing,
+                    "p50_ms": h.map(|h| ms(h.value_at_quantile(0.5))), "p99_ms": h.map(|h| ms(h.value_at_quantile(0.99))),
+                    "max_ms": h.map(|h| ms(h.max())),
+                })
+            }).collect::<Vec<_>>(),
         })
     }
 
