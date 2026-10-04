@@ -46,6 +46,12 @@ struct Args {
     /// A segment seals at this size even before its linger is up.
     #[arg(long, default_value_t = vlrelay::seq::DEFAULT_MAX_SEGMENT_BYTES >> 20)]
     max_segment_mb: usize,
+    /// zstd level for log segments: 0 stores them uncompressed, negative
+    /// levels are zstd's fast ones. Firehose frames are mostly hashes:
+    /// on production frames -1 compresses 1.8x faster than 1 for 0.6% more
+    /// bytes (docs/perf.md, iteration 5).
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    log_compression: i32,
     /// An upstream to subscribe to (repeatable). `http://` means plain
     /// `ws://` (dev mode); a bare hostname means `wss://`.
     #[arg(long = "host")]
@@ -181,6 +187,7 @@ async fn run(a: Args) -> anyhow::Result<()> {
     cfg.linger = Duration::from_millis(a.linger_ms);
     cfg.log_inflight = a.log_inflight;
     cfg.max_segment_bytes = a.max_segment_mb << 20;
+    vlpds::segment::set_compression_level(a.log_compression);
     cfg.did_shards = a.did_shards.max(1);
     cfg.retention = Duration::from_secs(a.retention.max(1) * 3600);
     if (a.retention_secs.is_some() || a.max_lag_mb.is_some()) && !dev_mode {
