@@ -8,11 +8,17 @@
 //! the new socket's copies count: an earlier socket's copy still in the
 //! pipeline can't move the cursor, which matters after a sequence restart
 //! (FutureCursor), where its seqs belong to another sequence.
+//!
+//! A host replays in seq order from the cursor, so once a new socket sends
+//! a seq above one an older socket left failed, the host doesn't have that
+//! one any more (it was pruned from its window, or skipped): it's settled
+//! as skipped, or it would pin the cursor and the tracker would grow behind
+//! it for good.
 
 use crate::types::FastMap;
 use crate::types::Host;
 use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 #[derive(Default)]
@@ -34,6 +40,8 @@ struct HostAcks {
     seqs: BTreeMap<i64, Entry>,
     /// The newest socket's epoch: copies from older ones are ignored.
     epoch: u64,
+    /// Seqs an older socket left failed, which the newest one should replay.
+    stale: BTreeSet<i64>,
 }
 
 #[derive(Default)]
@@ -74,6 +82,17 @@ impl Tracker {
         if epoch < h.epoch {
             return first;
         }
+        if h.stale.first().is_some_and(|s| *s < seq) {
+            let above = h.stale.split_off(&seq);
+            for s in std::mem::replace(&mut h.stale, above) {
+                if let Some(e) = h.seqs.get_mut(&s)
+                    && e.failed
+                    && e.pending == 0
+                {
+                    e.failed = false;
+                }
+            }
+        }
         let e = h.seqs.entry(seq).or_default();
         e.pending += 1;
         e.failed = false;
@@ -99,8 +118,12 @@ impl Tracker {
                     e.pending = 0;
                     e.failed = true;
                 }
+                h.stale = h.seqs.keys().copied().collect();
             }
-            _ => h.seqs.clear(),
+            _ => {
+                h.seqs.clear();
+                h.stale.clear();
+            }
         }
     }
 
@@ -242,6 +265,32 @@ mod tests {
         assert!(!t.begin(&h, 7), "the replayed copy is in flight");
         assert_eq!(t.finish(&h, 7, 0, None), None);
         assert_eq!(t.finish(&h, 7, 0, None), Some(7));
+    }
+
+    /// A seq the new socket skipped (the host no longer has it) used to pin
+    /// the cursor for good, with every later entry held behind it.
+    #[test]
+    fn a_seq_the_new_socket_skips_is_settled() {
+        let t = Tracker::default();
+        let h = Host("pds".into());
+        let at = Instant::now();
+        t.connected(&h, 1, Some(0), false);
+        for s in 1..=4 {
+            t.begin_at(&h, s, 1, at);
+        }
+        t.fail(&h, 2, 1);
+        assert_eq!(t.finish(&h, 1, 1, None), Some(1));
+        assert_eq!(t.finish(&h, 3, 1, None), None);
+        t.begin_at(&h, 5, 1, at);
+        assert_eq!(t.finish(&h, 5, 1, None), None, "the same socket may still be fenced: 2 holds");
+        t.connected(&h, 2, Some(1), false);
+        t.begin_at(&h, 3, 2, at);
+        assert_eq!(t.finish(&h, 3, 2, None), Some(3), "2 never came again: skipped");
+        t.begin_at(&h, 4, 2, at);
+        t.begin_at(&h, 5, 2, at);
+        assert_eq!(t.finish(&h, 5, 2, None), None);
+        assert_eq!(t.finish(&h, 4, 2, None), Some(5));
+        assert!(t.hosts.lock()[&h].seqs.is_empty());
     }
 
     /// After FutureCursor the old sequence's acks must not push the new
