@@ -207,23 +207,110 @@ Tests on this build:
 | `just e2e-policy` | PASS |
 | `just e2e-cluster --duration 60` | PASS |
 
+## Iteration 5: CPU per event (a6dfcda5)
+
+The 75k profile of the iteration 4 build, by thread pool: ingest 58%, main 25%, commit pool 16%, firehose 1%. Past the signature (~33% of all samples) and zstd (15%), these stood out:
+
+| Where | Share of samples | Why |
+|---|---|---|
+| Page faults, `madvise` and `rallocx` on 8 MiB buffers | ~8% (4.5 + 1.3 + 2.2) | Segments are ~8 MiB, jemalloc's oversize threshold. Allocations that big get an arena that hands pages back to the OS on free, so each segment buffer and its compressed copy were faulted in afresh. |
+| `policy::signals::TopK::add` | 2.4% | The per-account spam table holds 8,192 DIDs and the fleet has 100k, so nearly every add evicted. Each eviction scanned 512 entries for the minimum. |
+| aws-lc sha256 (SigV4 payload hash) | 1.6-2.2% | Each PUT hashed its whole body on a main-runtime worker, holding it for milliseconds per 8 MiB segment. |
+
+Changes, one commit each:
+
+- **`--log-compression`** (f759b7c4). A relay-only zstd level for segments, default -1. vlpds's own default stays 1, and its readers take either, since the level isn't in the format. The fleet's frames are a poor stand-in here. Their padding is random English-ish words, which compress 2.3x and slowly. Production frames are mostly CIDs and signatures, and compress 1.6x at level 1. So both were measured with the zstd CLI on one benchbox core, over 8 MiB of frames each (production: 21,943 frames read off `bsky.network` with `verify_bench capture`):
+
+  | Level | Production ratio | Production MB/s | µs/event (5.4 KB) | Fleet ratio | Fleet MB/s |
+  |---|---|---|---|---|---|
+  | 1 (vlpds) | 1.569 | 575-645 | ~9 | 2.256 | 465-488 |
+  | -1 (relay) | 1.559 | 1,070-1,150 | ~5 | 2.141 | 532-558 |
+  | -3 | 1.542 | 1,450-1,540 | ~3.6 | 2.014 | 585-613 |
+  | -8 | 1.421 | 1,820 | ~3 | 1.718 | 689 |
+  | 0 (none) | 1.0 | | 0 | 1.0 | |
+
+  On production frames -1 halves zstd's CPU for 0.6% more log bytes. -3 saves another ~1.4 µs for 1.8%. Storing segments raw would save all ~9 µs (~13% of the node) for 57% more bucket bytes and PUT bandwidth. On the fleet, -1 saves ~1 µs and stores 3.5% more bytes per event in all (2,620 to 2,710 B, log and state).
+- **jemalloc without the oversize arena** (2d714082). `oversize_threshold:0` in the binary's `malloc_conf`, so 8 MiB buffers come from the normal arenas and reuse dirty pages within the decay time. Page faults, `madvise` and `rallocx` went from ~8% of samples to ~1.4%. Peak RSS went up ~0.5 GB at 75k (2.6 to 3.1-3.3 GB), still far under the 12 GB cap.
+- **Spam signals evict from a batch of candidates** (0569eb6c). One scan finds the lightest 1/16 of a table shard, and each eviction takes the next of them whose estimate hasn't grown since. The newcomer still inherits the victim's count as error, so a lower bound never overstates and a trip is never a false positive. Only which light key goes first changes.
+- **SigV4 `UNSIGNED-PAYLOAD`** (a6dfcda5). `--s3-unsigned-payload`, on by default for an `https://` endpoint, where TLS already protects the body. vlpds gains `Store::s3_with`, and `Store::s3` is unchanged. The bench's MinIO is `http://`, so the steps below pass `--s3-unsigned-payload true` to measure it.
+
+`scripts/perf.sh` takes `PERF_HOME` (86d0bc23) for the MinIO data and the fleet dir, so a second bench on the box doesn't share them.
+
+### A/B on one box
+
+benchbox was busier than in iteration 4. Other relays were running unpinned, and the relay cores' SMT siblings (24-31) were 12-16% busy. The same iteration 4 build that measured 71.8 µs/event at 75k early in the session measured 77 µs here. So the comparison is interleaved: base (06a5737d), this build, base, this build, at the same rate, minutes apart.
+
+| Step | Build | Accepted/s | µs/event | Ingest | Main | Commit pool | TTF p50 / p99 | e2e |
+|---|---|---|---|---|---|---|---|---|
+| 75k | base | 78.1k | 77.2 | 44.9 | 19.8 | 11.5 | 200 / 436 ms | clean |
+| 75k | this | 79.7k | 70.7 | 43.0 | 17.1 | 9.8 | 214 / 524 ms | clean |
+| 75k | base | 77.6k | 76.9 | 44.7 | 19.8 | 11.5 | 212 / 447 ms | clean |
+| 75k | this | 78.5k | 70.3 | 42.7 | 17.1 | 9.7 | 194 / 425 ms | clean |
+| 75k | this, unsigned | 82.6k | 69.3 | 42.7 | 16.0 | 9.8 | 205 / 637 ms | clean |
+| 90k | base | 94.9k | 76.2 | 44.9 | 19.5 | 11.0 | 398 ms / 6.2 s | clean, behind at times |
+| 90k | this | 95.6k | 70.3 | 43.3 | 17.0 | 9.2 | 247 / 792 ms | clean |
+| 100k | base | 96.5k | 75.8 | 44.9 | 19.3 | 10.9 | 6.9 s / 23 s | behind |
+| 100k | this | 101.1k | 69.9 | 42.7 | 17.2 | 9.2 | 5.3 s / 21 s | behind |
+| 100k | this, unsigned | 106.1k | 67.7 | 42.4 | 15.5 | 9.1 | 2.0 s / 10.8 s | 0 missing, behind |
+
+The per-pool columns are µs of that pool's CPU per accepted event. Per change, from these and from single steps earlier in the session:
+
+| Change | µs/event saved | Where |
+|---|---|---|
+| zstd -1, fleet data | ~0.7-1 | commit pool |
+| zstd -1, production frames (CLI) | ~4.4 | commit pool |
+| jemalloc oversize arena off | ~4 | main 2.2-2.7, commit pool ~1 |
+| Spam table eviction | ~1.1-1.9 | ingest |
+| SigV4 unsigned payload | ~1.2 | main |
+| All four, fleet data | ~7.5 (77.0 to 69.5, -10%) | |
+
+Latency didn't move: at 75k both builds held ~200 ms p50 and ~430-520 ms p99, which is linger plus PUT. MinIO's PUT p50 was 205 ms at 75k and 409 ms from 90k up in this session, on a disk shared with the other benches.
+
+Tried and not kept: `--lanes 16` against 64, and `--ingest-threads 6` against 8. Both were within run-to-run noise (65.8 against 66.7 µs/event, 65.2 against 65.4), so the defaults stay.
+
+The ladder for this build with `--s3-unsigned-payload true`, as on an https bucket:
+
+| Offered | Accepted/s | TTF p50 / p99 | Durable p50 | PUT p50 | Relay CPU | µs/event | RSS | Rejects | e2e |
+|---|---|---|---|---|---|---|---|---|---|
+| 33k | 34.2k | 63 / 141 ms | 88 ms | 51 ms | 2.45 | 71.6 | 1.8 GB | 0 | clean |
+| 75k | 82.6k | 205 / 637 ms | 225 ms | 205 ms | 5.73 | 69.3 | 3.5 GB | 0 | clean |
+| 90k | 95.2k | 488 ms / 1.6 s | 576 ms | 409 ms | 6.23 | 65.4 | 4.1 GB | 0 | clean |
+| 100k | 106.1k | 2.0 s / 10.8 s | 360 ms | 409 ms | 7.18 | 67.7 | 4.0 GB | 0 | 0 missing, behind |
+| 110k | 107.1k | 11.5 s / 26 s | 576 ms | 409 ms | 7.12 | 66.5 | 4.6 GB | 0 | behind |
+
+At 90k the node now keeps up, where the base build fell seconds behind at times. It takes ~106-107k/s at ~7.1-7.2 of its 8 cores, against ~101k for iteration 4. The time to firehose at 90k is mostly MinIO's 409 ms PUTs in this session.
+
+Some steps on both builds saw the checker's relay socket closed with `ConsumerTooSlow` (1-4 times a step). The checker reconnects with its cursor and saw nothing missing or duplicated. It runs on the cores the fleet and MinIO share, so it's most likely the checker falling behind under load.
+
+Tests on this build:
+
+| Test | Result |
+|---|---|
+| Lib tests (the verify mutation tests included) | 108 passed |
+| `just e2e --duration 60 --rate 400 --accounts 60 --bucket` | PASS, p50 / p99 18 / 31 ms |
+| `just e2e --duration 60 --rate 50 --restart-at 20` | PASS |
+| `just e2e-cluster --duration 60` | PASS |
+
+The e2e runs use an `http://` MinIO, so they cover the signed path. The unsigned path ran in the 75k-110k steps above against MinIO, with every event accounted for.
+
 ## The per-node ceiling
 
-One node with 8 pinned cores sustains ~94k events/s, every event checked, with the time to firehose at p50 ~190 ms and p99 under 0.7 s, 0 rejects and a clean e2e. That's 2.8x the 33k/s target. With a committer per shard it takes ~101k/s with commits keeping pace. There it uses 7.3 of 8 cores, and latency grows with any backlog. So the ceiling is now the CPU.
+One node with 8 pinned cores sustains ~90-95k events/s, every event checked, with 0 rejects and a clean e2e. That's 2.8x the 33k/s target. It takes ~106k/s at its CPU ceiling (7.2 of 8 cores), where latency grows with any backlog. So the ceiling is the CPU.
 
-- **CPU** costs ~70-72 µs per event, linear in the rate:
+- **CPU** costs ~65-70 µs per event with the iteration 5 build, against ~72 before (both on a quiet box), linear in the rate. From the 75k profile:
 
   | Part | µs per event |
   |---|---|
-  | Signature verification (secp256k1 and sha256), being worked on by the verify-perf workstream | ~33 |
-  | Upstream sockets, sequencer, committer and SlateDB, on the main runtime | ~19 |
-  | zstd on the segments | ~12 |
-  | Dispatch, parse, apply and the lane | ~7 |
+  | secp256k1, the signature itself (the floor) | ~24 |
+  | The rest of verify: block hashes, MST inversion, commit decode | ~5 |
+  | Dispatch, parse, apply, the lane, spam signals, the clock | ~13 |
+  | Main runtime: upstream sockets (~2), sequencer (~2.5), committers and SlateDB (~5), scheduling and syscalls | ~15-16 |
+  | zstd -1 on the segments (fleet data; ~5 on production frames) | ~9 |
 
-  8 cores give ~110k/s with no headroom.
+  8 cores give ~115k/s with no headroom.
 - **The committer** gave out at ~90-95k/s while it was one task. A committer per shard (iteration 4) took it off the list.
-- **Time to firehose** is linger plus PUT. At 33k it's ~50 ms p50 and ~100 ms p99 on disk MinIO. With the bucket in RAM it was 32 / 50 ms. Above ~50k/s a segment seals on size, not linger, and its PUT takes 100-400 ms on this MinIO, so the p50 climbs to ~150-200 ms at 75-90k. S3's PUT latency for a few MB is lower and flatter. That needs measuring on S3.
-- **The target**, 33k/s per node, takes ~2.5 of the 8 cores, with p99 ~100 ms and 0 rejects.
+- **Time to firehose** is linger plus PUT. At 33k it's ~50-65 ms p50 and ~100-140 ms p99 on disk MinIO. With the bucket in RAM it was 32 / 50 ms. Above ~50k/s a segment seals on size, not linger, and its PUT takes 100-400 ms on this MinIO, so the p50 climbs to ~150-250 ms at 75-90k. S3's PUT latency for a few MB is lower and flatter. That needs measuring on S3.
+- **The target**, 33k/s per node, takes ~2.4 of the 8 cores, with p99 ~100-140 ms and 0 rejects.
 
 ## Fan-out at 33k
 
@@ -249,8 +336,10 @@ So a node serving many consumers wants a fan-out tier (replicas or edges), not m
 
 ## Not done, next
 
-- **CPU.** The ceiling now. Verify is about half of it, then the main runtime (upstream sockets, sequencer, SlateDB) and zstd.
+- **CPU.** Still the ceiling. The signature is about a third of it and is the floor. What's left above it is spread thin: outside secp256k1 and zstd, nothing is over ~2% of samples.
+- **Compression.** zstd -1 is still ~14% of the node's CPU on the fleet, ~7% on production frames. -3 would save ~1.4 µs more on production for 1.8% more bytes, and raw segments all of it for 57% more. That's a cost decision for the operator, so the default stops at -1.
+- **The upstream read buffer.** tungstenite reads 16 KB at a time (`read_buffer_bytes`), about three frames per `recv`, and `recv` is ~2% of samples. 64 KB would cut the syscalls but costs 48 KB more per host connection, ~150 MB across 3,000 hosts.
+- **The clock.** About 10 clock reads per event remain (vdso `clock_gettime`, ~2% of samples): the stage timers, the identity and verify stage boundaries, `now_secs` for the state step and the future-rev check, and the policy's `now_ms`. Sharing them across stages would save ~0.5 µs.
 - **Per-lane batching into the log.** Each event is still its own `log.submit` with its own oneshot, and its own boxed future in the committer. In the profile, these channel and future costs are under 1%, so they were left alone. Batching per lane would mean a `DidOwner::submit_batch` with a looping default, so the cluster's seam keeps its per-event contract.
-- **The clock.** Iteration 4 removed about 5 of the ~15 clock reads per event. What's left is mostly the stage timers, the upstream client's per-frame `last_rx` and its rate limiter. These weren't profiled again.
-- **SigV4 payload hashing.** Each PUT hashes its body (1.5%). object_store's unsigned payload would skip that. It's a vlpds `Store` setting.
-- **Compression.** zstd level 1 is ~15% of the node's CPU. Lower levels trade bucket bytes for CPU. That's a cost decision, so it wasn't changed here.
+- **Parse once.** The dispatcher's `event::route` and the lane's strict parse both walk the frame, but `route` is ~0.3% of samples, so handing the parse downstream isn't worth the churn.
+- **MST hashing.** `height_for_key` hashes each key of each loaded node, ~0.3% of samples on the fleet's 50-100 record repos. Production repos are deeper, so a per-thread key-height cache may be worth measuring on production frames (`verify_bench`). Caching a DID's previous proof nodes would help little: every node on a commit's path is new, and only unchanged neighbours can repeat.
