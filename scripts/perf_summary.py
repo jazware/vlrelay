@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """One load step's numbers from the files scripts/perf.sh leaves: relay
 /metrics before and after, MinIO metrics, per-thread CPU samples, e2e_check."""
+import glob
 import json
 import re
 import sys
@@ -121,4 +122,14 @@ r = {
     },
 }
 r["e2e"]["n"] = lat.get("n")
+consumers = []
+for f in sorted(glob.glob(f"{out}/{name}.consume-*.json")):
+    try:
+        c = json.loads(open(f).read().strip().splitlines()[-1])
+        consumers.append((c.get("events_per_s"), c.get("mb_per_s"), c.get("seq_regressions")))
+    except (OSError, ValueError, IndexError):
+        consumers.append(None)
+r["consumers"] = consumers
+r["firehose_disconnects"] = total(m1, "vlpds_firehose_disconnects_total") - total(m0, "vlpds_firehose_disconnects_total")
+r["firehose_mb_per_s"] = round(rate("vlpds_firehose_bytes_sent_total") / 1e6, 1)
 print(json.dumps(r, indent=1))

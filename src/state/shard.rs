@@ -12,7 +12,7 @@ use super::record::{self, Record};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use slatedb::Db;
-use std::collections::HashMap;
+use crate::types::FastMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use vlpds::slots::ShardId;
@@ -36,8 +36,8 @@ struct Slot {
 
 #[derive(Default)]
 struct Pending {
-    by_did: HashMap<Arc<str>, Slot>,
-    by_ticket: HashMap<u64, (Arc<str>, Arc<Record>)>,
+    by_did: FastMap<Arc<str>, Slot>,
+    by_ticket: FastMap<u64, (Arc<str>, Arc<Record>)>,
 }
 
 type RecordLru = lru::LruCache<Arc<str>, Arc<Record>>;
@@ -163,7 +163,7 @@ impl ShardState {
     /// order) to the memtable in one batch: what the log finalizer calls
     /// before it acks them. Unknown tickets (already committed) are skipped.
     pub async fn commit(&self, tickets: impl IntoIterator<Item = u64>) -> Result<usize, slatedb::Error> {
-        let mut rows: HashMap<Arc<str>, Arc<Record>> = HashMap::new();
+        let mut rows: FastMap<Arc<str>, Arc<Record>> = FastMap::default();
         let mut settled = Vec::new();
         {
             let mut p = self.pending.lock();
@@ -192,7 +192,7 @@ impl ShardState {
     /// Writes staged changes that no log entry carries, for DIDs with no
     /// uncommitted logged change.
     pub async fn flush_unlogged(&self) -> Result<usize, slatedb::Error> {
-        let rows: HashMap<Arc<str>, Arc<Record>> = {
+        let rows: FastMap<Arc<str>, Arc<Record>> = {
             let p = self.pending.lock();
             p.by_did
                 .iter()
@@ -210,7 +210,7 @@ impl ShardState {
         Ok(n)
     }
 
-    async fn write_rows(&self, rows: HashMap<Arc<str>, Arc<Record>>) -> Result<(), slatedb::Error> {
+    async fn write_rows(&self, rows: FastMap<Arc<str>, Arc<Record>>) -> Result<(), slatedb::Error> {
         let mut wb = slatedb::WriteBatch::new();
         for (did, rec) in rows {
             wb.put(record::did_key(&did), rec.encode());

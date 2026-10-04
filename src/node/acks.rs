@@ -4,7 +4,8 @@
 
 use crate::types::Host;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap};
+use crate::types::FastMap;
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 #[derive(Default)]
@@ -27,7 +28,7 @@ struct HostAcks {
 
 #[derive(Default)]
 pub struct Tracker {
-    hosts: Mutex<HashMap<Host, HostAcks>>,
+    hosts: Mutex<FastMap<Host, HostAcks>>,
 }
 
 #[derive(Debug, Default)]

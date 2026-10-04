@@ -17,3 +17,8 @@ pub struct UpstreamFrame {
     /// The raw DAG-CBOR frame (header + body), exactly as received.
     pub frame: Bytes,
 }
+
+/// A HashMap for the per-event hot paths. SipHash was ~2% of a loaded node's
+/// CPU; foldhash is seeded per process, so DID keys still can't be chosen to
+/// collide.
+pub type FastMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;

@@ -290,8 +290,7 @@ impl DidOwner for LocalOwner {
                 r => break r,
             }
         };
-        metrics::STAGE.with_label_values(&["apply"]).observe(t0.elapsed().as_secs_f64());
-        metrics::STAGE_CPU.with_label_values(&["apply"]).inc_by(t0.elapsed().as_micros() as u64);
+        metrics::APPLY.busy(t0.elapsed());
         match r {
             Ok(Applied::Append(a)) => {
                 let meta =
@@ -669,7 +668,7 @@ impl Node {
                     continue;
                 }
             };
-            metrics::EVENTS_IN.with_label_values(&[r.kind.as_str()]).inc();
+            metrics::IN_BY_KIND.inc(r.kind.as_str());
             let first = self.acks.begin(&f.host, f.upstream_seq);
             let did = match (r.kind, r.did) {
                 (Kind::Commit | Kind::Sync | Kind::Identity | Kind::Account, Some(d)) => d,
@@ -755,7 +754,7 @@ impl Node {
             let kind = checked.kind.label();
             match self.owner.submit(checked).await {
                 Submitted::Appended(rx) => {
-                    metrics::EVENTS_ACCEPTED.with_label_values(&[kind]).inc();
+                    metrics::ACCEPTED_BY_KIND.inc(kind);
                     if let Some(p) = &self.policy {
                         p.on_accepted(&host.0, &did, kind);
                     }
@@ -844,8 +843,7 @@ impl Node {
             )),
             _ => None,
         };
-        metrics::STAGE.with_label_values(&["parse"]).observe(parse_us.as_secs_f64());
-        metrics::STAGE_CPU.with_label_values(&["parse"]).inc_by(parse_us.as_micros() as u64);
+        metrics::PARSE.busy(parse_us);
         Ok(out)
     }
 
@@ -861,14 +859,13 @@ impl Node {
         loop {
             let t0 = Instant::now();
             let id = self.lookup(did, fresh).await?;
-            metrics::STAGE.with_label_values(&["identity"]).observe(t0.elapsed().as_secs_f64());
+            metrics::IDENTITY.wall(t0.elapsed());
             let t1 = Instant::now();
             let r = match &id.signing_key {
                 Some(k) => cpu(len, || check(k)),
                 None => Err(Reject::NoSigningKey),
             };
-            metrics::STAGE.with_label_values(&["verify"]).observe(t1.elapsed().as_secs_f64());
-            metrics::STAGE_CPU.with_label_values(&["verify"]).inc_by(t1.elapsed().as_micros() as u64);
+            metrics::VERIFY.busy(t1.elapsed());
             match r {
                 Err(e) if e.may_be_stale_key() && !fresh => fresh = true,
                 r => return r.map_err(Rejection::verify),

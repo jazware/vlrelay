@@ -28,7 +28,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 mime_guess = "2"
 prometheus = { version = "0.14", default-features = false }
-# the relay binary's allocator, as vlpds's server (glibc malloc was ~10% of a loaded node's CPU)
+# the relay binary's allocator, as vlpds's server (libc malloc/free were ~13% of a loaded node's samples)
 tikv-jemallocator = "0.7"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # dev tools (src/bin/e2e_check.rs, src/bin/devnet.rs). Features match

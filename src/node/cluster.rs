@@ -400,7 +400,7 @@ impl Node {
     ) {
         match rx.await {
             Ok(Ok(Outcome::Appended(_))) => {
-                metrics::EVENTS_ACCEPTED.with_label_values(&[kind]).inc();
+                metrics::ACCEPTED_BY_KIND.inc(kind);
                 self.finish(&host, useq, None);
             }
             Ok(Ok(Outcome::Duplicate)) => {

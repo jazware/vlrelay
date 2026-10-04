@@ -39,6 +39,56 @@ lazy!(ACCOUNTS_THROTTLED: IntCounterVec = register_int_counter_vec!("vlrelay_acc
 lazy!(ACCOUNTS_DEFERRED: IntCounterVec = register_int_counter_vec!("vlrelay_accounts_deferred_total", "Events of new accounts dropped while a new-account budget was spent, by which (host_rate, cluster_budget)", &["why"]));
 lazy!(LANE_QUEUED: IntGauge = register_int_gauge!("vlrelay_lane_queued", "Events queued in front of the pipeline lanes"));
 
+/// One pipeline stage's series, resolved once: `with_label_values` hashes
+/// its labels on every call, several times per event.
+pub struct Stage {
+    seconds: Histogram,
+    busy_us: IntCounter,
+}
+
+impl Stage {
+    fn of(name: &str) -> Stage {
+        Stage { seconds: STAGE.with_label_values(&[name]), busy_us: STAGE_CPU.with_label_values(&[name]) }
+    }
+
+    /// Wall time only (a stage that waits, like a DID lookup).
+    pub fn wall(&self, d: Duration) {
+        self.seconds.observe(d.as_secs_f64());
+    }
+
+    /// Wall time that is also busy time.
+    pub fn busy(&self, d: Duration) {
+        self.seconds.observe(d.as_secs_f64());
+        self.busy_us.inc_by(d.as_micros() as u64);
+    }
+}
+
+pub static PARSE: LazyLock<Stage> = LazyLock::new(|| Stage::of("parse"));
+pub static IDENTITY: LazyLock<Stage> = LazyLock::new(|| Stage::of("identity"));
+pub static VERIFY: LazyLock<Stage> = LazyLock::new(|| Stage::of("verify"));
+pub static APPLY: LazyLock<Stage> = LazyLock::new(|| Stage::of("apply"));
+
+const KINDS: [&str; 4] = ["commit", "sync", "identity", "account"];
+
+/// A per-kind counter of `vec`, resolved once for the four event kinds.
+pub struct ByKind([IntCounter; 4], &'static IntCounterVec);
+
+impl ByKind {
+    fn of(vec: &'static IntCounterVec) -> ByKind {
+        ByKind(KINDS.map(|k| vec.with_label_values(&[k])), vec)
+    }
+
+    pub fn inc(&self, kind: &str) {
+        match KINDS.iter().position(|k| *k == kind) {
+            Some(i) => self.0[i].inc(),
+            None => self.1.with_label_values(&[kind]).inc(),
+        }
+    }
+}
+
+pub static IN_BY_KIND: LazyLock<ByKind> = LazyLock::new(|| ByKind::of(&EVENTS_IN));
+pub static ACCEPTED_BY_KIND: LazyLock<ByKind> = LazyLock::new(|| ByKind::of(&EVENTS_ACCEPTED));
+
 /// Marks the time from when a frame arrived to when the merger emitted it.
 /// Durability (where the receive time is known) and emission (seen by a tap
 /// on the firehose ring) race, so whichever comes second records it.
@@ -49,8 +99,8 @@ pub struct Ttf {
 
 #[derive(Default)]
 struct TtfInner {
-    received: HashMap<i64, Instant>,
-    emitted: HashMap<i64, Instant>,
+    received: crate::types::FastMap<i64, Instant>,
+    emitted: crate::types::FastMap<i64, Instant>,
     window: Option<hdrhistogram::Histogram<u64>>,
 }
 
