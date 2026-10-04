@@ -87,7 +87,7 @@ async fn commit(st: &StateStore, did: &str, h: &Host, c: CommitClaim, now: u32) 
 fn ticket(a: &Applied) -> Ticket {
     match a {
         Applied::Append(a) => a.ticket,
-        Applied::Duplicate => panic!("duplicate"),
+        a => panic!("{a:?}"),
     }
 }
 
@@ -360,12 +360,13 @@ async fn identity_event_refreshes_the_key() {
     assert_eq!(id.fresh.load(Relaxed), 2);
     let rec = st.get(&did).await.unwrap().unwrap();
     assert_eq!((rec.host, rec.key.as_ref().unwrap().0[2]), (HostKey::of("pds.a"), 3));
-    // so is one for a DID nothing was heard from yet
+    // so is one for a DID nothing was heard from yet, but it creates no
+    // account (its own PDS's first event does)
     let other = plc(19);
     id.set(&other, "pds.a", 1);
     let r = st.apply(Incoming { did: &other, host: &host("pds.z"), now: NOW + 3, kind: EventKind::Identity }).await;
-    let Ok(Applied::Append(acc)) = r else { panic!("{r:?}") };
-    assert_eq!(acc.delta.host, HostKey::of("pds.a"));
+    assert!(matches!(r, Ok(Applied::Pass)), "{r:?}");
+    assert!(st.get(&other).await.unwrap().is_none());
     // commits from that host still aren't
     let r = commit(&st, &did, &host("pds.z"), claim(&did, 2), NOW + 4).await;
     assert!(matches!(r, Err(Reject::WrongHost { .. })), "{r:?}");
@@ -728,6 +729,33 @@ async fn only_a_repos_first_commit_is_a_creation() {
         (dids[3].clone(), FirstSeen),
         (dids[3].clone(), FirstCommit { created: false }),
     ]);
+}
+
+/// Another host's #identity for an unknown DID must not create the account
+/// under the PDS its document names: that skipped the PDS's cap, and its
+/// first commit then passed as `FirstCommit { created: false }`, which the
+/// cap doesn't check.
+#[tokio::test]
+async fn foreign_identity_creates_no_account() {
+    let id = MapIdentity::new();
+    let st = open(1, id.clone(), ApplyConfig::default()).await;
+    let gate = Arc::new(LogGate::default());
+    st.set_account_gate(gate.clone());
+    let (victim, other) = (host("victim.example"), host("relayer.example"));
+    st.put_host(&HostRecord::new("victim.example", Tier::Default, NOW)).await.unwrap();
+    let dids: Vec<String> = (40..43).map(plc).collect();
+    for d in &dids {
+        id.set(d, "victim.example", 1);
+        let r = st.apply(Incoming { did: d, host: &other, now: NOW, kind: EventKind::Identity }).await;
+        assert!(matches!(r, Ok(Applied::Pass)), "{r:?}");
+        assert!(st.get(d).await.unwrap().is_none());
+    }
+    assert!(gate.0.lock().is_empty());
+    st.flush_host_counts(&*st).await.unwrap();
+    assert_eq!(HostStore::get_host(&*st, "victim.example").await.unwrap().unwrap().account_count, 0);
+    // the account's own PDS meets the gate as for any unknown account
+    commit(&st, &dids[0], &victim, claim(&dids[0], 3), NOW).await.unwrap();
+    assert_eq!(*gate.0.lock(), vec![(dids[0].clone(), Arrival::FirstSeen)]);
 }
 
 /// A split and a merge carry every slot-keyed family (sync records, mirror

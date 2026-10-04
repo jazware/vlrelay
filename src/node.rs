@@ -292,6 +292,18 @@ impl LocalOwner {
         let _ = self.commits[shard as usize % self.commits.len()].send(p);
     }
 
+    /// Appends an event that changed no state, so its log entry carries no
+    /// delta.
+    async fn append_stateless(&self, c: Checked) -> Submitted {
+        let shard = self.state.shard_id_of_slot(vlpds::slots::slot_of(&c.did));
+        let meta = EventMeta { did: c.did, host: c.host, upstream_seq: c.upstream_seq, shard: shard.0 };
+        let ev = seq::Event { meta, frame: Box::new(Spliced { frame: c.frame, span: c.span }), delta: None };
+        let durable = self.log.submit(vec![ev]).await;
+        let (tx, rx) = oneshot::channel();
+        self.commit(shard.0, PendingCommit { durable, ticket: None, tx, received: c.received });
+        Submitted::Appended(rx)
+    }
+
     /// When the oldest durable-but-uncommitted batch became durable (µs since
     /// `epoch`, 0 = none): a checkpoint must not pass an uncommitted entry.
     pub fn committing_since_us(&self) -> u64 {
@@ -383,17 +395,12 @@ impl DidOwner for LocalOwner {
                 );
                 Submitted::Appended(rx)
             }
+            Ok(Applied::Pass) => self.append_stateless(c).await,
             // A #sync may restate the head the last #commit left (a
             // reactivation does): it's news to consumers, not a replay,
             // unless this very upstream seq was seen before.
             Ok(Applied::Duplicate) if matches!(c.kind, CheckedKind::Sync(_)) && c.first_sighting => {
-                let shard = self.state.shard_id_of_slot(vlpds::slots::slot_of(&c.did));
-                let meta = EventMeta { did: c.did, host: c.host, upstream_seq: c.upstream_seq, shard: shard.0 };
-                let ev = seq::Event { meta, frame: Box::new(Spliced { frame: c.frame, span: c.span }), delta: None };
-                let durable = self.log.submit(vec![ev]).await;
-                let (tx, rx) = oneshot::channel();
-                self.commit(shard.0, PendingCommit { durable, ticket: None, tx, received: c.received });
-                Submitted::Appended(rx)
+                self.append_stateless(c).await
             }
             Ok(Applied::Duplicate) => Submitted::Duplicate,
             Err(state::Reject::Stale { .. }) => Submitted::Duplicate,

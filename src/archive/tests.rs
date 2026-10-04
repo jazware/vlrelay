@@ -94,7 +94,7 @@ async fn apply(st: &StateStore, did: &str, frame: &Bytes, c: CommitClaim) -> Tic
     let ev = Incoming { did, host: &h, now: NOW, kind: EventKind::Commit(c) };
     match st.apply_with_frame(ev, Some(frame)).await.unwrap() {
         Applied::Append(a) => a.ticket,
-        Applied::Duplicate => panic!("duplicate"),
+        a => panic!("{a:?}"),
     }
 }
 

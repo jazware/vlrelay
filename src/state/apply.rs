@@ -233,6 +233,10 @@ pub enum Applied {
     Append(Accepted),
     /// Already applied (same commit at the current rev): ack, don't append.
     Duplicate,
+    /// Append the event with no state change: an `#identity` another host
+    /// relayed for an account unknown here. The account is created, and
+    /// gated, at its own PDS's first event.
+    Pass,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -342,6 +346,10 @@ impl<C: Chain> StateStore<C> {
                     self.add_host_counts(old, super::host::HostCounts { accounts: -1, ..Default::default() });
                 }
             }
+            Ok(Applied::Pass) => {
+                self.note_host(hk, &ev.host.0);
+                self.add_host_counts(hk, super::host::HostCounts { events: 1, ..Default::default() });
+            }
             Ok(Applied::Duplicate) => {}
             Err(e) if !e.retryable() => {
                 let mut c = super::host::HostCounts { dropped: 1, ..Default::default() };
@@ -412,11 +420,17 @@ impl<C: Chain> StateStore<C> {
             }
             Err(e) => return Err(e),
         }
+        // a record here would credit the account to the PDS its DID
+        // document names without that host's cap or rate check, and its
+        // first commit would then pass as FirstCommit: anyone could fill
+        // any host's cap, or skirt their own
+        if !from_owner && new_account {
+            return Ok(Applied::Pass);
+        }
         let created = matches!(&ev.kind, EventKind::Commit(v) if self.chain.created(v));
         let arrival = if !from_owner {
             // another host's #identity spends nothing of that host's
-            // new-account budget; the account's own PDS is gated at its
-            // first commit (FirstCommit below)
+            // new-account budget
             None
         } else if new_account {
             Some(if created { Arrival::Created } else { Arrival::FirstSeen })
@@ -509,8 +523,6 @@ impl<C: Chain> StateStore<C> {
         };
         if from_owner {
             rec.host = hk;
-        } else if new_account && let Some(pds) = rec.pds {
-            rec.host = pds;
         }
         let status = rec.status();
         let delta =
