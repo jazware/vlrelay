@@ -2,6 +2,7 @@
 //! Design: docs/DESIGN.md. Work plan and module ownership: docs/PLAN.md.
 
 pub mod admin;
+pub mod archive;
 pub mod cluster;
 pub mod event;
 pub mod identity;

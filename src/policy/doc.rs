@@ -29,6 +29,9 @@ pub struct TierLimits {
     /// Off for `trusted`: throttling the big PDSes for a buggy minute would
     /// stall most of the network.
     pub auto_throttle: bool,
+    /// Archival bootstrap `getRepo` fetches per second from one host. A
+    /// first backfill of a big PDS takes days at these rates, on purpose.
+    pub archival_fetches_per_host: f64,
 }
 
 impl Default for TierLimits {
@@ -52,6 +55,7 @@ impl TierLimits {
             identity_events_per_hour: 1_000,
             reconnects_per_hour: 60,
             auto_throttle: true,
+            archival_fetches_per_host: 1.0,
         }
     }
 
@@ -66,6 +70,7 @@ impl TierLimits {
             identity_events_per_hour: 0,
             reconnects_per_hour: 0,
             auto_throttle: false,
+            archival_fetches_per_host: 5.0,
         }
     }
 
@@ -80,6 +85,7 @@ impl TierLimits {
             identity_events_per_hour: 100,
             reconnects_per_hour: 12,
             auto_throttle: true,
+            archival_fetches_per_host: 0.1,
         }
     }
 }
@@ -270,6 +276,10 @@ pub struct Cluster {
     pub plc_lookups_per_sec: f64,
     pub new_accounts_per_min: f64,
     pub new_hosts_per_day: u32,
+    /// Archival `getRepo` fetches in flight, and their bytes per second,
+    /// across the cluster.
+    pub archival_fetch_concurrency: u32,
+    pub archival_fetch_bytes_per_sec: u64,
 }
 
 impl Default for Cluster {
@@ -278,6 +288,8 @@ impl Default for Cluster {
             plc_lookups_per_sec: 500.0,
             new_accounts_per_min: 6_000.0,
             new_hosts_per_day: 50,
+            archival_fetch_concurrency: 32,
+            archival_fetch_bytes_per_sec: 50 * 1024 * 1024,
         }
     }
 }
@@ -343,6 +355,50 @@ pub struct PolicyBody {
     pub cluster: Cluster,
     pub consumers: Consumers,
     pub crawl: Crawl,
+    pub archive: Archive,
+}
+
+/// Which accounts the relay mirrors (docs/archival.md). Off by default
+/// (PLAN.md decision 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ArchiveMode {
+    #[default]
+    Off,
+    All,
+    /// Accounts on hosts of the listed tiers.
+    Tiers,
+    /// Accounts on the listed hosts.
+    Hosts,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Archive {
+    pub mode: ArchiveMode,
+    pub tiers: Vec<Tier>,
+    pub hosts: Vec<String>,
+    /// A taken-down account's mirror stops serving at once and is deleted
+    /// this long after the takedown (an untakedown before then keeps it).
+    pub takedown_retention_hours: u32,
+}
+
+impl Default for Archive {
+    fn default() -> Self {
+        Archive { mode: ArchiveMode::Off, tiers: Vec::new(), hosts: Vec::new(), takedown_retention_hours: 72 }
+    }
+}
+
+impl Archive {
+    /// Whether an account on `host` (running at `tier`) is mirrored.
+    pub fn wants(&self, host: &str, tier: Option<Tier>) -> bool {
+        match self.mode {
+            ArchiveMode::Off => false,
+            ArchiveMode::All => true,
+            ArchiveMode::Tiers => tier.is_some_and(|t| self.tiers.contains(&t)),
+            ArchiveMode::Hosts => self.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)),
+        }
+    }
 }
 
 pub fn validate(p: &PolicyBody) -> Result<(), Vec<String>> {
@@ -357,6 +413,9 @@ pub fn validate(p: &PolicyBody) -> Result<(), Vec<String>> {
             errs.push(format!(
                 "tiers.{n}.eventsPerHour is below one second's worth"
             ));
+        }
+        if !(l.archival_fetches_per_host.is_finite() && l.archival_fetches_per_host > 0.0) {
+            errs.push(format!("tiers.{n}.archivalFetchesPerHost must be > 0"));
         }
         if l.events_per_day != 0 && l.events_per_day < l.events_per_hour {
             errs.push(format!("tiers.{n}.eventsPerDay is below eventsPerHour"));
@@ -394,6 +453,15 @@ pub fn validate(p: &PolicyBody) -> Result<(), Vec<String>> {
         || !(c.new_accounts_per_min.is_finite() && c.new_accounts_per_min > 0.0)
     {
         errs.push("cluster budgets must be > 0".into());
+    }
+    if c.archival_fetch_concurrency == 0 || c.archival_fetch_bytes_per_sec == 0 {
+        errs.push("cluster.archivalFetchConcurrency and archivalFetchBytesPerSec must be > 0".into());
+    }
+    if p.archive.mode == ArchiveMode::Tiers && p.archive.tiers.is_empty() {
+        errs.push("archive.tiers is empty with mode tiers".into());
+    }
+    if p.archive.mode == ArchiveMode::Hosts && p.archive.hosts.is_empty() {
+        errs.push("archive.hosts is empty with mode hosts".into());
     }
     if matches!(
         p.crawl.initial_tier,

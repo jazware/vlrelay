@@ -58,6 +58,8 @@ pub struct ShardState {
     stripes: Box<[tokio::sync::Mutex<()>]>,
     next_ticket: AtomicU64,
     pub stats: ShardStats,
+    /// Archival mode's in-memory side (`crate::archive`).
+    pub mirror: crate::archive::ShardMirror,
 }
 
 #[derive(Default)]
@@ -81,6 +83,7 @@ impl ShardState {
             stripes: (0..STRIPES).map(|_| tokio::sync::Mutex::new(())).collect(),
             next_ticket: AtomicU64::new(1),
             stats: ShardStats::default(),
+            mirror: Default::default(),
         }
     }
 
@@ -165,9 +168,15 @@ impl ShardState {
     pub async fn commit(&self, tickets: impl IntoIterator<Item = u64>) -> Result<usize, slatedb::Error> {
         let mut rows: FastMap<Arc<str>, Arc<Record>> = FastMap::default();
         let mut settled = Vec::new();
+        let mut mirror_rows = Vec::new();
+        let mut mirrored = Vec::new();
         {
             let mut p = self.pending.lock();
             for t in tickets {
+                if let Some((did, m)) = self.mirror.take_ticket(t) {
+                    mirror_rows.extend(m);
+                    mirrored.push(did);
+                }
                 let Some((did, snap)) = p.by_ticket.remove(&t) else { continue };
                 let slot = p.by_did.get_mut(&did).expect("a ticket's DID is pending");
                 slot.outstanding -= 1;
@@ -180,10 +189,13 @@ impl ShardState {
             }
         }
         let n = rows.len();
-        if n == 0 {
+        if n == 0 && mirror_rows.is_empty() {
             return Ok(0);
         }
-        self.write_rows(rows).await?;
+        self.write_rows_with(rows, mirror_rows).await?;
+        for did in mirrored {
+            self.mirror.settle(&did);
+        }
         self.settle(settled);
         self.stats.committed.fetch_add(n as u64, Relaxed);
         Ok(n)
@@ -211,9 +223,24 @@ impl ShardState {
     }
 
     async fn write_rows(&self, rows: FastMap<Arc<str>, Arc<Record>>) -> Result<(), slatedb::Error> {
+        self.write_rows_with(rows, Vec::new()).await
+    }
+
+    /// Sync records and mirror rows in one batch, the mirror's in log order.
+    async fn write_rows_with(
+        &self,
+        rows: FastMap<Arc<str>, Arc<Record>>,
+        mirror: Vec<vlpds::segment::Mutation>,
+    ) -> Result<(), slatedb::Error> {
         let mut wb = slatedb::WriteBatch::new();
         for (did, rec) in rows {
             wb.put(record::did_key(&did), rec.encode());
+        }
+        for m in mirror {
+            match m.val {
+                Some(v) => wb.put(&m.key, &v),
+                None => wb.delete(&m.key),
+            }
         }
         self.db.write(wb).await.map(|_| ())
     }

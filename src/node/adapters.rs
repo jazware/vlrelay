@@ -278,4 +278,28 @@ impl ReplaySource for LogReplay {
         }
         Ok(out)
     }
+    async fn frames(
+        &self,
+        log_id: &str,
+        shard: ShardId,
+        after: Option<u64>,
+    ) -> anyhow::Result<Vec<(u64, Vec<(String, bytes::Bytes)>)>> {
+        let from = after.map_or(0, |a| a + 1);
+        let t = self.read(log_id, from).await?;
+        let mut out = Vec::new();
+        for (ord, evs) in t.iter() {
+            if *ord < from {
+                continue;
+            }
+            let frames: Vec<(String, bytes::Bytes)> = evs
+                .iter()
+                .filter(|e| e.meta.shard == shard.0)
+                .map(|e| (e.meta.did.clone(), e.frame.clone()))
+                .collect();
+            if !frames.is_empty() {
+                out.push((*ord, frames));
+            }
+        }
+        Ok(out)
+    }
 }

@@ -140,6 +140,10 @@ impl Repo {
         self.commit = Cid::dag_cbor(&self.commit_block);
     }
 
+    pub fn commit_block(&self) -> &[u8] {
+        &self.commit_block
+    }
+
     pub fn new_path(&mut self) -> String {
         self.n += 1;
         format!(

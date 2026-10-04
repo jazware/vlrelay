@@ -17,6 +17,9 @@ pub enum BudgetKind {
     NewAccountsPerMin,
     /// Shared through the bucket, not split.
     NewHostsPerDay,
+    /// At least one per node.
+    ArchivalFetchConcurrency,
+    ArchivalFetchBytesPerSec,
 }
 
 /// How many nodes are live right now. The cluster module implements it over
@@ -50,6 +53,8 @@ pub fn share(c: &Cluster, kind: BudgetKind, live: usize) -> f64 {
         BudgetKind::PlcLookupsPerSec => c.plc_lookups_per_sec / n,
         BudgetKind::NewAccountsPerMin => c.new_accounts_per_min / n,
         BudgetKind::NewHostsPerDay => c.new_hosts_per_day as f64,
+        BudgetKind::ArchivalFetchConcurrency => (c.archival_fetch_concurrency as f64 / n).ceil().max(1.0),
+        BudgetKind::ArchivalFetchBytesPerSec => c.archival_fetch_bytes_per_sec as f64 / n,
     }
 }
 

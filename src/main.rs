@@ -207,7 +207,8 @@ async fn run(a: Args) -> anyhow::Result<()> {
                 Arc::new(vlrelay::node::cluster::ClusterSync { state: node.state.clone(), hosts: g.hosts.clone() })
             }
             None => node.state.clone(),
-        }));
+        }))
+        .merge(vlrelay::archive::read::router(node.state.clone(), None));
     if a.crawl {
         app = app.merge(node.crawler.router());
     }
@@ -215,7 +216,8 @@ async fn run(a: Args) -> anyhow::Result<()> {
         let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
         let policy = node.policy.clone().expect("the relay always runs the policy engine");
         let src = Arc::new(NodeAdmin::new(node.clone(), policy, vlrelay::admin::demo::Demo::start(42)));
-        app = app.merge(vlrelay::admin::app(src, token, ui));
+        app = app.merge(vlrelay::admin::app(src, token.clone(), ui));
+        app = app.merge(vlrelay::archive::admin::router(node.state.clone(), token));
     }
     let app = app.layer(middleware::map_response(server_header));
 

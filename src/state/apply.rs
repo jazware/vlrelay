@@ -288,10 +288,20 @@ enum Authority {
 
 impl<C: Chain> StateStore<C> {
     pub async fn apply(&self, ev: Incoming<'_, C::Verified>) -> Result<Applied, Reject> {
+        self.apply_with_frame(ev, None).await
+    }
+
+    /// [`apply`](Self::apply) with the frame as received, which archival
+    /// mode applies to the account's mirror.
+    pub async fn apply_with_frame(
+        &self,
+        ev: Incoming<'_, C::Verified>,
+        frame: Option<&bytes::Bytes>,
+    ) -> Result<Applied, Reject> {
         let shard = self.shard_for(ev.did)?;
         let _did_lock = shard.lock_did(ev.did).await;
         let prev = shard.load(ev.did).await?;
-        let r = self.apply_locked(&shard, &ev, prev.as_deref()).await;
+        let r = self.apply_locked(&shard, &ev, prev.as_deref(), frame).await;
         let hk = HostKey::of(&ev.host.0);
         match &r {
             Ok(Applied::Append(a)) => {
@@ -327,8 +337,10 @@ impl<C: Chain> StateStore<C> {
         shard: &ShardState,
         ev: &Incoming<'_, C::Verified>,
         prev: Option<&Record>,
+        frame: Option<&bytes::Bytes>,
     ) -> Result<Applied, Reject> {
         let hk = HostKey::of(&ev.host.0);
+        let mut mirror_rows = None;
         let new_account = prev.is_none();
         let mut rec = prev.cloned().unwrap_or_else(|| Record::new(hk, ev.now));
         let status_before = prev.map(|p| p.status());
@@ -401,12 +413,21 @@ impl<C: Chain> StateStore<C> {
                 }
                 match self.chain.check_chain(rec.chain.as_ref(), v) {
                     Ok(cs) => {
+                        if let Some(f) = frame
+                            && let crate::archive::Step::Rows(r) =
+                                self.archive_commit(shard, ev.did, &ev.host.0, f).await
+                        {
+                            mirror_rows = Some(r);
+                        }
                         rec.chain = Some(cs);
                         rec.desync = None;
                         rec.minute_commits += 1;
                     }
                     Err(e) => {
                         let was_desync = rec.desync.is_some();
+                        if was_desync || e == ChainError::PrevDataMismatch {
+                            self.archive_chain_broken(ev.did, &ev.host.0);
+                        }
                         rec.failed_checks = rec.failed_checks.saturating_add(1);
                         rec.desync.get_or_insert(e.reason());
                         shard.stage_unlogged(ev.did, rec);
@@ -421,6 +442,11 @@ impl<C: Chain> StateStore<C> {
                         shard.stage_unlogged(ev.did, rec.clone());
                     }
                     return Err(Reject::Inactive(rec.status()));
+                }
+                if let Some(f) = frame
+                    && let crate::archive::Step::Rows(r) = self.archive_sync(shard, ev.did, &ev.host.0, f).await
+                {
+                    mirror_rows = Some(r);
                 }
                 rec.chain = Some(ChainState { rev: *rev, commit: *commit, data: *data });
                 rec.desync = None;
@@ -437,6 +463,9 @@ impl<C: Chain> StateStore<C> {
         let delta = StateDelta { did: ev.did.to_string(), host: hk, kind, chain: rec.chain, upstream: rec.upstream };
         let key_changed = rec.key != key_before;
         let ticket = shard.stage_logged(ev.did, rec);
+        if let Some(r) = mirror_rows {
+            shard.mirror.attach(ticket.n, ev.did, r);
+        }
         Ok(Applied::Append(Accepted {
             ticket,
             delta,

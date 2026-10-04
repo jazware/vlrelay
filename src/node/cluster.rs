@@ -171,6 +171,7 @@ impl Node {
             Arc::new(super::adapters::CacheIdentity(identity.clone())),
             state::ApplyConfig::default(),
         ));
+        let archive = cfg.policy.as_ref().map(|p| crate::archive::wiring::install(&state, p.0.clone(), identity.clone()));
         let host_layout = cluster.hosts.as_ref().expect("a core node has host shards").layout();
         let hosts = Arc::new(BucketHosts::new(store.clone(), host_layout));
 
@@ -190,6 +191,9 @@ impl Node {
         if let Some(h) = &hooks {
             h.install(&manager, &crawler, &identity);
             h.load().await?;
+            if let Some((_, g)) = &archive {
+                let _ = g.hooks.set(h.clone());
+            }
         }
         let cli_tier = cfg.cli_host_tier;
 
@@ -832,6 +836,21 @@ impl ReplaySource for SpanTail<'_> {
             (Some(a), Some(s)) => Some(a.max(s)),
         };
         let mut v = self.replay.tail(log_id, shard, after).await?;
+        v.retain(|(o, _)| *o >= self.start && self.end.is_none_or(|e| *o < e));
+        Ok(v)
+    }
+    async fn frames(
+        &self,
+        log_id: &str,
+        shard: ShardId,
+        after: Option<u64>,
+    ) -> anyhow::Result<Vec<(u64, Vec<(String, Bytes)>)>> {
+        let after = match (after, self.start.checked_sub(1)) {
+            (a, None) => a,
+            (None, s) => s,
+            (Some(a), Some(s)) => Some(a.max(s)),
+        };
+        let mut v = self.replay.frames(log_id, shard, after).await?;
         v.retain(|(o, _)| *o >= self.start && self.end.is_none_or(|e| *o < e));
         Ok(v)
     }

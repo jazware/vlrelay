@@ -301,7 +301,7 @@ impl DidOwner for LocalOwner {
                 }
             };
             let ev = Incoming { did: &c.did, host: &c.host, now: state::now_secs(), kind };
-            match self.state.apply(ev).await {
+            match self.state.apply_with_frame(ev, Some(&c.frame)).await {
                 Err(e) if e.retryable() && tries < 3 => {
                     tries += 1;
                     tokio::time::sleep(Duration::from_millis(100 << (2 * tries))).await;
@@ -486,6 +486,7 @@ impl Node {
         for s in &layout {
             state.open_shard(s.id, None).await?;
         }
+        let archive = cfg.policy.as_ref().map(|p| crate::archive::wiring::install(&state, p.0.clone(), identity.clone()));
 
         let mut lcfg = LogConfig::new(seq::new_log_id(&cfg.node_id));
         lcfg.linger = cfg.linger;
@@ -562,6 +563,9 @@ impl Node {
         if let Some(h) = &hooks {
             h.install(&manager, &crawler, &identity);
             h.load().await?;
+            if let Some((_, g)) = &archive {
+                let _ = g.hooks.set(h.clone());
+            }
         }
 
         let ttf = Arc::new(Ttf::default());

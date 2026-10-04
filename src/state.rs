@@ -64,9 +64,21 @@ pub struct RepoPage {
 #[async_trait::async_trait]
 pub trait ReplaySource: Send + Sync {
     async fn tail(&self, log_id: &str, shard: ShardId, after: Option<u64>) -> anyhow::Result<Vec<(u64, Vec<StateDelta>)>>;
+
+    /// The same entries' (DID, frame) of the shard, for archival mode's
+    /// mirrors. Sources that don't carry frames give none.
+    async fn frames(
+        &self,
+        _log_id: &str,
+        _shard: ShardId,
+        _after: Option<u64>,
+    ) -> anyhow::Result<Vec<(u64, Vec<(String, bytes::Bytes)>)>> {
+        Ok(Vec::new())
+    }
 }
 
 pub struct StateStore<C: Chain = StubChain> {
+    archive: std::sync::OnceLock<Arc<crate::archive::Archive>>,
     pub store: Store,
     pub chain: C,
     pub identity: Arc<dyn IdentitySource>,
@@ -87,6 +99,7 @@ impl<C: Chain> StateStore<C> {
         config: ApplyConfig,
     ) -> StateStore<C> {
         StateStore {
+            archive: Default::default(),
             store,
             chain,
             identity,
@@ -97,6 +110,10 @@ impl<C: Chain> StateStore<C> {
             host_counts: Default::default(),
             gate: Default::default(),
         }
+    }
+
+    pub(crate) fn archive_cell(&self) -> &std::sync::OnceLock<Arc<crate::archive::Archive>> {
+        &self.archive
     }
 
     /// The policy's say on new accounts. Without one every account is
@@ -183,6 +200,17 @@ impl<C: Chain> StateStore<C> {
             }
             n += self.replay(&deltas, now).await.map_err(|e| anyhow::anyhow!("{e}"))?;
             last = Some(ord);
+        }
+        if self.archive().is_some() {
+            let mut frames = Vec::new();
+            for (ord, evs) in src.frames(log_id, shard, after).await? {
+                if after.is_some_and(|a| ord <= a) {
+                    continue;
+                }
+                frames.extend(evs);
+                last = last.max(Some(ord));
+            }
+            self.archive_replay(&s, frames).await?;
         }
         if let Some(ord) = last {
             s.checkpoint(log_id, ord).await?;
