@@ -278,6 +278,11 @@ impl ClusterNode {
         let http = opts.tls.clone().map(|t| vlpds::http::PeerClient::new(opts.peer_connections, t));
         let serve = Serve::new(store.clone(), opts.serve.clone(), opts.runtime.clone());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // A failed log (lease lapsed, fenced) can never append again, but a
+        // renewal sent before the lapse can still land and keep the lease
+        // valid: without this the node lived on holding its shards, every
+        // event to them failing for 20 s (the chaos minio-pause scenario).
+        let log_owner: Arc<std::sync::OnceLock<Weak<ClusterNode>>> = Arc::default();
         let (cluster, log, hosts) = if opts.role == Role::Core {
             let cc = ClusterConfig {
                 node_id: opts.node_id.clone(),
@@ -315,7 +320,13 @@ impl ClusterNode {
                 lease_ok: Some(Arc::new(move || lease.lease_valid())),
                 idle_heartbeat: t.idle_heartbeat,
             };
-            let log = NodeLog::start(store.clone(), cfg, tx.clone(), None);
+            let owner = log_owner.clone();
+            let on_fatal: crate::seq::OnFatal = Box::new(move |e| {
+                if let Some(n) = owner.get().and_then(Weak::upgrade) {
+                    n.lost_now(&format!("node log failed: {e}"));
+                }
+            });
+            let log = NodeLog::start(store.clone(), cfg, tx.clone(), Some(on_fatal));
             serve.follow_local(&log);
             let hosts =
                 HostShards::new(store.clone(), &opts.node_id, &cluster.log_id, &opts.addr, opts.host_shards).await?;
@@ -360,6 +371,7 @@ impl ClusterNode {
                 leaving_peers: Mutex::new(HashMap::new()),
             }
         });
+        let _ = log_owner.set(Arc::downgrade(&node));
         Ok(node)
     }
 

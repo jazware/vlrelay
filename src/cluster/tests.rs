@@ -516,3 +516,22 @@ async fn edges_and_replicas_serve_the_identical_stream() {
         n.node.shutdown().await.unwrap();
     }
 }
+
+/// A core whose log fails (here: fenced under it) is lost at once. Before,
+/// the log died but the node lived on holding its shards, and every event
+/// for them failed until the forwarder gave up 20 s later (chaos
+/// minio-pause: a renewal sent before the lapse kept the lease valid).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_log_loses_the_node() {
+    let (store, ca, applied) = (Store::memory(None), Ca::new(), Arc::new(Applied::default()));
+    let n = spawn(&store, &ca, "solo", Role::Core, &applied).await;
+    let lost = Arc::new(AtomicBool::new(false));
+    let l = lost.clone();
+    n.node.on_lost(Box::new(move |_| l.store(true, Ordering::SeqCst)));
+    eventually("a layout", Duration::from_secs(10), || n.node.layout().is_some()).await;
+    let log = n.node.log.clone().unwrap();
+    crate::seq::fence(&store, &log.log_id, "test").await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), n.node.forward(fwd(1, 1))).await;
+    eventually("the node is lost", Duration::from_secs(10), || lost.load(Ordering::SeqCst)).await;
+    assert!(n.node.halted());
+}
