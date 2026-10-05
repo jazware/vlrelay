@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type JSX, type ReactNode } from 'react'
 import { errText } from '../lib/api'
 import { setTheme, useTheme, type Theme } from '../lib/hooks'
 import { Link } from '../lib/router'
