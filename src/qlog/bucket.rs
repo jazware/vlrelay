@@ -26,7 +26,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use vlpds::store::Store;
 
-pub const PURPOSES: [&str; 7] = ["flush", "state", "leader", "recovery", "backfill", "retain", "tool"];
+pub const PURPOSES: [&str; 8] = ["flush", "state", "leader", "recovery", "backfill", "retain", "plc", "tool"];
 
 const CLIENT_PREFIX: &str = "qlog_";
 
@@ -38,6 +38,7 @@ fn client(purpose: &str) -> &'static str {
         "recovery" => "qlog_recovery",
         "backfill" => "qlog_backfill",
         "retain" => "qlog_retain",
+        "plc" => "qlog_plc",
         "tool" => "qlog_tool",
         p => panic!("qlog bucket: no purpose {p}"),
     }

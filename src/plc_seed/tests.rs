@@ -262,7 +262,8 @@ async fn the_leaders_job_survives_a_takeover_mid_export() {
     f.plc.throttle_every.store(7, Relaxed);
     let total = f.plc.op_count() as u64;
     let mut c = Cluster::with_cfg(3, None, None, 64 << 20).await;
-    let store = c.store.clone();
+    // as Node::start counts it
+    let store = crate::qlog::bucket::counted(&c.store, "plc");
     let start = |c: &Cluster, id: &str| {
         let mut cfg = f.cfg(2);
         cfg.rate = 400.0;
