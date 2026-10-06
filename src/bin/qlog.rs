@@ -193,6 +193,18 @@ struct NodeArgs {
     /// device on tmpfs.
     #[arg(long)]
     fsync_delay_us: Option<u64>,
+    /// When an entry counts: `fsync` (after its fdatasync), `page-cache`
+    /// (once written; fdatasync'd every --durability-sync-ms) or `memory`
+    /// (no commitlog). Default: page-cache for three members or more,
+    /// fsync below; a single node only runs fsync.
+    #[arg(long)]
+    durability: Option<String>,
+    #[arg(long, default_value_t = 100)]
+    durability_sync_ms: u64,
+    /// Mutation tests only: trust the commitlog after a power loss in
+    /// page-cache mode (what the chaos must catch).
+    #[arg(long)]
+    unsafe_trust_log: bool,
     #[arg(long, default_value_t = 100)]
     heartbeat_ms: u64,
     #[arg(long, default_value_t = 1000)]
@@ -380,9 +392,25 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
     } else {
         Emitter::new(&a.id, now_us() as u64, a.ring_mb << 20, None)
     };
-    let (durability, recovered): (Arc<dyn Durability>, _) = match &a.commitlog {
+    let mode = commitlog::DurabilityMode::choose(
+        a.durability.as_deref(),
+        Duration::from_millis(a.durability_sync_ms),
+        cfg.members.len().max(cfg.peers.len() + 1),
+    )?;
+    let commitlog_dir = match mode {
+        commitlog::DurabilityMode::Memory => None,
+        commitlog::DurabilityMode::Sync(_) => a.commitlog.as_ref(),
+    };
+    let sync = match mode {
+        commitlog::DurabilityMode::Sync(s) => s,
+        commitlog::DurabilityMode::Memory => commitlog::SyncMode::Fsync,
+    };
+    tracing::info!(durability = mode.name(), "qlog: durability");
+    let (durability, recovered): (Arc<dyn Durability>, _) = match commitlog_dir {
         Some(dir) => {
             let o = commitlog::Options {
+                sync,
+                trust_after_power_loss: a.unsafe_trust_log,
                 segment_bytes: a.segment_mb << 20,
                 retain_bytes: a.disk_retain_mb << 20,
                 memory_bytes: cfg.retain_bytes,

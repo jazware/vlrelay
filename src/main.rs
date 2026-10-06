@@ -215,6 +215,21 @@ struct QuorumArgs {
     /// Chaos: sleep this long before each commitlog fsync (emulates a disk).
     #[arg(long)]
     qlog_fsync_delay_us: Option<u64>,
+    /// When an entry counts on this node: `fsync` (after its fdatasync),
+    /// `page-cache` (once written to the commitlog, fdatasync'd every
+    /// --durability-sync-ms; a power cut on a majority within that window
+    /// is a bucket recovery) or `memory` (no commitlog). Default:
+    /// page-cache for three members or more, fsync below; a single node
+    /// only runs fsync.
+    #[arg(long, env = "VLRELAY_DURABILITY")]
+    durability: Option<String>,
+    /// Page-cache mode's background fdatasync interval.
+    #[arg(long, default_value_t = 100)]
+    durability_sync_ms: u64,
+    /// Mutation tests only: trust the commitlog after a power loss in
+    /// page-cache mode (the check the chaos must catch it without).
+    #[arg(long)]
+    qlog_unsafe_trust_log: bool,
 }
 
 fn quorum_setup(q: &QuorumArgs, node_id: &str) -> anyhow::Result<vlrelay::node::quorum::QuorumSetup> {
@@ -244,6 +259,13 @@ fn quorum_setup(q: &QuorumArgs, node_id: &str) -> anyhow::Result<vlrelay::node::
     s.disk_retain_bytes = q.qlog_disk_retain_mb.max(1) << 20;
     s.memory_bytes = q.qlog_memory_mb.map(|m| m.max(1) << 20);
     s.power_cut_on_usr1 = q.qlog_power_cut_on_usr1;
+    let members = if s.members.is_empty() { s.peers.len() + 1 } else { s.members.len() };
+    s.durability = vlrelay::qlog::commitlog::DurabilityMode::choose(
+        q.durability.as_deref(),
+        Duration::from_millis(q.durability_sync_ms),
+        members,
+    )?;
+    s.trust_after_power_loss = q.qlog_unsafe_trust_log;
     s.fsync_delay = q.qlog_fsync_delay_us.map(Duration::from_micros);
     vlrelay::qlog::state::set_compactor_poll(Duration::from_millis(q.qlog_state_compactor_poll_ms));
     if let Some(at) = q.qlog_crash_at.clone().filter(|a| !a.is_empty()) {

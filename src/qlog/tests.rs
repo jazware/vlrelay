@@ -229,6 +229,16 @@ impl Cluster {
         }
     }
 
+    /// A power cut that loses everything written since the last fsync.
+    pub(crate) fn power_cut_all_unsynced(&mut self, id: &str) {
+        if let Some(r) = self.nodes.remove(id) {
+            if let Some(cl) = &r.cl {
+                cl.power_cut(0.0, &[0xde, 0xad]).unwrap();
+            }
+            r.rt.shutdown_background();
+        }
+    }
+
     /// The disk is gone: kill -9, and its commitlog with it.
     pub(crate) fn wipe(&mut self, id: &str) {
         self.kill(id);
@@ -822,12 +832,18 @@ async fn flushing_n(
     opts: impl Fn(&str) -> flush::Options + Send + Sync + 'static,
     ring_bytes: usize,
 ) -> Cluster {
-    let o = commitlog::Options {
-        segment_bytes: 256 << 10,
-        retain_bytes: 1 << 20,
-        memory_bytes: 64 << 10,
-        ..commitlog::Options::default()
-    };
+    flushing_with(n, opts, ring_bytes, commitlog::Options::default()).await
+}
+
+/// As [`flushing_n`], with the commitlog's sync mode and test knobs from
+/// `base`.
+async fn flushing_with(
+    n: usize,
+    opts: impl Fn(&str) -> flush::Options + Send + Sync + 'static,
+    ring_bytes: usize,
+    base: commitlog::Options,
+) -> Cluster {
+    let o = commitlog::Options { segment_bytes: 256 << 10, retain_bytes: 1 << 20, memory_bytes: 64 << 10, ..base };
     let cfg = move |id: &str, addrs: &HashMap<String, String>| {
         let mut k = config(id, addrs);
         k.retain_bytes = 64 << 10;
@@ -2230,5 +2246,113 @@ async fn retention_deletes_only_what_it_reports_and_recovery_still_works() {
     // and the planner still runs on what's left
     let again = retain::plan(&c.store, Duration::from_secs(3600)).await.unwrap().unwrap();
     assert!(again.deletable.is_empty() && again.segments > 0, "{again:#?}");
+    c.shutdown();
+}
+
+// ---------------------------------------------------------------- durability modes
+
+fn page_cache(trust: bool) -> commitlog::Options {
+    commitlog::Options {
+        sync: commitlog::SyncMode::PageCache { every: Duration::from_millis(400) },
+        trust_after_power_loss: trust,
+        ..commitlog::Options::default()
+    }
+}
+
+/// Every process killed at once in page-cache mode: the kernel still holds
+/// what they wrote, so nothing acked is lost and no recovery runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn page_cache_loses_nothing_when_every_process_dies() {
+    let mut c = flushing_with(3, |_| flush_opts(), 64 << 20, page_cache(false)).await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = HostLoad::start(&c, 4, 10, Duration::from_millis(2));
+    for _ in 0..3 {
+        wait_flushed(&c, 1, Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for id in c.ids.clone() {
+            c.kill(&id);
+        }
+        for id in c.ids.clone() {
+            c.start(&id).await;
+        }
+        c.wait_leader(Duration::from_secs(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (_, r, m) = settle_recovered(&c, load).await;
+    assert!(m.gaps.is_empty() && c.recoveries().is_empty(), "a recovery ran: {m:?} {:?}", c.recoveries());
+    assert_eq!(r.reingested, 0, "{r:?}");
+    let st = c.nodes.values().next().unwrap().node.status();
+    assert_eq!(st.durability.mode, "page-cache");
+    c.shutdown();
+}
+
+/// A power cut on every node in page-cache mode, each losing everything
+/// it wrote since its last background fsync: no node vouches for its log
+/// afterwards, so the cluster recovers from the bucket at R + 1 with a
+/// recorded gap, hosts re-ingest, and no seq is reused or acked event
+/// lost. Then the same on two of the three (the third's log is intact but
+/// alone, so the recovery salvages from it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn page_cache_power_cuts_on_a_majority_recover_from_the_bucket() {
+    let mut c =
+        flushing_with(3, |_| flush::Options { headroom: 50_000, ..flush_opts() }, 64 << 20, page_cache(false)).await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = HostLoad::start(&c, 4, 10, Duration::from_millis(2));
+    for (round, cut) in [3usize, 2].into_iter().enumerate() {
+        wait_flushed(&c, 1, Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let l = c.wait_leader(Duration::from_secs(10)).await;
+        // the leader and as many others as it takes
+        let mut ids = vec![l.clone()];
+        ids.extend(c.ids.iter().filter(|i| **i != l).take(cut - 1).cloned());
+        for id in &ids {
+            c.power_cut_all_unsynced(id);
+        }
+        for id in &ids {
+            c.start(id).await;
+        }
+        let t = Instant::now();
+        while !c.recoveries().iter().any(|r| r.generation == round as u64 + 1) {
+            assert!(t.elapsed() < Duration::from_secs(15), "round {round}: no recovery: {}", status_line(&c));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (_, r, m) = settle_recovered(&c, load).await;
+    eprintln!("{r:?} gaps {:?}", m.gaps);
+    assert_eq!(m.gaps.len(), 2, "{m:?}");
+    c.shutdown();
+}
+
+/// The mutation: nodes that trust their logs after a power loss elect a
+/// leader from logs that lost acked entries, and the checker catches it
+/// (acked events lost, or seqs emitted twice with other contents).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trusting_a_short_log_after_a_power_loss_is_caught() {
+    let mut c =
+        flushing_with(3, |_| flush::Options { headroom: 50_000, ..flush_opts() }, 64 << 20, page_cache(true)).await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = HostLoad::start(&c, 4, 10, Duration::from_millis(2));
+    for _ in 0..3 {
+        wait_flushed(&c, 1, Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for id in c.ids.clone() {
+            c.power_cut_all_unsynced(&id);
+        }
+        for id in c.ids.clone() {
+            c.start(&id).await;
+        }
+        c.wait_leader(Duration::from_secs(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (acked, expected) = load.stop().await;
+    c.converge(Duration::from_secs(20)).await;
+    let m = flush::read_manifest(&c.store).await.unwrap().map(|(m, _)| m).unwrap_or_default();
+    let r = c.finish_recovered(&acked, &m.gaps, &expected);
+    eprintln!("{r:?}");
+    assert!(
+        !r.ok || r.acked_missing > 0 || r.events_lost > 0 || r.holes > 0,
+        "trusting short logs after power losses went unnoticed: {r:?}"
+    );
     c.shutdown();
 }

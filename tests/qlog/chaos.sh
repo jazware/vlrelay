@@ -14,7 +14,9 @@
 # directly), COMMITLOG (1: each node keeps a commitlog under OUT, and
 # SIGUSR1 is a power cut; 0: memory only), CL_DIR (where the commitlogs
 # go, OUT by default: /dev/shm for a device with no fsync cost),
-# DISK_RETAIN_MB, FSYNC_DELAY_US (emulates a slower device), RETAIN_MB,
+# DISK_RETAIN_MB, FSYNC_DELAY_US (emulates a slower device), DURABILITY
+# (fsync, page-cache or memory; default page-cache for three) and
+# DURABILITY_SYNC_MS, TRUST_LOG=1 (the power-loss mutation), RETAIN_MB,
 # RING_MB (the firehose ring: small, and old cursors come from the bucket),
 # QLOG_PROFILE (dev-release), QLOG_NO_BUILD=1, RESTART_SEC (1),
 # OUT (dev/state-qlog-$B/<scenario>), KEEP=1 (leave MinIO up),
@@ -182,6 +184,8 @@ supervise() {
   [ -n "${RING_MB:-}" ] && disk+=(--ring-mb "$RING_MB")
   [ -n "${DISK_RETAIN_MB:-}" ] && disk+=(--disk-retain-mb "$DISK_RETAIN_MB")
   [ -n "${FSYNC_DELAY_US:-}" ] && disk+=(--fsync-delay-us "$FSYNC_DELAY_US")
+  [ -n "${DURABILITY:-}" ] && disk+=(--durability "$DURABILITY" --durability-sync-ms "${DURABILITY_SYNC_MS:-100}")
+  [ "${TRUST_LOG:-}" = 1 ] && disk+=(--unsafe-trust-log)
   [ -n "${seg_mb:-}" ] && disk+=(--segment-mb "$seg_mb")
   [ -n "${STATE_POLL_MS:-}" ] && disk+=(--state-compactor-poll-ms "$STATE_POLL_MS")
   # shellcheck disable=SC2206 # flags, word split on purpose

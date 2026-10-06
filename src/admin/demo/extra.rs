@@ -205,6 +205,13 @@ impl Extra {
             "disk_reads": if id == "relay-c" { 14 } else { 2 },
             "bucket_reads": if id == "relay-c" { 1 } else { 0 },
             "commit_us": q(1_850 + wobble(4) * 40, 4_300 + wobble(5) * 300),
+            "durability": {
+                "mode": "page-cache",
+                "sync_ms": 100,
+                "unsynced_bytes": (ev * 0.05 * 4_700.0) as u64 + wobble(7) * 1_000,
+                "since_sync_ms": now % 100,
+                "background_syncs": up_secs * 10,
+            },
             "disk": {
                 "fsyncs": appended / 40,
                 "fsync_us": q(610, 2_100),
@@ -524,9 +531,24 @@ impl Extra {
                 Some("relay-a"),
                 "env",
                 Some("relay"),
-                "Node id: the node log's id prefix, and the cluster member name.",
+                "The member's name: unique per node.",
             ),
-            secret("--internal-token", "VLRELAY_INTERNAL_TOKEN", true, "env", "Shared secret on every peer request."),
+            e(
+                "--durability",
+                Some("VLRELAY_DURABILITY"),
+                Some("page-cache"),
+                "default",
+                None,
+                "When an entry counts on this node: fsync, page-cache (fdatasync'd every --durability-sync-ms) or memory.",
+            ),
+            e(
+                "--durability-sync-ms",
+                None,
+                Some("100"),
+                "default",
+                Some("100"),
+                "Page-cache mode's background fdatasync interval.",
+            ),
         ];
         SettingsView { binary: "vlrelay".into(), version: env!("CARGO_PKG_VERSION").into(), entries }
     }

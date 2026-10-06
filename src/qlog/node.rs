@@ -257,6 +257,25 @@ pub trait Durability: Send + Sync + 'static {
     fn report(&self, _reset: bool) -> Option<DiskStatus> {
         None
     }
+    /// When an entry counts here, and how far the disk trails it.
+    fn mode(&self) -> DurabilityStatus {
+        DurabilityStatus { mode: "memory", ..Default::default() }
+    }
+}
+
+/// The node's durability mode (docs/quorum.md, "Durability modes").
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DurabilityStatus {
+    /// `fsync`, `page-cache` or `memory`.
+    pub mode: &'static str,
+    /// Page-cache mode: the background fdatasync's interval.
+    pub sync_ms: Option<u64>,
+    /// Written (and acked) but not yet fdatasync'd: what a power cut on a
+    /// majority could lose.
+    pub unsynced_bytes: u64,
+    /// Since the last fdatasync.
+    pub since_sync_ms: Option<u64>,
+    pub background_syncs: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -312,6 +331,20 @@ impl Durability for Arc<CommitLog> {
     }
     fn first_readable(&self) -> Option<u64> {
         Some(CommitLog::first_readable(self))
+    }
+    fn mode(&self) -> DurabilityStatus {
+        let (unsynced_bytes, since) = self.unsynced();
+        let m = CommitLog::mode(self);
+        DurabilityStatus {
+            mode: m.name(),
+            sync_ms: match m {
+                crate::qlog::commitlog::SyncMode::PageCache { every } => Some(every.as_millis() as u64),
+                crate::qlog::commitlog::SyncMode::Fsync => None,
+            },
+            unsynced_bytes,
+            since_sync_ms: Some(since.as_millis() as u64),
+            background_syncs: self.stats.background_syncs.load(Ordering::Relaxed),
+        }
     }
     fn report(&self, reset: bool) -> Option<DiskStatus> {
         let st = &self.stats;
@@ -513,6 +546,7 @@ pub struct Status {
     pub bucket_reads: u64,
     pub commit_us: Quantiles,
     pub disk: Option<DiskStatus>,
+    pub durability: DurabilityStatus,
     pub flushed: u64,
     pub reserve: u64,
     pub flush: Option<flush::Status>,
@@ -656,7 +690,9 @@ impl Node {
             None => None,
         };
         let (mut log, promised, promised_to, whole) = match recovered {
-            Some(r) => (r.log, r.promised, r.promised_to, !r.fresh),
+            // after a power loss in page-cache mode the log is kept to catch
+            // up from, but it can't vouch for what this node acked
+            Some(r) => (r.log, r.promised, r.promised_to, !r.fresh && !r.power_lost),
             None => (Log::new(), 0, None, false),
         };
         if durability.journaling() {
@@ -775,6 +811,7 @@ impl Node {
             bucket_reads: self.stats.bucket_reads.load(Ordering::Relaxed),
             commit_us: Quantiles::of(&self.stats.commit_us.lock()),
             disk,
+            durability: self.durability.mode(),
             flushed: c.flushed,
             reserve: c.reserve,
             flush: self.cfg.flush.as_ref().map(|_| self.flush.status(reset)),

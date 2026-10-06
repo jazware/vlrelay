@@ -408,6 +408,10 @@ export type QStatus = {
   bucket_reads: number
   commit_us: Quantiles
   disk: QDisk | null
+  /** When an entry counts on this node, and what its disk hasn't synced yet. */
+  durability?: QDurability
+  /** Its leadership changes, oldest first (newer builds). */
+  history?: { at_ms: number; kind: 'lead' | 'step_down'; epoch: number; from: string | null; why: string }[]
   /** F: the log may leave local disk up to here. */
   flushed: number
   /** R: the commit index may rise to here. */
@@ -428,6 +432,17 @@ export type QStatus = {
   requests?: QRequests
   /** What the relay's hooks report (newer builds). */
   relay?: QRelayReport
+}
+
+/** `qlog::node::DurabilityStatus`. */
+export type QDurability = {
+  mode: 'fsync' | 'page-cache' | 'memory'
+  /** page-cache: the background fdatasync's interval */
+  sync_ms: number | null
+  /** acked but not fdatasync'd yet: what a power cut on a majority could lose */
+  unsynced_bytes: number
+  since_sync_ms: number | null
+  background_syncs: number
 }
 
 /** Requests by R2 class: A is every write and LIST, B every GET and HEAD, a DELETE is free. */

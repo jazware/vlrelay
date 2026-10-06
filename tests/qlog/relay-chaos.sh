@@ -33,6 +33,11 @@
 # RQ_CRATE (the crate, when this script runs from a copy), RETAIN_EVERY (60), STATE_POLL_MS (the state's compactor poll: 5000 under
 # 10 s flushes, else 30000), RELAY_LOG (RUST_LOG for the relays).
 #
+# DURABILITY (fsync, page-cache or memory; default: the node's, page-cache
+# for three) with DURABILITY_SYNC_MS (100); TRUST_LOG=1 is the mutation
+# (nodes trust their commitlogs after a power cut in page-cache mode),
+# which power-cut-all and power-cut-majority must fail.
+#
 # PLC_EXPORT=1 runs the PLC export on the leader against the fake PLC's
 # /export: PLC_HOSTS (1000) hosts of --dids accounts in its history,
 # PLC_RATE (4) requests a second, and every PLC_THROTTLE_EVERY'th (6)
@@ -46,7 +51,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 crate="${RQ_CRATE:-$(cd "$here/../.." && pwd)}"
 cd "$crate"
 
-scenarios="baseline kill-leader kill-follower down-follower down-leader kill-two kill-all power-cut-leader power-cut-all partition-leader partition-follower pause-leader mixed-durable flush-crash mixed-flush wipe-all wipe-two mixed-wipe replace-follower replace-leader grow-shrink single-kill single-wipe"
+scenarios="baseline kill-leader kill-follower down-follower down-leader kill-two kill-all power-cut-leader power-cut-all power-cut-majority partition-leader partition-follower pause-leader mixed-durable flush-crash mixed-flush wipe-all wipe-two mixed-wipe replace-follower replace-leader grow-shrink single-kill single-wipe"
 scenario=${1:-}
 [ -n "$scenario" ] && shift || true
 if [ -z "$scenario" ] || [ "$scenario" = list ]; then
@@ -157,6 +162,8 @@ supervise() {
   # 2 s flushes add an L0 each; at the 30 s default poll they outrun the
   # compactor and seals wait for L0 room
   extra+=(--qlog-state-compactor-poll-ms "${STATE_POLL_MS:-$(( flush_ms < 10000 ? 5000 : 30000 ))}")
+  [ -n "${DURABILITY:-}" ] && extra+=(--durability "$DURABILITY" --durability-sync-ms "${DURABILITY_SYNC_MS:-100}")
+  [ "${TRUST_LOG:-}" = 1 ] && extra+=(--qlog-unsafe-trust-log)
   [ "${PLC_EXPORT:-}" = 1 ] && extra+=(--plc-export --plc-export-rate "${PLC_RATE:-4}")
   [ -n "$crash_at" ] && extra+=(--qlog-crash-at "$crash_at" --qlog-crash-prob "$crash_prob" --qlog-crash-stop-file "$out/no-more-crashes")
   if [ -n "${RETAIN_SECS:-}" ]; then
@@ -297,7 +304,7 @@ wipe() {
 fault() {
   local kind=$1 who p
   case $kind in
-    kill-leader | down-leader | partition-leader | pause-leader | power-cut-leader | kill-two | wipe-two) who=$(leader) ;;
+    kill-leader | down-leader | partition-leader | pause-leader | power-cut-leader | power-cut-majority | kill-two | wipe-two) who=$(leader) ;;
     single-*) who=1 ;;
     *) who=$(follower) ;;
   esac
@@ -318,9 +325,10 @@ fault() {
       for v in $victims; do p=$(nodepid "$v" || true); [ -n "$p" ] && { ps+=("$p"); log "kill9 n$v $kind"; }; done
       [ ${#ps[@]} -gt 0 ] && kill -9 "${ps[@]}" || true
       ;;
-    power-cut-leader | power-cut-all)
+    power-cut-leader | power-cut-all | power-cut-majority)
       local victims=$who ps=()
       [ "$kind" = power-cut-all ] && victims="$ids"
+      if [ "$kind" = power-cut-majority ]; then for j in $ids; do [ "$j" != "$who" ] && { victims="$who $j"; break; }; done; fi
       for v in $victims; do p=$(nodepid "$v" || true); [ -n "$p" ] && { ps+=("$p"); log "powercut n$v $kind"; }; done
       [ ${#ps[@]} -gt 0 ] && kill -USR1 "${ps[@]}" || true
       ;;

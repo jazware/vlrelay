@@ -68,6 +68,102 @@ pub struct Options {
     /// Chaos: called between two segment deletions of one trim pass (a
     /// crash there leaves the older ones gone and the newer ones in place).
     pub mid_trim: Option<Hook>,
+    /// When a write counts (docs/quorum.md, "Durability modes").
+    pub sync: SyncMode,
+    /// Mutation tests only: don't distrust the log after a power loss in
+    /// `PageCache` mode (the check this switches off is what keeps a node
+    /// that lost acked entries from vouching for its log).
+    pub trust_after_power_loss: bool,
+}
+
+/// When the node may act on a write: ack it as a follower, count itself
+/// as the leader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncMode {
+    /// After its fdatasync: a power cut loses nothing acked.
+    Fsync,
+    /// Once written to the page cache, fdatasync'd every `every` in the
+    /// background. A process crash loses nothing (the kernel still holds
+    /// the pages); a power cut can lose the last `every` of acked writes,
+    /// so a node that comes back from one doesn't vouch for its log.
+    /// Promises are fsynced before they're answered in every mode.
+    PageCache { every: Duration },
+}
+
+impl SyncMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            SyncMode::Fsync => "fsync",
+            SyncMode::PageCache { .. } => "page-cache",
+        }
+    }
+}
+
+/// A node's durability mode, from `--durability` and the cluster's size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurabilityMode {
+    Sync(SyncMode),
+    /// No commitlog: a restarted node comes back empty, and a correlated
+    /// loss is a bucket recovery.
+    Memory,
+}
+
+impl DurabilityMode {
+    /// `mode` as given (None: page-cache for three members or more, fsync
+    /// below). A single node only runs fsync: it has no other copy.
+    pub fn choose(mode: Option<&str>, sync: Duration, members: usize) -> anyhow::Result<DurabilityMode> {
+        let m = match mode.unwrap_or(if members >= 3 { "page-cache" } else { "fsync" }) {
+            "fsync" => DurabilityMode::Sync(SyncMode::Fsync),
+            "page-cache" => DurabilityMode::Sync(SyncMode::PageCache { every: sync.max(Duration::from_millis(1)) }),
+            "memory" => DurabilityMode::Memory,
+            other => anyhow::bail!("--durability {other}: fsync, page-cache or memory"),
+        };
+        anyhow::ensure!(
+            members > 1 || m == DurabilityMode::Sync(SyncMode::Fsync),
+            "--durability {}: a single node has no other copy of its log; it runs fsync",
+            m.name()
+        );
+        Ok(m)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            DurabilityMode::Sync(s) => s.name(),
+            DurabilityMode::Memory => "memory",
+        }
+    }
+}
+
+/// What the previous run of this directory recorded: the machine's boot
+/// and the mode, so a reboot after page-cache writes is noticed.
+const BOOT_FILE: &str = "boot";
+/// Left by an emulated power cut ([`CommitLog::power_cut`]): the next open
+/// treats it as a reboot.
+const POWER_LOST: &str = "power-lost";
+
+fn boot_id() -> String {
+    if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+        return s.trim().to_string();
+    }
+    boot_time().map_or_else(|| "unknown".into(), |t| format!("boottime-{t}"))
+}
+
+/// Without /proc (macOS), the boot time stands in for a boot id.
+#[cfg(target_os = "macos")]
+fn boot_time() -> Option<i64> {
+    let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut len = std::mem::size_of::<libc::timeval>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+    // SAFETY: sysctl writes at most `len` bytes into `tv`.
+    let ok = unsafe {
+        libc::sysctl(mib.as_mut_ptr(), 2, (&mut tv as *mut libc::timeval).cast(), &mut len, std::ptr::null_mut(), 0)
+    } == 0;
+    ok.then_some(tv.tv_sec)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn boot_time() -> Option<i64> {
+    None
 }
 
 #[derive(Clone)]
@@ -88,6 +184,8 @@ impl Default for Options {
             sync_delay: None,
             abort_on_error: false,
             mid_trim: None,
+            sync: SyncMode::Fsync,
+            trust_after_power_loss: false,
         }
     }
 }
@@ -102,6 +200,10 @@ pub struct Recovered {
     /// No segment existed: a new or wiped disk, which can't vouch for
     /// anything this node acked before.
     pub fresh: bool,
+    /// The machine went down (a reboot since the last run, which wrote in
+    /// page-cache mode): acked writes past the last fsync may be gone, so
+    /// the log is kept but can't vouch for what this node acked either.
+    pub power_lost: bool,
     pub segments: usize,
     pub records: u64,
     pub torn_bytes: u64,
@@ -194,8 +296,11 @@ struct Shared {
     /// The commit index as last written (capped at the log's last seq, as
     /// replay caps it).
     written_commit: u64,
+    /// The active segment's length as of its last fdatasync.
     durable_len: u64,
     written_len: u64,
+    /// When the active segment was last fdatasync'd.
+    synced_at: Instant,
 }
 
 #[derive(Default)]
@@ -218,6 +323,8 @@ pub struct Stats {
     pub bytes: AtomicU64,
     pub rollovers: AtomicU64,
     pub deleted: AtomicU64,
+    /// Background fdatasyncs in page-cache mode (in `fsyncs` too).
+    pub background_syncs: AtomicU64,
 }
 
 impl Default for Stats {
@@ -229,6 +336,7 @@ impl Default for Stats {
             bytes: AtomicU64::new(0),
             rollovers: AtomicU64::new(0),
             deleted: AtomicU64::new(0),
+            background_syncs: AtomicU64::new(0),
         }
     }
 }
@@ -344,11 +452,35 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// Whether the previous run wrote in page-cache mode and the machine went
+/// down since (another boot, or an emulated power cut); records this run's
+/// boot and mode for the next one.
+fn power_lost_since_last_run(dir: &Path, opts: &Options) -> anyhow::Result<bool> {
+    let now = boot_id();
+    let prev = std::fs::read_to_string(dir.join(BOOT_FILE)).unwrap_or_default();
+    let mut it = prev.split_whitespace();
+    let (prev_boot, prev_mode) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
+    let cut = dir.join(POWER_LOST).exists();
+    let lost = prev_mode == "page-cache" && (cut || (!prev_boot.is_empty() && prev_boot != now));
+    if lost && opts.trust_after_power_loss {
+        tracing::warn!(dir = %dir.display(), "qlog commitlog: a power loss in page-cache mode, trusted anyway (mutation test)");
+    }
+    let mut f = File::create(dir.join(BOOT_FILE))?;
+    f.write_all(format!("{now} {}\n", opts.sync.name()).as_bytes())?;
+    f.sync_all()?;
+    if cut {
+        std::fs::remove_file(dir.join(POWER_LOST))?;
+    }
+    fsync_dir(dir)?;
+    Ok(lost && !opts.trust_after_power_loss)
+}
+
 impl CommitLog {
     /// Opens (or creates) the commitlog in `dir` and replays it.
     pub fn open(dir: &Path, opts: Options) -> anyhow::Result<(Arc<CommitLog>, Recovered)> {
         let t = Instant::now();
         std::fs::create_dir_all(dir)?;
+        let power_lost = power_lost_since_last_run(dir, &opts)?;
         let mut nos: Vec<u64> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
             .filter_map(|e| e.file_name().to_str()?.strip_suffix(".qlog")?.parse().ok())
@@ -490,6 +622,7 @@ impl CommitLog {
                 written_commit: commit,
                 durable_len: active_len,
                 written_len: active_len,
+                synced_at: Instant::now(),
             }),
             halted: AtomicBool::new(false),
             writer: Mutex::new(None),
@@ -503,13 +636,14 @@ impl CommitLog {
             promised: promised.epoch,
             promised_to: Some(promised.leader).filter(|l| !l.is_empty()),
             fresh,
+            power_lost: power_lost && !fresh,
             segments: n,
             records,
             torn_bytes: torn,
             took: t.elapsed(),
         };
         tracing::info!(
-            dir = %dir.display(), segments = r.segments, records, torn_bytes = torn, fresh,
+            dir = %dir.display(), segments = r.segments, records, torn_bytes = torn, fresh, power_lost = r.power_lost,
             base = r.log.base().1, last = r.log.last_seq(), commit = r.log.commit(), promised = r.promised,
             ms = r.took.as_millis() as u64, "qlog commitlog: recovered"
         );
@@ -613,7 +747,20 @@ impl CommitLog {
         let f = OpenOptions::new().write(true).open(seg_path(&self.dir, seg.no))?;
         f.set_len(keep)?;
         f.write_all_at(garbage, keep)?;
-        f.sync_all()
+        f.sync_all()?;
+        // the machine reboots: what the next open sees of /proc's boot id
+        File::create(self.dir.join(POWER_LOST))?.sync_all()?;
+        fsync_dir(&self.dir)
+    }
+
+    pub fn mode(&self) -> SyncMode {
+        self.opts.sync
+    }
+
+    /// (bytes written since the last fdatasync, how long ago that was).
+    pub fn unsynced(&self) -> (u64, Duration) {
+        let s = self.shared.lock();
+        (s.written_len.saturating_sub(s.durable_len), s.synced_at.elapsed())
     }
 }
 
@@ -673,8 +820,12 @@ impl Writer {
         loop {
             let (ops, ticket, commit) = {
                 let mut q = cl.queue.lock().expect("queue lock");
+                let idle = match cl.opts.sync {
+                    SyncMode::PageCache { every } => every.min(Duration::from_millis(500)),
+                    SyncMode::Fsync => Duration::from_millis(500),
+                };
                 while q.ops.is_empty() && !cl.halted.load(Ordering::Acquire) {
-                    let (g, to) = cl.wake.wait_timeout(q, Duration::from_millis(500)).expect("queue lock");
+                    let (g, to) = cl.wake.wait_timeout(q, idle).expect("queue lock");
                     q = g;
                     if to.timed_out() {
                         break;
@@ -689,6 +840,7 @@ impl Writer {
                 (std::mem::take(&mut q.ops), q.staged, commit)
             };
             let r = if ops.is_empty() { self.maintain(&cl) } else { self.batch(&cl, ops, ticket, commit) };
+            let r = r.and_then(|()| self.sync_due(&cl));
             if let Err(e) = r {
                 tracing::error!(dir = %cl.dir.display(), "qlog commitlog: write failed, nothing more is durable: {e}");
                 cl.durable.send_modify(|d| d.failed = true);
@@ -702,6 +854,7 @@ impl Writer {
 
     fn batch(&mut self, cl: &CommitLog, ops: Vec<Op>, ticket: u64, commit: u64) -> std::io::Result<()> {
         self.buf.clear();
+        let mut promise = false;
         let mut idx = Vec::with_capacity(ops.len());
         let n = ops.len();
         for op in &ops {
@@ -721,6 +874,7 @@ impl Writer {
                 Op::Promise { epoch, leader } => {
                     rec(&mut self.buf, T_PROMISE, &[&epoch.to_le_bytes(), leader.as_bytes()]);
                     self.promised.raise(*epoch, leader.as_bytes());
+                    promise = true;
                 }
             }
         }
@@ -756,19 +910,14 @@ impl Writer {
             self.len += self.buf.len() as u64;
             written += self.buf.len() as u64;
         }
-        if let Some(d) = cl.opts.sync_delay {
-            std::thread::sleep(d);
-        }
-        let t = Instant::now();
-        self.file.sync_data()?;
-        let us = t.elapsed().as_micros().max(1) as u64;
-        let _ = cl.stats.fsync_us.lock().record(us);
         let _ = cl.stats.batch_ops.lock().record(n.max(1) as u64);
-        cl.stats.fsyncs.fetch_add(1, Ordering::Relaxed);
-        {
+        // a promise is fsynced in every mode: a power cut must not let the
+        // node promise an older epoch again
+        if cl.opts.sync == SyncMode::Fsync || promise {
+            self.sync(cl, false)?;
+        } else {
             let mut s = cl.shared.lock();
             s.written_len = self.len;
-            s.durable_len = self.len;
             if let Some(seg) = s.segs.last_mut() {
                 seg.bytes = self.len;
             }
@@ -776,6 +925,39 @@ impl Writer {
         cl.stats.bytes.fetch_add(written, Ordering::Relaxed);
         cl.durable.send_modify(|d| d.ticket = d.ticket.max(ticket));
         self.maintain(cl)
+    }
+
+    fn sync(&mut self, cl: &CommitLog, background: bool) -> std::io::Result<()> {
+        if let Some(d) = cl.opts.sync_delay {
+            std::thread::sleep(d);
+        }
+        let t = Instant::now();
+        self.file.sync_data()?;
+        let us = t.elapsed().as_micros().max(1) as u64;
+        let _ = cl.stats.fsync_us.lock().record(us);
+        cl.stats.fsyncs.fetch_add(1, Ordering::Relaxed);
+        if background {
+            cl.stats.background_syncs.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut s = cl.shared.lock();
+        s.written_len = self.len;
+        s.durable_len = self.len;
+        s.synced_at = Instant::now();
+        if let Some(seg) = s.segs.last_mut() {
+            seg.bytes = self.len;
+        }
+        Ok(())
+    }
+
+    /// Page-cache mode: the writes since the last fdatasync, synced once
+    /// they're `every` old.
+    fn sync_due(&mut self, cl: &CommitLog) -> std::io::Result<()> {
+        let SyncMode::PageCache { every } = cl.opts.sync else { return Ok(()) };
+        let due = {
+            let s = cl.shared.lock();
+            s.written_len > s.durable_len && s.synced_at.elapsed() >= every
+        };
+        if due { self.sync(cl, true) } else { Ok(()) }
     }
 
     /// Rollover and deleting old segments, off the ack path.
@@ -842,6 +1024,7 @@ impl Writer {
             s.segs.push(Seg { no, base_seq: base, bytes: len, file: Arc::new(File::open(&path)?) });
             s.written_len = len;
             s.durable_len = len;
+            s.synced_at = Instant::now();
         }
         self.file = f;
         self.no = no;
@@ -1033,5 +1216,88 @@ mod tests {
         assert_eq!(got.last().unwrap().seq, 200);
         cl2.halt();
         drop(cl);
+    }
+
+    fn page_cache(every_ms: u64) -> Options {
+        Options { sync: SyncMode::PageCache { every: Duration::from_millis(every_ms) }, ..opts() }
+    }
+
+    /// Page-cache mode acks once written, before any fsync, and syncs in
+    /// the background on its interval.
+    #[tokio::test]
+    async fn page_cache_acks_before_the_fsync_and_syncs_on_its_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = Options { sync_delay: Some(Duration::from_millis(300)), ..page_cache(600) };
+        let (cl, r) = CommitLog::open(dir.path(), o).unwrap();
+        let mut log = r.log;
+        log.journal();
+        let t = Instant::now();
+        apply(&cl, &mut log, |l| {
+            l.append(1, Bytes::from_static(b"one"));
+        })
+        .await;
+        assert!(t.elapsed() < Duration::from_millis(200), "waited for an fsync: {:?}", t.elapsed());
+        assert!(cl.unsynced().0 > 0);
+        let t = Instant::now();
+        while cl.unsynced().0 > 0 {
+            assert!(t.elapsed() < Duration::from_secs(3), "no background fsync");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(cl.stats.background_syncs.load(Ordering::Relaxed) >= 1);
+        // a promise is fsynced before it counts, in every mode
+        let t = Instant::now();
+        apply(&cl, &mut log, |l| l.record_promise(5, "n1")).await;
+        assert!(t.elapsed() >= Duration::from_millis(300), "a promise counted before its fsync");
+        assert_eq!(cl.unsynced().0, 0);
+    }
+
+    /// After a power cut in page-cache mode the next open says so (the log
+    /// may have lost acked writes); after one in fsync mode, or a process
+    /// crash, it doesn't. A reboot (another boot id) counts as a power
+    /// loss after page-cache writes.
+    #[tokio::test]
+    async fn a_power_loss_after_page_cache_writes_is_noticed_at_open() {
+        for (o, cut, lost) in [
+            (page_cache(10_000), true, true),
+            (page_cache(10_000), false, false),
+            (opts(), true, false),
+            (Options { trust_after_power_loss: true, ..page_cache(10_000) }, true, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (cl, r) = CommitLog::open(dir.path(), o.clone()).unwrap();
+            assert!(!r.power_lost);
+            let mut log = r.log;
+            log.journal();
+            for i in 0..5u8 {
+                apply(&cl, &mut log, |l| {
+                    l.append(1, Bytes::from(vec![i; 100]));
+                })
+                .await;
+            }
+            if cut {
+                cl.power_cut(0.0, &[1, 2, 3]).unwrap();
+            } else {
+                cl.halt();
+            }
+            drop(cl);
+            let (_, r) = CommitLog::open(dir.path(), o.clone()).unwrap();
+            assert_eq!(r.power_lost, lost, "{:?} cut {cut}", o.sync);
+            if o.sync == SyncMode::Fsync || !cut {
+                assert_eq!(r.log.last_seq(), 5, "lost entries without a power loss");
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (cl, r) = CommitLog::open(dir.path(), page_cache(10_000)).unwrap();
+        let mut log = r.log;
+        log.journal();
+        apply(&cl, &mut log, |l| {
+            l.append(1, Bytes::from_static(b"x"));
+        })
+        .await;
+        cl.halt();
+        drop(cl);
+        std::fs::write(dir.path().join(BOOT_FILE), "another-boot page-cache\n").unwrap();
+        let (_, r) = CommitLog::open(dir.path(), page_cache(10_000)).unwrap();
+        assert!(r.power_lost, "a reboot after page-cache writes went unnoticed");
     }
 }

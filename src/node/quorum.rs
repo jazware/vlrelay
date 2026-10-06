@@ -92,6 +92,10 @@ pub struct QuorumSetup {
     pub power_cut_on_usr1: bool,
     /// Chaos: sleep this long before each commitlog fsync.
     pub fsync_delay: Option<Duration>,
+    /// When an entry counts here (`--durability`).
+    pub durability: crate::qlog::commitlog::DurabilityMode,
+    /// Mutation tests only (`--qlog-unsafe-trust-log`).
+    pub trust_after_power_loss: bool,
     /// The leader reads the PLC directory's export into the seed database
     /// (`plc_seed`), and every member seeds its DID documents from it.
     pub plc_export: Option<crate::plc_seed::ingest::Config>,
@@ -122,6 +126,8 @@ impl QuorumSetup {
             crash: None,
             power_cut_on_usr1: false,
             fsync_delay: None,
+            durability: crate::qlog::commitlog::DurabilityMode::Sync(crate::qlog::commitlog::SyncMode::Fsync),
+            trust_after_power_loss: false,
             plc_export: None,
         }
     }
@@ -2093,10 +2099,16 @@ impl Node {
             crate::plc_seed::job::PlcJob::new(c, st, seeds, identity.clone())
         });
         let bucket = Bucket::new(store.clone());
-        let memory = q.memory_bytes.unwrap_or(if q.commitlog.is_some() { 64 << 20 } else { 512 << 20 });
-        let (durability, recovered): (Arc<dyn qn::Durability>, _) = match &q.commitlog {
+        let (dir, sync) = match q.durability {
+            commitlog::DurabilityMode::Memory => (None, commitlog::SyncMode::Fsync),
+            commitlog::DurabilityMode::Sync(s) => (q.commitlog.as_ref(), s),
+        };
+        let memory = q.memory_bytes.unwrap_or(if dir.is_some() { 64 << 20 } else { 512 << 20 });
+        let (durability, recovered): (Arc<dyn qn::Durability>, _) = match dir {
             Some(dir) => {
                 let o = commitlog::Options {
+                    sync,
+                    trust_after_power_loss: q.trust_after_power_loss,
                     segment_bytes: q.commitlog_segment_bytes,
                     retain_bytes: q.disk_retain_bytes,
                     memory_bytes: memory,

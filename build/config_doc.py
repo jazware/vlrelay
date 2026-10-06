@@ -29,13 +29,13 @@ SECTIONS = [
         ["node-id", "qlog-listen", "qlog-peer", "qlog-members", "qlog-dir", "qlog-flush-ms", "qlog-headroom",
          "qlog-admin-token", "qlog-retain-hours", "qlog-retain-secs", "qlog-retain-every-secs",
          "qlog-host-failover-ms", "qlog-host-poll-ms", "qlog-election-ms", "qlog-heartbeat-ms",
-         "qlog-state-compactor-poll-ms", "qlog-no-auto-recover", "qlog-segment-mb", "qlog-disk-retain-mb",
+         "qlog-state-compactor-poll-ms", "qlog-no-auto-recover", "qlog-segment-mb", "qlog-disk-retain-mb", "durability", "durability-sync-ms",
          "qlog-memory-mb"],
     ),
     (
         "Chaos",
         "For the chaos harness (`tests/qlog/relay-chaos.sh`); never on a production node.",
-        ["qlog-crash-at", "qlog-crash-prob", "qlog-crash-stop-file", "qlog-power-cut-on-usr1", "qlog-fsync-delay-us"],
+        ["qlog-crash-at", "qlog-crash-prob", "qlog-crash-stop-file", "qlog-power-cut-on-usr1", "qlog-fsync-delay-us", "qlog-unsafe-trust-log"],
     ),
 ]
 

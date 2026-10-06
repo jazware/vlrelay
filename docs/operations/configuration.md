@@ -118,6 +118,8 @@ Every member uses the same bucket and `--prefix`. A node with no `--qlog-peer` i
 | `--qlog-no-auto-recover` |  |  | A lost quorum waits for an operator instead of recovering from the bucket |
 | `--qlog-segment-mb <QLOG_SEGMENT_MB>` |  | `64` | Commitlog file size on the local disk |
 | `--qlog-disk-retain-mb <QLOG_DISK_RETAIN_MB>` |  | `4096` | Flushed commitlog kept on the local disk, for followers catching up |
+| `--durability <DURABILITY>` | `VLRELAY_DURABILITY` |  | When an entry counts on this node: `fsync` (after its fdatasync), `page-cache` (once written to the commitlog, fdatasync'd every --durability-sync-ms; a power cut on a majority within that window is a bucket recovery) or `memory` (no commitlog). Default: page-cache for three members or more, fsync below; a single node only runs fsync |
+| `--durability-sync-ms <DURABILITY_SYNC_MS>` |  | `100` | Page-cache mode's background fdatasync interval |
 | `--qlog-memory-mb <QLOG_MEMORY_MB>` |  |  | Committed log kept in memory (default 64 with --qlog-dir, else 512) |
 
 ## Chaos
@@ -131,3 +133,4 @@ For the chaos harness (`tests/qlog/relay-chaos.sh`); never on a production node.
 | `--qlog-crash-stop-file <QLOG_CRASH_STOP_FILE>` |  |  | Chaos: no crash injected once this file exists |
 | `--qlog-power-cut-on-usr1` |  |  | Chaos: SIGUSR1 is a power cut |
 | `--qlog-fsync-delay-us <QLOG_FSYNC_DELAY_US>` |  |  | Chaos: sleep this long before each commitlog fsync (emulates a disk) |
+| `--qlog-unsafe-trust-log` |  |  | Mutation tests only: trust the commitlog after a power loss in page-cache mode (the check the chaos must catch it without) |
