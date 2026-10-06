@@ -338,8 +338,7 @@ async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<
     // always built: the public page's stats come from it
     let admin_src = {
         let policy = node.policy.clone().expect("the relay always runs the policy engine");
-        let demo = vlrelay::admin::demo::Demo::start(42);
-        Arc::new(NodeAdmin::new(node.clone(), policy, demo).with_settings(settings))
+        Arc::new(NodeAdmin::new(node.clone(), policy).with_settings(settings))
     };
     let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
     if let Some(token) = token {

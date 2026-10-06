@@ -15,7 +15,7 @@ use super::Node;
 use super::metrics::HostSeries as Series;
 use super::policy::PolicyHooks;
 use crate::admin::fleet::{self, Member, NodeReport};
-use crate::admin::{self, AdminError, AdminResult, AdminSource, RejectReason, demo::Demo};
+use crate::admin::{self, AdminError, AdminResult, AdminSource, RejectReason};
 use crate::policy::admin::PolicyAdmin;
 use crate::state::{AccountStatus, Upstream};
 use crate::types::Host;
@@ -28,7 +28,6 @@ use std::time::{Duration, Instant};
 pub struct NodeAdmin {
     pub node: Arc<Node>,
     pub policy: Arc<PolicyHooks>,
-    pub demo: Arc<Demo>,
     /// (when, open cases): the overview polls every second or two, and a
     /// count is a bucket listing.
     open_cases: Mutex<Option<(Instant, u32)>>,
@@ -83,8 +82,8 @@ fn pipeline_gauges() -> BTreeMap<String, f64> {
 }
 
 impl NodeAdmin {
-    pub fn new(node: Arc<Node>, policy: Arc<PolicyHooks>, demo: Arc<Demo>) -> NodeAdmin {
-        NodeAdmin { node, policy, demo, open_cases: Mutex::new(None), cpu: Mutex::new(None), settings: None }
+    pub fn new(node: Arc<Node>, policy: Arc<PolicyHooks>) -> NodeAdmin {
+        NodeAdmin { node, policy, open_cases: Mutex::new(None), cpu: Mutex::new(None), settings: None }
     }
 
     /// The process's effective config, for the Settings page.

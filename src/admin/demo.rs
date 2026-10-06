@@ -1385,6 +1385,49 @@ impl AdminSource for Demo {
         })
     }
 
+    async fn pipeline_view(&self) -> AdminResult<PipelineView> {
+        let s = self.sim.lock();
+        let owner = |h: &SimHost| s.host_shards[h.shard].clone().unwrap_or_else(|| NODES[0].to_string());
+        // ~40 ms of events in flight per host, so the busy hosts lead
+        let mut hosts: Vec<PipelineHost> = s
+            .hosts
+            .iter()
+            .filter(|h| h.connected_since.is_some() && h.rate > 0.0)
+            .map(|h| PipelineHost {
+                host: h.name.clone(),
+                node: owner(h),
+                inflight: (h.rate * 0.04).ceil() as u64,
+                inflight_cap: Some(512),
+                paused: h.throttle.is_some_and(|t| h.rate >= t),
+                status: Some(h.status),
+                events_per_sec: round2(h.rate),
+            })
+            .collect();
+        hosts.sort_by(|a, b| b.inflight.cmp(&a.inflight).then_with(|| a.host.cmp(&b.host)));
+        hosts.truncate(50);
+        let nodes = NODES
+            .iter()
+            .map(|id| {
+                let mine: Vec<&PipelineHost> = hosts.iter().filter(|h| h.node == *id).collect();
+                let pending: u64 = mine.iter().map(|h| h.inflight).sum();
+                let mut gauges = BTreeMap::new();
+                gauges.insert("relay_ack_pending".into(), pending as f64);
+                gauges.insert("relay_lane_queued".into(), (pending / 4) as f64);
+                PipelineNode {
+                    node: id.to_string(),
+                    stale: false,
+                    ack_pending: pending,
+                    oldest_pending_ms: if pending > 0 { 38.0 } else { 0.0 },
+                    lane_queued: pending / 4,
+                    dedupe_entries: 0,
+                    paused_hosts: mine.iter().filter(|h| h.paused).count() as u32,
+                    gauges,
+                }
+            })
+            .collect();
+        Ok(PipelineView { nodes, hosts })
+    }
+
     async fn cluster(&self) -> AdminResult<ClusterView> {
         let s = self.sim.lock();
         let now = s.now_ms;
@@ -1557,6 +1600,17 @@ mod tests {
             d.update_policy(PolicyUpdate { base_version: p.version, policy: np, note: String::new() }, "admin").await;
         assert!(matches!(stale, Err(AdminError::Conflict(_))));
         assert_eq!(d.policy_audit().await.unwrap()[0].changes, vec!["spam.rejectRatio: 0.2 → 0.3".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn the_pipeline_view_is_served() {
+        let d = Demo::start(7);
+        let p = d.pipeline_view().await.unwrap();
+        assert_eq!(p.nodes.len(), NODES.len());
+        assert!(!p.hosts.is_empty());
+        assert!(p.hosts.windows(2).all(|w| w[0].inflight >= w[1].inflight));
+        let pending: u64 = p.nodes.iter().map(|n| n.ack_pending).sum();
+        assert_eq!(pending, p.hosts.iter().map(|h| h.inflight).sum::<u64>());
     }
 
     #[tokio::test]

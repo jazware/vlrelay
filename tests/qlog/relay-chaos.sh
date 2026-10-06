@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The relay on the quorum log under chaos (docs/quorum.md, Phase 7): a
 # fakepds fleet (signed sync 1.1 commits, its own PLC) -> three
-# `vlrelay --quorum` nodes on a local MinIO, each restarted by a supervisor
+# `vlrelay` nodes on a local MinIO, each restarted by a supervisor
 # when it exits, peers dialing each other through the fault proxy
 # (tests/chaos/proxy.py, one route per direction) -> consumers.
 #
@@ -90,7 +90,7 @@ mkdir -p "$out"
 prefix="relayq-$scenario-$(date +%s)"
 ms() { date +%s%3N; }
 log() { echo "$(ms) $*" | tee -a "$out/events.log"; }
-nodepid() { pgrep -f "^$bin --quorum --node-id n$1 " | head -1; }
+nodepid() { pgrep -f "^$bin --node-id n$1 " | head -1; }
 
 pids=()
 cl_dir=${CL_DIR:-$out}
@@ -98,7 +98,7 @@ cleanup() {
   touch "$out/stop" 2>/dev/null || true
   for i in $slots; do p=$(nodepid "$i" || true); [ -n "$p" ] && kill -CONT "$p" 2>/dev/null; done
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
-  for i in $slots; do pkill -9 -f "^$bin --quorum --node-id n$i " 2>/dev/null || true; done
+  for i in $slots; do pkill -9 -f "^$bin --node-id n$i " 2>/dev/null || true; done
   pkill -f "^$target/fakepds run --seed relayq$B " 2>/dev/null || true
   wait 2>/dev/null || true
   [ "$cl_dir" = "$out" ] || rm -rf "$cl_dir"
@@ -160,7 +160,7 @@ supervise() {
   done
   while [ ! -e "$out/stop" ] && [ ! -e "$out/retired-n$i" ]; do
     set +e
-    RUST_LOG=${RELAY_LOG:-info,slatedb=warn} "$bin" --quorum --node-id "n$i" --listen "127.0.0.1:$(http "$i")" --qlog-listen "127.0.0.1:$(peer "$i")" "${peers[@]}" \
+    RUST_LOG=${RELAY_LOG:-info,slatedb=warn} "$bin" --node-id "n$i" --listen "127.0.0.1:$(http "$i")" --qlog-listen "127.0.0.1:$(peer "$i")" "${peers[@]}" \
       --qlog-members "$members_flag" --qlog-dir "$cl_dir/cl-n$i" --qlog-power-cut-on-usr1 \
       --qlog-flush-ms "$flush_ms" --qlog-headroom "${HEADROOM:-100000000}" --qlog-admin-token relayq \
       --s3-endpoint "http://127.0.0.1:$minio" --s3-bucket vlrelay --s3-access-key minioadmin --s3-secret-key minioadmin \
