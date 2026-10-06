@@ -6,8 +6,8 @@
 //! rows shown beside them.
 
 use super::{
-    ClusterView, History, HostRow, HostStatus, NodeTotals, NodeView, Overview, PipelineHost, PipelineNode,
-    PipelineView, PlcNode, PlcView, PlcWindow, RejectReason,
+    History, HostRow, HostStatus, NodeTotals, Overview, PipelineHost, PipelineNode, PipelineView, PlcNode, PlcView,
+    PlcWindow, RejectReason,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -31,7 +31,7 @@ pub struct NodeReport {
     pub rejects_by_reason: BTreeMap<RejectReason, f64>,
     pub ttf_p50_ms: f64,
     pub ttf_p99_ms: f64,
-    pub log_durability_lag_ms: f64,
+    pub commit_lag_ms: f64,
     /// The last seq its merged stream emitted.
     pub stream_seq: i64,
     pub cpu: f64,
@@ -203,7 +203,7 @@ pub fn overview(members: &[Member], open_cases: u32, now_ms: i64) -> Overview {
         rejects_by_reason: rejects,
         time_to_firehose_p50_ms: max(|r| r.ttf_p50_ms),
         time_to_firehose_p99_ms: max(|r| r.ttf_p99_ms),
-        log_durability_lag_ms: max(|r| r.log_durability_lag_ms),
+        commit_lag_ms: max(|r| r.commit_lag_ms),
         last_seq: reports.iter().map(|r| r.stream_seq).max().unwrap_or(0),
         open_cases,
         top_hosts: top,
@@ -211,118 +211,6 @@ pub fn overview(members: &[Member], open_cases: u32, now_ms: i64) -> Overview {
         stream_events_per_sec: max(|r| r.events_out_per_sec),
         by_node: members.iter().map(totals).collect(),
     }
-}
-
-/// Fills the lease-based node rows with each member's numbers and adds the
-/// members that hold no lease (edges, replicas).
-pub fn fill_cluster(view: &mut ClusterView, members: &[Member]) {
-    if let Some(s) = fresh(members).map(|r| r.stream_seq).max() {
-        view.last_seq = s;
-    }
-    let by_id: HashMap<&str, &Member> = members.iter().map(|m| (m.id.as_str(), m)).collect();
-    for n in &mut view.nodes {
-        if n.role.is_empty() {
-            n.role = "core".into();
-        }
-        match by_id.get(n.id.as_str()) {
-            Some(m) => fill_node(n, m),
-            None => {
-                n.stale = true;
-                n.error = Some("not polled".into());
-            }
-        }
-    }
-    for m in members {
-        if view.nodes.iter().any(|n| n.id == m.id) {
-            continue;
-        }
-        let mut n = NodeView {
-            id: m.id.clone(),
-            addr: String::new(),
-            version: String::new(),
-            rev: String::new(),
-            reachable: false,
-            lease_valid: false,
-            lease_expires_ms: 0,
-            host_shards: 0,
-            did_shards: 0,
-            hosts: 0,
-            consumers: 0,
-            events_in_per_sec: 0.0,
-            events_out_per_sec: 0.0,
-            log_durability_lag_ms: 0.0,
-            cpu: 0.0,
-            mem_bytes: 0,
-            role: m.role.clone(),
-            stale: false,
-            error: None,
-            reported_ms: 0,
-            bytes_out_per_sec: 0.0,
-            stream_seq: 0,
-        };
-        fill_node(&mut n, m);
-        view.nodes.push(n);
-    }
-    view.nodes.sort_by(|a, b| (a.role != "core", &a.id).cmp(&(b.role != "core", &b.id)));
-}
-
-fn fill_node(n: &mut NodeView, m: &Member) {
-    n.reported_ms = m.last_ok_ms;
-    n.error = m.error.clone();
-    n.stale = m.is_stale();
-    if !m.role.is_empty() {
-        n.role = m.role.clone();
-    }
-    match &m.report {
-        Some(r) => {
-            n.reachable = true;
-            n.hosts = r.hosts_total();
-            n.consumers = r.consumers;
-            n.events_in_per_sec = r.events_in_per_sec;
-            n.events_out_per_sec = r.events_out_per_sec;
-            n.bytes_out_per_sec = r.bytes_out_per_sec;
-            n.log_durability_lag_ms = r.log_durability_lag_ms;
-            n.cpu = r.cpu;
-            n.mem_bytes = r.mem_bytes;
-            n.stream_seq = r.stream_seq;
-            n.version = r.version.clone();
-        }
-        None => {
-            n.reachable = false;
-            n.hosts = 0;
-            n.consumers = 0;
-            n.events_in_per_sec = 0.0;
-            n.events_out_per_sec = 0.0;
-            n.bytes_out_per_sec = 0.0;
-            n.log_durability_lag_ms = 0.0;
-            n.cpu = 0.0;
-            n.mem_bytes = 0;
-        }
-    }
-}
-
-/// Every host once: the row from its owner where the owner answered (live
-/// rates), else this node's registry row, attributed to the owner.
-pub fn merge_hosts(
-    registry: Vec<HostRow>,
-    owned: &[(String, Vec<HostRow>)],
-    owner_of: impl Fn(&str) -> Option<String>,
-) -> Vec<HostRow> {
-    let mut out: BTreeMap<String, HostRow> = BTreeMap::new();
-    for mut r in registry {
-        r.events_per_sec = 0.0;
-        r.error_rate = 0.0;
-        r.node = owner_of(&r.host).unwrap_or_default();
-        out.insert(r.host.clone(), r);
-    }
-    for (node, rows) in owned {
-        for r in rows {
-            let mut r = r.clone();
-            r.node = node.clone();
-            out.insert(r.host.clone(), r);
-        }
-    }
-    out.into_values().collect()
 }
 
 pub fn plc_view(members: &[Member]) -> PlcView {
@@ -430,6 +318,7 @@ mod tests {
             rule: None,
             node: String::new(),
             max_accounts: 100,
+            history: Vec::new(),
         }
     }
 
@@ -502,64 +391,6 @@ mod tests {
         assert_eq!(n2.error.as_deref(), Some("connection refused"));
         let s: f64 = o.by_node.iter().map(|n| n.events_in_per_sec).sum();
         assert_eq!(s, o.events_in_per_sec);
-
-        let mut v = ClusterView {
-            nodes: vec![lease_row("n1"), lease_row("n2")],
-            host_shards: vec![],
-            did_shards: vec![],
-            last_seq: 0,
-        };
-        fill_cluster(&mut v, &ms);
-        let n2 = v.nodes.iter().find(|n| n.id == "n2").unwrap();
-        assert!(n2.stale && !n2.reachable);
-        assert_eq!((n2.consumers, n2.events_in_per_sec, n2.reported_ms), (0, 0.0, 900));
-        let n1 = v.nodes.iter().find(|n| n.id == "n1").unwrap();
-        assert_eq!((n1.consumers, n1.hosts, n1.events_in_per_sec), (2, 4, 100.0));
-        assert!(!n1.stale && n1.reachable);
-    }
-
-    fn lease_row(id: &str) -> NodeView {
-        NodeView {
-            id: id.into(),
-            addr: format!("https://{id}"),
-            version: "1".into(),
-            rev: "r".into(),
-            reachable: true,
-            lease_valid: true,
-            lease_expires_ms: 0,
-            host_shards: 1,
-            did_shards: 1,
-            hosts: 0,
-            consumers: 0,
-            events_in_per_sec: 0.0,
-            events_out_per_sec: 0.0,
-            log_durability_lag_ms: 0.0,
-            cpu: 0.0,
-            mem_bytes: 0,
-            role: String::new(),
-            stale: false,
-            error: None,
-            reported_ms: 0,
-            bytes_out_per_sec: 0.0,
-            stream_seq: 0,
-        }
-    }
-
-    #[test]
-    fn followers_without_a_lease_get_rows() {
-        let ms = vec![
-            Member::ok(report("n1", "core", 10.0, 0, 1)),
-            Member::ok(report("edge", "edge", 0.0, 5, 0)),
-            Member::stale("replica", "replica", "timed out".into(), 0),
-        ];
-        let mut v = ClusterView { nodes: vec![lease_row("n1")], host_shards: vec![], did_shards: vec![], last_seq: 0 };
-        fill_cluster(&mut v, &ms);
-        assert_eq!(v.nodes.len(), 3);
-        let e = v.nodes.iter().find(|n| n.id == "edge").unwrap();
-        assert_eq!((e.role.as_str(), e.consumers, e.stale), ("edge", 5, false));
-        let r = v.nodes.iter().find(|n| n.id == "replica").unwrap();
-        assert!(r.stale);
-        assert_eq!(r.role, "replica");
     }
 
     #[test]
@@ -571,20 +402,6 @@ mod tests {
         assert_eq!(h.t, vec![101, 102, 103]);
         assert_eq!(h.events_in, vec![12.0, 23.0, 30.0]);
         assert_eq!(h.ttf_p99_ms, vec![5.0, 9.0, 1.0]);
-    }
-
-    #[test]
-    fn hosts_come_from_their_owner() {
-        let registry = vec![row("a", 9.0), row("b", 9.0), row("c", 9.0)];
-        let owned = vec![("n1".to_string(), vec![row("a", 5.0)]), ("n2".to_string(), vec![row("b", 7.0)])];
-        let owner = |h: &str| Some(if h == "a" { "n1" } else { "n2" }.to_string());
-        let rows = merge_hosts(registry, &owned, owner);
-        assert_eq!(rows.len(), 3);
-        let get = |h: &str| rows.iter().find(|r| r.host == h).unwrap();
-        assert_eq!((get("a").events_per_sec, get("a").node.as_str()), (5.0, "n1"));
-        assert_eq!((get("b").events_per_sec, get("b").node.as_str()), (7.0, "n2"));
-        // its owner didn't report it: the registry row, with no rate
-        assert_eq!((get("c").events_per_sec, get("c").node.as_str()), (0.0, "n2"));
     }
 
     #[test]

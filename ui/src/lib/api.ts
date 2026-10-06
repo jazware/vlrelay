@@ -44,6 +44,37 @@ export type HostRow = {
   node: string
   /** The account cap in force (tier, or the host's own); 0 unknown. */
   maxAccounts: number
+  /** Events/s, 1 s apart, oldest first: only on the overview's top hosts. */
+  history?: number[]
+}
+
+export type CrawlAdmission = { atMs: number; host: string; outcome: 'admitted' | 'refused' | 'banned' | 'rate-limited'; tier?: string; reason: string }
+export type AdmissionLog = { newHostsToday: number; newHostsPerDay: number; entries: CrawlAdmission[] }
+export type TailFrame = {
+  atMs: number
+  host: string
+  did: string
+  kind: 'reject' | 'held' | 'passed'
+  reason?: string
+  detail?: string
+  upstreamSeq?: number
+  /** passed frames: the seq it went out at, and the event's kind */
+  seq?: number
+  event?: string
+}
+export type Released = { released: number }
+export type ClassCounts = { a: number; b: number; free: number }
+export type StorePurpose = { purpose: string; requests: ClassCounts; perSec: ClassCounts; bytesUp: number; bytesDown: number }
+export type StoreLatency = { op: string; count: number; meanMs: number; p50Ms: number; p99Ms: number }
+/** The object store as the answering node uses it; `retention` is retain/qlog as written (snake_case). */
+export type StoreView = {
+  node: string
+  atMs: number
+  windowSecs: number
+  total: StorePurpose
+  purposes: StorePurpose[]
+  latency: StoreLatency[]
+  retention: Record<string, unknown> | null
 }
 
 export type History = {
@@ -73,7 +104,7 @@ export type Overview = {
   rejectsByReason: Partial<Record<RejectReason, number>>
   timeToFirehoseP50Ms: number
   timeToFirehoseP99Ms: number
-  logDurabilityLagMs: number
+  commitLagMs: number
   lastSeq: number
   openCases: number
   topHosts: HostRow[]
@@ -162,26 +193,39 @@ export type NodeView = {
   version: string
   rev: string
   reachable: boolean
-  leaseValid: boolean
-  leaseExpiresMs: number
-  hostShards: number
-  didShards: number
+  /** Reachable, a member, and its log intact. */
+  healthy: boolean
+  /** leader, follower, candidate or unreachable */
+  role: string
+  /** Copying the leader's log before it becomes a member. */
+  learner: boolean
+  /** Hosts the leader's table gives it. */
+  ownedHosts: number
+  /** Hosts it has a socket open to. */
   hosts: number
   consumers: number
   eventsInPerSec: number
   eventsOutPerSec: number
-  logDurabilityLagMs: number
+  /** Submit to the leader until committed. */
+  commitLagMs: number
   cpu: number
   memBytes: number
-  role?: string
   /** It didn't answer this round: its numbers are 0, not its last ones. */
-  stale?: boolean
-  error?: string | null
-  reportedMs?: number
-  bytesOutPerSec?: number
-  streamSeq?: number
+  stale: boolean
+  error: string | null
+  reportedMs: number
+  bytesOutPerSec: number
+  streamSeq: number
 }
-export type ClusterView = { nodes: NodeView[]; hostShards: (string | null)[]; didShards: (string | null)[]; lastSeq: number }
+export type ClusterView = {
+  nodes: NodeView[]
+  leader: string | null
+  epoch: number
+  /** Hosts in the leader's table, and those no healthy member owns. */
+  hosts: number
+  unownedHosts: number
+  lastSeq: number
+}
 
 export type Takedown = { atMs: number; by: string; reason: string }
 export type Account = {

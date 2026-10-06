@@ -241,6 +241,8 @@ pub struct Node {
     pub ttf: Arc<Ttf>,
     pub dash: Mutex<Dash>,
     pub rejects: Mutex<HashMap<Host, HostRejects>>,
+    /// The last events this node read that went out, for the admin tail.
+    pub passed: Mutex<std::collections::VecDeque<metrics::PassedNote>>,
     pub policy: Option<Arc<policy::PolicyHooks>>,
     /// Per host: sockets below this epoch are fenced (`forward::Fence`).
     fences: Mutex<crate::types::FastMap<Host, Arc<AtomicU64>>>,
@@ -330,6 +332,7 @@ impl Node {
             ttf: Arc::new(Ttf::default()),
             dash: Mutex::new(Dash::default()),
             rejects: Mutex::new(HashMap::new()),
+            passed: Mutex::new(Default::default()),
             policy: hooks.clone(),
             fences: Mutex::new(Default::default()),
             lanes: lane_tx,

@@ -71,8 +71,22 @@ impl Node {
         kind: &'static str,
     ) {
         match rx.await {
-            Ok(Ok(Outcome::Appended(_))) => {
+            Ok(Ok(Outcome::Appended(seq))) => {
                 metrics::ACCEPTED_BY_KIND.inc(kind);
+                {
+                    let mut p = self.passed.lock();
+                    if p.len() >= metrics::PASSED_KEPT {
+                        p.pop_front();
+                    }
+                    p.push_back(metrics::PassedNote {
+                        at_ms: crate::upstream::host::now_ms() as i64,
+                        host: host.clone(),
+                        did: did.clone(),
+                        seq,
+                        upstream_seq: useq,
+                        kind,
+                    });
+                }
                 if let Some(p) = &self.policy {
                     p.on_accepted(&host.0, &did, kind);
                 }

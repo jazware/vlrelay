@@ -303,6 +303,8 @@ pub struct Status {
     pub applied: u64,
     pub last_flushed: u64,
     pub last_reserve: u64,
+    /// When this leader's last manifest was written (None before its first).
+    pub last_at_ms: Option<i64>,
 }
 
 fn hist() -> hdrhistogram::Histogram<u64> {
@@ -341,6 +343,7 @@ impl Shared {
             applied: s.applied,
             last_flushed: s.last.as_ref().map_or(0, |m| m.flushed),
             last_reserve: s.last.as_ref().map_or(0, |m| m.reserve),
+            last_at_ms: s.last.as_ref().map(|m| m.at_ms).filter(|&t| t > 0),
         };
         if reset {
             s.duration_us = None;
@@ -444,7 +447,11 @@ impl Leader {
                 }
             }
         }
-        self.node.flush.s.lock().fences += 1;
+        {
+            let mut s = self.node.flush.s.lock();
+            s.fences += 1;
+            s.last = Some(self.man.clone());
+        }
         self.node.set_flushed(self.man.flushed, self.man.reserve);
         self.node.note_manifest(&self.man);
         tracing::info!(

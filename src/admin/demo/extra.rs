@@ -49,6 +49,11 @@ pub(in crate::admin) struct Extra {
 }
 
 impl Extra {
+    /// (leader, epoch, members, learners)
+    pub(in crate::admin) fn roles(&self) -> (String, u64, Vec<String>, Vec<String>) {
+        (self.leader.clone(), self.epoch, self.members.clone(), self.learners.clone())
+    }
+
     pub fn new(now: i64, seq: i64) -> Extra {
         let seq = seq as u64;
         let mut full = serde_json::to_value(crate::policy::doc::PolicyBody::default()).unwrap_or_default();
@@ -195,6 +200,7 @@ impl Extra {
                 "applied": flushed,
                 "last_flushed": flushed,
                 "last_reserve": flushed + 400_000,
+                "last_at_ms": now - (now % 2_000),
             });
             s["recovered"] = self
                 .recoveries

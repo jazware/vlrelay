@@ -113,8 +113,8 @@ pub struct Overview {
     /// Upstream receive until the frame goes out on subscribeRepos.
     pub time_to_firehose_p50_ms: f64,
     pub time_to_firehose_p99_ms: f64,
-    /// Oldest sequenced-but-not-durable event in any node log.
-    pub log_durability_lag_ms: f64,
+    /// An event's submit to the leader until it committed (a quorum held it).
+    pub commit_lag_ms: f64,
     pub last_seq: i64,
     pub open_cases: u32,
     /// Busiest hosts right now, by events/s.
@@ -187,12 +187,16 @@ pub struct HostRow {
     pub throttle: Option<f64>,
     /// The domain rule that applies to this host, if any.
     pub rule: Option<u64>,
-    /// Owning node (host shard owner).
+    /// The member that reads it (the leader's host table).
     pub node: String,
     /// The account cap in force (tier, or an operator's per-host limit).
     /// 0: unknown.
     #[serde(default)]
     pub max_accounts: u64,
+    /// Events per second, one sample a second, oldest first: set on the
+    /// overview's top hosts only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<f64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -451,10 +455,11 @@ pub struct KickQuery {
 #[serde(rename_all = "camelCase")]
 pub struct ClusterView {
     pub nodes: Vec<NodeView>,
-    /// Owner node per host shard (None while unowned).
-    pub host_shards: Vec<Option<String>>,
-    /// Owner node per DID shard.
-    pub did_shards: Vec<Option<String>>,
+    pub leader: Option<String>,
+    pub epoch: u64,
+    /// Hosts in the leader's host table, and those no live member owns.
+    pub hosts: u32,
+    pub unowned_hosts: u32,
     pub last_seq: i64,
 }
 
@@ -466,35 +471,32 @@ pub struct NodeView {
     pub version: String,
     pub rev: String,
     pub reachable: bool,
-    pub lease_valid: bool,
-    pub lease_expires_ms: i64,
-    pub host_shards: u32,
-    pub did_shards: u32,
+    /// Reachable, in the member set, and holding an intact log.
+    pub healthy: bool,
+    /// `leader`, `follower`, `candidate`, or `unreachable`.
+    pub role: String,
+    /// Copying the leader's log before a membership change makes it a member.
+    pub learner: bool,
+    /// Hosts the leader's table gives it.
+    pub owned_hosts: u32,
+    /// Hosts it has a socket open to.
     pub hosts: u32,
     pub consumers: u32,
     pub events_in_per_sec: f64,
     pub events_out_per_sec: f64,
-    /// Sequenced but not yet durable, as time.
-    pub log_durability_lag_ms: f64,
+    /// Its events' submit to the leader until committed.
+    pub commit_lag_ms: f64,
     /// Cores busy over the last sample.
     pub cpu: f64,
     pub mem_bytes: u64,
-    /// `core`, `edge` or `replica`.
-    #[serde(default)]
-    pub role: String,
     /// It didn't answer this round (down, hung or partitioned): the numbers
     /// above are 0, not its last ones.
-    #[serde(default)]
     pub stale: bool,
-    #[serde(default)]
     pub error: Option<String>,
     /// When its numbers were last read (unix ms; 0: never).
-    #[serde(default)]
     pub reported_ms: i64,
-    #[serde(default)]
     pub bytes_out_per_sec: f64,
-    /// The last seq its merged stream emitted.
-    #[serde(default)]
+    /// The last seq its stream emitted.
     pub stream_seq: i64,
 }
 
@@ -749,6 +751,111 @@ pub struct PipelineHost {
     pub events_per_sec: f64,
 }
 
+/// requestCrawl outcomes this node saw, and the cluster's new-host budget.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdmissionLog {
+    pub new_hosts_today: u32,
+    pub new_hosts_per_day: u32,
+    /// Newest first.
+    pub entries: Vec<crate::upstream::crawl::CrawlAdmission>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailQuery {
+    /// Only this host's frames, passed ones included.
+    pub host: Option<String>,
+    /// Rejected and held frames (from every host, or `host`'s).
+    #[serde(default)]
+    pub rejects: Option<u8>,
+    /// Only frames after this time (unix ms), for a poll.
+    pub since_ms: Option<i64>,
+    pub limit: Option<usize>,
+}
+
+/// A frame this node read: rejected, held (an account the relay throttled,
+/// or a new one deferred), or passed (with the seq it went out at).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailFrame {
+    pub at_ms: i64,
+    pub host: String,
+    pub did: String,
+    /// `reject`, `held` or `passed`.
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
+    /// The event's kind (`commit`, `identity` ...), for passed frames.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Released {
+    pub released: u64,
+}
+
+/// Object-store requests by class: A (writes, lists), B (reads), free
+/// (deletes, aborts).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassCounts {
+    pub a: f64,
+    pub b: f64,
+    pub free: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorePurpose {
+    pub purpose: String,
+    /// Since this process started.
+    pub requests: ClassCounts,
+    /// Per second over `windowSecs`.
+    pub per_sec: ClassCounts,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreLatency {
+    pub op: String,
+    pub count: u64,
+    pub mean_ms: f64,
+    /// From the histogram's buckets: the upper bound of the bucket the
+    /// quantile falls in.
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+}
+
+/// The object store as this node uses it: requests by purpose and class,
+/// rates, latency by op, and the bucket's sizes and retention from the
+/// leader's last retention pass (`retain/qlog`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreView {
+    pub node: String,
+    pub at_ms: i64,
+    /// The rates' window: since the previous sample this node kept (the
+    /// first call has none: rates are 0).
+    pub window_secs: f64,
+    pub total: StorePurpose,
+    pub purposes: Vec<StorePurpose>,
+    pub latency: Vec<StoreLatency>,
+    /// The leader's last retention pass, as it wrote it; None before the
+    /// first or with retention off.
+    pub retention: Option<serde_json::Value>,
+}
+
 // ---------------------------------------------------------------- source trait
 
 #[derive(Debug, thiserror::Error)]
@@ -839,6 +946,20 @@ pub trait AdminSource: Send + Sync + 'static {
         }
     }
 
+    fn admissions(&self) -> impl Future<Output = AdminResult<AdmissionLog>> + Send {
+        async { Err(AdminError::NotFound("this relay keeps no admission log".into())) }
+    }
+    fn tail(&self, _q: TailQuery) -> impl Future<Output = AdminResult<Vec<TailFrame>>> + Send {
+        async { Err(AdminError::NotFound("this relay keeps no tail".into())) }
+    }
+    /// Lifts the relay throttle of every account `host` created.
+    fn release_throttled(&self, _host: &str, _by: &str) -> impl Future<Output = AdminResult<Released>> + Send {
+        async { Err(AdminError::NotFound("this relay can't release throttled accounts".into())) }
+    }
+    fn store(&self) -> impl Future<Output = AdminResult<StoreView>> + Send {
+        async { Err(AdminError::NotFound("this relay keeps no object-store numbers".into())) }
+    }
+
     fn plc_view(&self) -> impl Future<Output = AdminResult<PlcView>> + Send {
         async { Err(AdminError::NotFound("PLC export seeding isn't available on this relay".into())) }
     }
@@ -902,7 +1023,11 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
         .route("/admin/api/overview", get(overview::<S>))
         .route("/admin/api/hosts", get(hosts::<S>))
         .route("/admin/api/hosts/{host}", get(host::<S>))
+        .route("/admin/api/hosts/admissions", get(admissions::<S>))
         .route("/admin/api/hosts/{host}/action", post(host_action::<S>))
+        .route("/admin/api/hosts/{host}/release-throttled", post(release_throttled::<S>))
+        .route("/admin/api/ops/tail", get(tail::<S>))
+        .route("/admin/api/store", get(store::<S>))
         .route("/admin/api/domain-rules", get(rules::<S>).post(create_rule::<S>))
         .route("/admin/api/domain-rules/{id}", axum::routing::put(update_rule::<S>).delete(delete_rule::<S>))
         .route("/admin/api/policy", get(policy::<S>).put(update_policy::<S>))
@@ -1023,6 +1148,22 @@ async fn kick<S: AdminSource>(
     let node = q.node.as_deref().filter(|n| !n.is_empty());
     c.src.kick_consumer_on(node, id, BY).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+async fn admissions<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<AdmissionLog>> {
+    Ok(Json(c.src.admissions().await?))
+}
+async fn tail<S: AdminSource>(State(c): Ax<S>, Query(q): Query<TailQuery>) -> AdminResult<Json<Vec<TailFrame>>> {
+    if q.host.as_deref().is_none_or(str::is_empty) && q.rejects.unwrap_or(0) == 0 {
+        return Err(AdminError::BadRequest("ask for a host's frames (host=) or the rejected ones (rejects=1)".into()));
+    }
+    Ok(Json(c.src.tail(q).await?))
+}
+async fn release_throttled<S: AdminSource>(State(c): Ax<S>, Path(h): Path<String>) -> AdminResult<Json<Released>> {
+    tracing::info!(target: "vlrelay::audit", host = %h, by = BY, "release throttled accounts");
+    Ok(Json(c.src.release_throttled(&h, BY).await?))
+}
+async fn store<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<StoreView>> {
+    Ok(Json(c.src.store().await?))
 }
 async fn plc_view<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<PlcView>> {
     Ok(Json(c.src.plc_view().await?))

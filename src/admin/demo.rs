@@ -916,6 +916,7 @@ impl Sim {
             lag_ms: round2(h.lag),
             throttle: h.throttle,
             max_accounts: if h.tier == "trusted" { 10_000_000 } else { 100 },
+            history: Vec::new(),
             rule: self.rules.iter().find(|r| rule_matches(&r.pattern, &h.name)).map(|r| r.id),
             node: self.host_shards[h.shard].clone().unwrap_or_default(),
         }
@@ -1092,10 +1093,18 @@ impl AdminSource for Demo {
             rejects_by_reason: rejects_by_reason.into_iter().map(|(k, v)| (k, round2(v))).collect(),
             time_to_firehose_p50_ms: round2(last.p50),
             time_to_firehose_p99_ms: round2(last.p99),
-            log_durability_lag_ms: round2(last.dur),
+            commit_lag_ms: round2(last.dur),
             last_seq: s.last_seq,
             open_cases: s.cases.iter().filter(|c| c.status == CaseStatus::Open).count() as u32,
-            top_hosts: idx.iter().take(12).map(|&i| s.row(&s.hosts[i])).collect(),
+            top_hosts: idx
+                .iter()
+                .take(12)
+                .map(|&i| {
+                    let h = &s.hosts[i];
+                    let history = h.series.iter().rev().take(60).rev().map(|x| round2(x.1 as f64)).collect();
+                    HostRow { history, ..s.row(h) }
+                })
+                .collect(),
             history: hist,
             stream_events_per_sec: round2(last.ev_in),
             by_node: Vec::new(),
@@ -1428,39 +1437,210 @@ impl AdminSource for Demo {
         Ok(PipelineView { nodes, hosts })
     }
 
-    async fn cluster(&self) -> AdminResult<ClusterView> {
+    async fn admissions(&self) -> AdminResult<AdmissionLog> {
+        let per_day = self.full_policy().await?.policy["cluster"]["newHostsPerDay"].as_u64().unwrap_or(50) as u32;
         let s = self.sim.lock();
         let now = s.now_ms;
-        let nodes = NODES
+        let mut entries = Vec::new();
+        for (i, h) in s.hosts.iter().rev().filter(|h| h.tier != "trusted").take(14).enumerate() {
+            entries.push(crate::upstream::crawl::CrawlAdmission {
+                at_ms: now - 1_000 * (90 + 1_400 * i as i64 + (hash(&h.name) % 600) as i64),
+                host: h.name.clone(),
+                outcome: "admitted".into(),
+                tier: Some(h.tier.clone()),
+                reason: "new host".into(),
+            });
+        }
+        let refused = [
+            ("pds.spam-farm.example", "banned", "host is banned"),
+            ("10.0.0.7", "refused", "host check failed: not a public hostname"),
+            ("pds-31.fastvps.example", "rate-limited", "new-host budget is spent"),
+            ("bsky.unreachable.example", "refused", "host check failed: describeServer timed out"),
+            ("pds-32.fastvps.example", "rate-limited", "new-host budget is spent"),
+        ];
+        for (i, (h, o, why)) in refused.iter().enumerate() {
+            entries.push(crate::upstream::crawl::CrawlAdmission {
+                at_ms: now - 1_000 * (400 + 2_300 * i as i64),
+                host: h.to_string(),
+                outcome: o.to_string(),
+                tier: None,
+                reason: why.to_string(),
+            });
+        }
+        entries.sort_by_key(|a| std::cmp::Reverse(a.at_ms));
+        let today = entries.iter().filter(|e| e.outcome == "admitted").count() as u32 + 9;
+        Ok(AdmissionLog { new_hosts_today: today.min(per_day), new_hosts_per_day: per_day, entries })
+    }
+
+    async fn tail(&self, q: TailQuery) -> AdminResult<Vec<TailFrame>> {
+        let s = self.sim.lock();
+        let host = q.host.as_deref().filter(|h| !h.is_empty());
+        let since = q.since_ms.unwrap_or(i64::MIN);
+        let limit = q.limit.unwrap_or(200).clamp(1, 2000);
+        let mut out = Vec::new();
+        for h in s.hosts.iter().filter(|h| host.is_none_or(|w| w == h.name)) {
+            if q.rejects.unwrap_or(0) != 0 {
+                for r in h.recent.iter().filter(|r| r.at_ms > since) {
+                    let held = r.reason == RejectReason::Inactive && h.tier == "throttled";
+                    out.push(TailFrame {
+                        at_ms: r.at_ms,
+                        host: h.name.clone(),
+                        did: r.did.clone(),
+                        kind: if held { "held" } else { "reject" }.into(),
+                        reason: serde_json::to_value(r.reason).ok().and_then(|v| v.as_str().map(str::to_string)),
+                        detail: Some(r.detail.clone()),
+                        upstream_seq: Some(r.upstream_seq),
+                        seq: None,
+                        event: None,
+                    });
+                }
+            }
+            if host.is_some() && h.rate > 0.0 {
+                // the last two seconds at the host's rate, spread evenly
+                let n = ((h.rate * 2.0).round() as usize).min(limit);
+                for k in 0..n {
+                    let at = s.now_ms - (k as f64 * 2_000.0 / n as f64) as i64;
+                    if at <= since {
+                        break;
+                    }
+                    out.push(TailFrame {
+                        at_ms: at,
+                        host: h.name.clone(),
+                        did: fake_did(&format!("{}/{}", h.name, (h.seq as usize + k) % 40)),
+                        kind: "passed".into(),
+                        reason: None,
+                        detail: None,
+                        upstream_seq: Some(h.seq - k as i64),
+                        seq: Some(s.last_seq - (k * 7) as i64),
+                        event: Some(if k % 9 == 0 { "identity" } else { "commit" }.into()),
+                    });
+                }
+            }
+        }
+        out.sort_by_key(|a| std::cmp::Reverse(a.at_ms));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    async fn release_throttled(&self, host: &str, _by: &str) -> AdminResult<Released> {
+        let s = self.sim.lock();
+        let i = s
+            .hosts
+            .iter()
+            .position(|h| h.name == host)
+            .ok_or_else(|| AdminError::NotFound(format!("no host {host}")))?;
+        let h = &s.hosts[i];
+        let released = if h.accounts > 100 { (h.accounts - 100).min(400) } else { 0 };
+        Ok(Released { released })
+    }
+
+    async fn store(&self) -> AdminResult<StoreView> {
+        let s = self.sim.lock();
+        let now = s.now_ms;
+        let up = (s.history.len().max(1) as f64) * 40.0;
+        let ev = s.history.back().map_or(0.0, |x| x.ev_in);
+        let p = |name: &str, a: f64, b: f64, free: f64, up_b: f64, down_b: f64| StorePurpose {
+            purpose: name.into(),
+            requests: ClassCounts { a: (a * up).round(), b: (b * up).round(), free: (free * up).round() },
+            per_sec: ClassCounts { a: round2(a), b: round2(b), free: round2(free) },
+            bytes_up: (up_b * up) as u64,
+            bytes_down: (down_b * up) as u64,
+        };
+        let purposes = vec![
+            p("flush", 0.07, 0.0, 0.0, ev * 4_600.0 / 3.0, 0.0),
+            p("state", 0.31, 1.2, 0.04, 3_800.0, 22_000.0),
+            p("leader", 0.0, 0.0, 0.0, 0.0, 0.0),
+            p("backfill", 0.0, 0.42, 0.0, 0.0, 1_900_000.0),
+            p("retain", 0.003, 0.002, 0.012, 0.0, 120.0),
+        ];
+        let sum = |f: &dyn Fn(&StorePurpose) -> f64| purposes.iter().map(f).sum::<f64>();
+        let total = StorePurpose {
+            purpose: "total".into(),
+            requests: ClassCounts {
+                a: sum(&|x| x.requests.a),
+                b: sum(&|x| x.requests.b),
+                free: sum(&|x| x.requests.free),
+            },
+            per_sec: ClassCounts {
+                a: round2(sum(&|x| x.per_sec.a)),
+                b: round2(sum(&|x| x.per_sec.b)),
+                free: round2(sum(&|x| x.per_sec.free)),
+            },
+            bytes_up: purposes.iter().map(|x| x.bytes_up).sum(),
+            bytes_down: purposes.iter().map(|x| x.bytes_down).sum(),
+        };
+        let lat = |op: &str, n: f64, mean: f64, p50: f64, p99: f64| StoreLatency {
+            op: op.into(),
+            count: (n * up) as u64,
+            mean_ms: mean,
+            p50_ms: p50,
+            p99_ms: p99,
+        };
+        let seg = 64u64 << 20;
+        let segments = 3 * 24 * 40;
+        let retention = serde_json::json!({
+            "pruned_seq": s.last_seq.saturating_sub(90_000_000),
+            "plan": {
+                "at_ms": now - 212_000,
+                "horizon_secs": 72 * 3600,
+                "flushed": s.last_seq - 8_000,
+                "segments": segments,
+                "segment_bytes": segments * seg,
+                "deletable": [],
+                "deletable_bytes": 0,
+                "state": [{"path": "qlog/state", "current": true, "objects": 412, "bytes": 2_900_000_000u64}],
+            },
+            "applied": {"segments": 3, "segment_bytes": 3 * seg, "state_objects": 0, "state_bytes": 0, "kept": []},
+        });
+        Ok(StoreView {
+            node: "relay-a".into(),
+            at_ms: now,
+            window_secs: 10.0,
+            total,
+            purposes,
+            latency: vec![
+                lat("get", 1.6, 21.0, 25.0, 100.0),
+                lat("get_range", 0.4, 34.0, 50.0, 250.0),
+                lat("put", 0.3, 88.0, 100.0, 500.0),
+                lat("put_cas", 0.03, 61.0, 50.0, 250.0),
+                lat("list", 0.05, 40.0, 50.0, 100.0),
+            ],
+            retention: Some(retention),
+        })
+    }
+
+    async fn cluster(&self) -> AdminResult<ClusterView> {
+        let s = self.sim.lock();
+        let (leader, epoch, members, learners) = self.extra.lock().roles();
+        let now = s.now_ms;
+        let ids: Vec<String> = members.iter().chain(&learners).cloned().collect();
+        let nodes = ids
             .iter()
             .enumerate()
             .map(|(i, id)| {
                 let hosts: Vec<&SimHost> =
-                    s.hosts.iter().filter(|h| s.host_shards[h.shard].as_deref() == Some(*id)).collect();
+                    s.hosts.iter().filter(|h| s.host_shards[h.shard].as_deref() == Some(id.as_str())).collect();
                 let ev_in: f64 = hosts.iter().map(|h| h.rate).sum();
                 let consumers: Vec<&Consumer> = s.consumers.iter().filter(|c| c.node == *id).collect();
                 let ev_out: f64 = consumers.iter().map(|c| c.events_per_sec).sum();
+                let learner = learners.contains(id);
                 NodeView {
-                    id: id.to_string(),
-                    addr: format!("10.0.7.{}:2700", 11 + i),
+                    id: id.clone(),
+                    addr: format!("10.0.7.{}:2978", 11 + i),
                     version: env!("CARGO_PKG_VERSION").into(),
                     rev: "530a3e45".into(),
                     reachable: true,
-                    lease_valid: true,
-                    // leases renew every ~3 s with a 10 s TTL
-                    lease_expires_ms: now + 7_000 + ((now + i as i64 * 1_100) % 3_000),
-                    host_shards: s.host_shards.iter().filter(|o| o.as_deref() == Some(*id)).count() as u32,
-                    did_shards: s.did_shards.iter().filter(|o| o.as_deref() == Some(*id)).count() as u32,
-                    hosts: hosts.len() as u32,
+                    healthy: !learner,
+                    role: if *id == leader { "leader" } else { "follower" }.into(),
+                    learner,
+                    owned_hosts: hosts.len() as u32,
+                    hosts: hosts.iter().filter(|h| h.connected_since.is_some()).count() as u32,
                     consumers: consumers.len() as u32,
                     events_in_per_sec: round2(ev_in),
                     events_out_per_sec: round2(ev_out),
-                    log_durability_lag_ms: round2(
-                        s.history.back().map(|x| x.dur).unwrap_or(0.0) * (0.85 + 0.1 * i as f64),
-                    ),
+                    commit_lag_ms: round2(s.history.back().map(|x| x.dur).unwrap_or(0.0) * (0.85 + 0.1 * i as f64)),
                     cpu: round2((ev_in / 6_000.0 + ev_out / 400_000.0).min(7.6)),
                     mem_bytes: (9.5e9 + ev_in * 6.0e4) as u64,
-                    role: "core".into(),
                     stale: false,
                     error: None,
                     reported_ms: now,
@@ -1469,10 +1649,15 @@ impl AdminSource for Demo {
                 }
             })
             .collect();
+        let unowned =
+            s.hosts.iter().filter(|h| s.host_shards[h.shard].as_ref().is_none_or(|o| !members.contains(o))).count()
+                as u32;
         Ok(ClusterView {
             nodes,
-            host_shards: s.host_shards.clone(),
-            did_shards: s.did_shards.clone(),
+            leader: Some(leader),
+            epoch,
+            hosts: s.hosts.len() as u32,
+            unowned_hosts: unowned,
             last_seq: s.last_seq,
         })
     }
@@ -1611,6 +1796,78 @@ mod tests {
         assert!(p.hosts.windows(2).all(|w| w[0].inflight >= w[1].inflight));
         let pending: u64 = p.nodes.iter().map(|n| n.ack_pending).sum();
         assert_eq!(pending, p.hosts.iter().map(|h| h.inflight).sum::<u64>());
+    }
+
+    /// The console's endpoints over HTTP, behind the token.
+    #[tokio::test]
+    async fn the_console_endpoints_answer() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        let d = Demo::start(7);
+        let app = crate::admin::api_routes(d.clone(), "t".into());
+        // base64("admin:t")
+        let auth = "Basic YWRtaW46dA==".to_string();
+        let call = |method: &str, uri: &str, authed: bool| {
+            let mut b = Request::builder().method(method).uri(uri);
+            if authed {
+                b = b.header("authorization", auth.clone());
+            }
+            app.clone().oneshot(b.body(Body::empty()).unwrap())
+        };
+        let json = |r: axum::response::Response| async move {
+            let b = axum::body::to_bytes(r.into_body(), 1 << 24).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap()
+        };
+
+        let r = call("GET", "/admin/api/hosts/admissions", true).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let a = json(r).await;
+        assert!(a["newHostsPerDay"].as_u64().unwrap() > 0);
+        let e = a["entries"].as_array().unwrap();
+        assert!(e.iter().any(|x| x["outcome"] == "admitted" && x["tier"].is_string()));
+        assert!(e.iter().any(|x| x["outcome"] == "rate-limited"));
+        assert!(e.windows(2).all(|w| w[0]["atMs"].as_i64() >= w[1]["atMs"].as_i64()));
+
+        assert_eq!(call("GET", "/admin/api/ops/tail", true).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        let r = call("GET", "/admin/api/ops/tail?rejects=1", true).await.unwrap();
+        let frames = json(r).await;
+        assert!(frames.as_array().unwrap().iter().all(|f| f["kind"] == "reject" || f["kind"] == "held"));
+        let o = d.overview().await.unwrap();
+        let busy = &o.top_hosts[0];
+        assert!(!busy.history.is_empty(), "top hosts carry a rate history");
+        let r = call("GET", &format!("/admin/api/ops/tail?host={}&limit=50", busy.host), true).await.unwrap();
+        let frames = json(r).await;
+        let frames = frames.as_array().unwrap();
+        assert!(!frames.is_empty() && frames.len() <= 50);
+        assert!(frames.iter().all(|f| f["host"] == busy.host.as_str()));
+        assert!(frames.iter().any(|f| f["kind"] == "passed" && f["seq"].is_i64()));
+
+        let uri = format!("/admin/api/hosts/{}/release-throttled", busy.host);
+        assert_eq!(call("POST", &uri, false).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let r = call("POST", &uri, true).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(json(r).await["released"].is_u64());
+        let r = call("POST", "/admin/api/hosts/nope.example/release-throttled", true).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+        let r = call("GET", "/admin/api/store", true).await.unwrap();
+        let st = json(r).await;
+        assert!(st["total"]["perSec"]["a"].as_f64().unwrap() > 0.0);
+        assert!(st["purposes"].as_array().unwrap().iter().any(|p| p["purpose"] == "flush"));
+        assert!(!st["latency"].as_array().unwrap().is_empty());
+        assert!(st["retention"]["plan"]["segment_bytes"].as_u64().unwrap() > 0);
+        assert!(st.to_string().find('$').is_none());
+
+        let c = json(call("GET", "/admin/api/cluster", true).await.unwrap()).await;
+        let leader = c["leader"].as_str().unwrap();
+        assert!(c["nodes"].as_array().unwrap().iter().any(|n| n["id"] == leader && n["role"] == "leader"));
+        assert!(
+            c["nodes"].as_array().unwrap().iter().all(|n| n.get("leaseValid").is_none() && n["ownedHosts"].is_u64())
+        );
+        let q = d.quorum().await.unwrap();
+        let st = q.nodes.iter().filter_map(|n| n.status.as_ref()).find(|s| s["role"] == "leader").unwrap();
+        assert!(st["flush"]["last_at_ms"].as_i64().unwrap() > 0);
     }
 
     #[tokio::test]

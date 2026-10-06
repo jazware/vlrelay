@@ -131,6 +131,13 @@ const KIND_IDENTITY: u8 = 2;
 const KIND_ACCOUNT: u8 = 3;
 /// An operator's relay takedown (or its lifting), made on the leader.
 const KIND_TAKEDOWN: u8 = 4;
+/// An operator lifting a relay throttle, made on the leader.
+const KIND_RELEASE: u8 = 5;
+
+/// Operator items, after the item's upstream seq: `0xff | op`.
+const OP_UNTAKEDOWN: u8 = 0;
+const OP_TAKEDOWN: u8 = 1;
+const OP_RELEASE: u8 = 2;
 
 fn put_str16(b: &mut Vec<u8>, s: &str) {
     let s = &s.as_bytes()[..s.len().min(u16::MAX as usize)];
@@ -161,8 +168,17 @@ struct ItemMeta {
 }
 
 enum ItemKind {
-    Event { kind: CheckedKind, first_sighting: bool },
+    Event {
+        kind: CheckedKind,
+        first_sighting: bool,
+    },
     Takedown(bool),
+    /// Lift the relay throttle of an account `host` created; the status its
+    /// `#account` announces.
+    Release {
+        active: bool,
+        status: Option<String>,
+    },
 }
 
 fn encode_item(did: &str, host: &Host, from: &str, useq: i64, rest: &[u8]) -> Bytes {
@@ -183,8 +199,20 @@ fn decode_item(meta: &Bytes) -> anyhow::Result<ItemMeta> {
     anyhow::ensure!(r.remaining() >= 9, "short item");
     let useq = r.get_i64();
     if r[0] == 0xff {
-        anyhow::ensure!(r.remaining() >= 2, "short takedown");
-        return Ok(ItemMeta { did, host, from, useq, kind: ItemKind::Takedown(r[1] != 0) });
+        anyhow::ensure!(r.remaining() >= 2, "short operator item");
+        let kind = match r[1] {
+            OP_UNTAKEDOWN => ItemKind::Takedown(false),
+            OP_TAKEDOWN => ItemKind::Takedown(true),
+            OP_RELEASE => {
+                r.advance(2);
+                anyhow::ensure!(r.remaining() >= 1, "short release");
+                let active = r.get_u8() != 0;
+                let status = get_str16(&mut r).filter(|s| !s.is_empty());
+                ItemKind::Release { active, status }
+            }
+            op => anyhow::bail!("unknown operator item {op}"),
+        };
+        return Ok(ItemMeta { did, host, from, useq, kind });
     }
     // the frame here is the prefix and suffix, without the seq: the span
     // check is the host owner's
@@ -243,6 +271,30 @@ pub const HOST_PREFIX: &[u8] = b"h/";
 
 fn host_key(host: &str) -> Bytes {
     [HOST_PREFIX, host.as_bytes()].concat().into()
+}
+
+/// `t/{host}/{did}`: an account `host` created that the relay throttled
+/// ("1"), or whose throttle was lifted ("0"). The record is the truth; this
+/// is how the leader finds a host's throttled accounts without a scan.
+pub const THROTTLED_PREFIX: &[u8] = b"t/";
+
+fn throttled_key(host: &str, did: &str) -> Bytes {
+    [THROTTLED_PREFIX, host.as_bytes(), b"/", did.as_bytes()].concat().into()
+}
+
+fn throttled_from_key(k: &[u8]) -> Option<(String, String)> {
+    let rest = std::str::from_utf8(k.strip_prefix(THROTTLED_PREFIX)?).ok()?;
+    let (h, d) = rest.split_once('/')?;
+    Some((h.to_string(), d.to_string()))
+}
+
+/// One throttled account, as `leader:throttled` lists it: the status its
+/// `#account` announces once the throttle is lifted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Throttled {
+    pub did: String,
+    pub active: bool,
+    pub status: Option<String>,
 }
 
 /// One host as the log keeps it: its record's durable fields and the
@@ -316,6 +368,9 @@ struct TermInner {
     hosts: HostTable,
     /// Host rows to ride the next appended entry.
     pending_rows: BTreeMap<String, HostRow>,
+    /// host -> accounts it created that this term saw throttled, logged or
+    /// not (a commit-first account's throttle stays in memory).
+    throttled: HashMap<String, HashSet<String>>,
 }
 
 struct Staged {
@@ -426,6 +481,9 @@ impl RelayHooks {
         let ItemMeta { did, host, from, useq, kind } = m;
         let (kind, first_sighting) = match kind {
             ItemKind::Takedown(t) => return (self.takedown(term, &did, t).await, None),
+            ItemKind::Release { active, status } => {
+                return (self.release(term, &host.0, &did, active, status.as_deref()).await, None);
+            }
             ItemKind::Event { kind, first_sighting } => (kind, first_sighting),
         };
         // One reader per host: a DID's events must reach the state in its
@@ -488,7 +546,11 @@ impl RelayHooks {
         match r {
             Ok(Applied::Append(a)) => {
                 ext.key_changed = a.key_changed;
-                let writes = vec![(Bytes::from(state::record::did_key(&did)), a.record.encode())];
+                let mut writes = vec![(Bytes::from(state::record::did_key(&did)), a.record.encode())];
+                if a.record.relay_throttled {
+                    writes.push((throttled_key(&host.0, &did), Bytes::from_static(b"1")));
+                    term.inner.lock().throttled.entry(host.0.clone()).or_default().insert(did.clone());
+                }
                 (append(term, writes, Some(a.ticket.n), &ext), None)
             }
             Ok(Applied::Pass) => (append(term, Vec::new(), None, &ext), None),
@@ -514,12 +576,82 @@ impl RelayHooks {
                 )
             }
             Err(e) => {
+                if matches!(e, state::Reject::Inactive(state::AccountStatus::Throttled)) {
+                    term.inner.lock().throttled.entry(host.0.clone()).or_default().insert(did.clone());
+                }
                 let r = super::state_rejection(&e);
                 (
                     Verdict::Answer { outcome: Outcome::Rejected(format!("{}: {}", r.reason, r.detail)), after: None },
                     None,
                 )
             }
+        }
+    }
+
+    /// The accounts `host` created that are throttled now, with the status
+    /// each announces once lifted.
+    async fn throttled_of(&self, term: &Term, host: &str) -> anyhow::Result<Vec<Throttled>> {
+        let mut dids: std::collections::BTreeSet<String> =
+            term.inner.lock().throttled.get(host).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        let prefix = [THROTTLED_PREFIX, host.as_bytes(), b"/"].concat();
+        let mut it = term.shard.db.scan_prefix(&prefix, ..).await?;
+        while let Some(kv) = it.next().await? {
+            if let Some((_, d)) = throttled_from_key(&kv.key) {
+                dids.insert(d);
+            }
+        }
+        let mut out = Vec::new();
+        for did in dids {
+            let Some(rec) = term.shard.load(&did).await? else { continue };
+            if !rec.relay_throttled {
+                continue;
+            }
+            let mut lifted = (*rec).clone();
+            lifted.relay_throttled = false;
+            let st = lifted.status();
+            out.push(Throttled { did, active: st.is_active(), status: st.as_str().map(str::to_string) });
+        }
+        Ok(out)
+    }
+
+    /// An operator lifting a relay throttle: the record's flag, and the
+    /// `#account` the submitter built from `leader:throttled`'s status.
+    async fn release(&self, term: &Term, host: &str, did: &str, active: bool, status: Option<&str>) -> Verdict {
+        let prev = match term.shard.load(did).await {
+            Ok(Some(r)) if r.relay_throttled => r,
+            Ok(_) => return Verdict::Answer { outcome: Outcome::Duplicate, after: None },
+            Err(e) => return Verdict::Answer { outcome: Outcome::Retry(format!("store: {e}")), after: None },
+        };
+        let mut rec: Record = (*prev).clone();
+        rec.relay_throttled = false;
+        let st = rec.status();
+        // the frame announces what the record said when it was listed
+        if (st.is_active(), st.as_str()) != (active, status) {
+            return Verdict::Answer {
+                outcome: Outcome::Retry("status_changed: list the throttled again".into()),
+                after: None,
+            };
+        }
+        let record = rec.clone();
+        let t = term.shard.stage_logged(did, rec);
+        let ext = Ext { kind: KIND_RELEASE, key_changed: false, host: String::new(), useq: 0, did: did.to_string() };
+        let mut i = term.inner.lock();
+        if let Some(s) = i.throttled.get_mut(host) {
+            s.remove(did);
+        }
+        i.next += 1;
+        let tk = i.next;
+        i.staged.insert(tk, Staged { shard_ticket: Some(t.n), did: did.to_string(), dedupe: None });
+        Verdict::Append {
+            meta: Meta {
+                writes: vec![
+                    (Bytes::from(state::record::did_key(did)), record.encode()),
+                    (throttled_key(host, did), Bytes::from_static(b"0")),
+                ],
+                ext: ext.encode(),
+            }
+            .encode(),
+            ticket: tk,
         }
     }
 
@@ -540,8 +672,11 @@ impl RelayHooks {
         let mut rec: Record = (*prev).clone();
         rec.relay_takedown = takedown;
         // lifting a takedown is how an operator also lifts a relay throttle
-        if !takedown {
+        if !takedown && rec.relay_throttled {
             rec.relay_throttled = false;
+            for s in term.inner.lock().throttled.values_mut() {
+                s.remove(did);
+            }
         }
         let st = rec.status();
         let record = rec.clone();
@@ -982,13 +1117,22 @@ impl Hooks for RelayHooks {
         })
     }
 
-    fn answer<'a>(&'a self, topic: &'a str, _body: Bytes) -> BoxFuture<'a, Option<Bytes>> {
+    fn answer<'a>(&'a self, topic: &'a str, body: Bytes) -> BoxFuture<'a, Option<Bytes>> {
         Box::pin(async move {
             match topic {
                 "leader:hosts" => {
                     let t = self.term.read().clone()?;
                     let table = t.inner.lock().hosts.clone();
                     serde_json::to_vec(&table).ok().map(Bytes::from)
+                }
+                "leader:throttled" => {
+                    let t = self.term.read().clone()?;
+                    let host = std::str::from_utf8(&body).ok()?;
+                    let r = match self.throttled_of(&t, host).await {
+                        Ok(list) => serde_json::json!({ "accounts": list }),
+                        Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+                    };
+                    serde_json::to_vec(&r).ok().map(Bytes::from)
                 }
                 _ => None,
             }
@@ -1008,6 +1152,15 @@ impl RelayHooks {
                 if let Ok(r) = serde_json::from_slice::<HostRow>(v) {
                     let mut i = term.inner.lock();
                     i.hosts.rows.insert(String::from_utf8_lossy(h).into_owned(), r);
+                }
+                continue;
+            }
+            if let Some((h, d)) = throttled_from_key(k) {
+                let mut i = term.inner.lock();
+                if v.as_ref() == b"1" {
+                    i.throttled.entry(h).or_default().insert(d);
+                } else if let Some(s) = i.throttled.get_mut(&h) {
+                    s.remove(&d);
                 }
                 continue;
             }
@@ -1629,7 +1782,54 @@ impl Glue {
     }
 }
 
+/// [`Glue::release_throttled`], from `from`.
+pub async fn release_throttled(client: &Client, from: &str, host: &str) -> anyhow::Result<u64> {
+    let b = client
+        .ask_leader("leader:throttled", Bytes::from(host.to_string()), Duration::from_secs(30))
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let v: serde_json::Value = serde_json::from_slice(&b)?;
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+        anyhow::bail!("the leader couldn't list them: {e}");
+    }
+    let list: Vec<Throttled> = serde_json::from_value(v["accounts"].clone())?;
+    let mut released = 0u64;
+    let time = vlpds::events::now_rfc3339();
+    for chunk in list.chunks(256) {
+        let items = chunk
+            .iter()
+            .map(|t| {
+                let frame = vlpds::events::account_frame(&t.did, t.active, t.status.as_deref(), &time);
+                let mut op = vec![0xff, OP_RELEASE, t.active as u8];
+                put_str16(&mut op, t.status.as_deref().unwrap_or(""));
+                Item {
+                    prefix: frame.prefix.into(),
+                    suffix: frame.suffix.into(),
+                    meta: encode_item(&t.did, &Host(host.to_string()), from, 0, &op),
+                }
+            })
+            .collect();
+        let d = client.submit_events(items, Bytes::new(), Bytes::new(), client.generation()).await;
+        for o in d.outcomes {
+            match o {
+                Outcome::Appended(_) => released += 1,
+                Outcome::Duplicate => {}
+                Outcome::Rejected(r) | Outcome::Retry(r) => tracing::info!(host, "release-throttled: {r}"),
+            }
+        }
+    }
+    Ok(released)
+}
+
 impl Glue {
+    /// Lifts the relay throttle of every account `host` created that has one
+    /// (indigo lifts them when a host's cap is raised): the leader lists
+    /// them, and each goes through its log with the `#account` announcing
+    /// the account's status without the throttle. Returns how many.
+    pub async fn release_throttled(&self, host: &str) -> anyhow::Result<u64> {
+        release_throttled(&self.client, &self.id, host).await
+    }
+
     /// Every second, this node's numbers into its status (other members'
     /// dashboards read them there).
     async fn sample(self: Arc<Self>, node: std::sync::Weak<Node>) {
@@ -1665,9 +1865,15 @@ impl Glue {
     pub async fn cluster_view(&self) -> crate::admin::ClusterView {
         let q = self.view().await;
         let table = self.hosts.table.read().clone();
-        let host_shards: Vec<Option<String>> = table.rows.values().map(|r| r.owner.clone()).collect();
+        let mut owned: HashMap<&str, u32> = HashMap::new();
+        for r in table.rows.values() {
+            if let Some(o) = &r.owner {
+                *owned.entry(o.as_str()).or_default() += 1;
+            }
+        }
         let mut leader = None;
-        let nodes = q
+        let mut epoch = 0;
+        let nodes: Vec<crate::admin::NodeView> = q
             .nodes
             .into_iter()
             .map(|n| {
@@ -1675,25 +1881,25 @@ impl Glue {
                 let role = st["role"].as_str().unwrap_or("unreachable").to_string();
                 if role == "leader" {
                     leader = Some(n.node.clone());
+                    epoch = st["epoch"].as_u64().unwrap_or(0);
                 }
+                let listed = |k: &str| st[k].as_array().is_some_and(|m| m.iter().any(|x| x == n.node.as_str()));
                 let local = &st["relay"]["node"];
                 let f = |k: &str| local[k].as_f64().unwrap_or(0.0);
-                let owned = host_shards.iter().filter(|o| o.as_deref() == Some(n.node.as_str())).count() as u32;
                 crate::admin::NodeView {
                     id: n.node.clone(),
                     addr: n.addr.clone(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     rev: String::new(),
                     reachable: !n.stale,
-                    lease_valid: st["members"].as_array().is_some_and(|m| m.iter().any(|x| x == n.node.as_str())),
-                    lease_expires_ms: 0,
-                    host_shards: owned,
-                    did_shards: (role == "leader") as u32,
+                    healthy: !n.stale && listed("members") && st["intact"].as_bool().unwrap_or(false),
+                    learner: listed("learners"),
+                    owned_hosts: owned.get(n.node.as_str()).copied().unwrap_or(0),
                     hosts: local["hosts"].as_u64().unwrap_or(0) as u32,
                     consumers: local["consumers"].as_u64().unwrap_or(0) as u32,
                     events_in_per_sec: f("events_in_per_sec"),
                     events_out_per_sec: f("events_out_per_sec"),
-                    log_durability_lag_ms: f("durable_lag_ms"),
+                    commit_lag_ms: f("durable_lag_ms"),
                     cpu: f("cpu"),
                     mem_bytes: local["mem_bytes"].as_u64().unwrap_or(0),
                     role,
@@ -1705,11 +1911,16 @@ impl Glue {
                 }
             })
             .collect();
+        let live: HashSet<&str> = nodes.iter().filter(|n| n.healthy).map(|n| n.id.as_str()).collect();
+        let unowned =
+            table.rows.values().filter(|r| r.owner.as_deref().is_none_or(|o| !live.contains(o))).count() as u32;
         crate::admin::ClusterView {
-            nodes,
-            host_shards,
-            did_shards: vec![leader],
+            leader,
+            epoch,
+            hosts: table.rows.len() as u32,
+            unowned_hosts: unowned,
             last_seq: self.qnode.status().commit as i64,
+            nodes,
         }
     }
 }
@@ -1954,6 +2165,22 @@ mod tests {
         Item { prefix, suffix, meta: encode_item(did, &c.host, from, 0, &super::super::forward::encode_meta(&c)) }
     }
 
+    fn identity(did: &str, from: &str) -> Item {
+        let c = Checked {
+            did: did.to_string(),
+            host: Host(HOST.into()),
+            upstream_seq: 0,
+            kind: CheckedKind::Identity,
+            frame: Bytes::new(),
+            span: crate::event::SeqSpan { start: 0, end: 0 },
+            received: Instant::now(),
+            first_sighting: true,
+            fence: None,
+        };
+        let (prefix, suffix) = test_frame(&format!("{did}#identity"), 32, 0);
+        Item { prefix, suffix, meta: encode_item(did, &c.host, from, 0, &super::super::forward::encode_meta(&c)) }
+    }
+
     fn cluster_cfg(ident: Arc<MapIdentity>, slow_us: u64) -> ConfigFn {
         cluster_cfg_with(ident, slow_us, |_| {})
     }
@@ -1961,6 +2188,15 @@ mod tests {
     fn cluster_cfg_with(
         ident: Arc<MapIdentity>,
         slow_us: u64,
+        tweak: impl Fn(&mut QuorumSetup) + Send + Sync + 'static,
+    ) -> ConfigFn {
+        cluster_cfg_gated(ident, slow_us, None, tweak)
+    }
+
+    fn cluster_cfg_gated(
+        ident: Arc<MapIdentity>,
+        slow_us: u64,
+        gate: Option<Arc<dyn state::AccountGate>>,
         tweak: impl Fn(&mut QuorumSetup) + Send + Sync + 'static,
     ) -> ConfigFn {
         Arc::new(move |id: &str, addrs: &HashMap<String, String>| {
@@ -1976,6 +2212,9 @@ mod tests {
                 ident.clone(),
                 state::ApplyConfig::default(),
             ));
+            if let Some(g) = &gate {
+                state.set_account_gate(g.clone());
+            }
             let mut q = QuorumSetup::new("127.0.0.1:0");
             q.host_poll = Duration::from_millis(100);
             q.host_failover = Duration::from_secs(2);
@@ -2036,6 +2275,106 @@ mod tests {
                 assert_eq!(*ks.last().unwrap() + 1, last[did], "{stream} {did} ends early: {ks:?}");
             }
         }
+    }
+
+    /// Past its cap every new account is created throttled.
+    struct ThrottleNew;
+    impl state::AccountGate for ThrottleNew {
+        fn admit_account(&self, _host: &str, _did: &str, how: state::Arrival) -> state::NewAccount {
+            match how {
+                state::Arrival::FirstCommit { .. } => state::NewAccount::Admit,
+                _ => state::NewAccount::Throttle,
+            }
+        }
+    }
+
+    async fn submit_one(client: &Client, item: Item) -> Outcome {
+        let t = Instant::now();
+        loop {
+            let d = client.submit_events(vec![item.clone()], Bytes::new(), Bytes::new(), 0).await;
+            match d.outcomes.into_iter().next() {
+                Some(Outcome::Retry(r)) => assert!(t.elapsed() < Duration::from_secs(10), "retrying: {r}"),
+                Some(o) => return o,
+                None => {}
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn throttled(client: &Client) -> Vec<String> {
+        let b = client.ask_leader("leader:throttled", Bytes::from(HOST), Duration::from_secs(5)).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let list: Vec<Throttled> = serde_json::from_value(v["accounts"].clone()).unwrap();
+        let mut dids: Vec<String> = list.into_iter().map(|t| t.did).collect();
+        dids.sort();
+        dids
+    }
+
+    /// Accounts created throttled, logged (their `#identity` carried the
+    /// record) or only in the leader's memory (a first commit, dropped):
+    /// the leader lists the host's throttled accounts across a takeover
+    /// (the logged ones), a release lifts each through the log with an
+    /// `#account`, and their commits are taken again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn release_throttled_lifts_a_hosts_throttled_accounts_through_the_log() {
+        let ident = MapIdentity::new();
+        let logged: Vec<String> = (0..4).map(crate::state::tests::plc).collect();
+        let dropped: Vec<String> = (4..7).map(crate::state::tests::plc).collect();
+        for d in logged.iter().chain(&dropped) {
+            ident.set(d, HOST, 1);
+        }
+        let gate: Arc<dyn state::AccountGate> = Arc::new(ThrottleNew);
+        let mut c = Cluster::with_cfg(3, None, Some(cluster_cfg_gated(ident, 0, Some(gate), |_| {})), 64 << 20).await;
+        c.wait_leader(Duration::from_secs(5)).await;
+        let client = c.client();
+        let from = owner(&client).await;
+        for d in &logged {
+            assert!(matches!(submit_one(&client, identity(d, &from)).await, Outcome::Appended(_)), "{d}");
+        }
+        for d in &dropped {
+            let o = submit_one(&client, commit(d, 0, &from)).await;
+            assert!(matches!(&o, Outcome::Rejected(r) if r.contains("hrottled")), "{d}: {o:?}");
+        }
+        let mut all: Vec<String> = logged.iter().chain(&dropped).cloned().collect();
+        all.sort();
+        assert_eq!(throttled(&client).await, all);
+
+        // a takeover keeps what the log holds; the dropped commits' throttle
+        // was the old leader's memory
+        let l = c.wait_leader(Duration::from_secs(5)).await;
+        c.kill(&l);
+        c.start(&l).await;
+        c.wait_leader(Duration::from_secs(5)).await;
+        let from = owner(&client).await;
+        let mut want = logged.clone();
+        want.sort();
+        let t = Instant::now();
+        while throttled(&client).await != want {
+            assert!(t.elapsed() < Duration::from_secs(10), "after the takeover: {:?}", throttled(&client).await);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(release_throttled(&client, &from, HOST).await.unwrap(), logged.len() as u64);
+        assert!(throttled(&client).await.is_empty());
+        assert_eq!(release_throttled(&client, &from, HOST).await.unwrap(), 0, "a second release finds none");
+
+        // the dropped ones are new to this leader: throttled again, released
+        for d in &dropped {
+            assert!(matches!(submit_one(&client, commit(d, 0, &from)).await, Outcome::Rejected(_)));
+        }
+        assert_eq!(release_throttled(&client, &from, HOST).await.unwrap(), dropped.len() as u64);
+        for d in logged.iter().chain(&dropped) {
+            let o = submit_one(&client, commit(d, 0, &from)).await;
+            assert!(matches!(o, Outcome::Appended(_)), "{d}'s commit after the release: {o:?}");
+        }
+        c.converge(Duration::from_secs(15)).await;
+        let accounts = c
+            .emitted
+            .lock()
+            .iter()
+            .filter(|(s, _, data)| s.starts_with(&from) && data.windows(8).any(|w| w == b"#account"))
+            .count();
+        assert_eq!(accounts, logged.len() + dropped.len(), "one #account per release");
+        c.shutdown();
     }
 
     /// Hosts owners submit chains to the leader through kill -9s of the

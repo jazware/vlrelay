@@ -21,7 +21,7 @@ use crate::state::{AccountStatus, Upstream};
 use crate::types::Host;
 use crate::upstream::{HostStatus, HostView, Tier};
 use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,15 @@ pub struct NodeAdmin {
     open_cases: Mutex<Option<(Instant, u32)>>,
     cpu: Mutex<Option<(Instant, f64, f64)>>,
     settings: Option<admin::SettingsView>,
+    /// The request counts at the last store sample, for its rates.
+    store_prev: Mutex<Option<(Instant, crate::qlog::bucket::Requests)>>,
+    /// `retain/qlog`, read at most every [`RETAIN_TTL`].
+    retain: tokio::sync::Mutex<Option<(Instant, Option<serde_json::Value>)>>,
 }
+
+const RETAIN_TTL: Duration = Duration::from_secs(30);
+/// A store sample this young isn't replaced, so rates span a few polls.
+const STORE_WINDOW: Duration = Duration::from_secs(10);
 
 const OPEN_CASES_TTL: Duration = Duration::from_secs(10);
 
@@ -83,7 +91,15 @@ fn pipeline_gauges() -> BTreeMap<String, f64> {
 
 impl NodeAdmin {
     pub fn new(node: Arc<Node>, policy: Arc<PolicyHooks>) -> NodeAdmin {
-        NodeAdmin { node, policy, open_cases: Mutex::new(None), cpu: Mutex::new(None), settings: None }
+        NodeAdmin {
+            node,
+            policy,
+            open_cases: Mutex::new(None),
+            cpu: Mutex::new(None),
+            settings: None,
+            store_prev: Mutex::new(None),
+            retain: tokio::sync::Mutex::new(None),
+        }
     }
 
     /// The process's effective config, for the Settings page.
@@ -167,6 +183,9 @@ pub fn reject_class(reason: &str) -> RejectReason {
     }
 }
 
+/// Seconds of rate history on each of the overview's top hosts.
+const TOP_HISTORY: usize = 60;
+
 impl NodeAdmin {
     fn row(&self, h: &HostView, series: Option<&Series>, rejects: u64) -> admin::HostRow {
         let (rate, ratio) = series.map_or((0.0, 0.0), |s| (s.rate(), s.reject_ratio()));
@@ -187,6 +206,7 @@ impl NodeAdmin {
             rule: self.policy.limits(&h.record.hostname).and_then(|l| l.rule),
             node: self.node.cfg.node_id.clone(),
             max_accounts: self.policy.limits(&h.record.hostname).and_then(|l| l.limits).map_or(0, |l| l.max_accounts),
+            history: Vec::new(),
         }
     }
 
@@ -347,6 +367,14 @@ impl NodeAdmin {
         let mut top = rows;
         top.sort_by(|a, b| b.events_per_sec.total_cmp(&a.events_per_sec));
         top.truncate(10);
+        {
+            let d = self.node.dash.lock();
+            for r in &mut top {
+                if let Some(s) = d.hosts.get(&Host(r.host.clone())) {
+                    r.history = s.events.iter().rev().take(TOP_HISTORY).rev().copied().collect();
+                }
+            }
+        }
         let (cpu, mem_bytes) = self.process();
         NodeReport {
             node: self.id().to_string(),
@@ -367,7 +395,7 @@ impl NodeAdmin {
             rejects_by_reason,
             ttf_p50_ms: last.ttf_p50_ms,
             ttf_p99_ms: last.ttf_p99_ms,
-            log_durability_lag_ms: last.durable_lag_ms,
+            commit_lag_ms: last.durable_lag_ms,
             stream_seq: self.node.serve.head(),
             cpu,
             mem_bytes,
@@ -797,6 +825,55 @@ impl AdminSource for NodeAdmin {
         Ok(fleet::plc_view(&self.members().await))
     }
 
+    async fn admissions(&self) -> AdminResult<admin::AdmissionLog> {
+        let e = &self.policy.engine;
+        Ok(admin::AdmissionLog {
+            new_hosts_today: e.new_hosts_today().await.map_err(AdminError::Internal)?,
+            new_hosts_per_day: e.snapshot().policy.body.cluster.new_hosts_per_day,
+            entries: self.node.crawler.admissions(),
+        })
+    }
+
+    async fn tail(&self, q: admin::TailQuery) -> AdminResult<Vec<admin::TailFrame>> {
+        Ok(tail_frames(&self.node, &q))
+    }
+
+    async fn release_throttled(&self, host: &str, by: &str) -> AdminResult<admin::Released> {
+        let released = self.node.quorum.release_throttled(host).await.map_err(AdminError::Internal)?;
+        tracing::info!(target: "vlrelay::audit", host, by, released, "released throttled accounts");
+        Ok(admin::Released { released })
+    }
+
+    async fn store(&self) -> AdminResult<admin::StoreView> {
+        let retention = {
+            let mut r = self.retain.lock().await;
+            match &*r {
+                Some((at, v)) if at.elapsed() < RETAIN_TTL => v.clone(),
+                _ => {
+                    let v = match crate::qlog::retain::read_report(&self.node.quorum.qnode.bucket().retain).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::debug!("reading retain/qlog: {e:#}");
+                            None
+                        }
+                    };
+                    *r = Some((Instant::now(), v.clone()));
+                    v
+                }
+            }
+        };
+        let now = crate::qlog::bucket::requests();
+        let (window, prev) = {
+            let mut p = self.store_prev.lock();
+            let out = p.as_ref().map(|(at, r)| (at.elapsed(), r.clone()));
+            if p.as_ref().is_none_or(|(at, _)| at.elapsed() >= STORE_WINDOW) {
+                *p = Some((Instant::now(), now.clone()));
+            }
+            out.map_or((Duration::ZERO, None), |(w, r)| (w, Some(r)))
+        };
+        Ok(store_view(self.id(), &now, prev.as_ref(), window, retention))
+    }
+
     async fn pipeline_view(&self) -> AdminResult<admin::PipelineView> {
         Ok(fleet::pipeline_view(&self.members().await, 50))
     }
@@ -848,9 +925,203 @@ fn full_doc(d: &crate::policy::Stored<crate::policy::PolicyBody>) -> admin::Full
     }
 }
 
+/// What a frame the leader rejected counts as in the tail: `held` when the
+/// relay keeps the account back (throttled past its host's cap, or a new
+/// one deferred), else `reject`.
+fn tail_kind(reason: &str, detail: &str) -> &'static str {
+    let throttled = reason == "inactive" && detail.to_ascii_lowercase().contains("throttled");
+    if throttled || reason == "new_account_deferred" { "held" } else { "reject" }
+}
+
+pub(crate) fn tail_frames(node: &Node, q: &admin::TailQuery) -> Vec<admin::TailFrame> {
+    let host = q.host.as_deref().filter(|h| !h.is_empty());
+    let since = q.since_ms.unwrap_or(i64::MIN);
+    let limit = q.limit.unwrap_or(200).clamp(1, 2000);
+    let mut out = Vec::new();
+    if q.rejects.unwrap_or(0) != 0 {
+        let r = node.rejects.lock();
+        for (h, x) in r.iter() {
+            if host.is_some_and(|w| w != h.0) {
+                continue;
+            }
+            for n in x.recent.iter().filter(|n| n.at_ms > since) {
+                out.push(admin::TailFrame {
+                    at_ms: n.at_ms,
+                    host: h.0.clone(),
+                    did: n.did.clone(),
+                    kind: tail_kind(n.reason, &n.detail).into(),
+                    reason: Some(n.reason.to_string()),
+                    detail: Some(n.detail.clone()),
+                    upstream_seq: Some(n.upstream_seq),
+                    seq: None,
+                    event: None,
+                });
+            }
+        }
+    }
+    if let Some(h) = host {
+        let p = node.passed.lock();
+        for n in p.iter().rev().filter(|n| n.host.0 == h && n.at_ms > since).take(limit) {
+            out.push(admin::TailFrame {
+                at_ms: n.at_ms,
+                host: n.host.0.clone(),
+                did: n.did.clone(),
+                kind: "passed".into(),
+                reason: None,
+                detail: None,
+                upstream_seq: Some(n.upstream_seq),
+                seq: Some(n.seq),
+                event: Some(n.kind.to_string()),
+            });
+        }
+    }
+    out.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then_with(|| b.seq.cmp(&a.seq)));
+    out.truncate(limit);
+    out
+}
+
+fn class_counts(c: &crate::qlog::bucket::Counts) -> admin::ClassCounts {
+    admin::ClassCounts { a: c.a as f64, b: c.b as f64, free: c.free as f64 }
+}
+
+fn class_rate(
+    now: &crate::qlog::bucket::Counts,
+    prev: Option<&crate::qlog::bucket::Counts>,
+    secs: f64,
+) -> admin::ClassCounts {
+    let Some(p) = prev.filter(|_| secs > 0.0) else { return admin::ClassCounts::default() };
+    let r = |a: u64, b: u64| a.saturating_sub(b) as f64 / secs;
+    admin::ClassCounts { a: r(now.a, p.a), b: r(now.b, p.b), free: r(now.free, p.free) }
+}
+
+/// Payload bytes (up, down) by the quorum log's client purpose.
+fn store_bytes() -> HashMap<String, (u64, u64)> {
+    use prometheus::core::Collector;
+    let mut out: HashMap<String, (u64, u64)> = HashMap::new();
+    for mf in vlpds::metrics::OBJ_BYTES.collect() {
+        for m in mf.get_metric() {
+            let label = |k: &str| m.get_label().iter().find(|l| l.name() == k).map(|l| l.value().to_string());
+            let (Some(dir), Some(client)) = (label("dir"), label("client")) else { continue };
+            let Some(purpose) = client.strip_prefix("qlog_") else { continue };
+            let n = m.get_counter().get_value() as u64;
+            let e = out.entry(purpose.to_string()).or_default();
+            if dir == "up" {
+                e.0 += n;
+            } else {
+                e.1 += n;
+            }
+        }
+    }
+    out
+}
+
+/// Latency by op over every key component, from the request histogram.
+fn store_latency() -> Vec<admin::StoreLatency> {
+    use prometheus::core::Collector;
+    // (count, sum s, [(upper bound s, cumulative count)])
+    type Hist = (u64, f64, Vec<(f64, u64)>);
+    let mut by: BTreeMap<String, Hist> = BTreeMap::new();
+    for mf in vlpds::metrics::OBJ_DURATION.collect() {
+        for m in mf.get_metric() {
+            let Some(op) = m.get_label().iter().find(|l| l.name() == "op").map(|l| l.value().to_string()) else {
+                continue;
+            };
+            let h = m.get_histogram();
+            let e = by.entry(op).or_default();
+            e.0 += h.get_sample_count();
+            e.1 += h.get_sample_sum();
+            for (i, b) in h.get_bucket().iter().enumerate() {
+                match e.2.get_mut(i) {
+                    Some(x) => x.1 += b.cumulative_count(),
+                    None => e.2.push((b.upper_bound(), b.cumulative_count())),
+                }
+            }
+        }
+    }
+    by.into_iter()
+        .filter(|(_, (n, _, _))| *n > 0)
+        .map(|(op, (n, sum, buckets))| {
+            let q = |p: f64| {
+                let want = (n as f64 * p).ceil() as u64;
+                buckets.iter().find(|(_, c)| *c >= want).map_or(f64::INFINITY, |(ub, _)| *ub) * 1000.0
+            };
+            admin::StoreLatency { op, count: n, mean_ms: sum / n as f64 * 1000.0, p50_ms: q(0.5), p99_ms: q(0.99) }
+        })
+        .collect()
+}
+
+pub(crate) fn store_view(
+    node: &str,
+    now: &crate::qlog::bucket::Requests,
+    prev: Option<&crate::qlog::bucket::Requests>,
+    window: Duration,
+    retention: Option<serde_json::Value>,
+) -> admin::StoreView {
+    let secs = window.as_secs_f64();
+    let bytes = store_bytes();
+    let purposes: Vec<admin::StorePurpose> = now
+        .by_purpose
+        .iter()
+        .map(|(p, c)| {
+            let (up, down) = bytes.get(p).copied().unwrap_or_default();
+            admin::StorePurpose {
+                purpose: p.clone(),
+                requests: class_counts(c),
+                per_sec: class_rate(c, prev.and_then(|r| r.by_purpose.get(p)), secs),
+                bytes_up: up,
+                bytes_down: down,
+            }
+        })
+        .collect();
+    let total = admin::StorePurpose {
+        purpose: "total".into(),
+        requests: class_counts(&now.total),
+        per_sec: class_rate(&now.total, prev.map(|r| &r.total), secs),
+        bytes_up: purposes.iter().map(|p| p.bytes_up).sum(),
+        bytes_down: purposes.iter().map(|p| p.bytes_down).sum(),
+    };
+    admin::StoreView {
+        node: node.to_string(),
+        at_ms: now_ms(),
+        window_secs: secs,
+        total,
+        purposes,
+        latency: store_latency(),
+        retention,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn throttled_and_deferred_accounts_are_held_in_the_tail() {
+        assert_eq!(tail_kind("inactive", "account is Throttled"), "held");
+        assert_eq!(tail_kind("new_account_deferred", ""), "held");
+        assert_eq!(tail_kind("inactive", "account is Deactivated"), "reject");
+        assert_eq!(tail_kind("prev_data_mismatch", ""), "reject");
+    }
+
+    #[test]
+    fn store_rates_are_over_the_window_and_sum_to_the_total() {
+        use crate::qlog::bucket::{Counts, Requests};
+        let req = |a: u64, b: u64| {
+            let mut r = Requests::default();
+            r.by_purpose.insert("flush".into(), Counts { a, b: 0, free: 0 });
+            r.by_purpose.insert("state".into(), Counts { a: 0, b, free: 1 });
+            r.total = Counts { a, b, free: 1 };
+            r
+        };
+        let (prev, now) = (req(10, 100), req(30, 160));
+        let v = store_view("n1", &now, Some(&prev), Duration::from_secs(10), None);
+        assert_eq!((v.total.per_sec.a, v.total.per_sec.b), (2.0, 6.0));
+        let flush = v.purposes.iter().find(|p| p.purpose == "flush").unwrap();
+        assert_eq!((flush.requests.a, flush.per_sec.a), (30.0, 2.0));
+        assert_eq!(v.purposes.iter().map(|p| p.per_sec.b).sum::<f64>(), v.total.per_sec.b);
+        let first = store_view("n1", &now, None, Duration::ZERO, None);
+        assert_eq!(first.total.per_sec.a, 0.0, "no rate without a previous sample");
+    }
 
     #[test]
     fn inactive_rejects_are_not_takedowns() {

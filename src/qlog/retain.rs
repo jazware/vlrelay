@@ -208,6 +208,15 @@ fn report_path(store: &Store) -> Path {
     Path::from(format!("{}/retain/{LOG_ID}", store.prefix))
 }
 
+/// `retain/qlog` as the last pass wrote it, None before the first.
+pub async fn read_report(store: &Store) -> anyhow::Result<Option<serde_json::Value>> {
+    match store.raw.get(&report_path(store)).await {
+        Ok(r) => Ok(Some(serde_json::from_slice(&r.bytes().await?)?)),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The retained floor `retain/qlog` publishes: every seq at or below it may
 /// be gone from the bucket.
 pub async fn pruned_seq(store: &Store) -> anyhow::Result<u64> {

@@ -116,6 +116,32 @@ const FAILED_MAX: usize = 10_000;
 /// every few hours, not more.
 pub const PER_IP_PER_MIN: u32 = 10;
 const IPS_MAX: usize = 100_000;
+/// requestCrawl outcomes kept for the admin API.
+const LOG_MAX: usize = 500;
+
+/// One requestCrawl as the admin API shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrawlAdmission {
+    pub at_ms: i64,
+    pub host: String,
+    /// `admitted` (a new host, or a known one woken), `refused`, `banned`
+    /// or `rate-limited`.
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    pub reason: String,
+}
+
+impl CrawlError {
+    fn outcome(&self) -> &'static str {
+        match self {
+            CrawlError::HostBanned => "banned",
+            CrawlError::Budget | CrawlError::Busy => "rate-limited",
+            _ => "refused",
+        }
+    }
+}
 
 pub struct Crawler {
     admission: parking_lot::RwLock<Option<Arc<dyn Admission>>>,
@@ -128,6 +154,7 @@ pub struct Crawler {
     /// Per client IP: the minute's start and its calls.
     per_ip: Mutex<HashMap<IpAddr, (Instant, u32)>>,
     probing: Mutex<HashSet<Host>>,
+    log: Mutex<VecDeque<CrawlAdmission>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +211,7 @@ impl Crawler {
             failed: Mutex::new(HashMap::new()),
             per_ip: Mutex::new(HashMap::new()),
             probing: Mutex::new(HashSet::new()),
+            log: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -204,9 +232,50 @@ impl Crawler {
         Router::new().route("/xrpc/com.atproto.sync.requestCrawl", post(handle)).with_state(self.clone())
     }
 
+    /// The last requestCrawl outcomes this node saw, newest first.
+    pub fn admissions(&self) -> Vec<CrawlAdmission> {
+        self.log.lock().iter().rev().cloned().collect()
+    }
+
+    fn note(&self, host: &str, outcome: &str, tier: Option<Tier>, reason: String) {
+        let mut l = self.log.lock();
+        if l.len() >= LOG_MAX {
+            l.pop_front();
+        }
+        l.push_back(CrawlAdmission {
+            at_ms: chrono::Utc::now().timestamp_millis(),
+            host: host.to_string(),
+            outcome: outcome.to_string(),
+            tier: tier.and_then(|t| serde_json::to_value(t).ok()?.as_str().map(str::to_string)),
+            reason,
+        });
+    }
+
     /// Validates, checks policy and budget, probes, admits. Returns whether
     /// the host was new.
     pub async fn request_crawl(&self, hostname: &str) -> Result<bool, CrawlError> {
+        let r = self.request_crawl_inner(hostname).await;
+        let host = normalize_hostname(hostname, self.manager.config().dev_mode).map_or(hostname.to_string(), |h| h.0);
+        match &r {
+            Ok((true, tier)) => self.note(&host, "admitted", *tier, "new host".into()),
+            Ok((false, tier)) => self.note(&host, "admitted", *tier, "known host, woken".into()),
+            Err(e) => {
+                let msg = match e {
+                    CrawlError::HostBanned => "host is banned".to_string(),
+                    CrawlError::NotAllowed => "not on the allow list".to_string(),
+                    CrawlError::Budget => "new-host budget is spent".to_string(),
+                    CrawlError::Busy => "a crawl of this host is in progress".to_string(),
+                    CrawlError::InvalidHost(h) => h.to_string(),
+                    CrawlError::Unreachable(m) => format!("host check failed: {m}"),
+                    CrawlError::Internal(m) | CrawlError::Refused(m) => m.clone(),
+                };
+                self.note(&host, e.outcome(), None, msg);
+            }
+        }
+        r.map(|(new, _)| new)
+    }
+
+    async fn request_crawl_inner(&self, hostname: &str) -> Result<(bool, Option<Tier>), CrawlError> {
         let dev = self.manager.config().dev_mode;
         let host = normalize_hostname(hostname, dev).map_err(CrawlError::InvalidHost)?;
         let admission = self.admission.read().clone();
@@ -223,9 +292,9 @@ impl Crawler {
                 Tier::Banned => Err(CrawlError::HostBanned),
                 // an operator's suspension isn't lifted by asking
                 Tier::Suspended => Err(CrawlError::HostBanned),
-                _ => {
+                t => {
                     self.manager.wake(&host);
-                    Ok(false)
+                    Ok((false, Some(t)))
                 }
             };
         }
@@ -246,16 +315,17 @@ impl Crawler {
             }
             return Err(e);
         }
-        self.manager.admit(&host, Tier::New).await.map_err(|e| CrawlError::Internal(format!("{e:#}")))
+        let new = self.manager.admit(&host, Tier::New).await.map_err(|e| CrawlError::Internal(format!("{e:#}")))?;
+        Ok((new, Some(Tier::New)))
     }
 
-    async fn request_crawl_with(&self, host: &Host, a: &dyn Admission) -> Result<bool, CrawlError> {
+    async fn request_crawl_with(&self, host: &Host, a: &dyn Admission) -> Result<(bool, Option<Tier>), CrawlError> {
         let probe_timeout = Duration::from_secs(self.policy().probe_timeout_secs.max(1));
-        if self.manager.registry().get(host).is_some() {
+        if let Some(e) = self.manager.registry().get(host) {
             // a known host is still checked: a ban added since must hold
             a.admit(host, false).await?;
             self.manager.wake(host);
-            return Ok(false);
+            return Ok((false, Some(e.tier())));
         }
         self.recently_failed(host)?;
         if !self.probing.lock().insert(host.clone()) {
@@ -266,7 +336,8 @@ impl Crawler {
         self.probe_noting(host, probe_timeout).await?;
         // spends the budget, and sees a ban added during the probe
         let tier = a.admit(host, true).await?;
-        self.manager.admit(host, tier).await.map_err(|e| CrawlError::Internal(format!("{e:#}")))
+        let new = self.manager.admit(host, tier).await.map_err(|e| CrawlError::Internal(format!("{e:#}")))?;
+        Ok((new, Some(tier)))
     }
 
     fn recently_failed(&self, host: &Host) -> Result<(), CrawlError> {
@@ -385,6 +456,7 @@ async fn handle(State(c): State<Arc<Crawler>>, req: Request) -> Response {
     if let Some(ip) = crate::serve::client_ip(req.extensions())
         && !c.take_ip(ip)
     {
+        c.note("", "rate-limited", None, format!("{ip}: over {PER_IP_PER_MIN} requestCrawl calls a minute"));
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({"error": "RateLimitExceeded", "message": "too many requestCrawl calls"})),
@@ -440,6 +512,19 @@ mod tests {
         assert_eq!(banned.0.load(Ordering::SeqCst), 2);
         c.set_admission(Arc::new(Refuse(AtomicUsize::new(0), Ok(Tier::New))));
         assert_eq!(c.request_crawl("known.example.com").await, Ok(false));
+        // every call is in the admission log, newest first
+        let log = c.admissions();
+        let seen: Vec<(&str, &str, Option<&str>)> =
+            log.iter().map(|a| (a.host.as_str(), a.outcome.as_str(), a.tier.as_deref())).collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("known.example.com", "admitted", Some("default")),
+                ("known.example.com", "banned", None),
+                ("pds.nowhere.dev", "banned", None),
+            ]
+        );
+        assert_eq!(log[0].reason, "known host, woken");
     }
 
     /// Records each admission call, admitting at tier new.

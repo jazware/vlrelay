@@ -176,6 +176,20 @@ pub struct RejectNote {
     pub detail: String,
 }
 
+/// An event this node read that the leader appended.
+#[derive(Clone)]
+pub struct PassedNote {
+    pub at_ms: i64,
+    pub host: Host,
+    pub did: String,
+    pub seq: i64,
+    pub upstream_seq: i64,
+    pub kind: &'static str,
+}
+
+/// Passed events the admin tail keeps (a few seconds at today's rates).
+pub const PASSED_KEPT: usize = 8192;
+
 /// Seconds of history the overview keeps (5 minutes), and per host (2).
 pub const HISTORY: usize = 300;
 pub const HOST_HISTORY: usize = 120;
