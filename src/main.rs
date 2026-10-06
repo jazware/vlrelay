@@ -174,6 +174,139 @@ struct Args {
     /// Host shards (used only when the bucket has no host layout yet).
     #[arg(long, default_value_t = 64)]
     host_shards: u32,
+    /// The lease cluster (`--role`, `--cluster`), which the quorum log
+    /// (`--quorum`) supersedes: kept for comparison, off unless asked for.
+    #[arg(long, env = "VLRELAY_LEGACY_CLUSTER")]
+    legacy_cluster: bool,
+    #[command(flatten)]
+    quorum: QuorumArgs,
+}
+
+/// The relay on the quorum log (docs/quorum.md): one node of a cluster of
+/// any size (one is a single node with the commitlog as its WAL).
+#[derive(clap::Args, Debug)]
+struct QuorumArgs {
+    /// Run on the quorum log.
+    #[arg(long, env = "VLRELAY_QUORUM")]
+    quorum: bool,
+    /// The peer protocol: replication, submits, members' questions.
+    #[arg(long, default_value = "127.0.0.1:2978", env = "VLRELAY_QLOG_LISTEN")]
+    qlog_listen: String,
+    /// Another node: `id=host:port` of its --qlog-listen (repeatable, or
+    /// comma-separated).
+    #[arg(long = "qlog-peer", env = "VLRELAY_QLOG_PEERS", value_delimiter = ',')]
+    qlog_peers: Vec<String>,
+    /// The bootstrap member set (default: this node and its peers); after
+    /// the first start, `qlog/leader` holds it.
+    #[arg(long, env = "VLRELAY_QLOG_MEMBERS", value_delimiter = ',')]
+    qlog_members: Vec<String>,
+    /// The commitlog's directory (NVMe). Without one the log is memory only.
+    #[arg(long, env = "VLRELAY_QLOG_DIR")]
+    qlog_dir: Option<PathBuf>,
+    /// The bucket flush interval.
+    #[arg(long, default_value_t = 30_000)]
+    qlog_flush_ms: u64,
+    /// Seqs reserved past each flush (R = F + H).
+    #[arg(long, default_value_t = 8_640_000)]
+    qlog_headroom: u64,
+    /// Bearer token membership changes need (`qlog member`, the dashboard).
+    #[arg(long, env = "QLOG_ADMIN_TOKEN", hide_env_values = true)]
+    qlog_admin_token: Option<String>,
+    /// Bucket retention, run by the leader: segments older than this go
+    /// (0: never).
+    #[arg(long, default_value_t = 72)]
+    qlog_retain_hours: u64,
+    /// Dev: retention in seconds instead.
+    #[arg(long)]
+    qlog_retain_secs: Option<u64>,
+    #[arg(long, default_value_t = 600)]
+    qlog_retain_every_secs: u64,
+    /// A member silent this long loses its hosts to the others.
+    #[arg(long, default_value_t = 2_000)]
+    qlog_host_failover_ms: u64,
+    #[arg(long, default_value_t = 500)]
+    qlog_host_poll_ms: u64,
+    #[arg(long, default_value_t = 1_000)]
+    qlog_election_ms: u64,
+    #[arg(long, default_value_t = 100)]
+    qlog_heartbeat_ms: u64,
+    /// The state's SlateDB compactor and worker poll.
+    #[arg(long, default_value_t = 30_000)]
+    qlog_state_compactor_poll_ms: u64,
+    /// A lost quorum waits for an operator instead of recovering from the
+    /// bucket.
+    #[arg(long)]
+    qlog_no_auto_recover: bool,
+    #[arg(long, default_value_t = 64)]
+    qlog_segment_mb: u64,
+    #[arg(long, default_value_t = 4096)]
+    qlog_disk_retain_mb: u64,
+    /// Committed log kept in memory (default 64 with --qlog-dir, else 512).
+    #[arg(long)]
+    qlog_memory_mb: Option<usize>,
+    /// Chaos: kill -9 at this flush step (or `any`), with --qlog-crash-prob.
+    #[arg(long)]
+    qlog_crash_at: Option<String>,
+    #[arg(long, default_value_t = 0.05)]
+    qlog_crash_prob: f64,
+    /// Chaos: no crash injected once this file exists.
+    #[arg(long)]
+    qlog_crash_stop_file: Option<PathBuf>,
+    /// Chaos: SIGUSR1 is a power cut.
+    #[arg(long)]
+    qlog_power_cut_on_usr1: bool,
+    /// Chaos: sleep this long before each commitlog fsync (emulates a disk).
+    #[arg(long)]
+    qlog_fsync_delay_us: Option<u64>,
+}
+
+fn quorum_setup(q: &QuorumArgs, node_id: &str) -> anyhow::Result<vlrelay::node::quorum::QuorumSetup> {
+    let mut s = vlrelay::node::quorum::QuorumSetup::new(&q.qlog_listen);
+    for p in &q.qlog_peers {
+        let (id, addr) = p.split_once('=').ok_or_else(|| anyhow::anyhow!("--qlog-peer {p}: want id=host:port"))?;
+        anyhow::ensure!(id != node_id, "--qlog-peer {p} names this node");
+        s.peers.insert(id.to_string(), addr.to_string());
+    }
+    s.members = q.qlog_members.clone();
+    s.commitlog = q.qlog_dir.clone();
+    s.flush = Duration::from_millis(q.qlog_flush_ms.max(100));
+    s.headroom = q.qlog_headroom.max(1);
+    s.admin_token = q.qlog_admin_token.clone().filter(|t| !t.is_empty());
+    s.retain_horizon = match (q.qlog_retain_secs, q.qlog_retain_hours) {
+        (Some(secs), _) => Some(Duration::from_secs(secs.max(1))),
+        (None, 0) => None,
+        (None, h) => Some(Duration::from_secs(h * 3600)),
+    };
+    s.retain_every = Duration::from_secs(q.qlog_retain_every_secs.max(1));
+    s.host_failover = Duration::from_millis(q.qlog_host_failover_ms.max(100));
+    s.host_poll = Duration::from_millis(q.qlog_host_poll_ms.max(50));
+    s.election_timeout = Duration::from_millis(q.qlog_election_ms.max(100));
+    s.heartbeat = Duration::from_millis(q.qlog_heartbeat_ms.max(10));
+    s.auto_recover = !q.qlog_no_auto_recover;
+    s.commitlog_segment_bytes = q.qlog_segment_mb.max(1) << 20;
+    s.disk_retain_bytes = q.qlog_disk_retain_mb.max(1) << 20;
+    s.memory_bytes = q.qlog_memory_mb.map(|m| m.max(1) << 20);
+    s.power_cut_on_usr1 = q.qlog_power_cut_on_usr1;
+    s.fsync_delay = q.qlog_fsync_delay_us.map(Duration::from_micros);
+    vlrelay::qlog::state::set_compactor_poll(Duration::from_millis(q.qlog_state_compactor_poll_ms));
+    if let Some(at) = q.qlog_crash_at.clone().filter(|a| !a.is_empty()) {
+        use vlrelay::qlog::flush::Step;
+        let only: Option<Step> = if at == "any" { None } else { Some(at.parse().map_err(anyhow::Error::msg)?) };
+        let (prob, stop) = (q.qlog_crash_prob, q.qlog_crash_stop_file.clone());
+        s.crash = Some(Arc::new(move |step| {
+            use rand::Rng;
+            if only.is_none_or(|o| o == step)
+                && stop.as_ref().is_none_or(|f| !f.exists())
+                && rand::thread_rng().gen_bool(prob)
+            {
+                eprintln!("vlrelay: crash injected at {step:?}");
+                // as sudden as a crash: no unwinding, no flush of anything
+                unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+            }
+            false
+        }));
+    }
+    Ok(s)
 }
 
 fn main() {
@@ -229,6 +362,11 @@ async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<
     cfg.max_segment_bytes = a.max_segment_mb << 20;
     vlpds::segment::set_compression_level(a.log_compression);
     let role = a.role.or(a.cluster.then_some(vlrelay::cluster::Role::Core));
+    anyhow::ensure!(
+        role.is_none() || a.legacy_cluster,
+        "the lease cluster (--role, --cluster) is superseded by the quorum log (--quorum): pass --legacy-cluster to run it anyway"
+    );
+    anyhow::ensure!(!(role.is_some() && a.quorum.quorum), "--quorum and --role are different clusters: pick one");
     cfg.did_shards = a.did_shards.unwrap_or(default_did_shards(role)).max(1);
     cfg.retention = Duration::from_secs(a.retention.max(1) * 3600);
     if (a.retention_secs.is_some() || a.max_lag_mb.is_some()) && !dev_mode {
@@ -279,6 +417,10 @@ async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<
         None => None,
     };
     let node = match &setup {
+        None if a.quorum.quorum => {
+            let q = quorum_setup(&a.quorum, &a.node_id)?;
+            Node::start_quorum(store, cfg, q).await?
+        }
         None => Node::start(store, cfg).await?,
         Some(s) if s.role == vlrelay::cluster::Role::Core => {
             let peer = tokio::net::TcpListener::bind(a.peer_listen).await?;
@@ -290,7 +432,12 @@ async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<
     let mut app = axum::Router::new()
         .route("/xrpc/_health", axum::routing::get(health))
         .route("/metrics", axum::routing::get(|| async { vlpds::metrics::render() }))
-        .merge(node.serve.router())
+        .merge(node.serve.router());
+    if let Some(q) = node.quorum.get() {
+        let admin = vlrelay::qlog::emit::Admin::for_listener(a.quorum.qlog_admin_token.clone(), a.listen);
+        app = app.merge(vlrelay::qlog::emit::control_router(q.qnode.clone(), admin));
+    }
+    let mut app = app
         .merge(vlrelay::sync_api::router(match &node.cluster {
             Some(g) => {
                 Arc::new(vlrelay::node::cluster::ClusterSync { state: node.state.clone(), hosts: g.hosts.clone() })
@@ -331,7 +478,8 @@ async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<
     let app = with_real_ip(app.layer(middleware::map_response(server_header)), &a.trusted_proxies);
 
     let listener = tokio::net::TcpListener::bind(a.listen).await?;
-    tracing::info!(addr = %a.listen, log = %node.log.log_id, dev_mode, "vlrelay listening");
+    let log = node.log.as_ref().map(|l| l.log_id.to_string()).unwrap_or_else(|| "qlog".into());
+    tracing::info!(addr = %a.listen, log = %log, dev_mode, "vlrelay listening");
     // Consumers (a reconnect storm's accepts and upgrades) are served on the
     // subscriber runtime, so they can't starve the pipeline and peer RPC on
     // this one. The tokio listener must be registered there too.

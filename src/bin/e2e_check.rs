@@ -5,8 +5,8 @@
 //!
 //! Every event is keyed by DID plus what identifies it across a relay:
 //! `#commit`/`#sync` by (rev, commit CID); `#identity` by handle and
-//! `#account` by (active, status), each with its occurrence count, because
-//! those carry no rev. Both sides are timestamped on receipt here, so the
+//! `#account` by (active, status), plus the frame's `time` (or else their
+//! occurrence count), because those carry no rev. Both sides are timestamped on receipt here, so the
 //! latency (upstream emit -> relay emit) needs no clock agreement with
 //! either server. Upstream events seen in [warmup, duration] are expected on
 //! the relay; the relay gets `settle` more seconds to deliver them.
@@ -201,14 +201,19 @@ fn classify(frame: &[u8]) -> Result<Option<Classified>, String> {
             };
             (did, Kind::Sync, format!("s:{rev}:{root}"), Some(rev), seq)
         }
+        // An event's `time` names it across a relay: counting occurrences
+        // instead pairs the wrong copies when the two sides' streams start
+        // a few events apart.
         "#identity" => {
             let handle = s("handle").unwrap_or_else(|| "-".into());
-            (did, Kind::Identity, format!("i:{handle}"), None, seq)
+            let at = s("time").map(|t| format!("@{t}")).unwrap_or_default();
+            (did, Kind::Identity, format!("i:{handle}{at}"), None, seq)
         }
         "#account" => {
             let active = matches!(body.get("active"), Some(ValueRef::Bool(true)));
             let status = s("status").unwrap_or_else(|| "-".into());
-            (did, Kind::Account, format!("a:{active}:{status}"), None, seq)
+            let at = s("time").map(|t| format!("@{t}")).unwrap_or_default();
+            (did, Kind::Account, format!("a:{active}:{status}{at}"), None, seq)
         }
         _ => return Ok(None),
     }))
@@ -553,14 +558,15 @@ impl Cmp {
         let seen_before = *occ > 0;
         *occ += 1;
         let occ = *occ;
-        if seen_before && matches!(kind, Kind::Commit | Kind::Sync) {
+        let unique = matches!(kind, Kind::Commit | Kind::Sync) || base.contains('@');
+        if seen_before && unique {
             if side == Side::Relay {
                 self.duplicates += 1;
                 self.note("duplicates", format!("{did} {base}"), w.show);
             }
             return Ok(());
         }
-        let key = if matches!(kind, Kind::Commit | Kind::Sync) { base.clone() } else { format!("{base}#{}", occ - 1) };
+        let key = if unique { base.clone() } else { format!("{base}#{}", occ - 1) };
         let c = self.counts.entry(kind).or_default();
         match side {
             Side::Up => c.up += 1,

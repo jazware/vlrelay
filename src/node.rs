@@ -57,6 +57,7 @@ pub mod cluster;
 pub mod metrics;
 pub mod peer_admin;
 pub mod policy;
+pub mod quorum;
 
 use crate::event::{self, Kind, SeqSpan};
 use crate::identity::{HttpFetch, Identity, IdentityCache, LookupError};
@@ -481,9 +482,11 @@ pub struct Node {
     pub crawler: Arc<upstream::Crawler>,
     pub state: Arc<State>,
     pub identity: Arc<IdentityCache<HttpFetch>>,
-    pub log: Arc<NodeLog>,
+    /// This node's own log (a single node, or a lease cluster's core);
+    /// None on the quorum log, which `quorum` holds.
+    pub log: Option<Arc<NodeLog>>,
     pub serve: Arc<Serve>,
-    pub local: Arc<LocalOwner>,
+    pub local: Option<Arc<LocalOwner>>,
     pub owner: Arc<dyn DidOwner>,
     pub acks: acks::Tracker,
     pub ttf: Arc<Ttf>,
@@ -506,6 +509,8 @@ pub struct Node {
     pub recovery: Mutex<RecoveryReport>,
     /// A core cluster node's cluster half (docs/cluster.md).
     pub cluster: Option<Arc<cluster::Glue>>,
+    /// The quorum log half of a node on it (docs/quorum.md).
+    pub quorum: std::sync::OnceLock<Arc<quorum::Glue>>,
     /// The PLC export reader, when `--plc-export` is on (on a cluster, every
     /// core has one and the lowest-named live core runs it).
     pub plc_ingest: std::sync::OnceLock<Arc<crate::plc_seed::ingest::Ingester>>,
@@ -673,9 +678,9 @@ impl Node {
             crawler,
             state,
             identity,
-            log,
+            Some(log),
             srv,
-            local,
+            Some(local),
             owner,
             ttf,
             replayed,
@@ -712,9 +717,9 @@ impl Node {
         crawler: Arc<upstream::Crawler>,
         state: Arc<State>,
         identity: Arc<IdentityCache<HttpFetch>>,
-        log: Arc<NodeLog>,
+        log: Option<Arc<NodeLog>>,
         srv: Arc<Serve>,
-        local: Arc<LocalOwner>,
+        local: Option<Arc<LocalOwner>>,
         owner: Arc<dyn DidOwner>,
         ttf: Arc<Ttf>,
         replayed: HashMap<Host, HashSet<(i64, u64)>>,
@@ -763,6 +768,7 @@ impl Node {
             started_ms: upstream::host::now_ms() as i64,
             recovery: Mutex::new(report),
             cluster,
+            quorum: Default::default(),
             plc_ingest: Default::default(),
         });
         let weak = Arc::downgrade(&node);
@@ -780,9 +786,10 @@ impl Node {
         }
         ingest_handle.spawn(node.clone().dispatch(rx));
         tokio::spawn(node.clone().tap());
-        // a cluster node checkpoints in node::cluster
-        if node.cluster.is_none() {
-            tokio::spawn(node.clone().checkpoints());
+        // a cluster node checkpoints in node::cluster, and on the quorum
+        // log cursors ride the log
+        if let (None, Some(log), Some(local)) = (&node.cluster, &node.log, &node.local) {
+            tokio::spawn(node.clone().checkpoints(log.clone(), local.clone()));
         }
         tokio::spawn(node.clone().sampler());
 
@@ -1144,7 +1151,7 @@ impl Node {
     /// replays it and only the log tail past the marker can say it's a
     /// duplicate. So the marker is computed from the ack state first, and
     /// the cursors (which can only have moved forward since) written after.
-    async fn checkpoints(self: Arc<Self>) {
+    async fn checkpoints(self: Arc<Self>, log: Arc<NodeLog>, local: Arc<LocalOwner>) {
         let every = self.cfg.checkpoint_interval;
         let mut tick = tokio::time::interval(every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1153,8 +1160,8 @@ impl Node {
         loop {
             tick.tick().await;
             let snap = self.acks.snapshot();
-            let durable = self.log.durable_ordinal.load(Ordering::Acquire);
-            let committing = self.local.committing_since_us();
+            let durable = log.durable_ordinal.load(Ordering::Acquire);
+            let committing = local.committing_since_us();
             let stuck_commit = committing != 0 && mono_us(*EPOCH).saturating_sub(committing) > every.as_micros() as u64;
             let mut marker = (prev_durable != u64::MAX).then_some(prev_durable);
             if let Some(m) = snap.min_ordinal_above_ack {
@@ -1178,7 +1185,7 @@ impl Node {
             {
                 let mut ok = true;
                 for s in self.state.shards() {
-                    if let Err(e) = s.checkpoint(&self.log.log_id, m).await {
+                    if let Err(e) = s.checkpoint(&log.log_id, m).await {
                         tracing::warn!(shard = %s.id, "checkpoint failed: {e}");
                         ok = false;
                     }
@@ -1265,8 +1272,10 @@ impl Node {
                 r.iter().map(|(h, x)| (h.clone(), x.total)).collect()
             };
             let (p50, p99) = self.ttf.roll();
-            let lat =
-                (self.log.stats.latency_us.load(Ordering::Relaxed), self.log.stats.events.load(Ordering::Relaxed));
+            let lat = match &self.log {
+                Some(l) => (l.stats.latency_us.load(Ordering::Relaxed), l.stats.events.load(Ordering::Relaxed)),
+                None => quorum::latency_totals(&self),
+            };
             let lag_ms = if lat.1 > prev_lat.1 {
                 (lat.0 - prev_lat.0) as f64 / (lat.1 - prev_lat.1) as f64 / 1000.0
             } else {

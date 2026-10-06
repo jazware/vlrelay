@@ -254,9 +254,9 @@ impl Node {
             crawler,
             state,
             identity.clone(),
-            log.clone(),
+            Some(log.clone()),
             cluster.serve.clone(),
-            local,
+            Some(local),
             Arc::new(Forwarding(cluster.clone())),
             ttf,
             HashMap::new(),
@@ -534,7 +534,7 @@ fn static_reason(r: &str) -> &'static str {
 /// commit cid, data cid, prev_data (u8 flags: 1 = a cid follows, 2 = the
 /// repo's first commit; + cid) | account: active u8,
 /// status (u16 len + bytes, 0xffff = none)
-fn encode_meta(c: &Checked) -> Bytes {
+pub(super) fn encode_meta(c: &Checked) -> Bytes {
     let mut b = Vec::with_capacity(120);
     let tag = match &c.kind {
         CheckedKind::Commit(_) => 0u8,
@@ -581,15 +581,15 @@ fn encode_meta(c: &Checked) -> Bytes {
     b.into()
 }
 
-struct Meta {
-    kind: CheckedKind,
-    first_sighting: bool,
+pub(super) struct Meta {
+    pub(super) kind: CheckedKind,
+    pub(super) first_sighting: bool,
     span: SeqSpan,
 }
 
 /// `frame_len`: the span must lie in the frame, or the splice into our log
 /// panics the sequencer.
-fn decode_meta(did: &str, frame_len: usize, mut r: Bytes) -> anyhow::Result<Meta> {
+pub(super) fn decode_meta(did: &str, frame_len: usize, mut r: Bytes) -> anyhow::Result<Meta> {
     anyhow::ensure!(r.remaining() >= 10, "short meta");
     let tag = r.get_u8();
     let first_sighting = r.get_u8() != 0;

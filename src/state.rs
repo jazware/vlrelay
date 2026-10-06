@@ -182,6 +182,20 @@ impl<C: Chain> StateStore<C> {
         Ok(s)
     }
 
+    /// Serves a shard whose database someone else opened and writes (the
+    /// quorum log's state, `node::quorum`): replaces any shard of that id.
+    pub fn attach_shard(&self, s: Arc<ShardState>) {
+        self.shards.write().insert(s.id, s);
+    }
+
+    /// Stops serving `id` if it's `s`, without touching its database.
+    pub fn detach_shard(&self, s: &Arc<ShardState>) {
+        let mut m = self.shards.write();
+        if m.get(&s.id).is_some_and(|x| Arc::ptr_eq(x, s)) {
+            m.remove(&s.id);
+        }
+    }
+
     /// Stops serving `id` and closes its DB. Logged changes still pending
     /// are dropped: the next owner replays them from the log.
     pub async fn close_shard(&self, id: ShardId) -> anyhow::Result<()> {

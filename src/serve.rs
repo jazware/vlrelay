@@ -64,6 +64,23 @@ pub struct ServeConfig {
     pub takedown_poll: Duration,
 }
 
+impl ServeConfig {
+    pub fn firehose_options(&self, runtime: Option<tokio::runtime::Handle>) -> firehose::Options {
+        firehose::Options {
+            ring_bytes: self.ring_bytes,
+            max_lag_bytes: self.max_lag_bytes,
+            readahead_bytes: self.readahead_bytes,
+            backfill_cache_bytes: self.backfill_cache_bytes,
+            max_backfills: self.max_backfills,
+            max_per_ip: self.max_per_ip,
+            write_idle: firehose::DEFAULT_WRITE_IDLE,
+            runtime,
+            max_labelled: firehose::DEFAULT_MAX_LABELLED,
+            start_floor: None,
+        }
+    }
+}
+
 impl Default for ServeConfig {
     fn default() -> Self {
         ServeConfig {
@@ -88,7 +105,8 @@ pub struct Serve {
     pub firehose: Arc<Firehose>,
     /// The firehose's filter: taken-down accounts' commits and syncs.
     pub takedowns: Arc<TakedownSet>,
-    seqs: seq::dense::DenseSeqs,
+    /// None on the quorum log, whose seqs are its own (dense) counts.
+    seqs: Option<seq::dense::DenseSeqs>,
     pub store: Store,
     cfg: ServeConfig,
     /// Per-consumer rates by firehose connection id, sampled every second.
@@ -131,24 +149,22 @@ impl Serve {
     /// A firehose over the logs in `store`, with no sources yet. Its start
     /// floor is the clock now: older events are served from the bucket.
     pub fn new(store: Store, cfg: ServeConfig, runtime: Option<tokio::runtime::Handle>) -> Arc<Serve> {
-        let opts = firehose::Options {
-            ring_bytes: cfg.ring_bytes,
-            max_lag_bytes: cfg.max_lag_bytes,
-            readahead_bytes: cfg.readahead_bytes,
-            backfill_cache_bytes: cfg.backfill_cache_bytes,
-            max_backfills: cfg.max_backfills,
-            max_per_ip: cfg.max_per_ip,
-            write_idle: firehose::DEFAULT_WRITE_IDLE,
-            runtime,
-            max_labelled: firehose::DEFAULT_MAX_LABELLED,
-            start_floor: None,
-        };
-        let fh = Firehose::new(opts);
+        let fh = Firehose::new(cfg.firehose_options(runtime));
         fh.set_max_queue_bytes(cfg.merge_queue_bytes);
         *fh.store.write() = Some(store.clone());
         // JavaScript consumers need seqs below 2^53, and indigo's are dense
         let seqs = seq::dense::DenseSeqs::new(store.clone(), cfg.seq_checkpoint_every, cfg.write_seq_checkpoints);
         fh.set_renumber(Arc::new(seqs.clone()));
+        Serve::wrap(fh, Some(seqs), store, cfg)
+    }
+
+    /// The quorum log's firehose (`qlog::emit`), already counting its own
+    /// seqs, with the relay's takedown filter and consumer views on it.
+    pub fn counted(store: Store, cfg: ServeConfig, fh: Arc<Firehose>) -> Arc<Serve> {
+        Serve::wrap(fh, None, store, cfg)
+    }
+
+    fn wrap(fh: Arc<Firehose>, seqs: Option<seq::dense::DenseSeqs>, store: Store, cfg: ServeConfig) -> Arc<Serve> {
         let takedowns = Arc::new(TakedownSet::default());
         fh.set_filter(takedowns.clone());
         let s = Arc::new(Serve {
@@ -176,7 +192,7 @@ impl Serve {
 
     /// The newest `n` stream seq checkpoints this node knows (docs/seq.md).
     pub fn seq_checkpoints(&self, n: usize) -> Vec<(i64, i64)> {
-        self.seqs.recent(n)
+        self.seqs.as_ref().map(|s| s.recent(n)).unwrap_or_default()
     }
 
     /// The connected consumers, by id.
@@ -230,7 +246,9 @@ impl Serve {
     /// Follows a log of this process (its watermark is read directly).
     pub fn follow_local(&self, log: &NodeLog) {
         self.firehose.set_source(&log.log_id, Some(Source::Local(log.wm.clone())));
-        self.seqs.set_own_log(&log.log_id);
+        if let Some(s) = &self.seqs {
+            s.set_own_log(&log.log_id);
+        }
     }
 
     pub fn router(self: &Arc<Self>) -> axum::Router {

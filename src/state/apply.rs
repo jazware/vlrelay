@@ -9,6 +9,7 @@ use super::record::{AccountStatus, ChainState, DesyncReason, HostKey, Record, Si
 use super::shard::{ShardState, Ticket};
 use super::{StateStore, StoreError};
 use crate::types::Host;
+use std::sync::Arc;
 use vlpds::cid::{CODEC_DAG_CBOR, Cid};
 use vlpds::tid::Tid;
 
@@ -225,6 +226,9 @@ fn upstream_from(b: u8) -> Option<Upstream> {
 #[derive(Debug)]
 pub struct Accepted {
     pub ticket: Ticket,
+    /// The record staged under `ticket`: what the quorum log's entry
+    /// carries for its state.
+    pub record: Box<Record>,
     pub delta: StateDelta,
     pub status: AccountStatus,
     /// The status before, when this event changed it (emit `#account`).
@@ -331,9 +335,32 @@ impl<C: Chain> StateStore<C> {
         frame: Option<&bytes::Bytes>,
     ) -> Result<Applied, Reject> {
         let shard = self.shard_for(ev.did)?;
+        self.apply_in(&shard, ev, frame).await
+    }
+
+    /// [`apply_with_frame`](Self::apply_with_frame) against `shard`, which
+    /// needn't be the one this store routes the DID to: the quorum log's
+    /// leader applies against its own term's view.
+    pub async fn apply_in(
+        &self,
+        shard: &Arc<ShardState>,
+        ev: Incoming<'_, C::Verified>,
+        frame: Option<&bytes::Bytes>,
+    ) -> Result<Applied, Reject> {
         let _did_lock = shard.lock_did(ev.did).await;
+        self.apply_held(shard, ev, frame).await
+    }
+
+    /// [`apply_in`](Self::apply_in) with the DID's lock already held by the
+    /// caller (`ShardState::lock_dids_owned`).
+    pub async fn apply_held(
+        &self,
+        shard: &Arc<ShardState>,
+        ev: Incoming<'_, C::Verified>,
+        frame: Option<&bytes::Bytes>,
+    ) -> Result<Applied, Reject> {
         let prev = shard.load(ev.did).await?;
-        let r = self.apply_locked(&shard, &ev, prev.as_deref(), frame).await;
+        let r = self.apply_locked(shard, &ev, prev.as_deref(), frame).await;
         let hk = HostKey::of(&ev.host.0);
         match &r {
             Ok(Applied::Append(a)) => {
@@ -535,12 +562,14 @@ impl<C: Chain> StateStore<C> {
         let delta =
             StateDelta { did: ev.did.to_string(), host: rec.host, kind, chain: rec.chain, upstream: rec.upstream };
         let key_changed = rec.key != key_before;
+        let record = Box::new(rec.clone());
         let ticket = shard.stage_logged(ev.did, rec);
         if let Some(r) = mirror_rows {
             shard.mirror.attach(ticket.n, ev.did, r);
         }
         Ok(Applied::Append(Accepted {
             ticket,
+            record,
             delta,
             status,
             status_was: status_before.filter(|s| *s != status),

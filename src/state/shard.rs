@@ -55,7 +55,7 @@ pub struct ShardState {
     pending: Mutex<Pending>,
     /// Serializes each DID's applies (a DID's events must apply in order,
     /// and the identity lookup inside one is async).
-    stripes: Box<[tokio::sync::Mutex<()>]>,
+    stripes: Box<[Arc<tokio::sync::Mutex<()>>]>,
     next_ticket: AtomicU64,
     pub stats: ShardStats,
     /// Archival mode's in-memory side (`crate::archive`).
@@ -80,7 +80,7 @@ impl ShardState {
             db,
             cache: (0..CACHE_WAYS).map(|_| Mutex::new(lru::LruCache::new(per_way))).collect(),
             pending: Mutex::new(Pending::default()),
-            stripes: (0..STRIPES).map(|_| tokio::sync::Mutex::new(())).collect(),
+            stripes: (0..STRIPES).map(|_| Arc::new(tokio::sync::Mutex::new(()))).collect(),
             next_ticket: AtomicU64::new(1),
             stats: ShardStats::default(),
             mirror: Default::default(),
@@ -99,6 +99,23 @@ impl ShardState {
 
     pub async fn lock_did(&self, did: &str) -> tokio::sync::MutexGuard<'_, ()> {
         self.stripes[Self::way(did) % STRIPES].lock().await
+    }
+
+    /// The locks of every DID in `dids`, taken in stripe order (so two
+    /// callers can't deadlock), held until the guards drop: the quorum
+    /// log's leader holds a batch's DIDs from deciding to appending.
+    pub async fn lock_dids_owned<'a>(
+        &self,
+        dids: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let mut idx: Vec<usize> = dids.into_iter().map(|d| Self::way(d) % STRIPES).collect();
+        idx.sort_unstable();
+        idx.dedup();
+        let mut out = Vec::with_capacity(idx.len());
+        for i in idx {
+            out.push(self.stripes[i].clone().lock_owned().await);
+        }
+        out
     }
 
     /// The current record: pending, then cache, then SlateDB.
@@ -259,6 +276,39 @@ impl ShardState {
                 && !Arc::ptr_eq(&s.rec, &rec)
             {
                 s.dirty = true;
+            }
+        }
+    }
+
+    /// The quorum log's leader: these tickets' entries are applied, by the
+    /// log's applier from the records their meta carried, so their records
+    /// leave pending for the cache without being written here. A DID with
+    /// an unlogged change on top keeps it in memory only. The cache takes
+    /// a record before pending lets it go, under pending's lock: a load
+    /// between the two would find neither and read an older one.
+    pub fn release(&self, tickets: impl IntoIterator<Item = u64>) {
+        let mut p = self.pending.lock();
+        for t in tickets {
+            let Some((did, _)) = p.by_ticket.remove(&t) else { continue };
+            let slot = p.by_did.get_mut(&did).expect("a ticket's DID is pending");
+            slot.outstanding -= 1;
+            if slot.outstanding == 0 {
+                let rec = slot.rec.clone();
+                self.cache[Self::way(&did) % CACHE_WAYS].lock().put(did.clone(), rec);
+                p.by_did.remove(&did);
+            }
+        }
+    }
+
+    /// The quorum log's leader: unlogged changes (failed-check counts,
+    /// desync marks) of DIDs with nothing outstanding go to the cache, not
+    /// the database: only the log's applier writes there.
+    pub fn settle_unlogged_in_memory(&self) {
+        let mut p = self.pending.lock();
+        let ds: Vec<Arc<str>> = p.by_did.iter().filter(|(_, s)| s.outstanding == 0).map(|(d, _)| d.clone()).collect();
+        for d in ds {
+            if let Some(s) = p.by_did.remove(&d) {
+                self.cache[Self::way(&d) % CACHE_WAYS].lock().put(d, s.rec);
             }
         }
     }

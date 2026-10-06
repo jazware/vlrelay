@@ -339,9 +339,37 @@ impl NodeAdmin {
         })
     }
 
+    /// On the quorum log the leader makes the takedown: the record's flag
+    /// and the `#account` announcing it are one entry.
+    async fn quorum_takedown(
+        &self,
+        q: &Arc<super::quorum::Glue>,
+        did: &str,
+        takedown: bool,
+        by: &str,
+        reason: &str,
+    ) -> AdminResult<admin::Account> {
+        self.policy.engine.takedowns.record(did, takedown, by, reason).await?;
+        self.node.serve.takedowns.apply_local(did, takedown);
+        match q.takedown(did, takedown).await {
+            Ok(_) => {}
+            Err(e) if format!("{e}").starts_with("no_account") => {
+                return Err(AdminError::NotFound(format!("no account {did}")));
+            }
+            Err(e) => return Err(AdminError::Internal(e)),
+        }
+        self.account_view(did).await
+    }
+
     /// Writes the takedown flag, then announces the new status on the
     /// firehose with an `#account` the relay makes itself.
     async fn set_takedown(&self, did: &str, takedown: bool, by: &str, reason: &str) -> AdminResult<admin::Account> {
+        if let Some(q) = self.node.quorum.get() {
+            return self.quorum_takedown(q, did, takedown, by, reason).await;
+        }
+        let Some(local) = self.node.local.clone() else {
+            return Err(AdminError::BadRequest("this node has no log of its own to announce a takedown on".into()));
+        };
         if self.node.state.get(did).await.map_err(internal)?.is_none() {
             return Err(AdminError::NotFound(format!("no account {did}")));
         }
@@ -369,7 +397,7 @@ impl NodeAdmin {
         let frame = vlpds::events::account_frame(did, st.is_active(), st.as_str(), &vlpds::events::now_rfc3339());
         let shard = self.node.state.shard_id_of_slot(vlpds::slots::slot_of(did));
         let meta = EventMeta { did: did.to_string(), host: Host(host), upstream_seq: 0, shard: shard.0 };
-        self.node.local.append_own(meta, frame).await.map_err(|e| AdminError::Internal(anyhow::anyhow!("{e}")))?;
+        local.append_own(meta, frame).await.map_err(|e| AdminError::Internal(anyhow::anyhow!("{e}")))?;
         self.account_view(did).await
     }
 }
@@ -977,13 +1005,42 @@ impl AdminSource for NodeAdmin {
         self.settings.clone().ok_or_else(|| AdminError::NotFound("this node doesn't report its config".into()))
     }
 
-    // TODO(qlog wiring): once a relay node runs the quorum log, answer
-    // `quorum` from each member's `/qlog/status` (addrs from `qlog/leader`,
-    // never `?reset=true`) and forward `change_quorum_members` to the
-    // leader's `POST /qlog/members`. Until then the trait's defaults say
-    // the relay doesn't run one, and the public page leaves quorum out.
+    /// Each member's status, asked over the peer protocol (addresses from
+    /// `qlog/leader` and `--qlog-peer`); never resets its histograms.
+    async fn quorum(&self) -> AdminResult<admin::QuorumView> {
+        match self.node.quorum.get() {
+            Some(q) => Ok(q.view().await),
+            None => Err(AdminError::NotFound("this relay doesn't run the quorum log".into())),
+        }
+    }
+
+    /// Sent to the leader with the qlog admin token (`--qlog-admin-token`):
+    /// the dashboard's own token only gets it this far.
+    async fn change_quorum_members(
+        &self,
+        req: admin::QuorumMembersChange,
+        _by: &str,
+    ) -> AdminResult<serde_json::Value> {
+        let Some(q) = self.node.quorum.get() else {
+            return Err(AdminError::NotFound("this relay doesn't run the quorum log".into()));
+        };
+        if req.members.is_empty() {
+            return Err(AdminError::BadRequest("an empty member set".into()));
+        }
+        q.change_members(req).await.map_err(|e| {
+            let m = format!("{e:#}");
+            if m.contains("unauthorized") || m.contains("are off") {
+                AdminError::BadRequest(m)
+            } else {
+                AdminError::Internal(e)
+            }
+        })
+    }
 
     async fn cluster(&self) -> AdminResult<admin::ClusterView> {
+        if let Some(q) = self.node.quorum.get() {
+            return Ok(q.cluster_view().await);
+        }
         match &self.node.cluster {
             Some(g) => {
                 let mut v = g.view(&self.node);

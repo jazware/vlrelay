@@ -452,6 +452,11 @@ impl Manager {
         self.tasks.lock().len()
     }
 
+    /// Whether `host` has a socket task (connected or trying to).
+    pub fn is_running(&self, host: &Host) -> bool {
+        self.tasks.lock().get(host).is_some_and(|r| !r.join.is_finished())
+    }
+
     /// Closes every socket and writes the registry.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         let hosts: Vec<Host> = self.tasks.lock().keys().cloned().collect();
