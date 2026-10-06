@@ -1,6 +1,6 @@
 # vlRelay: quorum replication (design and cost study)
 
-The first pass at vlRelay's economics didn't pan out. Three nodes on OVH with R2 came to ~$3.4k a month, and ~$2.8k of that was bucket requests: segments sealed every 25 ms on every node, plus host bookkeeping in bucket objects every 2-5 s. A non-archival sync 1.1 relay on one node costs about $10-15 a month to run. This page is a design and cost study for a vlRelay that keeps its recent log in replicas instead of the bucket, and writes the bucket rarely and in bulk. Nothing here is built. `scripts/cost_model.py --quorum` generates every table on this page.
+The first pass at vlRelay's economics didn't pan out. Three nodes on OVH with R2 came to ~$3.4k a month, and ~$2.8k of that was bucket requests: segments sealed every 25 ms on every node, plus host bookkeeping in bucket objects every 2-5 s. A non-archival sync 1.1 relay on one node costs about $10-15 a month to run. This page is a design and cost study for a vlRelay that keeps its recent log in replicas instead of the bucket, and writes the bucket rarely and in bulk. The replication core (Phase 1) is built and measured, see [Implementation notes](#implementation-notes). The flush, the commitlog and the relay's wiring aren't built yet. `scripts/cost_model.py --quorum` generates every table above the notes.
 
 The idea is the one in vlpds's TODO ("Quorum in-memory durability"). A leader appends each event, replicates it to two other nodes and emits it once two of the three hold it. The bucket gets a flush every 10-60 s, and the host cursors ride in the same flush as the log they belong to. A relay suits this better than a PDS does, because the PDSes upstream are the source of truth. If the relay loses an unflushed tail, it asks each PDS to replay from its last flushed cursor. Losing a quorum costs a re-ingest and some time, and never a user's data. Jaz's call: the firehose holds every event back until a quorum has it, so consumers only see events that a takeover keeps.
 
@@ -448,6 +448,114 @@ What to prototype, in order:
 4. Bucket recovery with the jump to R + 1, the re-ingest storm at 10x against fakepds, and consumers checked for the jump and for repeated revs only.
 5. Membership change at a flush barrier, and a box replacement under load.
 6. Wire vlpds's `Store::counted` in and run an hour at today's rate to check the request table above against what the code really sends.
+
+## Implementation notes
+
+The build is under way on the `vlrelay-quorum` branch, in `src/qlog/` (the library), `src/bin/qlog.rs` (the node, load and checker tools) and `tests/qlog/` (the chaos harness). These notes record the decisions made while building it and what was measured.
+
+### Serving: vlpds's firehose, one counted log
+
+Consumers are served by vlpds's `Firehose` as it is. The quorum log feeds it as one followed log (`qlog`). Its watermark is the commit index, and it's handed only committed entries as `LogBatch`es, in seq order (`src/qlog/emit.rs`).
+
+- The k-way merge doesn't fight the single-leader model. With one log it degenerates to "emit up to the watermark", which is exactly the hold-until-quorum rule. Every node runs the same merger over its own commit index, so a follower emits up to the commit index it has learned, and a promoted follower keeps the same firehose with no re-sourcing.
+- The watermark source is `Source::Remote` (a plain `AtomicI64`), not `Source::Local`. vlpds's `Watermark` is time-based: when it's idle, `get()` advances to the clock, which is the right thing for `unix_micros << 8` keys and wrong for a counter. The name is historical, and nothing in the merger cares where the atomic is stored.
+- Seqs are already dense, so no `Renumber`, `seqck/` checkpoints or `seq::dense` are involved. The frame carries the leader's seq from the moment it's appended (`wire::splice_seq`), so every node emits identical bytes for a seq.
+- The one vlpds hook is `firehose::Options::start_floor`. `None` keeps vlpds's behaviour (the stream starts at the clock). `Some(f)` starts a counted stream above `f`. In counted mode, a cursor past the head gets the renumbered stream's 2 s grace instead of a clock comparison, and the clock-based emit-delay metric is skipped. It's tested in vlpds (`counted_stream_starts_at_its_floor`), and `Firehose` is otherwise untouched.
+- Why the rule is airtight: the emitter reads only `(emitted, commit]`. It sends the batch before it stores the watermark (the merger reads the watermark, then drains, so it never holds a watermark past events it hasn't been given). The commit index only moves when a quorum's acks cover a current-epoch entry. `Log::truncate_after` and `Log::reset` panic rather than touch anything at or below the commit index.
+- What carries over unchanged: the subscriber registry, kick, labelled per-consumer series, `ConsumerTooSlow`, per-IP caps, the takedown filter hook and the ring. Backfill also carries over, provided Phase 3 writes its 64 MiB segments in vlpds's segment format under `log/qlog/` with the seq as the key. The existing `backfill::Reader`, `retention::retained_floor` and `OutdatedCursor` then work as they are. Until then, a cursor below a node's ring floor gets `OutdatedCursor`, because the firehose has no store.
+- Each node creates its firehose at its first emission, with the floor at where that emission starts. That's 0 at genesis, or the leader's base for a memory-only node that restarted and was reset to it.
+
+The alternative, a thinner serving path of our own, would have needed the subscriber machinery rebuilt for no gain.
+
+### The replication core (Phase 1)
+
+What's built (`src/qlog/`):
+
+- `log.rs`: one node's log in memory. Entries are `(epoch, seq, frame)`, and seqs are dense above a base. It implements Raft's log matching. An entry that differs from the one held at its seq truncates the log from there, while a matching entry is kept, so a stale, shorter append never drops later entries. A prev at or below the commit index always matches. It also does trimming and resets.
+- `node.rs`: the leader assigns seqs at append and replicates to each follower over one connection per follower. There's one request in flight, batched up to 4 MiB, and a heartbeat every 100 ms when idle. The leader commits at a quorum (itself counted only once its own `Durability::persist` returns) and answers the submitter at commit. Followers learn the commit index on the next append, and the leader sends one at once when the commit index moves.
+- Takeover: CAS `qlog/leader` to epoch + 1, then the promise round, then adopting the longest tail. The details are the next list.
+- `Durability` is the Phase 2 seam. A follower acks after it, and the leader counts itself after it. `MemoryOnly` returns at once.
+
+Choices the design left open, and what was picked:
+
+- **Re-tagging the adopted tail.** The new leader re-tags every entry above its commit index with its own epoch before it leads. That's Raft's rule that only a current-term entry commits by count, done without a no-op entry (a no-op would burn a seq that consumers would see as a hole). Seqs and bytes are unchanged, and followers holding the old tag replace it through the matching rule.
+- **The longest tail is fetched from its holder.** Promise replies carry only `(last_epoch, last_seq)`, and the new leader pulls what it lacks with `Fetch` (4 MiB a request). The holder has promised the epoch, so its log can't change under the fetch.
+- **Restarted memory-only nodes are "not intact".** A node that starts while `qlog/leader` exists may have acked entries it no longer holds. It still promises, but it doesn't count toward a takeover's quorum until its log has matched the leader's last seq as of the first append it hears after starting. Without this rule, a quorum of one real log and one emptied one could elect a leader that lacks an emitted entry. With it, losing the leader while the only other intact node is down stops emission. That's the design's "lost quorum", which is bucket recovery in Phase 4, and the commitlog makes it rare in Phase 2.
+- **A minority never takes over.** Before its CAS, a candidate needs pongs from enough peers to make a quorum. Without that, a cut-off node would CAS a higher epoch and unseat the majority's leader when the partition healed. The pings, like the promise round, wait only until they have a quorum, not for a member that's down or blackholed.
+- **Detection.** The leader dials its followers, so a follower sees its inbound replication connection close the moment the leader's process dies, and probes the leader's port at once. A refused or reset connection starts the takeover. Otherwise a silence of 300 ms triggers one probe, and 1 s of silence triggers the takeover. The lowest-ranked follower tries first, and the others wait 500 ms per rank.
+- **Liveness.** It comes from peer heartbeats only: no node leases and no bucket polling. The bucket sees one GET and one CAS per takeover.
+- **Memory bounds.** Each node keeps 512 MiB of committed, emitted log (`--retain-mb`) on top of the firehose's 512 MiB ring. A follower that falls further behind than that is reset to the leader's base, and its stream jumps (counted as `emit_gaps`; a node that restarted empty just starts its stream at the base).
+
+### Tests and chaos (Phase 1)
+
+In-tree (`cargo test --lib qlog`): log matching, truncation and trimming, a randomized follower-versus-leader model (200 seeds of appends, stale and reordered deliveries, takeovers with truncation), the wire format, and the checker itself. Six integration tests run three nodes on real TCP, each node on its own runtime, so a crash takes its memory and sockets at once:
+
+- commit and emit on every node;
+- an isolated leader acks and emits nothing, and its lone entry is never committed;
+- five leader kills under load, each victim restarted empty;
+- a restarted node can't make a quorum before it catches up;
+- six partitions;
+- seeded random kills, restarts, partitions and heals (`QLOG_SEED`). Seeds 1-20 all pass with 0 violations: 2.34M seqs across 54 kills and 55 isolations, with every acked seq emitted.
+
+Two mutations confirm the tests bite. With the tail adoption skipped, the random chaos test reports 72,648 violations ("seq 60081 emitted with two contents"). With commit at one ack instead of two, three tests fail.
+
+The harness (`tests/qlog/chaos.sh`, `just qlog-chaos`) runs three `qlog node` processes on a local MinIO (`qlog/leader` only), each restarted by a supervisor 1 s after it exits. Load comes from `qlog load`, frames are ~5.3 KB (the network's mean), and `qlog check` consumes every node's `subscribeRepos` from cursor 0. Partitions blackhole every peer route through `tests/chaos/proxy.py`, one route per direction. The checker asserts:
+
+- no seq is emitted with two contents across all nodes and incarnations (emitted, lost and reissued);
+- every consumer's stream is strictly increasing and dense (no repeat, no step back, no hole);
+- every acked seq is emitted with the content it was acked with;
+- every consumer ends at the same commit index.
+
+Results on benchbox (Ryzen 395, loopback), with the final build:
+
+| run | faults | distinct seqs | violations |
+|---|---|---|---|
+| baseline, 350/s, 60 s | none | 21,001 | 0 |
+| baseline, 3,500/s, 60 s | none | 210,017 | 0 |
+| baseline, 35,000/s, 30 s | none | 1,050,175 | 0 |
+| kill-leader, 350/s | 7 x kill -9 | 35,001 | 0 |
+| kill-leader, 3,500/s | 7 x kill -9 | 350,017 | 0 |
+| kill-follower, 3,500/s | 7 x kill -9 | 350,017 | 0 |
+| partition-leader, 350/s | 5 x isolated 5 s | 35,001 | 0 |
+| partition-follower, 3,500/s | 5 x isolated 5 s | 350,017 | 0 |
+| pause-leader, 350/s | 4 x SIGSTOP 3 s | 28,001 | 0 |
+| mixed, 3,500/s, 180 s | 4 kill -9, 6 partitions, 3 SIGSTOP | 630,017 | 0 |
+
+That's 3,059,264 seqs across 25 kill -9s, 16 partitions and 7 SIGSTOPs, seen 9.18M times by the three consumers. Every acked seq was emitted, and nothing was lost, duplicated or reissued.
+
+What was measured:
+
+| | 350/s (today) | 3,500/s (10x) | 35,000/s (100x) |
+|---|---|---|---|
+| leader append to quorum commit | p50 0.04 ms, p99 0.10 | p50 0.07, p99 0.17 | p50 0.21, p99 0.56 |
+| submit to ack, at the host owner | p50 0.10 ms, p99 0.22 | p50 0.17, p99 0.38 | p50 0.56, p99 1.31 |
+| submit to the first consumer's receipt | p50 1.23 ms, p99 2.29 | p50 1.33, p99 2.45 | p50 1.98, p99 3.48 |
+| CPU, leader / follower (cores) | 0.034 / 0.019 | 0.054 / 0.030 | 0.20 / 0.095 |
+| RSS a node | 254 MB | 1.2 GB | 1.3 GB |
+
+| fault | emission pause (fault to the next new seq at any consumer) |
+|---|---|
+| kill -9 the leader | 15-40 ms at 350/s (n=7), 43-81 ms at 3,500/s (n=7) |
+| kill -9 a follower | none over 15 ms |
+| partition the leader | 984-1,015 ms (n=5) |
+| partition a follower | none over 15 ms |
+| SIGSTOP the leader | 990-1,016 ms (n=4) |
+
+What the numbers say against the study's assumptions:
+
+- **The emit path is dominated by the firehose's 2 ms merger tick**, not by replication. The quorum ack on loopback is 0.1-0.2 ms. Consumers see an event 1.2-2.5 ms after it's submitted, which is ~1 ms on average and 2 ms at most from the tick. Real placements add the RTT (0.2 ms in one DC, 3 ms in a metro), as §3's table assumed. A waker on commit would cut the tick if it ever matters.
+- **Takeover is faster than assumed when the process dies.** The study assumed 0.5-1.5 s for a dead leader process. Measured, it's 15-80 ms: the follower's replication connection closes, the refused probe confirms it, and the pre-vote ping, the CAS on a local MinIO, the promise round and the first commit follow. On R2 the CAS alone is ~200 ms, so expect ~0.25-0.3 s there. A hung or partitioned leader takes the 1 s heartbeat timeout, as assumed. That's within the study's 1.5-2.5 s, and the host owner's resend needed its timeout cut to 1 s to meet it.
+- **The replication CPU is tiny.** At 100x the leader spends 0.2 cores and each follower 0.1 on replication, emission and one consumer each, ~6 µs an event on the leader. That's a small part of the ~10 vCPUs the study sizes the leader at for 100x, which are verify and apply. The sizing stands, and replication isn't what decides the host.
+- **RAM in memory-only mode is ~2x the log window.** The node keeps its retained log (512 MiB here) and the firehose ring (512 MiB) as separate copies of the same frames, so a node sits at ~1.2-1.6 GB at 10x and above (2.1 GB at its peak during the mixed run). The study's 2 GB baseline plus a ring should count the ring twice in memory-only mode, or the log should share the ring's bytes. With the commitlog (Phase 2), the retained log can shrink to what replication needs.
+- **Memory-only can't survive two losses, by design.** A takeover needs two intact logs. A restarted node that hasn't caught up doesn't count, so losing the leader while the other node is still catching up stops emission rather than risk losing an emitted seq. That's the design's lost-quorum case. The commitlog (Phase 2) turns a restarted node into an intact one at once.
+
+Known gaps, for later phases:
+
+- The relay itself doesn't use the quorum log yet. The forward path, verify and state still run on the old node log. Wiring `cluster/forward.rs` to `Client::submit` (with its resend) and the DID state apply to committed entries is the integration step.
+- A follower more than `--retain-mb` behind is reset to the leader's base, and its stream jumps. Phase 3's bucket segments let it catch up instead.
+- The pre-vote and the probe treat any I/O error from the leader as "dead". A flaky link can cost an unneeded takeover (availability, not safety).
+- Nothing is flushed, and a lost quorum is unrecoverable until Phase 4. Until then it stops emission rather than reissuing seqs.
+- Membership is fixed (`--peer`).
 
 ## Inputs
 
