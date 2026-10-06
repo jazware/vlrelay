@@ -21,7 +21,7 @@ SECTIONS = [
         "and the leader gives it to a member.",
         ["host", "crawl", "host-tier", "plc-url", "dev-mode", "did-lookups-per-sec"],
     ),
-    ("Pipeline and serving", "", ["lanes", "ingest-threads", "ring-mb", "max-lag-mb", "log-compression"]),
+    ("Pipeline and serving", "", ["lanes", "ingest-threads", "host-inflight-events", "host-inflight-mb", "inflight-events", "inflight-mb", "ring-mb", "max-lag-mb", "log-compression"]),
     (
         "Quorum log",
         "Every member uses the same bucket and `--prefix`. A node with no `--qlog-peer` is a single node with "

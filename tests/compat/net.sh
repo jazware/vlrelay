@@ -47,21 +47,21 @@ up)
   ;;
 vlrelay)
   start vlrelay "$tdir/vlrelay" --listen "127.0.0.1:$VLRELAY_PORT" --memory \
-    --plc-url "http://127.0.0.1:$PLC_PORT" --linger-ms 25 --admin-token "$VLRELAY_ADMIN_TOKEN" $(hosts | sed 's/^/--host /') ${VLRELAY_ARGS:-}
+    --plc-url "http://127.0.0.1:$PLC_PORT" --qlog-listen 127.0.0.1:0 --admin-token "$VLRELAY_ADMIN_TOKEN" $(hosts | sed 's/^/--host /') ${VLRELAY_ARGS:-}
   wait_http "http://127.0.0.1:$VLRELAY_PORT/xrpc/_health" 30
   ;;
 vlrelay-short)
   # a vlRelay with a 10 s window and a 1 MiB lag allowance, so OutdatedCursor
   # and ConsumerTooSlow can be reached
   start vlrelay-short "$tdir/vlrelay" --listen "127.0.0.1:$((VLRELAY_PORT - 2))" --memory \
-    --plc-url "http://127.0.0.1:$PLC_PORT" --linger-ms 25 --retention-secs 10 --max-lag-mb 1 \
+    --plc-url "http://127.0.0.1:$PLC_PORT" --qlog-listen 127.0.0.1:0 --qlog-flush-ms 1000 --qlog-retain-secs 10 --qlog-retain-every-secs 2 --qlog-memory-mb 1 --max-lag-mb 1 \
     $(hosts | sed 's/^/--host /')
   wait_http "http://127.0.0.1:$((VLRELAY_PORT - 2))/xrpc/_health" 30
   ;;
 vlrelay-chain)
   # a second vlRelay whose only upstream is indigo's relay
   start vlrelay-chain "$tdir/vlrelay" --listen "127.0.0.1:$((VLRELAY_PORT - 1))" --memory \
-    --plc-url "http://127.0.0.1:$PLC_PORT" --linger-ms 25 --host "http://localhost:$INDIGO_PORT"
+    --plc-url "http://127.0.0.1:$PLC_PORT" --qlog-listen 127.0.0.1:0 --host "http://localhost:$INDIGO_PORT"
   wait_http "http://127.0.0.1:$((VLRELAY_PORT - 1))/xrpc/_health" 30
   ;;
 indigo)

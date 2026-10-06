@@ -1,4 +1,4 @@
-//! vlRelay: one node of a relay on the quorum log (docs/quorum-cluster.md;
+//! vlRelay: one node of a relay on the quorum log (docs/cluster.md;
 //! with no peers, a single node).
 
 use axum::http::{HeaderValue, header};
@@ -100,11 +100,13 @@ struct Args {
     /// (or its MB cap) the host's socket isn't read.
     #[arg(long, default_value_t = 8192)]
     host_inflight_events: usize,
+    /// The same cap in bytes.
     #[arg(long, default_value_t = 64)]
     host_inflight_mb: usize,
     /// The same over every host together.
     #[arg(long, default_value_t = 32768)]
     inflight_events: usize,
+    /// The same cap over every host, in bytes.
     #[arg(long, default_value_t = 384)]
     inflight_mb: usize,
     /// DID document fetches per second, all DIDs together.
@@ -151,15 +153,19 @@ struct QuorumArgs {
     /// Dev: retention in seconds instead.
     #[arg(long)]
     qlog_retain_secs: Option<u64>,
+    /// How often the leader runs a retention pass.
     #[arg(long, default_value_t = 600)]
     qlog_retain_every_secs: u64,
     /// A member silent this long loses its hosts to the others.
     #[arg(long, default_value_t = 2_000)]
     qlog_host_failover_ms: u64,
+    /// How often a member reads the host table and the hosts' cursors from the leader.
     #[arg(long, default_value_t = 500)]
     qlog_host_poll_ms: u64,
+    /// Silence from the leader that starts an election.
     #[arg(long, default_value_t = 1_000)]
     qlog_election_ms: u64,
+    /// How often the leader heartbeats its followers.
     #[arg(long, default_value_t = 100)]
     qlog_heartbeat_ms: u64,
     /// The state's SlateDB compactor and worker poll.
@@ -169,8 +175,10 @@ struct QuorumArgs {
     /// bucket.
     #[arg(long)]
     qlog_no_auto_recover: bool,
+    /// Commitlog file size on the local disk.
     #[arg(long, default_value_t = 64)]
     qlog_segment_mb: u64,
+    /// Flushed commitlog kept on the local disk, for followers catching up.
     #[arg(long, default_value_t = 4096)]
     qlog_disk_retain_mb: u64,
     /// Committed log kept in memory (default 64 with --qlog-dir, else 512).
@@ -179,6 +187,7 @@ struct QuorumArgs {
     /// Chaos: kill -9 at this flush step (or `any`), with --qlog-crash-prob.
     #[arg(long)]
     qlog_crash_at: Option<String>,
+    /// Chaos: the chance of the crash at each step.
     #[arg(long, default_value_t = 0.05)]
     qlog_crash_prob: f64,
     /// Chaos: no crash injected once this file exists.

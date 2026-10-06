@@ -177,7 +177,7 @@ function Seqs({ v }: { v: SeqView }) {
       <h2 className="ops-sub">Stream seq checkpoints</h2>
       {!v.agree && (
         <Notice kind="err">
-          Nodes counted the stream differently at a checkpoint (see the red rows). Consumers failing over between them would resume at the wrong event. docs/seq.md explains the numbering.
+          Nodes counted the stream differently at a checkpoint (see the red rows). Consumers failing over between them would resume at the wrong event.
         </Notice>
       )}
       <div className="tiles">

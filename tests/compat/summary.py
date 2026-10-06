@@ -83,7 +83,7 @@ for side in ("vl", "in"):
         print(f"   {n} cursor {d.get('cursor')}: frames={d.get('frames')} infos={d.get('infos')} errorFrames={d.get('errorFrames')} ended={d.get('ended')}")
 
 d = load("old-short.json")
-print(f"-- vlRelay --retention-secs 10, cursor 1: infos={d.get('infos')} firstSeq={d.get('firstSeq')} frames={d.get('frames')} ended={d.get('ended')}")
+print(f"-- vlRelay --qlog-retain-secs 10, cursor 1: infos={d.get('infos')} firstSeq={d.get('firstSeq')} frames={d.get('frames')} ended={d.get('ended')}")
 print(f"-- vlRelay --max-lag-mb 1, a consumer that stops reading: {json.dumps(load('slow.json'))}")
 
 print("\n== account states (deactivate at the PDS, takedown on each relay, then undo)")

@@ -66,7 +66,7 @@ const SECTIONS: { id: string; title: string; desc: string; knobs: Knob[] }[] = [
   {
     id: 'archive',
     title: 'Archival',
-    desc: 'Which accounts the relay mirrors (docs/archival.md).',
+    desc: 'Which accounts an archival relay mirrors. This relay has no archival mode, so nothing reads these.',
     knobs: [
       { path: ['archive', 'mode'], label: 'Mode', why: 'off, all, tiers (hosts in the listed tiers) or hosts (listed hosts).', kind: { t: 'enum', options: ['off', 'all', 'tiers', 'hosts'] } },
       { path: ['archive', 'takedownRetentionHours'], label: 'Takedown retention', why: 'A taken-down account’s mirror stops serving at once and is deleted this long after.', kind: { t: 'num', int: true, unit: 'h' } },

@@ -2,7 +2,7 @@
 # The quorum log's chaos harness (docs/quorum.md, "Implementation notes"):
 # three `qlog node` processes on a local MinIO, each restarted by a
 # supervisor when it exits, peers dialing each other through a fault proxy
-# (tests/chaos/proxy.py, one route per direction so a partition is exact),
+# (tests/qlog/proxy.py, one route per direction so a partition is exact),
 # a load generator at --rate, and `qlog check` consuming every node's
 # subscribeRepos with the emission checker.
 #
@@ -133,7 +133,7 @@ if [ "$proxy" = 1 ]; then
     [ "$i" = "$j" ] || routes+=(--route "r$i-$j:$(route "$i" "$j"):$(peer "$j")")
   done; done
   ulimit -n 65536 2>/dev/null || true
-  python3 "$crate/tests/chaos/proxy.py" --control "$ctl" "${routes[@]}" >"$out/proxy.log" 2>&1 &
+  python3 "$crate/tests/qlog/proxy.py" --control "$ctl" "${routes[@]}" >"$out/proxy.log" 2>&1 &
   pids+=($!)
 fi
 

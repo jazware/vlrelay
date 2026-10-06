@@ -303,7 +303,30 @@ impl NodeAdmin {
             }
             Err(e) => return Err(AdminError::Internal(e)),
         }
-        self.account_view(did).await
+        match self.account_view(did).await {
+            // a follower made it through the leader's log but doesn't hold
+            // the record: answer with what it knows
+            Err(AdminError::BadRequest(_)) => Ok(admin::Account {
+                did: did.to_string(),
+                handle: None,
+                host: String::new(),
+                status: if takedown { "takendown".into() } else { String::new() },
+                upstream_status: String::new(),
+                takedown: takedown.then(|| admin::Takedown {
+                    at_ms: chrono::Utc::now().timestamp_millis(),
+                    by: by.to_string(),
+                    reason: reason.to_string(),
+                }),
+                rev: String::new(),
+                last_seq: 0,
+                last_event_ms: 0,
+                events_last_hour: 0,
+                rejects_last_hour: 0,
+                did_shard: 0,
+                node: self.node.quorum.qnode.status().leader.unwrap_or_default(),
+            }),
+            r => r,
+        }
     }
 }
 

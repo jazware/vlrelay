@@ -346,8 +346,8 @@ pub struct PolicyBody {
     pub archive: Archive,
 }
 
-/// Which accounts the relay mirrors (docs/archival.md). Off by default
-/// (PLAN.md decision 6).
+/// Which accounts an archival relay mirrors. Off by default (PLAN.md
+/// decision 6). The relay has no archival mode, so nothing reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ArchiveMode {

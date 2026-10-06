@@ -3,7 +3,7 @@
 # fakepds fleet (signed sync 1.1 commits, its own PLC) -> three
 # `vlrelay` nodes on a local MinIO, each restarted by a supervisor
 # when it exits, peers dialing each other through the fault proxy
-# (tests/chaos/proxy.py, one route per direction) -> consumers.
+# (tests/qlog/proxy.py, one route per direction) -> consumers.
 #
 #   tests/qlog/relay-chaos.sh SCENARIO [--rate 350] [--duration 90] [--every 15] [--hosts 16] [--dids 200]
 #   tests/qlog/relay-chaos.sh list
@@ -117,7 +117,7 @@ if [ "$proxy" = 1 ]; then
     [ "$i" = "$j" ] || routes+=(--route "r$i-$j:$(route "$i" "$j"):$(peer "$j")")
   done; done
   ulimit -n 65536 2>/dev/null || true
-  python3 "$crate/tests/chaos/proxy.py" --control "$ctl" "${routes[@]}" >"$out/proxy.log" 2>&1 &
+  python3 "$crate/tests/qlog/proxy.py" --control "$ctl" "${routes[@]}" >"$out/proxy.log" 2>&1 &
   pids+=($!)
 fi
 
