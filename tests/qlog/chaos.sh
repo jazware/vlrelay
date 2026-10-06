@@ -97,7 +97,8 @@ while [ $# -gt 0 ]; do
 done
 
 B=${QLOG_BASE:-3150}
-case $scenario in single-*) NODES=1 PROXY=0 ;; esac
+# a single node only runs fsync (it has no other copy of its log)
+case $scenario in single-*) NODES=1 PROXY=0 DURABILITY= ;; esac
 N=${NODES:-3}
 case $scenario in replace-* | grow-shrink | switch-*) SLOTS=${SLOTS:-9} ;; esac
 S=${SLOTS:-$N}
