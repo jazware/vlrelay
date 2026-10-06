@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 pub use diff::diff_json;
-pub use ui::{UiFiles, ui_routes};
+pub use ui::{UiFiles, docs_routes, ui_routes};
 
 // ---------------------------------------------------------------- shared enums
 

@@ -1,5 +1,6 @@
 //! Serves the built dashboard (`ui/dist`): `/admin` and everything under it
-//! that isn't `/admin/api` gets index.html, `/assets/*` and `/fonts/*` are files.
+//! that isn't `/admin/api`, and `/docs/*`, get index.html; `/assets/*` and
+//! `/fonts/*` are files.
 
 use axum::{
     Router,
@@ -75,6 +76,17 @@ pub fn ui_routes(ui: Arc<UiFiles>) -> Router {
         .route("/admin", get(shell))
         .route("/admin/", get(shell))
         .route("/admin/{*rest}", get(shell))
+        .with_state(ui.clone())
+        .merge(docs_routes(ui))
+}
+
+/// The docs site and the files it loads. Public, so a node serves it even
+/// without `--admin-token`: the shell is static, and only `/admin/api` holds data.
+pub fn docs_routes(ui: Arc<UiFiles>) -> Router {
+    Router::new()
+        .route("/docs", get(shell))
+        .route("/docs/", get(shell))
+        .route("/docs/{*rest}", get(shell))
         .route("/assets/{*path}", get(asset))
         .route("/fonts/{*path}", get(asset))
         .route("/favicon.svg", get(asset))

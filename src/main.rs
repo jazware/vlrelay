@@ -49,7 +49,7 @@ struct Args {
     prefix: String,
     #[arg(long, default_value = "https://plc.directory", env = "VLRELAY_PLC_URL")]
     plc_url: String,
-    /// Segment linger (PLAN.md decision 1).
+    /// Segment linger: a segment seals this long after its first event (docs/design.md, "Decisions").
     #[arg(long, default_value_t = 25)]
     linger_ms: u64,
     /// Segment PUTs in flight at once.
@@ -61,7 +61,7 @@ struct Args {
     /// zstd level for log segments: 0 stores them uncompressed, negative
     /// levels are zstd's fast ones. Firehose frames are mostly hashes:
     /// on production frames -1 compresses 1.8x faster than 1 for 0.6% more
-    /// bytes (docs/perf.md, iteration 5).
+    /// bytes (docs/perf.md, "Compression").
     #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
     log_compression: i32,
     /// An upstream to subscribe to (repeatable). `http://` means plain
@@ -316,10 +316,12 @@ async fn run(a: Args) -> anyhow::Result<()> {
         let _ = g.admin.set(Arc::downgrade(src));
     }
     // admin_src stays bound for the life of `run`: the peer slot holds it weakly
+    let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
     if let (Some(token), Some(src)) = (token, admin_src.clone()) {
-        let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
         app = app.merge(vlrelay::admin::app(src, token.clone(), ui));
         app = app.merge(vlrelay::archive::admin::router(node.state.clone(), token));
+    } else {
+        app = app.merge(vlrelay::admin::docs_routes(ui));
     }
     let app = with_real_ip(app.layer(middleware::map_response(server_header)), &a.trusted_proxies);
 

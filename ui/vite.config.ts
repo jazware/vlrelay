@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { vlrelayDocs } from './docs-build/plugin.mjs'
 
 // Node's environment, without pulling in @types/node for one variable.
 declare const process: { env: Record<string, string | undefined> }
@@ -8,7 +9,7 @@ declare const process: { env: Record<string, string | undefined> }
 const target = process.env.VLRELAY_URL ?? 'http://127.0.0.1:2790'
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), vlrelayDocs()],
   base: '/',
   build: {
     outDir: 'dist',
