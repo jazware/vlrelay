@@ -131,7 +131,14 @@ pub struct CrawlAdmission {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
     pub reason: String,
+    /// Where it came from: `requestCrawl`, `bootstrap:<relay>` or `plc`.
+    #[serde(default)]
+    pub source: String,
 }
+
+/// Told the source of every host about to be admitted, before it's
+/// recorded (the host table keeps it).
+pub type Provenance = Arc<dyn Fn(&Host, &str) + Send + Sync>;
 
 impl CrawlError {
     fn outcome(&self) -> &'static str {
@@ -155,6 +162,7 @@ pub struct Crawler {
     per_ip: Mutex<HashMap<IpAddr, (Instant, u32)>>,
     probing: Mutex<HashSet<Host>>,
     log: Mutex<VecDeque<CrawlAdmission>>,
+    provenance: parking_lot::RwLock<Option<Provenance>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,6 +220,7 @@ impl Crawler {
             per_ip: Mutex::new(HashMap::new()),
             probing: Mutex::new(HashSet::new()),
             log: Mutex::new(VecDeque::new()),
+            provenance: parking_lot::RwLock::new(None),
         })
     }
 
@@ -237,7 +246,28 @@ impl Crawler {
         self.log.lock().iter().rev().cloned().collect()
     }
 
+    /// Whether `hostname` is one of this relay's hosts already.
+    pub fn knows(&self, hostname: &str) -> bool {
+        normalize_hostname(hostname, self.manager.config().dev_mode)
+            .is_ok_and(|h| self.manager.registry().get(&h).is_some())
+    }
+
+    pub fn set_provenance(&self, p: Provenance) {
+        *self.provenance.write() = Some(p);
+    }
+
+    fn provenance(&self, host: &Host, source: &str) {
+        let p = self.provenance.read().clone();
+        if let Some(p) = p {
+            p(host, source);
+        }
+    }
+
     fn note(&self, host: &str, outcome: &str, tier: Option<Tier>, reason: String) {
+        self.note_from(host, outcome, tier, reason, "requestCrawl")
+    }
+
+    fn note_from(&self, host: &str, outcome: &str, tier: Option<Tier>, reason: String, source: &str) {
         let mut l = self.log.lock();
         if l.len() >= LOG_MAX {
             l.pop_front();
@@ -248,17 +278,26 @@ impl Crawler {
             outcome: outcome.to_string(),
             tier: tier.and_then(|t| serde_json::to_value(t).ok()?.as_str().map(str::to_string)),
             reason,
+            source: source.to_string(),
         });
     }
 
     /// Validates, checks policy and budget, probes, admits. Returns whether
     /// the host was new.
     pub async fn request_crawl(&self, hostname: &str) -> Result<bool, CrawlError> {
-        let r = self.request_crawl_inner(hostname).await;
+        self.admit_from(hostname, "requestCrawl").await
+    }
+
+    /// As [`Self::request_crawl`], for a host found by `source`
+    /// (`bootstrap:<relay>`, `plc`): the same checks and probe, but not the
+    /// daily new-host budget (discovery paces itself with its own).
+    pub async fn admit_from(&self, hostname: &str, source: &str) -> Result<bool, CrawlError> {
+        let spend = source == "requestCrawl";
+        let r = self.request_crawl_inner(hostname, source, spend).await;
         let host = normalize_hostname(hostname, self.manager.config().dev_mode).map_or(hostname.to_string(), |h| h.0);
         match &r {
-            Ok((true, tier)) => self.note(&host, "admitted", *tier, "new host".into()),
-            Ok((false, tier)) => self.note(&host, "admitted", *tier, "known host, woken".into()),
+            Ok((true, tier)) => self.note_from(&host, "admitted", *tier, "new host".into(), source),
+            Ok((false, tier)) => self.note_from(&host, "admitted", *tier, "known host, woken".into(), source),
             Err(e) => {
                 let msg = match e {
                     CrawlError::HostBanned => "host is banned".to_string(),
@@ -269,18 +308,23 @@ impl Crawler {
                     CrawlError::Unreachable(m) => format!("host check failed: {m}"),
                     CrawlError::Internal(m) | CrawlError::Refused(m) => m.clone(),
                 };
-                self.note(&host, e.outcome(), None, msg);
+                self.note_from(&host, e.outcome(), None, msg, source);
             }
         }
         r.map(|(new, _)| new)
     }
 
-    async fn request_crawl_inner(&self, hostname: &str) -> Result<(bool, Option<Tier>), CrawlError> {
+    async fn request_crawl_inner(
+        &self,
+        hostname: &str,
+        source: &str,
+        spend: bool,
+    ) -> Result<(bool, Option<Tier>), CrawlError> {
         let dev = self.manager.config().dev_mode;
         let host = normalize_hostname(hostname, dev).map_err(CrawlError::InvalidHost)?;
         let admission = self.admission.read().clone();
         if let Some(a) = admission {
-            return self.request_crawl_with(&host, a.as_ref()).await;
+            return self.request_crawl_with(&host, a.as_ref(), source, spend).await;
         }
         let policy = self.policy();
         let verdict = policy.verdict(&host);
@@ -306,7 +350,7 @@ impl Crawler {
         }
         let _probing = Unmark(&self.probing, host.clone());
         self.recently_failed(&host)?;
-        let reserved = verdict != Verdict::Allowed;
+        let reserved = spend && verdict != Verdict::Allowed;
         let slot = if reserved { Some(self.reserve(policy.new_hosts_per_hour)?) } else { None };
         let probe = self.probe_noting(&host, Duration::from_secs(policy.probe_timeout_secs.max(1))).await;
         if let Err(e) = probe {
@@ -315,11 +359,18 @@ impl Crawler {
             }
             return Err(e);
         }
+        self.provenance(&host, source);
         let new = self.manager.admit(&host, Tier::New).await.map_err(|e| CrawlError::Internal(format!("{e:#}")))?;
         Ok((new, Some(Tier::New)))
     }
 
-    async fn request_crawl_with(&self, host: &Host, a: &dyn Admission) -> Result<(bool, Option<Tier>), CrawlError> {
+    async fn request_crawl_with(
+        &self,
+        host: &Host,
+        a: &dyn Admission,
+        source: &str,
+        spend: bool,
+    ) -> Result<(bool, Option<Tier>), CrawlError> {
         let probe_timeout = Duration::from_secs(self.policy().probe_timeout_secs.max(1));
         if let Some(e) = self.manager.registry().get(host) {
             // a known host is still checked: a ban added since must hold
@@ -335,7 +386,8 @@ impl Crawler {
         a.admit(host, false).await?;
         self.probe_noting(host, probe_timeout).await?;
         // spends the budget, and sees a ban added during the probe
-        let tier = a.admit(host, true).await?;
+        let tier = a.admit(host, spend).await?;
+        self.provenance(host, source);
         let new = self.manager.admit(host, tier).await.map_err(|e| CrawlError::Internal(format!("{e:#}")))?;
         Ok((new, Some(tier)))
     }
@@ -525,6 +577,7 @@ mod tests {
             ]
         );
         assert_eq!(log[0].reason, "known host, woken");
+        assert!(log.iter().all(|a| a.source == "requestCrawl"));
     }
 
     /// Records each admission call, admitting at tier new.

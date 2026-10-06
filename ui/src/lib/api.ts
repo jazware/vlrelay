@@ -46,11 +46,21 @@ export type HostRow = {
   maxAccounts: number
   /** Accounts it created that the relay throttled past its cap (the leader's count). */
   throttledAccounts: number
+  /** How the relay found it: requestCrawl, bootstrap:<relay>, plc or cli. */
+  source: string | null
   /** Events/s, 1 s apart, oldest first: only on the overview's top hosts. */
   history?: number[]
 }
 
-export type CrawlAdmission = { atMs: number; host: string; outcome: 'admitted' | 'refused' | 'banned' | 'rate-limited'; tier?: string; reason: string }
+export type CrawlAdmission = {
+  atMs: number
+  host: string
+  outcome: 'admitted' | 'refused' | 'banned' | 'rate-limited'
+  tier?: string
+  reason: string
+  /** requestCrawl, bootstrap:<relay> or plc */
+  source: string
+}
 export type AdmissionLog = { newHostsToday: number; newHostsPerDay: number; entries: CrawlAdmission[] }
 export type TailFrame = {
   atMs: number
@@ -613,3 +623,35 @@ export type QuorumEvent = { node: string; atMs: number; kind: 'lead' | 'step_dow
 export type QuorumHistory = { events: QuorumEvent[]; stale: string[] }
 /** One of the leader's flushes, in `status.flush.recent` (snake_case, as the status serializes). */
 export type FlushRecord = { at_ms: number; epoch: number; flushed: number; entries: number; segments: number; bytes: number; raw_bytes: number; took_us: number; seal_us: number }
+
+/** One discovery source: a seed relay's listHosts (`bootstrap:<host>`) or the PLC export (`plc`). */
+export type DiscoverySource = {
+  key: string
+  url: string | null
+  enabled: boolean
+  refreshIntervalSecs: number | null
+  /** now while a run is in progress */
+  nextRunMs: number | null
+  /** plc: hosts waiting for admission */
+  pending: number
+  runs: number
+  lastStartedMs: number | null
+  lastFinishedMs: number | null
+  cursor: string | null
+  inProgress: boolean
+  runRequested: boolean
+  /** this run's (or the last one's) counts */
+  hostsSeen: number
+  known: number
+  new: number
+  admitted: number
+  refused: number
+  errors: number
+  throttled: number
+  pages: number
+  /** times a new leader took over this run from its cursor */
+  resumed: number
+  lastError: string | null
+}
+export type DiscoveryView = { leader: string | null; leading: boolean; connectsPerMin: number; requestsPerSec: number; sources: DiscoverySource[] }
+

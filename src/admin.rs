@@ -201,6 +201,10 @@ pub struct HostRow {
     /// operator has released, as the leader counts them.
     #[serde(default)]
     pub throttled_accounts: u64,
+    /// How the relay found it: `requestCrawl`, `bootstrap:<relay>`, `plc`
+    /// or `cli` (None: before sources were recorded).
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -760,6 +764,41 @@ pub struct PipelineHost {
     pub events_per_sec: f64,
 }
 
+/// Host discovery as the leader runs it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryView {
+    /// The member running it (the leader).
+    pub leader: Option<String>,
+    /// The answering node is the one running it.
+    pub leading: bool,
+    pub connects_per_min: f64,
+    pub requests_per_sec: f64,
+    pub sources: Vec<DiscoverySource>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverySource {
+    /// `bootstrap:<relay host>` or `plc`.
+    pub key: String,
+    pub url: Option<String>,
+    pub enabled: bool,
+    pub refresh_interval_secs: Option<u64>,
+    /// When its next run starts (now while one is in progress).
+    pub next_run_ms: Option<i64>,
+    /// `plc`: hosts waiting for admission.
+    pub pending: u64,
+    #[serde(flatten)]
+    pub state: crate::discovery::SourceState,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct DiscoveryRun {
+    /// A source's key; None runs every enabled one.
+    pub source: Option<String>,
+}
+
 /// requestCrawl outcomes this node saw, and the cluster's new-host budget.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1075,6 +1114,12 @@ pub trait AdminSource: Send + Sync + 'static {
     fn flush_now(&self, _by: &str) -> impl Future<Output = AdminResult<serde_json::Value>> + Send {
         async { Err(AdminError::NotFound("this relay doesn't run the quorum log".into())) }
     }
+    fn discovery(&self) -> impl Future<Output = AdminResult<DiscoveryView>> + Send {
+        async { Err(AdminError::NotFound("this relay doesn't run host discovery".into())) }
+    }
+    fn discovery_run(&self, _req: DiscoveryRun, _by: &str) -> impl Future<Output = AdminResult<DiscoveryView>> + Send {
+        async { Err(AdminError::NotFound("this relay doesn't run host discovery".into())) }
+    }
     fn store(&self) -> impl Future<Output = AdminResult<StoreView>> + Send {
         async { Err(AdminError::NotFound("this relay keeps no object-store numbers".into())) }
     }
@@ -1147,6 +1192,8 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
         .route("/admin/api/hosts/{host}/release-throttled", post(release_throttled::<S>))
         .route("/admin/api/ops/tail", get(tail::<S>))
         .route("/admin/api/store", get(store::<S>))
+        .route("/admin/api/discovery", get(discovery::<S>))
+        .route("/admin/api/discovery/run", post(discovery_run::<S>))
         .route("/admin/api/policy/usage", get(policy_usage::<S>))
         .route("/admin/api/policy/signals", get(policy_signals::<S>))
         .route("/admin/api/takedowns", get(takedowns::<S>))
@@ -1301,6 +1348,17 @@ async fn quorum_history<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Quo
 async fn flush_now<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<serde_json::Value>> {
     tracing::info!(target: "vlrelay::audit", by = BY, "flush now");
     Ok(Json(c.src.flush_now(BY).await?))
+}
+async fn discovery<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<DiscoveryView>> {
+    Ok(Json(c.src.discovery().await?))
+}
+async fn discovery_run<S: AdminSource>(
+    State(c): Ax<S>,
+    body: Option<Json<DiscoveryRun>>,
+) -> AdminResult<Json<DiscoveryView>> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    tracing::info!(target: "vlrelay::audit", source = ?req.source, by = BY, "discovery run");
+    Ok(Json(c.src.discovery_run(req, BY).await?))
 }
 async fn store<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<StoreView>> {
     Ok(Json(c.src.store().await?))

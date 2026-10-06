@@ -2,6 +2,7 @@
 //! Design: docs/design.md and docs/quorum.md.
 
 pub mod admin;
+pub mod discovery;
 pub mod event;
 pub mod identity;
 pub mod node;

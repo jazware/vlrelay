@@ -318,6 +318,9 @@ pub struct HostRow {
     pub first_seen: u32,
     #[serde(default)]
     pub owner: Option<String>,
+    /// How it was found: `requestCrawl`, `bootstrap:<relay>`, `plc`, `cli`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl HostRow {
@@ -431,6 +434,8 @@ pub struct RelayHooks {
     local: Mutex<serde_json::Value>,
     /// The PLC export job, for `leader:plc`.
     pub plc: std::sync::OnceLock<Arc<crate::plc_seed::job::PlcJob>>,
+    /// Host discovery, for `leader:discovery`.
+    pub discovery: std::sync::OnceLock<Arc<crate::discovery::DiscoveryJob>>,
     /// The node's own answers (`node:*`: its consumers, settings, kicks),
     /// from its admin source.
     pub answers: std::sync::OnceLock<Arc<dyn LocalAsk>>,
@@ -480,6 +485,7 @@ impl RelayHooks {
             stats: HookStats::default(),
             local: Mutex::new(serde_json::Value::Null),
             plc: std::sync::OnceLock::new(),
+            discovery: std::sync::OnceLock::new(),
             answers: std::sync::OnceLock::new(),
             #[cfg(test)]
             slow_us: AtomicU64::new(0),
@@ -723,8 +729,8 @@ impl RelayHooks {
         for r in rows {
             let cur = i.hosts.rows.get(&r.hostname).cloned();
             let next = match cur {
-                Some(c) if c.tier == r.tier => continue,
-                Some(c) => HostRow { tier: r.tier, ..c },
+                Some(c) if c.tier == r.tier && (c.source.is_some() || r.source.is_none()) => continue,
+                Some(c) => HostRow { tier: r.tier, source: c.source.clone().or(r.source), ..c },
                 None => HostRow { owner: None, ..r },
             };
             i.hosts.rows.insert(next.hostname.clone(), next.clone());
@@ -1181,6 +1187,18 @@ impl Hooks for RelayHooks {
                     }
                     serde_json::to_vec(&q.status()).ok().map(Bytes::from)
                 }
+                "leader:discovery" => {
+                    let j = self.discovery.get()?;
+                    serde_json::to_vec(&j.view()).ok().map(Bytes::from)
+                }
+                "leader:discovery-run" => {
+                    let j = self.discovery.get()?;
+                    let source = serde_json::from_slice::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v["source"].as_str().map(str::to_string));
+                    j.request(source);
+                    serde_json::to_vec(&j.view()).ok().map(Bytes::from)
+                }
                 "leader:plc" => {
                     let r = match self.plc.get() {
                         Some(j) => j.report().await,
@@ -1474,6 +1492,8 @@ pub struct QuorumHosts {
     table: RwLock<HostTable>,
     local: RwLock<BTreeMap<String, state::HostRecord>>,
     shared: Arc<Shared>,
+    /// Sources of hosts this node admitted, until the table has them.
+    sources: Mutex<HashMap<String, String>>,
 }
 
 impl QuorumHosts {
@@ -1481,6 +1501,19 @@ impl QuorumHosts {
     /// counted them at the last poll.
     pub fn throttled(&self, host: &str) -> u64 {
         self.table.read().throttled.get(host).copied().unwrap_or(0)
+    }
+
+    /// Where `host` came from, for the row this node is about to propose.
+    pub fn note_source(&self, host: &str, source: &str) {
+        let mut m = self.sources.lock();
+        if m.len() < 100_000 {
+            m.insert(host.to_string(), source.to_string());
+        }
+    }
+
+    /// Where the host table says `host` came from.
+    pub fn source(&self, host: &str) -> Option<String> {
+        self.table.read().rows.get(host).and_then(|r| r.source.clone())
     }
 
     fn record(&self, h: &str) -> Option<state::HostRecord> {
@@ -1510,8 +1543,12 @@ impl QuorumHosts {
     /// A row the table doesn't have yet, or a new tier: rides the next
     /// submit to the leader (again on every poll until the table has it).
     fn propose(&self, rec: &state::HostRecord) {
-        let cur = self.table.read().rows.get(&rec.hostname).map(|r| r.tier);
-        if cur == Some(rec.tier) {
+        let cur = self.table.read().rows.get(&rec.hostname).map(|r| (r.tier, r.source.is_some()));
+        let source = self.sources.lock().get(&rec.hostname).cloned();
+        if cur.is_some_and(|(t, has)| t == rec.tier && (has || source.is_none())) {
+            if cur.is_some_and(|(_, has)| has) {
+                self.sources.lock().remove(&rec.hostname);
+            }
             return;
         }
         let mut o = self.shared.outbox.lock();
@@ -1521,6 +1558,7 @@ impl QuorumHosts {
             tier: rec.tier,
             first_seen: rec.first_seen,
             owner: None,
+            source,
         });
         o.since.get_or_insert_with(Instant::now);
     }
@@ -1951,6 +1989,20 @@ pub async fn release_throttled(client: &Client, from: &str, host: &str) -> anyho
 }
 
 impl Glue {
+    /// Host discovery as the leader runs it (`run`: start a run of
+    /// `source`, or of every enabled source, first).
+    pub async fn discovery(&self, run: Option<Option<String>>) -> anyhow::Result<crate::admin::DiscoveryView> {
+        let (topic, body) = match run {
+            Some(source) => ("leader:discovery-run", serde_json::to_vec(&serde_json::json!({ "source": source }))?),
+            None => ("leader:discovery", Vec::new()),
+        };
+        let b = self.client.ask_leader(topic, body.into(), Duration::from_secs(5)).await.map_err(anyhow::Error::msg)?;
+        let mut v: crate::admin::DiscoveryView = serde_json::from_slice(&b)?;
+        v.leader = self.qnode.status().leader;
+        v.leading = v.leader.as_deref() == Some(self.id.as_str());
+        Ok(v)
+    }
+
     /// The PLC export as the leader reports it (None: no export, or the
     /// leader didn't answer).
     pub async fn plc_report(&self) -> Option<crate::admin::fleet::PlcReport> {
@@ -2199,6 +2251,7 @@ impl Node {
             table: RwLock::new(HostTable::default()),
             local: RwLock::new(BTreeMap::new()),
             shared: shared.clone(),
+            sources: Mutex::new(HashMap::new()),
         });
         let cursors =
             Arc::new(QuorumCursors { shared: shared.clone(), hosts: hosts.clone(), registry: Default::default() });
@@ -2210,6 +2263,10 @@ impl Node {
         let (manager, rx) = Manager::new(ucfg, hosts.clone(), Some(cursors.clone() as Arc<dyn upstream::CursorSource>));
         let _ = cursors.registry.set(manager.registry().clone());
         let crawler = upstream::Crawler::new(manager.clone(), upstream::CrawlPolicy::default());
+        {
+            let hosts = hosts.clone();
+            crawler.set_provenance(Arc::new(move |h: &Host, src: &str| hosts.note_source(&h.0, src)));
+        }
         let policy = cfg.policy.as_ref().map(|p| {
             let raw: Arc<dyn state::HostStore> = hosts.clone();
             super::policy::PolicyHooks::new(p.0.clone(), state.clone(), raw, cfg.dev_mode)
@@ -2217,6 +2274,16 @@ impl Node {
         if let Some(h) = &policy {
             h.install(&manager, &crawler, &identity);
             h.load().await?;
+        }
+        if let Some(h) = &policy {
+            let feed = Arc::new(crate::discovery::Feed::default());
+            if let Some(j) = &plc {
+                *j.feed.lock() = Some(feed.clone());
+            }
+            let st = crate::qlog::bucket::counted(&store, "discovery");
+            let d = crate::discovery::DiscoveryJob::new(h.engine.clone(), crawler.clone(), st, feed);
+            let _ = hooks.discovery.set(d.clone());
+            tokio::spawn(d.run(Arc::downgrade(&qnode)));
         }
         let (filter_tx, filter_rx) = watch::channel::<HostFilter>(Arc::new(|_: &Host| false));
         let glue = Arc::new_cyclic(|w: &std::sync::Weak<Glue>| {
@@ -2256,6 +2323,7 @@ impl Node {
         manager.follow_filter(filter_rx);
         manager.start().await?;
         for h in cli_hosts {
+            hosts.note_source(&h.0, "cli");
             manager.admit(&h, cli_tier).await?;
         }
         if let Some(h) = &policy {
@@ -2375,7 +2443,8 @@ mod tests {
     }
 
     async fn owner(client: &Client) -> String {
-        let row = HostRow { hostname: HOST.into(), tier: state::Tier::Trusted, first_seen: 1, owner: None };
+        let row =
+            HostRow { hostname: HOST.into(), tier: state::Tier::Trusted, first_seen: 1, owner: None, source: None };
         let control: Bytes = serde_json::to_vec(&Control { rows: vec![row] }).unwrap().into();
         let t = Instant::now();
         loop {

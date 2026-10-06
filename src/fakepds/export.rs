@@ -44,6 +44,11 @@ pub struct FakePlc {
     /// plc.directory's rate limit answers (0: never).
     pub throttle_every: AtomicU64,
     pub throttled: AtomicU64,
+    /// `listHosts`, as a relay would serve it: the fleet's hosts and this
+    /// many more that don't answer, `list_page` a page at most.
+    pub list_extra: AtomicU64,
+    pub list_page: AtomicU64,
+    pub list_requests: AtomicU64,
 }
 
 pub fn now_ms() -> u64 {
@@ -89,6 +94,9 @@ impl FakePlc {
             fail_next: AtomicU64::new(0),
             throttle_every: AtomicU64::new(0),
             throttled: AtomicU64::new(0),
+            list_extra: AtomicU64::new(0),
+            list_page: AtomicU64::new(100),
+            list_requests: AtomicU64::new(0),
         })
     }
 
@@ -187,10 +195,48 @@ impl FakePlc {
     pub fn router(self: &Arc<Self>, fallback: Option<String>) -> Router {
         Router::new()
             .route("/export", get(export))
+            .route("/xrpc/com.atproto.sync.listHosts", get(list_hosts))
             .route("/{did}", get(doc))
             .route("/_health", get(|| async { Json(json!({"version": "fakepds-plc"})) }))
             .with_state((self.clone(), fallback, reqwest::Client::new()))
     }
+}
+
+#[derive(serde::Deserialize)]
+struct ListQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Every host the fleet serves, then the extra ones, in pages; the cursor
+/// is the next offset.
+async fn list_hosts(State((p, _, _)): S, Query(q): Query<ListQuery>) -> Response {
+    let n = p.list_requests.fetch_add(1, Relaxed) + 1;
+    let every = p.throttle_every.load(Relaxed);
+    if every > 0 && n % every == 0 {
+        p.throttled.fetch_add(1, Relaxed);
+        return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "1")]).into_response();
+    }
+    let total = p.hosts as u64 + p.list_extra.load(Relaxed);
+    let from: u64 = q.cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0);
+    let page = q.limit.unwrap_or(200).min(p.list_page.load(Relaxed) as usize).max(1) as u64;
+    let to = (from + page).min(total);
+    let hosts: Vec<serde_json::Value> = (from..to)
+        .map(|i| {
+            let name = if i < p.hosts as u64 {
+                let u = p.layout.host_url(i as u32);
+                u.split("://").nth(1).unwrap_or(&u).trim_end_matches('/').to_string()
+            } else {
+                format!("gone-{i}.fakepds.invalid")
+            };
+            json!({"hostname": name, "seq": i, "accountCount": 0, "status": "active"})
+        })
+        .collect();
+    let mut out = json!({ "hosts": hosts });
+    if to < total {
+        out["cursor"] = json!(to.to_string());
+    }
+    Json(out).into_response()
 }
 
 #[derive(serde::Deserialize)]

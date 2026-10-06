@@ -94,6 +94,13 @@ struct RunArgs {
     /// Every Nth /export request answers 429 with Retry-After: 1 (0: never).
     #[arg(long, default_value_t = 0)]
     plc_throttle_every: u64,
+    /// The PLC port also serves com.atproto.sync.listHosts, as a relay
+    /// would: the fleet's hosts and this many more that don't answer.
+    #[arg(long, default_value_t = 0)]
+    list_extra: u64,
+    /// listHosts' largest page.
+    #[arg(long, default_value_t = 100)]
+    list_page: u64,
     /// Events/s for this process, split over its hosts.
     #[arg(long, default_value_t = 10000.0)]
     rate: f64,
@@ -284,6 +291,8 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
         // genesis ops a millisecond apart, the last one a minute ago
         let plc = export::FakePlc::new(layout.clone(), hosts, a.dids, export::now_ms() - 60_000, 1);
         plc.throttle_every.store(a.plc_throttle_every, std::sync::atomic::Ordering::Relaxed);
+        plc.list_extra.store(a.list_extra, std::sync::atomic::Ordering::Relaxed);
+        plc.list_page.store(a.list_page, std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(axum::serve(lis, plc.router(a.plc_fallback.clone())).into_future());
         if a.plc_tail_rate > 0.0 && hosts > 0 && a.dids > 0 {
             let (rate, dids) = (a.plc_tail_rate, a.dids);

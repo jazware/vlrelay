@@ -472,4 +472,4 @@ impl identity::Seeder for Seeder {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

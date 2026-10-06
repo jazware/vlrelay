@@ -66,6 +66,11 @@ struct Args {
     /// Time windows of the export read side by side on a fresh start.
     #[arg(long, default_value_t = 4)]
     plc_export_streams: usize,
+    /// A relay whose com.atproto.sync.listHosts seeds host discovery (read
+    /// only; repeatable): added to the policy's discovery.seedRelays when
+    /// it has none yet. The dashboard edits the list after that.
+    #[arg(long = "bootstrap-relay", env = "VLRELAY_BOOTSTRAP_RELAYS", value_delimiter = ',')]
+    bootstrap_relays: Vec<String>,
     /// zstd level for log segments: 0 stores them uncompressed, negative
     /// levels are zstd's fast ones. Firehose frames are mostly hashes:
     /// on production frames -1 compresses 1.8x faster than 1 for 0.6% more
@@ -395,6 +400,9 @@ async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<
         Arc::new(NodeAdmin::new(node.clone(), policy).with_settings(settings))
     };
     let _ = node.quorum.hooks.answers.set(admin_src.clone());
+    if !a.bootstrap_relays.is_empty() {
+        seed_discovery(admin_src.as_ref(), &a.bootstrap_relays).await;
+    }
     let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
     if let Some(token) = token {
         app = app.merge(vlrelay::admin::app(admin_src.clone(), token, ui));
@@ -446,4 +454,40 @@ fn with_real_ip(app: axum::Router, trusted: &[vlrelay::serve::Cidr]) -> axum::Ro
         return app;
     }
     app.layer(middleware::from_fn_with_state(Arc::new(trusted.to_vec()), vlrelay::serve::real_ip))
+}
+
+/// `--bootstrap-relay`: the policy's seed relays, if it has none yet (an
+/// operator's list is never overwritten). Retried a few times: another node
+/// may be saving the document at once.
+async fn seed_discovery(admin: &NodeAdmin, urls: &[String]) {
+    use vlrelay::admin::AdminSource;
+    for _ in 0..5 {
+        let doc = match admin.full_policy().await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("--bootstrap-relay: reading the policy: {e}");
+                return;
+            }
+        };
+        let mut p = doc.policy.clone();
+        let have = p["discovery"]["seedRelays"].as_array().is_some_and(|a| !a.is_empty());
+        if have {
+            return;
+        }
+        p["discovery"]["seedRelays"] = serde_json::Value::Array(
+            urls.iter()
+                .map(|u| serde_json::json!({ "url": u, "enabled": true, "refreshIntervalSecs": 6 * 3600 }))
+                .collect(),
+        );
+        let u =
+            vlrelay::admin::FullPolicyUpdate { base_version: doc.version, policy: p, note: "--bootstrap-relay".into() };
+        match admin.update_full_policy(u, "--bootstrap-relay").await {
+            Ok(_) => {
+                tracing::info!(relays = ?urls, "discovery: seeded the policy's relays");
+                return;
+            }
+            Err(e) => tracing::info!("--bootstrap-relay: saving the policy ({e}); again"),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }

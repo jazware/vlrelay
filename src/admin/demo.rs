@@ -930,6 +930,11 @@ impl Sim {
             max_accounts: if h.tier == "trusted" { 10_000_000 } else { 100 },
             history: Vec::new(),
             throttled_accounts: if h.tier == "trusted" { 0 } else { h.accounts.saturating_sub(100).min(5_000) },
+            source: Some(match hash(&h.name) % 5 {
+                0 => "requestCrawl".into(),
+                1 => "plc".into(),
+                _ => "bootstrap:relay1.us-east.bsky.network".into(),
+            }),
             rule: self.rules.iter().find(|r| rule_matches(&r.pattern, &h.name)).map(|r| r.id),
             node: self.host_shards[h.shard].clone().unwrap_or_default(),
         }
@@ -1572,6 +1577,7 @@ impl AdminSource for Demo {
                 outcome: "admitted".into(),
                 tier: Some(h.tier.clone()),
                 reason: "new host".into(),
+                source: if i % 3 == 0 { "requestCrawl".into() } else { "bootstrap:relay1.us-east.bsky.network".into() },
             });
         }
         let refused = [
@@ -1588,6 +1594,7 @@ impl AdminSource for Demo {
                 outcome: o.to_string(),
                 tier: None,
                 reason: why.to_string(),
+                source: "requestCrawl".into(),
             });
         }
         entries.sort_by_key(|a| std::cmp::Reverse(a.at_ms));
@@ -1794,6 +1801,81 @@ impl AdminSource for Demo {
                 errors: 2,
             }],
         })
+    }
+
+    async fn discovery(&self) -> AdminResult<DiscoveryView> {
+        let now = self.sim.lock().now_ms;
+        let (leader, ..) = self.extra.lock().roles();
+        let hour = 3_600_000i64;
+        let relay = crate::discovery::SourceState {
+            url: Some("https://relay1.us-east.bsky.network".into()),
+            runs: 5,
+            last_started_ms: Some(now - 2 * hour - 340_000),
+            last_finished_ms: Some(now - 2 * hour),
+            hosts_seen: 2_412,
+            known: 2_371,
+            new: 41,
+            admitted: 33,
+            refused: 8,
+            throttled: 2,
+            pages: 3,
+            ..Default::default()
+        };
+        let plc = crate::discovery::SourceState {
+            runs: 1,
+            last_started_ms: Some(now - 26 * hour),
+            last_finished_ms: Some(now - 40_000),
+            hosts_seen: 1_960,
+            known: 1_902,
+            new: 58,
+            admitted: 44,
+            refused: 14,
+            ..Default::default()
+        };
+        Ok(DiscoveryView {
+            leader: Some(leader),
+            leading: true,
+            connects_per_min: 120.0,
+            requests_per_sec: 2.0,
+            sources: vec![
+                DiscoverySource {
+                    key: "bootstrap:relay1.us-east.bsky.network".into(),
+                    url: relay.url.clone(),
+                    enabled: true,
+                    refresh_interval_secs: Some(6 * 3600),
+                    next_run_ms: Some(now + 4 * hour),
+                    pending: 0,
+                    state: relay,
+                },
+                DiscoverySource {
+                    key: crate::discovery::PLC_SOURCE.into(),
+                    url: None,
+                    enabled: true,
+                    refresh_interval_secs: None,
+                    next_run_ms: None,
+                    pending: 3,
+                    state: plc,
+                },
+            ],
+        })
+    }
+
+    async fn discovery_run(&self, req: DiscoveryRun, _by: &str) -> AdminResult<DiscoveryView> {
+        let mut v = self.discovery().await?;
+        let now = self.sim.lock().now_ms;
+        let mut hit = false;
+        for s in &mut v.sources {
+            if req.source.as_deref().is_none_or(|k| k == s.key) && s.enabled {
+                s.state.in_progress = true;
+                s.state.run_requested = true;
+                s.next_run_ms = Some(now);
+                hit = true;
+            }
+        }
+        if !hit {
+            return Err(AdminError::NotFound(format!("no enabled source {:?}", req.source)));
+        }
+        Ok(v)
     }
 
     async fn cluster(&self) -> AdminResult<ClusterView> {
@@ -2088,6 +2170,26 @@ mod tests {
         let uri = format!("/admin/api/consumers/{}/kick?node={}", other.id, other.node);
         assert_eq!(call("POST", &uri, true).await.unwrap().status(), StatusCode::NO_CONTENT);
         assert!(cs.iter().all(|c| !c.read_tier.is_empty()));
+
+        let dv = json(call("GET", "/admin/api/discovery", true).await.unwrap()).await;
+        assert!(dv["sources"].as_array().unwrap().iter().any(|s| s["key"] == "plc" && s["hostsSeen"].is_u64()));
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/discovery/run")
+                    .header("authorization", auth.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"source":"plc"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let dv = json(r).await;
+        assert!(dv["sources"].as_array().unwrap().iter().any(|s| s["key"] == "plc" && s["inProgress"] == true));
+        assert!(all.hosts.iter().all(|h| h.source.is_some()));
 
         let p = json(call("GET", "/admin/api/ops/plc", true).await.unwrap()).await;
         assert_eq!(p["enabled"], true);

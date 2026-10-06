@@ -9,10 +9,10 @@ use std::sync::atomic::Ordering::Relaxed;
 
 #[allow(dead_code)]
 #[path = "../fakepds/export.rs"]
-mod export;
+pub(crate) mod export;
 #[allow(dead_code)]
 #[path = "../fakepds/fleet.rs"]
-mod fleet;
+pub(crate) mod fleet;
 
 use export::FakePlc;
 use fleet::Layout;

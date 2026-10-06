@@ -38,6 +38,12 @@
 # (nodes trust their commitlogs after a power cut in page-cache mode),
 # which power-cut-all and power-cut-majority must fail.
 #
+# DISCOVERY=1 seeds host discovery with the fake PLC's listHosts (every
+# fleet host, which the nodes already have, and LIST_EXTRA (40) that don't
+# answer, LIST_PAGE (1) a page, a 429 every PLC_THROTTLE_EVERY'th): the run
+# fails unless a whole read of the list finished, whatever the faults did
+# to the leaders reading it.
+#
 # PLC_EXPORT=1 runs the PLC export on the leader against the fake PLC's
 # /export: PLC_HOSTS (1000) hosts of --dids accounts in its history,
 # PLC_RATE (4) requests a second, and every PLC_THROTTLE_EVERY'th (6)
@@ -73,7 +79,8 @@ while [ $# -gt 0 ]; do
 done
 
 B=${RQ_BASE:-3550}
-case $scenario in single-*) NODES=1 PROXY=0 ;; esac
+# a single node only runs fsync (it has no other copy of its log)
+case $scenario in single-*) NODES=1 PROXY=0 DURABILITY= ;; esac
 N=${NODES:-3}
 case $scenario in replace-* | grow-shrink) SLOTS=${SLOTS:-9} ;; esac
 S=${SLOTS:-$N}
@@ -139,6 +146,7 @@ gen_threads=$(( rate > 2000 ? 8 : 2 ))
   --gen-threads "$gen_threads" --plc-port "$fake_plc" --replay-mb 256 --lag-secs 30 \
   --initial-records 20 --target-records 60 --stats-secs 30 \
   $([ "${PLC_EXPORT:-}" = 1 ] && echo "--plc-hosts ${PLC_HOSTS:-1000} --plc-throttle-every ${PLC_THROTTLE_EVERY:-6}") \
+  $([ "${DISCOVERY:-}" = 1 ] && echo "--list-extra ${LIST_EXTRA:-40} --list-page ${LIST_PAGE:-1} --plc-throttle-every ${PLC_THROTTLE_EVERY:-6}") \
   >"$out/fakepds.log" 2>&1 &
 pids+=($!)
 for _ in $(seq 1 600); do grep -q READY "$out/fakepds.log" && break; sleep 0.2; done
@@ -164,6 +172,7 @@ supervise() {
   extra+=(--qlog-state-compactor-poll-ms "${STATE_POLL_MS:-$(( flush_ms < 10000 ? 5000 : 30000 ))}")
   [ -n "${DURABILITY:-}" ] && extra+=(--durability "$DURABILITY" --durability-sync-ms "${DURABILITY_SYNC_MS:-100}")
   [ "${TRUST_LOG:-}" = 1 ] && extra+=(--qlog-unsafe-trust-log)
+  [ "${DISCOVERY:-}" = 1 ] && extra+=(--bootstrap-relay "http://127.0.0.1:$fake_plc")
   [ "${PLC_EXPORT:-}" = 1 ] && extra+=(--plc-export --plc-export-rate "${PLC_RATE:-4}")
   [ -n "$crash_at" ] && extra+=(--qlog-crash-at "$crash_at" --qlog-crash-prob "$crash_prob" --qlog-crash-stop-file "$out/no-more-crashes")
   if [ -n "${RETAIN_SECS:-}" ]; then
@@ -484,6 +493,25 @@ vrc=$?
 [ $vrc = 0 ] || { echo "relay chaos: the final manifest is inconsistent" >&2; rc=1; }
 grep -q "verify FAILED" "$out/events.log" && { echo "relay chaos: a mid-run verify failed" >&2; rc=1; }
 grep -q "switch-FAILED" "$out/events.log" && { echo "relay chaos: a membership change never landed" >&2; rc=1; }
+if [ "${DISCOVERY:-}" = 1 ]; then
+  for i in $started; do
+    curl -sf --max-time 5 -u admin:relayq "http://127.0.0.1:$(http "$i")/admin/api/discovery" >"$out/discovery-n$i.json" || echo '{}' >"$out/discovery-n$i.json"
+  done
+  python3 - "$out" "$fake_hosts" "${LIST_EXTRA:-40}" $started <<'PY' || rc=1
+import json, sys
+out, hosts, extra, ids = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4:]
+views = [json.load(open(f"{out}/discovery-n{i}.json")) for i in ids]
+v = next((x for x in views if x.get("sources")), {})
+src = next((s for s in v.get("sources", []) if s["key"].startswith("bootstrap:")), {})
+print(f"discovery: leader {v.get('leader')} runs {src.get('runs')} finished {src.get('lastFinishedMs') is not None} "
+      f"seen {src.get('hostsSeen')} known {src.get('known')} new {src.get('new')} admitted {src.get('admitted')} "
+      f"refused {src.get('refused')} throttled {src.get('throttled')} pages {src.get('pages')} resumed {src.get('resumed')}")
+total = hosts + extra
+if src.get("lastFinishedMs") is None or src.get("hostsSeen", 0) < total or src.get("known", 0) < hosts:
+    print(f"relay chaos: discovery didn't read the whole list ({total} hosts)", file=sys.stderr)
+    sys.exit(1)
+PY
+fi
 if [ "${PLC_EXPORT:-}" = 1 ]; then
   for i in $started; do
     curl -sf --max-time 5 -u admin:relayq "http://127.0.0.1:$(http "$i")/admin/api/ops/plc" >"$out/plc-n$i.json" || echo '{}' >"$out/plc-n$i.json"

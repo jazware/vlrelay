@@ -128,6 +128,33 @@ is refused for 10 minutes without another probe, and each client IP gets 10 call
 past it). An upstream whose handshake says it's a relay (`Server: … atproto-relay`) is refused
 at connect and banned through the audited ban action, and an operator unban is how to retry it.
 
+## Discovering hosts
+
+A cold relay knows only the hosts it's given and the PDSes that ask it to crawl. The `discovery`
+section of the policy document adds two sources, both run by the leader in the background:
+
+- **Seed relays** (`discovery.seedRelays`: `{url, enabled, refreshIntervalSecs}`): their
+  `com.atproto.sync.listHosts`, read a page at a time at `discovery.requestsPerSec` (2), waiting
+  out a 429 or a 5xx for its `Retry-After`, the whole list again every `refreshIntervalSecs` (6 h).
+  This relay only reads: it never asks them to crawl anything. `--bootstrap-relay` fills the list
+  on a first start, while the document has none; the dashboard edits it after that, as every
+  policy field (a versioned save with its base version).
+- **The PLC export** (`discovery.plc`, with `--plc-export`): the distinct PDS hosts the documents
+  the export reader reads name.
+
+Every host found goes through the admission above: the crawl switch aside, the same hostname
+rules, domain bans, allow-list mode, starting tier and `describeServer` probe. Nothing comes from
+the other relay but the name: not its status, bans or tiers. A new host starts live, with no
+backfill. Discovery's admissions don't spend `cluster.newHostsPerDay`, which stays
+requestCrawl's: they're paced by their own `discovery.connectsPerMin` (120), so a cold start
+isn't held to the daily budget.
+
+Each source's progress is saved in the bucket (`discovery/state.json`) after every page: a new
+leader resumes a list where the old one stopped. Each host's source (`requestCrawl`,
+`bootstrap:<relay>`, `plc`, `cli`) is kept in the leader's host table and shown on the host and in
+the admission log. `GET /admin/api/discovery` shows each source's last and next run and its counts,
+and `POST /admin/api/discovery/run` starts one now ([Admin API](admin-api.md)).
+
 ## Limits and signals
 
 Each host gets token buckets for events per second, bytes per second, and events per hour and per

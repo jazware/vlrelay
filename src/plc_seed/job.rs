@@ -19,11 +19,19 @@ use vlpds::store::Store;
 struct WriterSink {
     w: Arc<SeedWriter>,
     cache: Arc<IdentityCache<HttpFetch>>,
+    feed: Option<Arc<crate::discovery::Feed>>,
 }
 
 #[async_trait::async_trait]
 impl Sink for WriterSink {
     async fn apply(&self, ops: Vec<(String, super::Seed)>) -> anyhow::Result<usize> {
+        if let Some(f) = &self.feed {
+            for (_, s) in &ops {
+                if let Some(p) = s.pds.as_deref().filter(|_| !s.tombstone) {
+                    f.push(p);
+                }
+            }
+        }
         let a = self.w.apply(ops).await?;
         for d in &a.changed {
             self.cache.invalidate(d);
@@ -48,6 +56,8 @@ pub struct PlcJob {
     checkpoint: parking_lot::Mutex<Option<(Instant, Option<Checkpoint>)>>,
     pub restarts: std::sync::atomic::AtomicU64,
     stopped: std::sync::atomic::AtomicBool,
+    /// Discovery's feed of the PDS hosts the documents name.
+    pub feed: parking_lot::Mutex<Option<Arc<crate::discovery::Feed>>>,
 }
 
 /// How often a member checks whether it leads.
@@ -65,6 +75,7 @@ impl PlcJob {
             checkpoint: Default::default(),
             restarts: Default::default(),
             stopped: Default::default(),
+            feed: Default::default(),
         })
     }
 
@@ -126,7 +137,7 @@ impl PlcJob {
         };
         tracing::info!(epoch, url = %self.cfg.url, "PLC export: this node leads; reading the export");
         *self.seeds.writer.write() = Some(w.clone());
-        let sink = Arc::new(WriterSink { w: w.clone(), cache: self.cache.clone() });
+        let sink = Arc::new(WriterSink { w: w.clone(), cache: self.cache.clone(), feed: self.feed.lock().clone() });
         let ing = Ingester::new(self.cfg.clone(), self.store.clone(), sink);
         *self.term.lock() = Some((epoch, ing.stats.clone()));
         ing.supervise(keep).await;

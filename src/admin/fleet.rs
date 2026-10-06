@@ -320,6 +320,7 @@ mod tests {
             max_accounts: 100,
             history: Vec::new(),
             throttled_accounts: 0,
+            source: None,
         }
     }
 

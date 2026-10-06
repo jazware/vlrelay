@@ -223,6 +223,7 @@ impl NodeAdmin {
             max_accounts: self.policy.limits(&h.record.hostname).and_then(|l| l.limits).map_or(0, |l| l.max_accounts),
             history: Vec::new(),
             throttled_accounts: self.node.quorum.hosts.throttled(&h.record.hostname),
+            source: self.node.quorum.hosts.source(&h.record.hostname),
         }
     }
 
@@ -949,6 +950,14 @@ impl AdminSource for NodeAdmin {
         }
         h.events.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then_with(|| a.node.cmp(&b.node)));
         Ok(h)
+    }
+
+    async fn discovery(&self) -> AdminResult<admin::DiscoveryView> {
+        self.node.quorum.discovery(None).await.map_err(|e| AdminError::BadRequest(format!("{e:#}")))
+    }
+
+    async fn discovery_run(&self, req: admin::DiscoveryRun, _by: &str) -> AdminResult<admin::DiscoveryView> {
+        self.node.quorum.discovery(Some(req.source)).await.map_err(|e| AdminError::BadRequest(format!("{e:#}")))
     }
 
     async fn flush_now(&self, _by: &str) -> AdminResult<serde_json::Value> {

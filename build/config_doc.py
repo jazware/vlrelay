@@ -19,7 +19,7 @@ SECTIONS = [
         "Upstreams and identity",
         "`--host` and `--crawl` work on any member: a host admitted anywhere goes into the leader's host table, "
         "and the leader gives it to a member.",
-        ["host", "crawl", "host-tier", "plc-url", "plc-export", "plc-export-url", "plc-export-rate", "plc-export-streams", "dev-mode", "did-lookups-per-sec"],
+        ["host", "crawl", "host-tier", "plc-url", "plc-export", "plc-export-url", "plc-export-rate", "plc-export-streams", "bootstrap-relay", "dev-mode", "did-lookups-per-sec"],
     ),
     ("Pipeline and serving", "", ["lanes", "ingest-threads", "host-inflight-events", "host-inflight-mb", "inflight-events", "inflight-mb", "ring-mb", "max-lag-mb", "log-compression"]),
     (

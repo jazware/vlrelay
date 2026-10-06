@@ -344,6 +344,45 @@ pub struct PolicyBody {
     pub consumers: Consumers,
     pub crawl: Crawl,
     pub archive: Archive,
+    pub discovery: Discovery,
+}
+
+/// Host discovery for a cold start: other relays' `listHosts` (read only)
+/// and the PDS endpoints in the PLC export's documents. Every host found
+/// goes through this relay's own admission, as a requestCrawl does.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Discovery {
+    pub seed_relays: Vec<SeedRelay>,
+    /// Admit the PDS endpoints the PLC export names (with `--plc-export`).
+    pub plc: bool,
+    /// New hosts discovery may connect a minute, cluster-wide. Its own
+    /// budget: `cluster.newHostsPerDay` stays requestCrawl's.
+    pub connects_per_min: f64,
+    /// `listHosts` requests a second to any one relay.
+    pub requests_per_sec: f64,
+}
+
+impl Default for Discovery {
+    fn default() -> Self {
+        Discovery { seed_relays: Vec::new(), plc: false, connects_per_min: 120.0, requests_per_sec: 2.0 }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SeedRelay {
+    /// e.g. `https://relay1.us-east.bsky.network`.
+    pub url: String,
+    pub enabled: bool,
+    /// How often its whole list is read again.
+    pub refresh_interval_secs: u64,
+}
+
+impl Default for SeedRelay {
+    fn default() -> Self {
+        SeedRelay { url: String::new(), enabled: true, refresh_interval_secs: 6 * 3600 }
+    }
 }
 
 /// Which accounts an archival relay mirrors. Off by default (PLAN.md
