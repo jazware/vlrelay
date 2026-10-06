@@ -3,7 +3,7 @@
 use axum::http::{HeaderValue, header};
 use axum::middleware;
 use axum::response::Response;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -185,9 +185,12 @@ fn main() {
     // reqwest, tungstenite and object_store each pull rustls; with more than
     // one provider compiled in, nothing picks one unless we do
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let args = Args::parse();
+    let cmd = Args::command();
+    let matches = cmd.clone().get_matches();
+    let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let settings = vlrelay::admin::settings::from_clap(&cmd, &matches);
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("main").build().expect("runtime");
-    let code = match rt.block_on(run(args)) {
+    let code = match rt.block_on(run(args, settings)) {
         Ok(()) => 0,
         Err(e) => {
             tracing::error!("{e:#}");
@@ -197,7 +200,7 @@ fn main() {
     std::process::exit(code);
 }
 
-async fn run(a: Args) -> anyhow::Result<()> {
+async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<()> {
     let loopback_plc = a.plc_url.contains("://127.") || a.plc_url.contains("://localhost");
     let dev_mode = a.dev_mode || a.hosts.iter().any(|h| h.starts_with("http://")) || loopback_plc;
     let mut lease_store = None;
@@ -309,7 +312,8 @@ async fn run(a: Args) -> anyhow::Result<()> {
         let policy = node.policy.clone().expect("the relay always runs the policy engine");
         let demo = vlrelay::admin::demo::Demo::start(42);
         let src = NodeAdmin::new(node.clone(), policy, demo)
-            .with_followers(a.admin_followers.clone(), token.clone().unwrap_or_default());
+            .with_followers(a.admin_followers.clone(), token.clone().unwrap_or_default())
+            .with_settings(settings);
         Arc::new(src)
     });
     if let (Some(g), Some(src)) = (&node.cluster, &admin_src) {

@@ -1,4 +1,4 @@
-//! Serves the built dashboard (`ui/dist`): `/admin` and everything under it
+//! Serves the built dashboard (`ui/dist`): `/` (the public page), `/admin` and everything under it
 //! that isn't `/admin/api` gets index.html, `/assets/*` and `/fonts/*` are files.
 
 use axum::{
@@ -6,7 +6,7 @@ use axum::{
     body::Bytes,
     extract::{Path as AxPath, State},
     http::{HeaderValue, StatusCode, header},
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use std::{collections::HashMap, path::Path, sync::Arc};
@@ -71,7 +71,7 @@ fn walk(root: &Path, dir: &Path, out: &mut HashMap<String, (Bytes, HeaderValue)>
 
 pub fn ui_routes(ui: Arc<UiFiles>) -> Router {
     Router::new()
-        .route("/", get(|| async { Redirect::temporary("/admin") }))
+        .route("/", get(shell))
         .route("/admin", get(shell))
         .route("/admin/", get(shell))
         .route("/admin/{*rest}", get(shell))
