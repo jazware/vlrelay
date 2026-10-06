@@ -3,15 +3,16 @@ import { DataTable, type Col } from '../../components/console/DataTable'
 import { Banners, Chip, Empty, HostName, KV, LiveVal, Loaded, NeedsVersion, PageHead, Panel, Spark, Src, Swatch, Tiles, type BannerSpec, type TileSpec } from '../../components/console/kit'
 import { LogRail, type RailData } from '../../components/console/LogRail'
 import { openPanel } from '../../components/console/nav'
-import type { ClusterView, HostRow, QStatus } from '../../lib/api'
+import { confirmAction } from '../../components/console/dialogs'
+import { errText, type ClusterView, type HostRow, type QStatus } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, clock, dt, dur, fmtBytes, fmtMs, fmtNum, fmtSi, fmtUs, plural, seqS } from '../../lib/console/fmt'
 import { useLivePoll } from '../../lib/console/live'
-import { clusterPoll, flushSeenAt, overviewPoll, quorumPoll, seenEpochs, seenFlushes, seriesOf, settingsPoll } from '../../lib/console/polls'
+import { clusterPoll, flushSeenAt, historyPoll, overviewPoll, quorumPoll, seenEpochs, seriesOf, settingsPoll } from '../../lib/console/polls'
 import { useRelay, type RelayView } from '../../lib/console/relay'
 import './logPages.css'
 import './quorumDetail'
-import { EPOCH_GLYPH, EpochChip, epochEvents, memberRows, membersDialog, membershipOn, refStatus, RoleChip, type EpochEvent, type MemberRow } from './quorumUi'
+import { Durability, EPOCH_GLYPH, EpochChip, epochDetail, epochEvents, memberRows, membersDialog, membershipOn, refStatus, RoleChip, type EpochEvent, type MemberRow } from './quorumUi'
 import { Lg, NodeTag, relayBanners } from './relayUi'
 
 // The quorum log and the cluster around it: the log rail (each member's track around F and the
@@ -40,7 +41,8 @@ export function Quorum() {
   const on = membershipOn(sp.data)
   const flushMs = Number(setting(sp.data, '--qlog-flush-ms')?.value ?? '') || undefined
   const stream = ov.data ? (ov.data.streamEventsPerSec ?? ov.data.eventsOutPerSec) : 0
-  const events = epochEvents(qv, seenEpochs())
+  const hist = historyPoll.use()
+  const events = epochEvents(qv, hist.data?.events ?? [], seenEpochs())
   const known = [...new Set([...rows.map((r) => r.id), ...(view?.nodes.map((n) => n.id) ?? [])])]
   const change = () => membersDialog({ current: members, leader: lead?.id ?? null, known, on })
 
@@ -146,12 +148,12 @@ export function Quorum() {
           </div>
         </div>
       </Panel>
-      <Leadership events={events} view={view} className="cx-mt" />
+      <Leadership events={events} stale={hist.data?.stale ?? []} error={hist.error && !hist.data ? hist.error : undefined} view={view} className="cx-mt" />
       <Panel title="Members" className="cx-mt" src={<Src>cluster/quorum</Src>} right={<span className="muted sm">lag is entries behind the leader's last append</span>}>
         <Members rows={rows} lead={lead} />
       </Panel>
       <div className="cx-grid2 cx-mt">
-        <FlushPanel lead={lead} flushMs={flushMs} />
+        <FlushPanel lead={lead} flushMs={flushMs} on={on} />
         <ShardPanel c={cp.data} view={view} />
       </div>
       <div className="cx-grid2 cx-mt">
@@ -209,13 +211,14 @@ function Members({ rows, lead }: { rows: MemberRow[]; lead?: QStatus }) {
         ),
     },
     { id: 'fsync', label: 'fsync p99', r: true, render: (r) => <span className="mono sm">{r.s?.disk ? fmtUs(r.s.disk.fsync_us.p99) : '—'}</span> },
+    { id: 'durability', label: 'Durability', title: 'When an entry counts on this member (--durability)', render: (r) => <Durability d={r.s?.durability} /> },
   ]
   return <DataTable rows={rows} cols={cols} rowKey={(r) => r.id} open={(r) => ({ type: 'node', id: r.id })} dim={(r) => r.stale || r.kind === 'retired'} compact label="Members" empty={<Empty>No member answered.</Empty>} />
 }
 
 // ---------------------------------------------------------------- leadership
 
-export function Leadership({ events, view, className, limit }: { events: EpochEvent[]; view?: RelayView; className?: string; limit?: number }) {
+export function Leadership({ events, stale, error, view, className, limit }: { events: EpochEvent[]; stale: string[]; error?: unknown; view?: RelayView; className?: string; limit?: number }) {
   const timed = events.filter((e) => e.atMs !== undefined).sort((a, b) => a.atMs! - b.atMs!)
   const now = Date.now()
   const first = timed[0]?.atMs
@@ -225,20 +228,14 @@ export function Leadership({ events, view, className, limit }: { events: EpochEv
     { id: 'epoch', label: 'Epoch', render: (e) => <span className="mono">{e.fromEpoch !== undefined ? `${e.fromEpoch} → ${e.epoch}` : `→ ${e.epoch}`}</span> },
     { id: 'what', label: 'What', render: (e) => <EpochChip kind={e.kind} /> },
     { id: 'leader', label: 'Leader after', render: (e) => (e.leader ? <NodeTag view={view} id={e.leader} /> : <span className="muted">—</span>) },
-    { id: 'pause', label: 'Pause', r: true, title: 'Appends paused (a membership change) or the recovery took', render: (e) => <span className="mono sm">{e.pausedMs !== undefined ? fmtMs(e.pausedMs) : '—'}</span> },
     {
-      id: 'why',
-      label: 'Detail',
-      render: (e) => (
-        <span className="sm t2">
-          {e.kind === 'switch' && e.sw
-            ? `${e.sw.from.join(', ')} → ${e.sw.to.join(', ')}`
-            : e.kind === 'recovery' && e.rec
-              ? `generation ${e.rec.generation}: resumed after ${seqS(e.rec.after)}, ${fmtNum(e.rec.salvaged)} salvaged`
-              : 'a takeover or a handoff, seen by this console'}
-        </span>
-      ),
+      id: 'pause',
+      label: 'Pause',
+      r: true,
+      title: 'Appends paused (a membership change), the recovery took, or no member led (from the old leader stepping down to the new one leading)',
+      render: (e) => <span className="mono sm">{e.pausedMs !== undefined ? fmtMs(e.pausedMs) : '—'}</span>,
     },
+    { id: 'why', label: 'Detail', render: (e) => <span className="sm t2">{epochDetail(e)}</span> },
     { id: 'when', label: 'When', r: true, render: (e) => <span className="sm muted" title={e.atMs ? dt(e.atMs) : undefined}>{e.atMs ? ago(e.atMs) : '—'}</span> },
   ]
   return (
@@ -247,19 +244,23 @@ export function Leadership({ events, view, className, limit }: { events: EpochEv
       className={className}
       src={
         <>
-          <Src>cluster/quorum · status.switches, status.recovered</Src> <Src isNew>cluster/quorum/history</Src>
+          <Src>cluster/quorum/history</Src> <Src>cluster/quorum · status.switches, status.recovered</Src>
         </>
       }
       right={
         <span className="cx-legend">
-          <span>{EPOCH_GLYPH.seen} new epoch</span>
+          <span>{EPOCH_GLYPH.takeover} takeover</span>
+          <span>{EPOCH_GLYPH.handoff} handoff</span>
           <span>{EPOCH_GLYPH.switch} membership</span>
-          <span>{EPOCH_GLYPH.recovery} bucket recovery</span>
+          <span>{EPOCH_GLYPH.recovery} recovery</span>
+          <span>{EPOCH_GLYPH.stepdown} step-down</span>
         </span>
       }
       foot={
         <span>
-          Membership changes and recoveries come from the statuses (the leader that ran them). Takeovers and handoffs show only when this console saw the epoch move.
+          {error ? <span className="s-err">The history didn't load ({errText(error)}); only membership changes and recoveries show. </span> : null}
+          {stale.length ? <span className="s-warn">{stale.join(', ')} didn't answer, so {stale.length === 1 ? 'its' : 'their'} changes are missing. </span> : null}
+          Each member keeps its last 64 leadership changes; membership changes and recoveries add their timings from the status of the leader that ran them.
         </span>
       }
     >
@@ -289,20 +290,60 @@ export function Leadership({ events, view, className, limit }: { events: EpochEv
         open={(e) => ({ type: 'epoch', id: e.id })}
         compact
         label="Epoch changes"
-        empty={<Empty title="No epoch changes recorded">The members' statuses list no membership change or recovery, and the epoch hasn't moved while this page was open.</Empty>}
+        empty={<Empty title="No leadership changes recorded">No member lists a takeover, handoff, membership change or recovery.</Empty>}
       />
-      <NeedsVersion what="Takeovers and handoffs with their times" endpoint="GET cluster/quorum/history" />
     </Panel>
   )
 }
 
 // ---------------------------------------------------------------- flush
 
-function FlushPanel({ lead, flushMs }: { lead?: QStatus; flushMs?: number }) {
+function flushNowDialog(lead: QStatus, on: boolean, flushMs?: number) {
+  const f = lead.flush
+  return confirmAction({
+    tone: 'warn',
+    primary: true,
+    title: 'Flush the log now?',
+    items: [
+      <>
+        {lead.id} seals what it has committed and writes the segments, state and host cursors to the bucket, then CASes the manifest: F moves up to the commit index it has when the request lands
+        (now {seqS(lead.commit)}, {fmtNum(Math.max(0, lead.commit - lead.flushed))} above F).
+      </>,
+      `It's the flush the leader makes${flushMs ? ` every ${dur(flushMs)}` : ' on its interval'}, early: one more set of bucket writes${f?.flushes ? ` (about ${fmtNum(Object.values(f.requests ?? {}).reduce((a, b) => a + b, 0) / f.flushes, 0)} requests)` : ''}, and the applier pauses for the state checkpoint${f ? ` (p99 ${fmtUs(f.seal_us.p99)})` : ''}.`,
+      'Nothing is lost if it fails: the next flush covers the same entries.',
+      ...(on ? [] : [<span className="s-err">The nodes run without --qlog-admin-token, so the leader refuses flushes on demand.</span>]),
+    ],
+    word: 'flush',
+    action: 'Flush now',
+    call: A.flushNowCall,
+    run: () => A.flushNow(),
+    done: (r) => {
+      quorumPoll.refresh()
+      const s = r as QStatus | undefined
+      return s && typeof s.flushed === 'number' ? `Flushed: F is ${seqS(s.flushed)}` : 'Flushed'
+    },
+  })
+}
+
+function FlushPanel({ lead, flushMs, on }: { lead?: QStatus; flushMs?: number; on: boolean }) {
   const f = lead?.flush
-  const seen = seenFlushes()
+  const recent = [...(f?.recent ?? [])].reverse()
+  const [all, setAll] = useState(false)
   return (
-    <Panel title="Flush" src={<Src>cluster/quorum · status.flush</Src>} right={flushMs ? <span className="muted sm">every {dur(flushMs)}</span> : undefined}>
+    <Panel
+      title="Flush"
+      src={<Src>cluster/quorum · status.flush, flush.recent</Src>}
+      right={
+        <>
+          {flushMs ? <span className="muted sm">every {dur(flushMs)}</span> : null}
+          {lead && f && (
+            <button type="button" className="cx-btn sm" onClick={() => flushNowDialog(lead, on, flushMs)} title={on ? undefined : 'The nodes run without --qlog-admin-token'}>
+              Flush now…
+            </button>
+          )}
+        </>
+      }
+    >
       {f ? (
         <>
           <KV
@@ -337,37 +378,49 @@ function FlushPanel({ lead, flushMs }: { lead?: QStatus; flushMs?: number }) {
             <table className="cx-t compact">
               <thead>
                 <tr>
-                  <th>Seen</th>
+                  <th>When</th>
                   <th className="r">F</th>
                   <th className="r">Entries</th>
+                  <th className="r">Segs</th>
                   <th className="r">Stored</th>
                   <th className="r">Raw</th>
+                  <th className="r" title="Seal to manifest CAS; the seal pause in brackets">Took</th>
                 </tr>
               </thead>
               <tbody>
-                {seen.slice(0, 6).map((x) => (
-                  <tr key={x.atMs}>
-                    <td className="sm muted" title={clock(x.atMs)}>
-                      {ago(x.atMs)}
-                      {x.flushes > 1 && ` · ${x.flushes} flushes`}
+                {(all ? recent : recent.slice(0, 8)).map((x) => (
+                  <tr key={`${x.epoch}-${x.flushed}-${x.at_ms}`} className={x.epoch !== lead?.epoch ? 'dim' : undefined}>
+                    <td className="sm muted nowrap" title={`${dt(x.at_ms)} · epoch ${x.epoch}`}>
+                      {clock(x.at_ms)}
                     </td>
                     <td className="r mono sm">{seqS(x.flushed)}</td>
                     <td className="r mono sm">{fmtNum(x.entries)}</td>
-                    <td className="r mono sm">{fmtBytes(x.segmentBytes)}</td>
-                    <td className="r mono sm">{fmtBytes(x.rawBytes)}</td>
+                    <td className="r mono sm">{fmtNum(x.segments)}</td>
+                    <td className="r mono sm">{fmtBytes(x.bytes)}</td>
+                    <td className="r mono sm t2">{fmtBytes(x.raw_bytes)}</td>
+                    <td className="r mono sm nowrap" title={`seal pause ${fmtUs(x.seal_us)}`}>
+                      {fmtUs(x.took_us)}
+                    </td>
                   </tr>
                 ))}
-                {!seen.length && (
+                {!recent.length && (
                   <tr>
-                    <td colSpan={5}>
-                      <Empty>The flushes this page sees land here (F moving between two polls of the leader).</Empty>
+                    <td colSpan={7}>
+                      <Empty>{f.recent ? `${lead?.id ?? 'The leader'} hasn't flushed since it started.` : "The leader's status lists no recent flushes (flush.recent)."}</Empty>
                     </td>
                   </tr>
                 )}
               </tbody>
             </table>
           </div>
-          <NeedsVersion what="The leader's own flush history" endpoint="qlog status.flush.recent" />
+          {recent.length > 8 && (
+            <div className="cx-pn-b">
+              <button type="button" className="cx-btn sm quiet" onClick={() => setAll(!all)}>
+                {all ? 'Show the last 8' : `Show all ${recent.length}`}
+              </button>
+              <span className="muted sm"> the leader keeps its last 32</span>
+            </div>
+          )}
         </>
       ) : (
         <Empty title="No flush status">Only the leader flushes{lead ? ', and this one has no bucket configured' : ', and no member leads right now'}.</Empty>

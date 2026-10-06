@@ -10,6 +10,7 @@ import {
   type CaseStatus,
   type ClusterView,
   type Consumer,
+  type DiscoveryView,
   type DomainRule,
   type DomainRuleInput,
   type FullPolicyDoc,
@@ -25,12 +26,16 @@ import {
   type Policy,
   type PolicyAudit,
   type PolicyDoc,
+  type PolicyUsage,
   type QStatus,
+  type QuorumHistory,
   type QuorumView,
   type StoreView,
   type TailFrame,
   type Released,
   type SettingsView,
+  type SignalsView,
+  type TakedownEntry,
 } from '../api'
 import { isUnsupported } from './live'
 
@@ -80,8 +85,9 @@ export const hostAction = (h: string, a: HostAction) => api<HostRow>(`hosts/${en
 export const hostActionCall = (h: string, a: HostAction) => `POST /admin/api/hosts/${h}/action ${JSON.stringify(a)}`
 
 export const cluster = () => api<ClusterView>('cluster')
+/** Every member's sockets, each with its `node` and `readTier`. */
 export const consumers = () => api<Consumer[]>('consumers')
-/** Consumer ids are per node: `node` names the one serving it. */
+/** Consumer ids are per node: `node` names the one serving it. Another member's is kicked there with the nodes' --qlog-admin-token. */
 export const kickConsumer = (id: number, node: string) => api(`consumers/${id}/kick`, { method: 'POST', params: { node: node || undefined } })
 export const kickCall = (id: number, node: string) => `POST /admin/api/consumers/${id}/kick${node ? `?node=${node}` : ''}`
 export const openCases = () => api<Case[]>('cases', { params: { status: 'open' } })
@@ -154,20 +160,20 @@ export const account = (did: string) => api<Account>(`accounts/${enc(did)}`)
 export const takedown = (did: string, reason: string) => api<Account>(`accounts/${enc(did)}/takedown`, { body: { reason } })
 export const untakedown = (did: string) => api<Account>(`accounts/${enc(did)}/untakedown`, { method: 'POST' })
 
+/** Host discovery as the leader runs it: each source's last and next run and its counts. */
+export const discovery = () => api<DiscoveryView>('discovery')
+/** Runs one source now (its key), or every enabled one. */
+export const runDiscovery = (source?: string) => api<DiscoveryView>('discovery/run', { body: source ? { source } : {} })
+export const runDiscoveryCall = (source?: string) => `POST /admin/api/discovery/run ${JSON.stringify(source ? { source } : {})}`
+
 /** This node's last 500 requestCrawl outcomes, newest first, and today's new-host budget. */
 export const admissions = () => api<AdmissionLog>('hosts/admissions')
 
 /** Lifts every account a host created throttled past its cap (through the leader's log). */
 export const releaseThrottled = (h: string) => api<Released>(`hosts/${enc(h)}/release-throttled`, { method: 'POST' })
 
-export async function plc(): Promise<Optional<PlcView>> {
-  try {
-    return { supported: true, data: await api<PlcView>('ops/plc') }
-  } catch (e) {
-    if (e instanceof ApiError && e.status === 404) return { supported: false, endpoint: 'ops/plc', why: e.message }
-    throw e
-  }
-}
+/** The PLC export as the leader reads it (`enabled` false without --plc-export); any node answers. */
+export const plc = () => api<PlcView>('ops/plc')
 
 /** com.atproto.sync.requestCrawl on this relay: the same admission path a PDS takes. */
 export async function requestCrawl(hostname: string): Promise<void> {
@@ -236,46 +242,29 @@ export function retentionOf(v?: StoreView): RetainReport | undefined {
 /** When F last moved: the leader's flush.last_at_ms, else (older builds) when this console saw F move. */
 export const flushedAt = (lead: QStatus | undefined, seenAt: number | undefined) => lead?.flush?.last_at_ms || seenAt
 
+// ---------------------------------------------------------------- the quorum's history, budgets, signals, takedowns
+
+/** Every member's leadership changes, newest first, and the members that didn't answer. */
+export const quorumHistory = () => api<QuorumHistory>('cluster/quorum/history')
+
+/** The leader flushes to the commit index it has now (the nodes' --qlog-admin-token). */
+export const flushNow = () => api<QStatus>('cluster/quorum/flush', { method: 'POST' })
+export const flushNowCall = 'POST /admin/api/cluster/quorum/flush'
+
+/** The cluster budgets against what this node sees them spend. */
+export const budgetUse = () => api<PolicyUsage>('policy/usage')
+
+/** Each spam rule's threshold and its ten heaviest keys on this node. */
+export const spamSignals = () => api<SignalsView>('policy/signals')
+
+/** Every account under a relay takedown, newest first. */
+export const takedowns = () => api<TakedownEntry[]>('takedowns')
+
+/** A member's flags, asked over the peer protocol (this node's when `node` is empty). */
+export const settingsOf = (node: string) => api<SettingsView>('settings', { params: { node: node || undefined } })
+
 // ---------------------------------------------------------------- what the console wants next
 
-export type FlushRecord = { atMs: number; flushed: number; reserve: number; entries: number; segmentBytes: number; tookMs: number }
-/** The leader's recent flushes. Until then the console records the ones it sees F move for. */
-export const flushHistory = () => missing<FlushRecord[]>('qlog status.flush.recent', 'the recent flushes')
-
-export type EpochChange = { epoch: number; atMs: number; kind: 'takeover' | 'handoff' | 'switch' | 'recovery'; leader: string; pausedMs: number; why: string }
-/** Every epoch change (takeovers and handoffs too), not only the membership changes and recoveries this leader ran. */
-export const quorumHistory = () => missing<EpochChange[]>('GET cluster/quorum/history', 'takeovers and handoffs in the leadership history')
-
-export type ConsumerTier = 'ring' | 'disk' | 'bucket'
-/** Where each consumer's frames come from: the in-memory ring, the commitlog on disk, or the bucket. */
-export const consumerTiers = () => missing<Record<string, ConsumerTier>>('consumers[].readTier', 'where a replaying consumer reads from')
-
-/** How many accounts each host has that were created throttled past its cap. */
-export const throttledAccounts = () => missing<Record<string, number>>('HostRow.throttledAccounts', 'accounts created throttled, per host')
-
-export type BudgetUse = { plcLookupsPerSec: number; newAccountsPerMin: number }
-/** What the cluster budgets are spending now, against policy.cluster. */
-export const budgetUse = () => missing<BudgetUse>('GET policy/usage', 'live use of the cluster budgets')
-
-export type SignalTop = { signal: string; keys: { key: string; count: number }[] }
-/** The heaviest keys each spam signal is tracking, against its threshold. */
-export const spamSignals = () => missing<SignalTop[]>('GET policy/signals', 'the heaviest keys per spam signal')
-
-/** Every account taken down on this relay; today the API only answers per DID. */
-export const takedowns = () => missing<Account[]>('GET takedowns', 'the list of takedowns')
-
-/** Another node's flags (the settings endpoint answers for the node you reach). */
-export const settingsOf = (node: string) => missing<SettingsView>(`GET settings?node=${node}`, "another node's flags")
-
-/** Everything above, for CONSOLE.md and the "needs a newer vlRelay" placeholders. */
-export const MISSING = [
-  ['qlog status.flush.recent', 'Quorum › Flush: the recent flushes (F, entries, bytes, how long); the console records only the ones it sees while open'],
-  ['GET cluster/quorum/history', 'Quorum › Leadership: takeovers and handoffs with their times (the status has membership changes and recoveries only)'],
-  ['consumers[].readTier', 'Consumers: where a replaying consumer reads from (ring, disk, bucket)'],
-  ['GET consumers?all=1', "Consumers: every member's sockets (the list is the answering node's until it's asked over the qlog peer protocol)"],
-  ['HostRow.throttledAccounts', 'Moderation › Accounts created throttled: how many each host has (the panel lists hosts at their cap until then)'],
-  ['GET policy/usage', 'Policy › Cluster budgets: PLC lookups/s and new accounts/min against their budgets (new hosts today comes from hosts/admissions)'],
-  ['GET policy/signals', 'Policy › Spam signals and Moderation: the heaviest key per signal against its threshold (open cases stand in until then)'],
-  ['GET takedowns', 'Moderation: every account taken down here (today the API answers per DID)'],
-  ['GET settings?node=', 'Settings: each node’s flags side by side, and the flags that differ across nodes'],
-] as const
+/** Endpoints the design assumes but the relay doesn't serve: answer with `missing(endpoint, why)` and list them here (CONSOLE.md has the table). */
+export const MISSING: readonly (readonly [endpoint: string, feeds: string])[] = []
+export { missing }

@@ -5,10 +5,10 @@ import { registerDetail } from '../../components/console/Drawer'
 import { openPanel } from '../../components/console/nav'
 import { registerPalette } from '../../components/console/Palette'
 import { toast } from '../../components/console/toast'
-import { Banners, Chip, Empty, KV, Loaded, Meter, NeedsVersion, PageHead, Panel, Src, TierTag, type BannerSpec } from '../../components/console/kit'
-import { ApiError, errText, type Case, type Policy as WirePolicy, type PolicyAudit } from '../../lib/api'
+import { Banners, Chip, Empty, ErrorState, KV, Loaded, Meter, PageHead, Panel, Src, TierTag, type BannerSpec } from '../../components/console/kit'
+import { ApiError, errText, type Case, type Policy as WirePolicy, type PolicyAudit, type PolicyUsage } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
-import { ago, dt, fmtNum, fmtSi, plural } from '../../lib/console/fmt'
+import { ago, dt, dur, fmtNum, fmtSi, plural } from '../../lib/console/fmt'
 import { createPoller, useLivePoll } from '../../lib/console/live'
 import { capPoll, consumersPoll, openCasesPoll, overviewPoll, policyFullPoll, policyPoll } from '../../lib/console/polls'
 import {
@@ -30,7 +30,8 @@ import {
   type PolicyBase,
 } from '../../lib/console/policyDraft'
 import { Link } from '../../lib/router'
-import { patternError } from './moderationDetail'
+import { useRelay } from '../../lib/console/relay'
+import { openSignalKey, patternError } from './moderationDetail'
 import '../../console-rules.css'
 
 // The policy is one versioned document. Every edit on this page (a tier cell, a knob, a spam
@@ -155,6 +156,18 @@ function validate(base: PolicyBase, b: Json): Map<string, string> {
   for (const k of ['connectionsPerIp', 'consumersPerNode', 'slowConsumerLagSecs', 'maxBackfillSecs']) {
     const v = getIn(b, `consumers.${k}`)
     if (v !== undefined && !isInt(v)) put(`consumers.${k}`, `consumers.${k} must be a whole number ≥ 0`)
+  }
+  if (getIn(b, 'discovery') !== undefined) {
+    for (const k of ['connectsPerMin', 'requestsPerSec']) if (!(num(getIn(b, `discovery.${k}`)) > 0)) put(`discovery.${k}`, `discovery.${k} must be > 0`)
+    const seeds = (getIn(b, 'discovery.seedRelays') as SeedRelay[] | undefined) ?? []
+    const seen = new Set<string>()
+    for (const r of seeds) {
+      const err = seedUrlError(r.url)
+      if (err) put('discovery.seedRelays', `discovery.seedRelays: ${err}`)
+      else if (seen.has(r.url)) put('discovery.seedRelays', `discovery.seedRelays: ${r.url} is listed twice`)
+      else if (!(isInt(r.refreshIntervalSecs) && r.refreshIntervalSecs >= 60)) put('discovery.seedRelays', `discovery.seedRelays: ${r.url} refreshes at least every 60 s`)
+      seen.add(r.url)
+    }
   }
   const it = getIn(b, 'crawl.initialTier')
   if (it !== undefined && !['trusted', 'default', 'new'].includes(String(it))) put('crawl.initialTier', 'crawl.initialTier must be trusted, default or new')
@@ -407,6 +420,7 @@ function SpamTable() {
   const d = useDraft()
   const defs = defaultsPoll.use().data
   const cases = openCasesPoll.use().data ?? []
+  const sig = useLivePoll(A.spamSignals, 'signals', 10_000).data
   const sigs = SIGNALS.filter((s) => getIn(d.body, `spam.${s.k}`) !== undefined)
   const worst = (s: Signal): Case | undefined =>
     cases.filter((c) => s.kinds.includes(c.kind) && c.threshold > 0).sort((a, b) => b.observed / b.threshold - a.observed / a.threshold)[0]
@@ -421,7 +435,8 @@ function SpamTable() {
             <th className="r">Window s</th>
             <th>Action</th>
             <th>Default</th>
-            <th title="Open cases of this kind, and the worst one against its threshold">Open cases now</th>
+            <th title="The heaviest key this signal tracks now, against the threshold in force">Heaviest now</th>
+            <th title="Open cases of this kind, and the worst one against its threshold">Open cases</th>
           </tr>
         </thead>
         <tbody>
@@ -431,6 +446,8 @@ function SpamTable() {
             const w = worst(s)
             const open = cases.filter((c) => s.kinds.includes(c.kind)).length
             const off = num(getIn(d.body, `${p}.limit`)) === 0
+            const live = sig?.signals.find((x) => s.kinds.includes(x.rule))
+            const top = live?.top[0]
             return (
               <tr key={s.k} className={off ? 'dim' : undefined}>
                 <td>
@@ -448,6 +465,15 @@ function SpamTable() {
                   <SelectIn path={`${p}.action`} label={`${s.label} per ${s.per} action`} options={ACTIONS} />
                 </td>
                 <td className="cx-kd">{def ? `${fmtNum(num(def.limit), num(def.limit) % 1 ? 2 : 0)} / ${def.windowSecs} s · ${def.action}` : '—'}</td>
+                <td className="sm">
+                  {top && live ? (
+                    <button type="button" className="cx-linklike" onClick={() => openSignalKey(live.per, top)} title={`${top.key}: ~${fmtNum(top.estimate)} (at least ${fmtNum(top.lower)}) in ${live.windowSecs} s, on ${sig?.node}`}>
+                      <Use v={top.estimate} max={live.limit} label={live.limit > 0 ? `${fmtNum(top.estimate / live.limit, 2)}×` : fmtNum(top.estimate)} />
+                    </button>
+                  ) : (
+                    <span className="muted">{sig ? 'nothing counted' : '—'}</span>
+                  )}
+                </td>
                 <td className="sm">
                   {w ? (
                     <button type="button" className="cx-linklike" onClick={() => openPanel('case', String(w.id))} title={`case ${w.id} on ${w.host}`}>
@@ -508,17 +534,184 @@ function ErrorBudget() {
   )
 }
 
-function BudgetKnobs() {
-  const use = useLivePoll(A.budgetUse, 'budget', 10_000)
-  const adm = useLivePoll(A.admissions, 'admissions', 15_000)
+/** The budgets against what the answering node sees them spend (policy/usage). */
+function BudgetKnobs({ u }: { u?: PolicyUsage }) {
   const d = useDraft()
-  const u = use.data?.supported ? use.data.data : undefined
+  const { view } = useRelay()
   const lim = (k: string) => num(getIn(d.body, `cluster.${k}`))
+  const leader = view?.quorum?.leader
+  const counted = !u || !leader || u.node === leader
   return (
     <>
-      <Knob path="cluster.plcLookupsPerSec" label="PLC lookups" why="DID document fetches per second across the cluster. The directory rate-limits; stay well under it." unit="/s" use={u && <Use v={u.plcLookupsPerSec} max={lim('plcLookupsPerSec')} label={`${fmtNum(u.plcLookupsPerSec, 1)}/s now`} />} />
-      <Knob path="cluster.newAccountsPerMin" label="New accounts" why="Accounts first seen per minute across every host. A spam wave hits this before consumers see it." unit="/min" use={u && <Use v={u.newAccountsPerMin} max={lim('newAccountsPerMin')} label={`${fmtNum(u.newAccountsPerMin)}/min now`} />} />
-      <Knob path="cluster.newHostsPerDay" label="New hosts" why="requestCrawl admissions per UTC day. Allow rules and trusted domains don’t spend it." unit="/day" use={adm.data && <Use v={adm.data.newHostsToday} max={lim('newHostsPerDay')} label={`${fmtNum(adm.data.newHostsToday)} today`} />} />
+      <Knob
+        path="cluster.plcLookupsPerSec"
+        label="PLC lookups"
+        why="DID document fetches per second across the cluster. The directory rate-limits; stay well under it."
+        unit="/s"
+        use={u && <Use v={u.plcLookupsPerSec} max={u.plcLookupsShare || lim('plcLookupsPerSec')} label={`${fmtNum(u.plcLookupsPerSec, 1)}/s on ${u.node}${u.plcLookupsShare ? ` of its ${fmtNum(u.plcLookupsShare, 1)}/s share` : ''}${u.seededPerSec ? ` · ${fmtNum(u.seededPerSec, 1)}/s seeded` : ''}`} />}
+      />
+      <Knob
+        path="cluster.newAccountsPerMin"
+        label="New accounts"
+        why="Accounts first seen per minute across every host. A spam wave hits this before consumers see it."
+        unit="/min"
+        use={u && (counted ? <Use v={u.newAccountsPerMin} max={lim('newAccountsPerMin')} label={`${fmtNum(u.newAccountsPerMin, 1)}/min now`} /> : <span className="muted">counted on the leader ({leader}), not {u.node}</span>)}
+      />
+      <Knob path="cluster.newHostsPerDay" label="New hosts" why="requestCrawl admissions per UTC day. Allow rules and trusted domains don’t spend it." unit="/day" use={u && <Use v={u.newHostsToday} max={lim('newHostsPerDay')} label={`${fmtNum(u.newHostsToday)} today`} />} />
+    </>
+  )
+}
+
+// ---------------------------------------------------------------- discovery (Discovery shows it too)
+
+export type SeedRelay = { url: string; enabled: boolean; refreshIntervalSecs: number }
+
+/** Why a seed relay's URL won't do, or undefined. */
+export function seedUrlError(url: string): string | undefined {
+  try {
+    const u = new URL(url)
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return `${url} isn't http(s)`
+    if (u.pathname !== '/' || u.search || u.hash) return `${url}: give the relay's origin, no path`
+    return undefined
+  } catch {
+    return `${JSON.stringify(url)} isn't a URL`
+  }
+}
+
+/** A seed relay URL as the relay keys it: the origin, no trailing slash. */
+export const normSeedUrl = (url: string) => {
+  const t = url.trim()
+  const v = /^[a-z]+:\/\//i.test(t) ? t : `https://${t}`
+  try {
+    return new URL(v).origin
+  } catch {
+    return v
+  }
+}
+
+const seedsOf = (body?: Json) => (getIn(body, 'discovery.seedRelays') as SeedRelay[] | undefined) ?? []
+
+/** Adds a seed relay to the draft (enabled, read every 6 h). False if it's already there. */
+export function addSeedRelay(url: string): boolean {
+  const d = getDraft()
+  const u = normSeedUrl(url)
+  const seeds = seedsOf(d.body)
+  if (!d.body || seeds.some((r) => r.url === u)) return false
+  setField('discovery.seedRelays', [...seeds, { url: u, enabled: true, refreshIntervalSecs: 6 * 3600 }])
+  return true
+}
+
+function setSeed(i: number, r: SeedRelay | null) {
+  const seeds = [...seedsOf(getDraft().body)]
+  if (r) seeds[i] = r
+  else seeds.splice(i, 1)
+  setField('discovery.seedRelays', seeds)
+}
+
+/** The seed relays, the PLC source and discovery's own budgets, all in the policy draft. */
+export function DiscoveryPolicy() {
+  const d = useDraft()
+  const errs = useErrors()
+  const [url, setUrl] = useState('')
+  if (getIn(d.body, 'discovery') === undefined) return <Empty>This relay's policy has no discovery section.</Empty>
+  const seeds = seedsOf(d.body)
+  const base = seedsOf(d.base?.body)
+  const nu = normSeedUrl(url)
+  const bad = url.trim() ? (seedUrlError(nu) ?? (seeds.some((r) => r.url === nu) ? `${nu} is already listed` : undefined)) : undefined
+  const err = errs.get('discovery.seedRelays')
+  return (
+    <>
+      <div className="cx-tw">
+        <table className="cx-t compact">
+          <thead>
+            <tr>
+              <th>Seed relay</th>
+              <th>On</th>
+              <th className="r">Read every</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {seeds.map((r, i) => {
+              const was = base.find((b) => b.url === r.url)
+              return (
+                <tr key={r.url} className={r.enabled ? undefined : 'dim'}>
+                  <td className="mono sm">
+                    {r.url}
+                    {!was && <span className="s-sig sm"> new</span>}
+                  </td>
+                  <td>
+                    <button
+                      type="button"
+                      className={`cx-toggle${r.enabled ? ' on' : ''}${was && was.enabled !== r.enabled ? ' dirty' : ''}`}
+                      aria-pressed={r.enabled}
+                      aria-label={`Read ${r.url}`}
+                      onClick={() => setSeed(i, { ...r, enabled: !r.enabled })}
+                    />
+                  </td>
+                  <td className="r nowrap">
+                    <input
+                      className={`cx-inp num${was && was.refreshIntervalSecs !== r.refreshIntervalSecs ? ' dirty' : ''}`}
+                      style={{ width: 64 }}
+                      inputMode="decimal"
+                      aria-label={`Hours between reads of ${r.url}`}
+                      value={String(Math.round((r.refreshIntervalSecs / 3600) * 100) / 100)}
+                      onChange={(e) => {
+                        const h = Number(e.target.value)
+                        if (Number.isFinite(h) && h > 0) setSeed(i, { ...r, refreshIntervalSecs: Math.round(h * 3600) })
+                      }}
+                    />{' '}
+                    <span className="muted sm">h</span>
+                  </td>
+                  <td className="r">
+                    <button type="button" className="cx-btn sm quiet" onClick={() => setSeed(i, null)} aria-label={`Remove ${r.url}`}>
+                      Remove
+                    </button>
+                  </td>
+                </tr>
+              )
+            })}
+            {base
+              .filter((b) => !seeds.some((r) => r.url === b.url))
+              .map((b) => (
+                <tr key={`rm-${b.url}`} className="dim">
+                  <td className="mono sm">
+                    <s>{b.url}</s> <span className="s-err sm">removed</span>
+                  </td>
+                  <td colSpan={2} />
+                  <td className="r">
+                    <button type="button" className="cx-btn sm quiet" onClick={() => setField('discovery.seedRelays', [...seeds, b])}>
+                      Keep
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            {!seeds.length && !base.length && (
+              <tr>
+                <td colSpan={4}>
+                  <Empty>No seed relays: only requestCrawl and the hosts given at start find new PDSes.</Empty>
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      <form
+        className="cx-pn-b cx-form-row"
+        onSubmit={(e) => {
+          e.preventDefault()
+          if (url.trim() && !bad && addSeedRelay(url)) setUrl('')
+        }}
+      >
+        <input className={`cx-inp mono${bad ? ' bad' : ''}`} style={{ flex: '1 1 220px' }} placeholder="https://relay.example.com" aria-label="Seed relay URL" spellCheck={false} autoComplete="off" value={url} onChange={(e) => setUrl(e.target.value)} title={bad} />
+        <button className="cx-btn" disabled={!url.trim() || !!bad}>
+          Add seed relay
+        </button>
+        {(bad || err) && <span className="s-err sm">{bad ?? err}</span>}
+      </form>
+      <Knob path="discovery.plc" label="PDS hosts from the PLC export" why="Admit the PDS endpoints the documents the export reader reads name (needs --plc-export)." />
+      <Knob path="discovery.connectsPerMin" label="Discovery connects" why="New hosts discovery may connect a minute, cluster-wide. Its own budget: requestCrawl keeps the daily one." unit="/min" />
+      <Knob path="discovery.requestsPerSec" label="listHosts requests" why="Pages a second to any one seed relay; a 429 or 5xx waits out its Retry-After on top." unit="/s" />
     </>
   )
 }
@@ -565,12 +758,45 @@ function History() {
 
 // ---------------------------------------------------------------- review, conflicts, JSON
 
+/** The seed relay list as one line per relay added, removed or changed (the document holds it as one array). */
+function seedDiff(from: unknown, to: unknown): ReactNode[] {
+  const a = Array.isArray(from) ? (from as SeedRelay[]) : []
+  const b = Array.isArray(to) ? (to as SeedRelay[]) : []
+  const say = (r: SeedRelay) => `${r.enabled ? 'on' : 'off'}, every ${dur(r.refreshIntervalSecs * 1000)}`
+  const out: ReactNode[] = []
+  for (const r of b) {
+    const was = a.find((x) => x.url === r.url)
+    if (!was) out.push(<span className="n">+ {r.url} ({say(r)})</span>)
+    else if (!same(was, r))
+      out.push(
+        <>
+          {r.url}: <span className="o">{say(was)}</span> → <span className="n">{say(r)}</span>
+        </>,
+      )
+  }
+  for (const r of a) if (!b.some((x) => x.url === r.url)) out.push(<span className="o">− {r.url}</span>)
+  return out
+}
+
 function DiffList({ list, clash }: { list: Change[]; clash?: string[] }) {
   return (
     <div className="cx-diff" role="list">
       {list.map((c) => (
         <div key={c.path} role="listitem">
-          {c.path}: <span className="o">{showVal(c.from)}</span> → <span className="n">{showVal(c.to)}</span>
+          {c.path === 'discovery.seedRelays' ? (
+            <>
+              {c.path}:
+              {seedDiff(c.from, c.to).map((x, i) => (
+                <div key={i} style={{ paddingLeft: 12 }}>
+                  {x}
+                </div>
+              ))}
+            </>
+          ) : (
+            <>
+              {c.path}: <span className="o">{showVal(c.from)}</span> → <span className="n">{showVal(c.to)}</span>
+            </>
+          )}
           {clash?.includes(c.path) && <span className="w"> (also changed by the newer version; yours wins)</span>}
         </div>
       ))}
@@ -702,7 +928,7 @@ function JsonDialog({ close }: { close: () => void }) {
 
 // ---------------------------------------------------------------- the page
 
-function DraftBar() {
+export function DraftBar() {
   const d = useDraft()
   const errs = useErrors()
   const list = changesOf(d)
@@ -812,10 +1038,13 @@ export function Policy() {
                     <ErrorBudget />
                     <Knob path="transitions.errorMinEvents" label="Error budget floor" why="Fewer frames than this never trip the budget, so one bad commit from a tiny PDS doesn’t throttle it." unit="frames" />
                   </Panel>
-                  <Panel title="Cluster budgets" src={<><Src>policy/full · cluster</Src> <Src isNew>policy/usage</Src></>} foot={<BudgetFoot />}>
-                    <BudgetKnobs />
-                  </Panel>
+                  <Budgets />
                 </div>
+                {getIn(d.body, 'discovery') !== undefined && (
+                  <Panel title="Host discovery" to="/admin/discovery" src={<Src>policy/full · discovery</Src>} right={<Link className="sm" to="/admin/discovery">sources and runs →</Link>}>
+                    <DiscoveryPolicy />
+                  </Panel>
+                )}
                 <div className="cx-grid2">
                   <Panel title="Crawl admission" src={<Src>policy/full · crawl</Src>}>
                     <Knob path="crawl.enabled" label="Public requestCrawl" why="Off: only operators add hosts." />
@@ -830,9 +1059,9 @@ export function Policy() {
                 </div>
                 <Panel
                   title="Spam signals"
-                  src={<><Src>policy/full · spam</Src> <Src>cases?status=open</Src> <Src isNew>policy/signals</Src></>}
+                  src={<><Src>policy/full · spam</Src> <Src>cases?status=open</Src> <Src>policy/signals</Src></>}
                   right={<span className="muted sm">checked against count − error, so churn can’t trip a false positive</span>}
-                  foot={<SignalsFoot />}
+                  foot={<span>A threshold of 0 turns a signal off. A per-account signal that throttles throttles the account's host.</span>}
                 >
                   <SpamTable />
                   <Knob path="spam.trackHosts" label="Hosts tracked per signal" why="Only the heaviest keys are tracked, so memory stays fixed however many hosts are noisy." />
@@ -853,16 +1082,19 @@ export function Policy() {
   )
 }
 
-function BudgetFoot() {
+function Budgets() {
   const use = useLivePoll(A.budgetUse, 'budget', 10_000)
-  if (!use.data || use.data.supported) return <span>Each budget is shared by every node; per-second ones split over the live cores.</span>
-  return <NeedsVersion what="Live use of these budgets" endpoint={use.data.endpoint} />
-}
-
-function SignalsFoot() {
-  const s = useLivePoll(A.spamSignals, 'signals', 10_000)
-  if (!s.data || s.data.supported) return <span>A threshold of 0 turns a signal off. A per-account signal that throttles throttles the account's host.</span>
-  return <NeedsVersion what="The heaviest key per signal" endpoint={s.data.endpoint}>Open cases stand in for now.</NeedsVersion>
+  const u = use.data
+  return (
+    <Panel
+      title="Cluster budgets"
+      src={<><Src>policy/full · cluster</Src> <Src>policy/usage</Src></>}
+      right={u ? <span className="muted sm">use over the last {fmtNum(u.windowSecs, 0)} s</span> : undefined}
+      foot={<span>Each budget is shared by every node; per-second ones split over the live cores. The rates are the answering node's.</span>}
+    >
+      {use.error && !u ? <ErrorState error={use.error} retry={use.reload} /> : <BudgetKnobs u={u} />}
+    </Panel>
+  )
 }
 
 // ---------------------------------------------------------------- a version: its diff and undo

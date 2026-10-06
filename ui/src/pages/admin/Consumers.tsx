@@ -2,36 +2,33 @@ import { useMemo, type ReactNode } from 'react'
 import { DataTable, type Col } from '../../components/console/DataTable'
 import { confirmAction } from '../../components/console/dialogs'
 import { registerDetail } from '../../components/console/Drawer'
-import { Banners, Chip, Copy, Empty, Glyph, KV, LiveVal, Loaded, Meter, Mini, NeedsVersion, PageHead, Panel, SearchInput, Sec, Seg, Spark, Src, Strip, Tiles, type BannerSpec, type TileSpec } from '../../components/console/kit'
+import { Banners, Bars, Chip, Copy, Empty, Glyph, KV, LiveVal, Loaded, Meter, Mini, PageHead, Panel, SearchInput, Sec, Seg, Spark, Src, Strip, Tiles, type BannerSpec, type TileSpec } from '../../components/console/kit'
 import { openPanel } from '../../components/console/nav'
 import { registerPalette } from '../../components/console/Palette'
 import type { Consumer } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { dt, dur, fmtBytes, fmtMs, fmtNum, fmtSi, plural, seqS } from '../../lib/console/fmt'
-import { consumersPoll, isSlow, overviewPoll, policyFullPoll, quorumPoll, seriesOf, slowLagMs } from '../../lib/console/polls'
-import { useRelay, type RelayView } from '../../lib/console/relay'
+import { consumersPoll, isSlow, overviewPoll, policyFullPoll, quorumPoll, seriesOf, settingsPoll, slowLagMs } from '../../lib/console/polls'
+import { useRelay } from '../../lib/console/relay'
 import { Link, navigate, useSearch } from '../../lib/router'
 import './logPages.css'
-import { RoleChip, memberRows } from './quorumUi'
+import { RoleChip, memberRows, membershipOn } from './quorumUi'
 import { NodeTag } from './relayUi'
 
-// Every subscribeRepos socket: per serving node, how each keeps up with the stream, where a
-// replay reads from, and a kick behind a typed confirm. On the quorum log the list is the node
-// this console talks to (the others' consumers come back when it's rebuilt on the qlog peer
-// protocol); the serving-nodes table counts every member's from their statuses.
+// Every subscribeRepos socket on every member (the answering node asks the others over the peer
+// protocol): how each keeps up with the stream, which tier it reads from, and a kick behind a
+// typed confirm, sent on to the member serving it.
 
 const keyOf = (c: Consumer) => `${c.node}/${c.id}`
-
-/** The list answers for one node only: the quorum log's admin API lists this node's sockets. */
-function useScope(view?: RelayView, list?: Consumer[]) {
-  const listed = new Set((list ?? []).map((c) => c.node))
-  const multi = !!view && !view.single && view.nodes.length > 1
-  const onlyThis = multi && !!view?.quorum && listed.size <= 1
-  const self = view?.self ?? [...listed][0]
-  return { onlyThis, self }
-}
+type Tier = Consumer['readTier']
+const TIERS: Tier[] = ['ring', 'disk', 'bucket']
+const TIER_LABEL: Record<Tier, string> = { ring: 'ring', disk: 'local disk', bucket: 'bucket' }
 
 export function kickDialog(c: Consumer) {
+  const flags = settingsPoll.get().data
+  const self = flags?.entries.find((e) => e.flag === '--node-id')?.value
+  const relayed = !!self && c.node !== self
+  const on = membershipOn(flags)
   return confirmAction({
     tone: 'warn',
     title: `Kick consumer #${c.id}?`,
@@ -39,6 +36,19 @@ export function kickDialog(c: Consumer) {
       <>
         Drops the socket from <span className="mono">{c.ip}</span> ({c.userAgent || 'no user agent'}) on {c.node} at once.
       </>,
+      ...(!relayed
+        ? []
+        : on
+          ? [
+              <>
+                {self} sends it on to {c.node} over the peer protocol, with the nodes' <span className="mono">--qlog-admin-token</span>.
+              </>,
+            ]
+          : [
+              <span className="s-err">
+                {c.node} isn't the node answering this console, and the nodes run without <span className="mono">--qlog-admin-token</span>, so {self} can't send the kick on.
+              </span>,
+            ]),
       'A well-behaved client reconnects with its cursor, on any node, and resumes where it was.',
       'It is not banned: nothing stops it reconnecting.',
     ],
@@ -53,11 +63,15 @@ export function kickDialog(c: Consumer) {
   })
 }
 
-function ModeChip({ c, tier }: { c: Consumer; tier?: A.ConsumerTier }) {
-  if (tier === 'disk') return <Chip k="info">local disk</Chip>
-  if (tier === 'bucket') return <Chip k="violet">bucket</Chip>
-  if (tier === 'ring') return <Chip k="plain" glyph={false}>ring</Chip>
-  return c.backfilling ? <Chip k="info">replaying</Chip> : <Chip k="plain" glyph={false}>live</Chip>
+/** Where its next events come from: the firehose's memory, the node's own log, or the bucket's segments. */
+function TierChip({ c }: { c: Consumer }) {
+  if (c.readTier === 'disk') return <Chip k="info">local disk</Chip>
+  if (c.readTier === 'bucket') return <Chip k="violet">bucket</Chip>
+  return (
+    <Chip k="plain" glyph={false}>
+      ring{c.backfilling ? ' · replaying' : ''}
+    </Chip>
+  )
 }
 
 export function Consumers() {
@@ -68,10 +82,11 @@ export function Consumers() {
   const { view } = useRelay()
   const s = useSearch()
   const node = s.get('node') ?? ''
+  const tier = (s.get('tier') ?? '') as Tier | ''
   const q = (s.get('q') ?? '').toLowerCase()
   const cut = slowLagMs(pol.data)
   const all = subs.data
-  const { onlyThis, self } = useScope(view, all)
+  const silent = (view?.nodes ?? []).filter((n) => n.stale).map((n) => n.id)
   const o = ov.data
   const stream = o ? (o.streamEventsPerSec ?? o.eventsOutPerSec) : 0
   const setUrl = (k: string, v: string) => {
@@ -85,9 +100,9 @@ export function Consumers() {
   const rows = useMemo(
     () =>
       (all ?? [])
-        .filter((c) => (!node || c.node === node) && (!q || c.ip.includes(q) || c.userAgent.toLowerCase().includes(q) || String(c.id) === q))
+        .filter((c) => (!node || c.node === node) && (!tier || c.readTier === tier) && (!q || c.ip.includes(q) || c.userAgent.toLowerCase().includes(q) || String(c.id) === q))
         .sort((a, b) => Number(isSlow(b, cut)) - Number(isSlow(a, cut)) || Number(b.backfilling) - Number(a.backfilling) || b.lagMs - a.lagMs || a.node.localeCompare(b.node) || a.id - b.id),
-    [all, node, q, cut],
+    [all, node, tier, q, cut],
   )
   const nodes = [...new Set((all ?? []).map((c) => c.node))].sort()
   const qv = qp.data?.supported ? qp.data.data : undefined
@@ -96,6 +111,8 @@ export function Consumers() {
 
   const slow = (all ?? []).filter((c) => isSlow(c, cut))
   const backfill = (all ?? []).filter((c) => c.backfilling).length
+  const byTier: Record<Tier, number> = { ring: 0, disk: 0, bucket: 0 }
+  for (const c of all ?? []) byTier[c.readTier] = (byTier[c.readTier] ?? 0) + 1
   const liveOnes = (all ?? []).filter((c) => !c.backfilling)
   const slowest = liveOnes.reduce<Consumer | undefined>((a, c) => (!a || c.lagMs > a.lagMs ? c : a), undefined)
   const frameBytes = o && o.eventsOutPerSec > 0 ? o.bytesOutPerSec / o.eventsOutPerSec : 0
@@ -124,16 +141,16 @@ export function Consumers() {
       ),
     })
   }
-  if (onlyThis)
+  if (silent.length)
     banners.push({
-      id: 'scope',
-      tone: 'info',
-      title: `Connections on ${self ?? 'this node'} only`,
-      desc: "the admin API lists the sockets of the node you're talking to; Serving nodes counts every member's",
+      id: 'silent',
+      tone: 'warn',
+      title: `${silent.join(', ')} didn't answer`,
+      desc: `${silent.length === 1 ? 'its' : 'their'} consumers aren't listed until ${silent.length === 1 ? 'it answers' : 'they answer'}`,
     })
 
   const tiles: TileSpec[] = [
-    { label: 'Consumers', right: onlyThis ? 'this node' : undefined, value: all ? fmtNum(all.length) : '—', sec: `${fmtNum(backfill)} replaying` },
+    { label: 'Consumers', right: 'every node', value: all ? fmtNum(all.length) : '—', sec: `${fmtNum(backfill)} replaying` },
     { label: 'Events sent', right: 'every node', value: o ? fmtSi(o.eventsOutPerSec) : '—', unit: '/s', spark: <Spark data={o?.history.eventsOut ?? []} color="c5" /> },
     { label: 'Egress', right: 'every node', value: o ? `${fmtBytes(o.bytesOutPerSec)}/s` : '—', spark: <Spark data={o?.history.bytesOut ?? []} color="c5" /> },
     { label: 'Per full-stream consumer', value: frameBytes ? `${fmtBytes(stream * frameBytes)}/s` : '—', sec: 'at the stream’s rate now', title: 'The merged stream’s rate times the mean frame size sent' },
@@ -156,7 +173,7 @@ export function Consumers() {
     { id: 'ip', label: 'IP', render: (c) => <span className="mono sm t2">{c.ip}</span> },
     { id: 'since', label: 'Connected', r: true, sort: (a, b) => b.connectedSinceMs - a.connectedSinceMs, render: (c) => <span className="sm muted" title={dt(c.connectedSinceMs)}>{dur(Date.now() - c.connectedSinceMs)}</span> },
     { id: 'lag', label: 'Lag', r: true, sort: (a, b) => a.lagMs - b.lagMs, render: (c) => <LiveVal className={`mono sm${isSlow(c, cut) ? ' s-warn' : ''}`}>{fmtMs(c.lagMs)}</LiveVal> },
-    { id: 'mode', label: 'Reads from', render: (c) => <ModeChip c={c} /> },
+    { id: 'tier', label: 'Reads from', sort: (a, b) => TIERS.indexOf(a.readTier) - TIERS.indexOf(b.readTier), render: (c) => <TierChip c={c} /> },
     {
       id: 'rate',
       label: 'Events/s vs stream',
@@ -182,7 +199,7 @@ export function Consumers() {
         title="Consumers"
         sub={
           <>
-            <span>{all ? `${plural(all.length, 'subscribeRepos socket')}${onlyThis ? ` on ${self ?? 'this node'}` : ''}` : '…'}</span>
+            <span>{all ? `${plural(all.length, 'subscribeRepos socket')}${nodes.length > 1 ? ` on ${nodes.length} nodes` : ''}` : '…'}</span>
             {o && <span>{fmtBytes(o.bytesOutPerSec)}/s out</span>}
           </>
         }
@@ -218,7 +235,7 @@ export function Consumers() {
                       <NodeTag view={view} id={n.id} />
                     </td>
                     <td>{m ? <RoleChip kind={m.kind} /> : <span className="sm">{n.role}</span>}</td>
-                    <td className="r mono sm">{n.stale ? '—' : fmtNum(view?.single ? (all?.length ?? n.consumers) : n.consumers)}</td>
+                    <td className="r mono sm">{n.stale ? '—' : fmtNum(all ? all.filter((c) => c.node === n.id).length : n.consumers)}</td>
                     <td className="r mono sm">{n.stale ? '—' : fmtSi(view?.single ? (o?.eventsOutPerSec ?? n.eventsOutPerSec) : n.eventsOutPerSec)}</td>
                     <td className="r mono sm" title="Entries the leader has committed that this node hasn't emitted yet">
                       {behind === undefined ? '—' : `${fmtNum(behind)} entries`}
@@ -238,18 +255,15 @@ export function Consumers() {
         </div>
       </Panel>
       <Panel
-        title={
-          <>
-            Connections {onlyThis && <span className="cx-scope">this node · {self}</span>}
-          </>
-        }
+        title="Connections"
         className="cx-mt"
-        src={
+        src={<Src>consumers</Src>}
+        right={
           <>
-            <Src>consumers</Src> <Src isNew>consumers[].readTier</Src>
+            <Seg<Tier | ''> label="Reads from" value={tier} options={[{ v: '', label: 'any tier' }, ...TIERS.map((t) => ({ v: t, label: TIER_LABEL[t], n: fmtNum(byTier[t]) }))]} onChange={(v) => setUrl('tier', v)} />
+            <SearchInput mono value={q} placeholder="IP, client or #id" onChange={(v) => setUrl('q', v.trim().toLowerCase())} style={{ width: 200 }} />
           </>
         }
-        right={<SearchInput mono value={q} placeholder="IP, client or #id" onChange={(v) => setUrl('q', v.trim().toLowerCase())} style={{ width: 220 }} />}
       >
         <Loaded load={subs}>
           {() => (
@@ -260,7 +274,7 @@ export function Consumers() {
               open={(c) => ({ type: 'consumer', id: keyOf(c) })}
               compact
               label="Consumers"
-              empty={<Empty title={all?.length ? 'No consumer matches' : 'No consumers'}>{all?.length ? 'Clear the filter to see them all.' : 'Nobody is subscribed to this node’s firehose right now.'}</Empty>}
+              empty={<Empty title={all?.length ? 'No consumer matches' : 'No consumers'}>{all?.length ? 'Clear the filters to see them all.' : 'Nobody is subscribed to any member’s firehose right now.'}</Empty>}
             />
           )}
         </Loaded>
@@ -281,11 +295,37 @@ export function Consumers() {
             <Loaded load={pol}>{() => <Empty>The policy has no consumer limits.</Empty>}</Loaded>
           )}
         </Panel>
-        <Panel title="Where replays read from" src={<Src isNew>consumers[].readTier</Src>}>
-          <NeedsVersion what="Each consumer's read tier" endpoint="consumers[].readTier">
-            A replaying consumer reads from the in-memory ring, then the commitlog on local disk, then the bucket's segments (the <span className="mono">backfill</span> purpose on{' '}
-            <Link to="/admin/store">Object store</Link>). Until then the list says live or replaying.
-          </NeedsVersion>
+        <Panel
+          title="Where consumers read from"
+          src={<Src>consumers · readTier</Src>}
+          foot={
+            <span>
+              Every live consumer reads the firehose's memory (the ring). A replay older than it reads the node's own log on disk, and older still the bucket's segments (the{' '}
+              <span className="mono">backfill</span> purpose on <Link to="/admin/store">Object store</Link>).
+            </span>
+          }
+        >
+          <Loaded load={subs}>
+            {(cs) =>
+              cs.length ? (
+                <div className="cx-pn-b">
+                  <Bars
+                    rows={TIERS.map((t) => ({
+                      key: t,
+                      label: TIER_LABEL[t],
+                      v: byTier[t],
+                      fmt: fmtNum(byTier[t]),
+                      color: t === 'ring' ? 'c5' : t === 'disk' ? 'info' : 'violet',
+                      title: `Show only the consumers reading from ${TIER_LABEL[t]}`,
+                      onClick: () => setUrl('tier', tier === t ? '' : t),
+                    }))}
+                  />
+                </div>
+              ) : (
+                <Empty>No consumers.</Empty>
+              )
+            }
+          </Loaded>
         </Panel>
       </div>
     </>
@@ -339,7 +379,7 @@ registerDetail('consumer', {
               ['Client', <span className="mono">{c.userAgent || '—'}</span>],
               ['Connected', `${dt(c.connectedSinceMs)} (${dur(Date.now() - c.connectedSinceMs)})`],
               ['Cursor', <span className="mono">{c.cursor > 0 ? seqS(c.cursor) : '—'}</span>],
-              ['Mode', <ModeChip c={c} />],
+              ['Reads from', <TierChip c={c} />],
             ]}
           />
         </Sec>

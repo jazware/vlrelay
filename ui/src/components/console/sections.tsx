@@ -2,13 +2,14 @@
 // after `g`; `aliases` are older paths that still land in the section (the pre-console pages
 // keep their URLs until their sections are rebuilt).
 
-export type SectionId = 'overview' | 'hosts' | 'consumers' | 'quorum' | 'store' | 'policy' | 'moderation' | 'settings'
+export type SectionId = 'overview' | 'hosts' | 'discovery' | 'consumers' | 'quorum' | 'store' | 'policy' | 'moderation' | 'settings'
 
 export type Section = { id: SectionId; label: string; short?: string; key: string; group: '' | 'Traffic' | 'The log' | 'Rules' | 'System'; path: string; aliases?: string[] }
 
 export const SECTIONS: Section[] = [
   { id: 'overview', label: 'Overview', key: 'o', group: '', path: '/admin' },
   { id: 'hosts', label: 'Hosts', key: 'h', group: 'Traffic', path: '/admin/hosts' },
+  { id: 'discovery', label: 'Discovery', key: 'd', group: 'Traffic', path: '/admin/discovery' },
   { id: 'consumers', label: 'Consumers', key: 'c', group: 'Traffic', path: '/admin/consumers' },
   { id: 'quorum', label: 'Quorum & cluster', short: 'Quorum', key: 'q', group: 'The log', path: '/admin/quorum', aliases: ['/admin/cluster', '/admin/ops'] },
   { id: 'store', label: 'Object store', short: 'Store', key: 'b', group: 'The log', path: '/admin/store' },

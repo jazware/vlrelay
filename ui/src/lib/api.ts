@@ -359,6 +359,8 @@ export type QFlush = {
   last_reserve: number
   /** When F last moved (unix ms; newer builds). */
   last_at_ms?: number
+  /** This leader's last 32 flushes, oldest first. */
+  recent?: FlushRecord[]
 }
 
 export type QSwitch = {

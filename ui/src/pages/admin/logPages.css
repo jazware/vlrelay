@@ -147,16 +147,6 @@
   padding: 10px 12px;
   margin: 0;
 }
-.cx-scope {
-  font: 600 10.5px/1 var(--mono);
-  color: var(--ink3);
-  border: 1px dashed var(--rule);
-  border-radius: 3px;
-  padding: 2px 5px;
-  white-space: nowrap;
-  text-transform: none;
-  letter-spacing: 0;
-}
 .cx-gauge {
   display: flex;
   align-items: center;

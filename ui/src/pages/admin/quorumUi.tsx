@@ -1,9 +1,10 @@
 import { useState, type ReactNode } from 'react'
 import { closeDialog, openDialog } from '../../components/console/dialogs'
-import { Chip, Spinner } from '../../components/console/kit'
+import { Chip, Spinner, type ChipKind } from '../../components/console/kit'
 import { toast } from '../../components/console/toast'
-import { errText, type QRecovery, type QStatus, type QSwitch, type QuorumView, type SettingsView } from '../../lib/api'
+import { errText, type QDurability, type QRecovery, type QStatus, type QSwitch, type QuorumEvent, type QuorumView, type SettingsView } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
+import { fmtBytes, fmtMs, fmtNum, seqS } from '../../lib/console/fmt'
 import { quorumPoll, type SeenEpoch } from '../../lib/console/polls'
 import type { RelayView } from '../../lib/console/relay'
 
@@ -73,17 +74,51 @@ export function RoleChip({ kind }: { kind: MemberKind }) {
   }
 }
 
+/** When an entry counts on a member: after its fdatasync, once in the page cache (synced in the background), or in memory only. */
+export function Durability({ d, long }: { d?: QDurability; long?: boolean }) {
+  if (!d) return <span className="muted">—</span>
+  if (d.mode === 'fsync') return <Chip k="ok" title="An entry counts once it's fdatasync'd">fsync</Chip>
+  if (d.mode === 'memory') return <Chip k="warn" title="No commitlog: a restart loses what only this node held">memory</Chip>
+  return (
+    <span className="nowrap" title={`Acked once written; fdatasync'd every ${d.sync_ms ?? '?'} ms in the background (${fmtNum(d.background_syncs)} so far). Unsynced bytes are what a power cut on a majority could lose.`}>
+      <Chip k="info">page cache</Chip>{' '}
+      <span className="mono sm t2">
+        {fmtBytes(d.unsynced_bytes)} unsynced{d.since_sync_ms != null ? ` · ${fmtMs(d.since_sync_ms)}${long ? ' since the last sync' : ''}` : ''}
+      </span>
+    </span>
+  )
+}
+
 // ---------------------------------------------------------------- epoch changes
 
-export type EpochKind = 'switch' | 'recovery' | 'seen'
-export type EpochEvent = { id: string; epoch: number; fromEpoch?: number; atMs?: number; kind: EpochKind; leader: string | null; pausedMs?: number; sw?: QSwitch; rec?: QRecovery; seen?: SeenEpoch }
+export type EpochKind = 'takeover' | 'handoff' | 'switch' | 'recovery' | 'stepdown' | 'seen'
+export type EpochEvent = {
+  id: string
+  epoch: number
+  fromEpoch?: number
+  atMs?: number
+  kind: EpochKind
+  /** Who leads after it (null: nobody, after a step-down nothing followed). */
+  leader: string | null
+  /** Appends paused (a membership change), the recovery took, or no member led (a step-down to the next lead). */
+  pausedMs?: number
+  sw?: QSwitch
+  rec?: QRecovery
+  /** The new leader's own record of taking over (`status.history`). */
+  lead?: QuorumEvent
+  /** The old leader stepping down before it, when it lived to record it. */
+  down?: QuorumEvent
+  seen?: SeenEpoch
+}
 
 /**
- * Membership changes (`switches`, from whichever leader ran them) and bucket recoveries
- * (`recovered`) as the statuses list them, plus the epoch changes the console saw while open
- * that neither explains (a takeover or a handoff: the status doesn't say which). Newest first.
+ * The quorum's leadership changes, newest first: each member's own history (takeovers by
+ * election, handoffs, recoveries, membership changes and step-downs, with their times), joined
+ * with the membership changes (`switches`) and bucket recoveries (`recovered`) the statuses
+ * detail, plus any epoch change the console saw that no member's history explains (its leader
+ * is gone, or the change is older than the 64 a member keeps).
  */
-export function epochEvents(q: QuorumView | undefined, seen: SeenEpoch[]): EpochEvent[] {
+export function epochEvents(q: QuorumView | undefined, history: QuorumEvent[], seen: SeenEpoch[]): EpochEvent[] {
   const out = new Map<string, EpochEvent>()
   for (const n of q?.nodes ?? []) {
     const s = n.status
@@ -97,29 +132,98 @@ export function epochEvents(q: QuorumView | undefined, seen: SeenEpoch[]): Epoch
       if (!out.has(id)) out.set(id, { id, epoch: r.epoch, kind: 'recovery', leader: s.id, pausedMs: r.total_ms, rec: r })
     }
   }
+  const leads: EpochEvent[] = []
+  for (const h of history) {
+    if (h.kind !== 'lead') continue
+    const why = h.why.toLowerCase()
+    let e: EpochEvent | undefined
+    if (why.startsWith('recovery')) e = [...out.values()].find((x) => x.kind === 'recovery' && x.epoch === h.epoch)
+    else e = out.get(`e${h.epoch}`)
+    if (e) {
+      e.lead = h
+      e.atMs ??= h.atMs
+    } else {
+      const kind: EpochKind = why.startsWith('membership') ? 'switch' : why.startsWith('recovery') ? 'recovery' : why.startsWith('handoff') ? 'handoff' : 'takeover'
+      e = { id: `e${h.epoch}`, epoch: h.epoch, atMs: h.atMs, kind, leader: h.node, lead: h }
+      out.set(e.id, e)
+    }
+    leads.push(e)
+  }
+  leads.sort((a, b) => a.epoch - b.epoch || a.atMs! - b.atMs!)
+  // a step-down belongs to the next epoch's lead (a partitioned leader may only notice after it);
+  // one no later epoch followed leaves the quorum leaderless
+  for (const h of history) {
+    if (h.kind !== 'step_down') continue
+    const next = leads.find((e) => e.epoch > h.epoch)
+    if (next) {
+      if (!next.down || next.down.atMs < h.atMs) next.down = h
+      if ((next.kind === 'takeover' || next.kind === 'handoff') && next.atMs! >= h.atMs) next.pausedMs = next.atMs! - h.atMs
+    } else {
+      const id = `d${h.node}-${h.epoch}-${h.atMs}`
+      out.set(id, { id, epoch: h.epoch, atMs: h.atMs, kind: 'stepdown', leader: null, down: h })
+    }
+  }
   const known = new Set([...out.values()].map((e) => e.epoch))
   for (const e of seen) {
     if (known.has(e.epoch)) {
-      // a recovery's time is when the console saw its epoch
+      // a recovery no history dates is dated when the console saw its epoch
       const r = [...out.values()].find((x) => x.kind === 'recovery' && x.epoch === e.epoch && x.atMs === undefined)
       if (r) r.atMs = e.atMs
       continue
     }
     out.set(`e${e.epoch}`, { id: `e${e.epoch}`, epoch: e.epoch, fromEpoch: e.from, atMs: e.atMs, kind: 'seen', leader: e.leader, seen: e })
   }
-  return [...out.values()].sort((a, b) => b.epoch - a.epoch || (b.atMs ?? 0) - (a.atMs ?? 0))
+  const all = [...out.values()]
+  const epochs = [...new Set(all.map((e) => e.epoch))].sort((a, b) => a - b)
+  for (const e of all) if (e.fromEpoch === undefined && e.kind !== 'stepdown') e.fromEpoch = epochs[epochs.indexOf(e.epoch) - 1]
+  return all.sort((a, b) => b.epoch - a.epoch || (b.atMs ?? 0) - (a.atMs ?? 0))
 }
 
 export const EPOCH_GLYPH: Record<EpochKind, ReactNode> = {
+  takeover: <span className="s-warn">▲</span>,
+  handoff: <span className="s-ok">●</span>,
   switch: <span className="s-acc">◆</span>,
   recovery: <span className="s-err">■</span>,
-  seen: <span className="s-warn">▲</span>,
+  stepdown: <span className="s-idle">○</span>,
+  seen: <span className="s-warn">△</span>,
+}
+
+const EPOCH_CHIP: Record<EpochKind, [ChipKind, string]> = {
+  takeover: ['warn', 'takeover'],
+  handoff: ['ok', 'handoff'],
+  switch: ['acc', 'membership'],
+  recovery: ['err', 'bucket recovery'],
+  stepdown: ['idle', 'step-down'],
+  seen: ['warn', 'new epoch'],
 }
 
 export function EpochChip({ kind }: { kind: EpochKind }) {
-  if (kind === 'switch') return <Chip k="acc">membership</Chip>
-  if (kind === 'recovery') return <Chip k="err">bucket recovery</Chip>
-  return <Chip k="warn">new epoch</Chip>
+  const [k, label] = EPOCH_CHIP[kind]
+  return <Chip k={k}>{label}</Chip>
+}
+
+/** One line on what happened. */
+export function epochDetail(e: EpochEvent): string {
+  const down = e.down ? `${e.down.node} stepped down (${e.down.why})` : ''
+  switch (e.kind) {
+    case 'switch':
+      return e.sw ? `${e.sw.from.join(', ')} → ${e.sw.to.join(', ')}` : (e.lead?.why ?? 'membership change')
+    case 'recovery':
+      return e.rec ? `generation ${e.rec.generation}: resumed after ${seqS(e.rec.after)}, ${fmtNum(e.rec.salvaged)} salvaged` : `${e.leader} recovered from the bucket`
+    case 'handoff':
+      return `${e.lead?.from ?? e.down?.node ?? 'the leader'} handed off to ${e.leader}`
+    case 'takeover':
+      return [
+        `${e.leader} elected${e.lead?.from ? ` after ${e.lead.from}` : ''}`,
+        e.down && e.lead && e.down.atMs > e.lead.atMs ? `${e.down.node} stepped down ${fmtMs(e.down.atMs - e.lead.atMs)} later (${e.down.why})` : down || (e.lead?.from ? `${e.lead.from} stopped answering` : ''),
+      ]
+        .filter(Boolean)
+        .join(' · ')
+    case 'stepdown':
+      return `${down}: no member has led since`
+    default:
+      return "seen by this console: no member's history lists it"
+  }
 }
 
 /** Members before and after: kept plain, added dashed green, removed struck red. */

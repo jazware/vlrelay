@@ -3,8 +3,8 @@ import { DataTable, type Col } from '../../components/console/DataTable'
 import { registerDetail } from '../../components/console/Drawer'
 import { openPanel } from '../../components/console/nav'
 import { registerPalette } from '../../components/console/Palette'
-import { Chip, Empty, KV, Loaded, Meter, NeedsVersion, PageHead, Panel, SearchInput, Sec, Seg, Src, Strip, Tiles, Toggle } from '../../components/console/kit'
-import { setAdminToken, type ConfigEntry, type PlcView, type SettingsView } from '../../lib/api'
+import { Chip, Empty, KV, Loaded, Meter, PageHead, Panel, SearchInput, Sec, Seg, Src, Strip, Tiles, Toggle } from '../../components/console/kit'
+import { errText, setAdminToken, type ConfigEntry, type SettingsView } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, dt, dur, fmtNum, fmtSi, plural } from '../../lib/console/fmt'
 import { useLiveState, toggleSources, useLivePoll } from '../../lib/console/live'
@@ -14,33 +14,40 @@ import { navigate, useSearch } from '../../lib/router'
 import { NodeTag } from './relayUi'
 import '../../console-rules.css'
 
-// The process config each node was started with (GET settings): every flag with its source,
-// secrets only as set or not. Flags change with a restart; what changes live is on Policy.
-// The settings endpoint answers for the node you reach, so comparing nodes waits on
-// settings?node= (adminAdapter); the page is ready for it.
+// The process config each node was started with (GET settings, and settings?node= for the other
+// members): every flag with its source, secrets only as set or not, and the flags that differ
+// across nodes. Flags change with a restart; what changes live is on Policy.
 
 type Src = ConfigEntry['source']
 const changed = (e: ConfigEntry) => !e.secret && (e.source === 'flag' || e.source === 'env') && e.value !== e.default
 
-/** Each node's flags, where the relay can answer for more than the node you reach. */
+/** Each node's flags: the answering node's from the shared poll, every other member's asked through it. */
 function useNodes() {
   const { view } = useRelay()
   const self = settingsPoll.use()
-  const ids = (view?.nodes ?? []).map((n) => n.id)
+  const ids = (view?.nodes ?? []).map((n) => n.id).filter((id) => id !== view?.self)
   const others = useLivePoll(
-    () => Promise.all(ids.filter((id) => id !== view?.self).map(async (id) => [id, await A.settingsOf(id)] as const)),
+    () =>
+      Promise.all(
+        ids.map((id) =>
+          A.settingsOf(id).then(
+            (v) => [id, v] as const,
+            (e: unknown) => [id, errText(e)] as const,
+          ),
+        ),
+      ),
     ids.join(','),
     60_000,
     { keep: true },
   )
   const per = new Map<string, SettingsView>()
   if (self.data) per.set(view?.self ?? 'this node', self.data)
-  let gap: string | undefined
+  const silent = new Map<string, string>()
   for (const [id, r] of others.data ?? []) {
-    if (r.supported) per.set(id, r.data)
-    else gap = r.endpoint.replace(/=.*$/, '=')
+    if (typeof r === 'string') silent.set(id, r)
+    else per.set(id, r)
   }
-  return { self, view, per, gap: ids.length > 1 ? gap : undefined }
+  return { self, view, per, silent }
 }
 
 /** The flags whose value isn't the same on every node that answered. */
@@ -67,7 +74,7 @@ function ValueCell({ e }: { e: ConfigEntry }) {
 const SourceChip = ({ s }: { s: Src }) => (s === 'default' ? <Chip k="idle">default</Chip> : s === 'unset' ? <Chip k="plain" glyph={false}>unset</Chip> : <Chip k={s === 'flag' ? 'acc' : 'plain'} glyph={false}>{s}</Chip>)
 
 function Flags() {
-  const { self, view, per, gap } = useNodes()
+  const { self, view, per, silent } = useNodes()
   const search = useSearch()
   const [q, setQ] = useState(search.get('q') ?? '')
   const [onlyChanged, setOnlyChanged] = useState(search.get('changed') === '1')
@@ -108,7 +115,7 @@ function Flags() {
   return (
     <Panel
       title="Process flags"
-      src={<><Src>settings</Src> <Src isNew>settings?node=</Src></>}
+      src={<Src>settings?node=</Src>}
       right={
         nodeIds.length > 1 ? (
           <Seg label="Node" value={node ?? nodeIds[0]} options={nodeIds.map((n) => ({ v: n, label: n }))} onChange={setNode} />
@@ -118,7 +125,12 @@ function Flags() {
           </span>
         ) : undefined
       }
-      foot={gap ? <NeedsVersion what="Comparing nodes" endpoint={gap}>These are the flags of the node answering this console.</NeedsVersion> : <span>Flags change with a restart. Roll a change out one node at a time; the leader hands off before its own restart.</span>}
+      foot={
+        <span>
+          {silent.size > 0 && <span className="s-warn">{[...silent.keys()].join(', ')} didn't answer, so the comparison leaves {silent.size === 1 ? 'it' : 'them'} out. </span>}
+          Flags change with a restart. Roll a change out one node at a time; the leader hands off before its own restart.
+        </span>
+      }
     >
       <div className="cx-toolbar">
         <SearchInput mono value={q} placeholder="Filter flags, env, values" onChange={setQ} />
@@ -147,46 +159,56 @@ function Flags() {
   )
 }
 
-/** PLC export seeding, when this relay was started with it (ops/plc 404s otherwise, so it isn't asked). */
+const day = (ms: number) => new Date(ms).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })
+
+/** PLC export seeding: the leader reads the export into seeds every node resolves from. Any node answers ops/plc. */
 function Plc() {
-  const flags = settingsPoll.use().data
-  const on = flags?.entries.some((e) => e.flag.startsWith('--plc-export') && e.value !== null && e.value !== 'false')
-  const l = useLivePoll(() => (on ? A.plc() : Promise.resolve({ supported: false as const, endpoint: 'ops/plc', why: '' })), String(on), on ? 5000 : 0)
+  const l = useLivePoll(A.plc, 'plc', 5000)
   const { view } = useRelay()
-  if ((l.data && !l.data.supported) || (flags && !on))
-    return (
-      <Panel title="PLC seeding" src={<Src>ops/plc</Src>}>
-        <Empty>This relay doesn't seed DID keys from the PLC export: it resolves each DID on first sight.</Empty>
-      </Panel>
-    )
-  const v: PlcView | undefined = l.data?.supported ? l.data.data : undefined
+  const v = l.data
+  const done = v ? v.windows.filter((w) => w.done).length : 0
+  const progress = v?.windows.length ? v.windows.reduce((a, w) => a + (w.done ? 1 : w.progress), 0) / v.windows.length : 0
   return (
     <Panel
       title="PLC seeding"
       src={<Src>ops/plc</Src>}
       right={v ? v.enabled ? <Chip k={v.caughtUp ? 'ok' : 'info'}>{v.caughtUp ? 'caught up' : 'backfilling'}</Chip> : <Chip k="idle">off</Chip> : undefined}
-      foot={v ? <span>Read by {v.leader ? <NodeTag view={view} id={v.leader} /> : 'no node'} · checkpoint {v.checkpointMs ? ago(v.checkpointMs) : 'never'} · newest op {v.newestMs ? ago(v.newestMs) : '—'}</span> : undefined}
+      foot={
+        v?.enabled ? (
+          <span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: '2px 6px', alignItems: 'center' }}>
+            Read by {v.leader ? <NodeTag view={view} id={v.leader} /> : 'no node'} · checkpoint {v.checkpointMs ? <span title={dt(v.checkpointMs)}>{ago(v.checkpointMs)}</span> : 'never'} · newest op{' '}
+            {v.newestMs ? <span title={dt(v.newestMs)}>{ago(v.newestMs)}</span> : '—'}. The counters are the current leader's term; the checkpoint is shared.
+          </span>
+        ) : undefined
+      }
     >
-      <Loaded load={{ ...l, data: v }}>
-        {(p) => (
+      <Loaded load={l}>
+        {(p) =>
+          !p.enabled ? (
+            <Empty>This relay doesn't seed DID keys from the PLC export (it runs without --plc-export): it resolves each DID on first sight.</Empty>
+          ) : (
           <>
             <Strip
               items={[
+                ['export read', p.windows.length ? `${Math.round(progress * 100)}%` : '—'],
                 ['ops read', fmtSi(p.ops)],
                 ['ops/s', fmtNum(p.opsPerSec, 1)],
-                ['written', fmtSi(p.written)],
+                ['seeds written', fmtSi(p.written)],
+                ['requests', fmtSi(p.requests)],
                 ['throttled (429)', fmtNum(p.throttled)],
                 ['errors', fmtNum(p.errors)],
+                ['restarts', fmtNum(p.restarts)],
               ]}
             />
             {p.windows.length > 0 && (
-              <Sec title="Windows" digest={`${p.windows.filter((w) => w.done).length} of ${p.windows.length} done`} open flush>
+              <Sec title="Windows" digest={`${done} of ${p.windows.length} done`} open flush>
                 <div className="cx-tw">
                   <table className="cx-t compact">
                     <thead>
                       <tr>
                         <th>From</th>
                         <th>Until</th>
+                        <th>Read to</th>
                         <th className="r">Ops</th>
                         <th>Progress</th>
                       </tr>
@@ -194,8 +216,9 @@ function Plc() {
                     <tbody>
                       {p.windows.map((w, i) => (
                         <tr key={i}>
-                          <td className="sm">{dt(w.fromMs)}</td>
-                          <td className="sm">{w.untilMs ? dt(w.untilMs) : 'live'}</td>
+                          <td className="sm nowrap">{day(w.fromMs)}</td>
+                          <td className="sm nowrap">{w.untilMs ? day(w.untilMs) : 'live'}</td>
+                          <td className="sm muted">{w.done ? '' : w.afterMs ? `at ${dt(w.afterMs)}` : 'not started'}</td>
                           <td className="r mono sm">{fmtSi(w.ops)}</td>
                           <td className="sm">
                             <Meter v={w.progress} max={1} k={w.done ? 'ok' : 'info'} /> <span className="mono">{w.done ? 'done' : `${Math.round(w.progress * 100)}%`}</span>
@@ -229,7 +252,8 @@ function Plc() {
               </Sec>
             )}
           </>
-        )}
+          )
+        }
       </Loaded>
     </Panel>
   )
@@ -327,14 +351,14 @@ registerDetail('flag', {
   kind: 'Flag',
   section: 'settings',
   use: (id) => {
-    const { self, view, per, gap } = useNodes()
+    const { self, view, per, silent } = useNodes()
     const e = self.data?.entries.find((x) => x.flag === id)
     if (!e) return { title: id, body: null, loading: self.loading, missing: self.data ? `This relay has no ${id}.` : undefined }
     const vals = [...per.entries()].map(([n, s]) => [n, s.entries.find((x) => x.flag === id)] as const)
     return {
       title: e.flag,
       chip: e.secret ? <Chip k={e.set ? 'ok' : 'idle'}>{e.set ? 'secret · set' : 'secret · not set'}</Chip> : <SourceChip s={e.source} />,
-      foot: <>GET /admin/api/settings</>,
+      foot: <>GET /admin/api/settings?node=</>,
       body: (
         <>
           {e.help && <p className="cx-lede">{e.help}</p>}
@@ -356,10 +380,17 @@ registerDetail('flag', {
                       <td className="mono sm">{x ? <ValueCell e={x} /> : <span className="muted">not reported</span>}</td>
                     </tr>
                   ))}
+                  {[...silent].map(([n, why]) => (
+                    <tr key={n} className="dim">
+                      <td>{view?.byId.has(n) ? <NodeTag view={view} id={n} /> : <span className="sm">{n}</span>}</td>
+                      <td className="sm muted" title={why}>
+                        didn't answer
+                      </td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
-            {gap && <NeedsVersion what="The other nodes' values" endpoint={gap} />}
           </Sec>
           <p className="muted sm" style={{ margin: 0 }}>
             Flags change with a restart. {e.source === 'env' ? `Set in the environment as ${e.env}.` : e.source === 'flag' ? 'Set on the command line.' : ''}

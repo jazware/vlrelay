@@ -8,6 +8,7 @@ import { api, setAdminToken } from '../../lib/api'
 import { useAdminToken } from '../../lib/hooks'
 import { Link, match } from '../../lib/router'
 import { Consumers } from './Consumers'
+import { Discovery } from './Discovery'
 import './hostDetail'
 import { Hosts } from './Hosts'
 import { Moderation } from './Moderation'
@@ -40,6 +41,8 @@ function route(p: string): Route {
       return { section: S.overview, page: <Overview /> }
     case '/admin/hosts':
       return { section: S.hosts, page: <Hosts /> }
+    case '/admin/discovery':
+      return { section: S.discovery, page: <Discovery /> }
     case '/admin/consumers':
       return { section: S.consumers, page: <Consumers /> }
     case '/admin/quorum':

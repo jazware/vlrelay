@@ -9,6 +9,7 @@ import { ago, dt, fmtMs, fmtNum, fmtRatio, fmtSi, plural, shortDid } from '../..
 import { useLivePoll } from '../../lib/console/live'
 import { policyPoll } from '../../lib/console/polls'
 import { useRelay } from '../../lib/console/relay'
+import { SourceTag } from './hostSource'
 import { releaseDialog } from './moderationDetail'
 import { NodeTag, REASON_WHAT, reasonLabel } from './relayUi'
 
@@ -195,6 +196,7 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
               ),
             ],
             ['Connected', r.connectedSinceMs ? dt(r.connectedSinceMs) : <span key="c" className="muted">not connected</span>],
+            ['Found by', <SourceTag key="src" s={r.source} />],
           ]}
         />
       </Sec>
@@ -290,10 +292,13 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
           ))}
         </Sec>
       )}
-      {atCap && (
-        <Sec title="Accounts created throttled" digest="past its cap" open flush>
+      {(atCap || r.throttledAccounts > 0) && (
+        <Sec title="Accounts created throttled" digest={r.throttledAccounts ? plural(r.throttledAccounts, 'account') : 'past its cap'} open flush>
           <div className="cx-acts">
-            <Act title="Lift them" desc="Each gets #account active. Raise the cap first, or new ones keep arriving throttled.">
+            <Act
+              title={r.throttledAccounts ? `Lift ${plural(r.throttledAccounts, 'account')}` : 'Lift them'}
+              desc={atCap ? 'Each gets #account active. Raise the cap first, or new ones keep arriving throttled.' : 'Each gets #account active.'}
+            >
               <button type="button" className="cx-btn sm" onClick={() => releaseDialog(r.host, atCap)}>
                 Lift…
               </button>

@@ -5,7 +5,7 @@ import { hostActionDialog, useHostsVersion, type HostVerb } from '../../componen
 import { closePanel, openPanel } from '../../components/console/nav'
 import { toast } from '../../components/console/toast'
 import { Chip, Copy, Empty, HostStatusChip, KV, Sec, Strip, TierTag, type ChipKind } from '../../components/console/kit'
-import { errText, type Account, type Case, type CaseStatus, type DomainRule, type DomainRuleInput, type RuleEffect, type Severity } from '../../lib/api'
+import { errText, type Account, type Case, type CaseStatus, type DomainRule, type DomainRuleInput, type RuleEffect, type Severity, type SignalKey } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, dt, fmtNum, plural, shortDid } from '../../lib/console/fmt'
 import { createPoller, useLivePoll } from '../../lib/console/live'
@@ -19,12 +19,22 @@ export const rulesPoll = createPoller(A.domainRules, 10_000)
 export const rulesAuditPoll = createPoller(A.domainRulesAudit, 30_000)
 /** Every case, for the status counts; open ones also come from openCasesPoll. */
 export const casesPoll = createPoller(() => A.cases(), 10_000)
+/** Opens what a spam signal's key names: the host, or the account (a per-account signal's key is the DID). */
+export const signalKeyRef = (per: string, k: SignalKey) => (per === 'account' && k.key.startsWith('did:') ? { type: 'acct', id: k.key } : { type: 'host', id: k.host || k.key })
+export const openSignalKey = (per: string, k: SignalKey) => {
+  const r = signalKeyRef(per, k)
+  openPanel(r.type, r.id)
+}
+
+/** Every account under a takedown, newest first. */
+export const takedownsPoll = createPoller(A.takedowns, 30_000)
 
 // accounts re-read after a takedown lands
 let acctVersion = 0
 const acctSubs = new Set<() => void>()
 const acctChanged = () => {
   acctVersion++
+  takedownsPoll.refresh()
   acctSubs.forEach((l) => l())
 }
 export const useAcctVersion = () =>

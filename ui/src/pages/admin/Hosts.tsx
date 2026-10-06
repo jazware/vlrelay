@@ -7,16 +7,17 @@ import type { HostRow, HostStatus } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { fmtMs, fmtNum, fmtRatio, fmtSi } from '../../lib/console/fmt'
 import { useLivePoll } from '../../lib/console/live'
-import { capPoll, overviewPoll, policyFullPoll, policyPoll, slowLagMs, throttledPoll } from '../../lib/console/polls'
+import { capPoll, discoveryPoll, overviewPoll, policyFullPoll, policyPoll, slowLagMs, throttledPoll } from '../../lib/console/polls'
 import { useRelay } from '../../lib/console/relay'
 import { Link, useSearch } from '../../lib/router'
 import { Admissions } from './Admissions'
+import { SourceSelect, SourceTag, sourceOk } from './hostSource'
 import { crawlDialog } from './Overview'
 import { NodeTag, relayBanners } from './relayUi'
 
 // Every PDS the relay knows, thousands of them: the server filters, sorts and pages
-// (GET hosts?q&tier&status&sort&desc&limit&offset). The flags (at cap, lagging, erroring) have no
-// server filter, so with one on the page asks for every match and filters here.
+// (GET hosts?q&tier&status&sort&desc&limit&offset). The flags (at cap, lagging, erroring) and the
+// source have no server filter, so with one on the page asks for every match and filters here.
 
 const PAGE = 100
 type Flag = '' | 'cap' | 'lag' | 'err'
@@ -31,6 +32,7 @@ function useUrlState() {
     tier: s.get('tier') ?? '',
     status: (s.get('status') ?? '') as HostStatus | '',
     flag: (s.get('flag') ?? '') as Flag,
+    source: s.get('source') ?? '',
     sort: (s.get('sort') as A.HostSort) || 'events',
     asc: s.get('asc') === '1',
     page: Math.max(0, Number(s.get('page') ?? 0) || 0),
@@ -48,6 +50,7 @@ function setUrl(p: Partial<UrlState>, cur: UrlState) {
   put('tier', n.tier)
   put('status', n.status)
   put('flag', n.flag)
+  put('source', n.source)
   put('sort', n.sort)
   put('asc', n.asc)
   put('page', n.page)
@@ -77,7 +80,7 @@ export function Hosts() {
         status: u.status,
         sort: u.sort,
         desc: !u.asc,
-        ...(u.flag ? { limit: 10_000 } : { limit: PAGE, offset: u.page * PAGE }),
+        ...(u.flag || u.source ? { limit: 10_000 } : { limit: PAGE, offset: u.page * PAGE }),
       }),
     key,
     5000,
@@ -86,10 +89,11 @@ export function Hosts() {
   const { rows, matched } = useMemo(() => {
     const d = list.data
     if (!d) return { rows: [] as HostRow[], matched: 0 }
-    if (!u.flag) return { rows: d.hosts, matched: d.total }
-    const f = d.hosts.filter((h) => flagOk(u.flag, h))
+    if (!u.flag && !u.source) return { rows: d.hosts, matched: d.total }
+    const f = d.hosts.filter((h) => flagOk(u.flag, h) && sourceOk(u.source, h.source))
     return { rows: f.slice(u.page * PAGE, u.page * PAGE + PAGE), matched: f.length }
-  }, [list.data, u.flag, u.page])
+  }, [list.data, u.flag, u.source, u.page])
+  const disc = discoveryPoll.use()
   const pages = Math.max(1, Math.ceil(matched / PAGE))
 
   // a tier's host count is one cheap call each (limit 0 still returns the total)
@@ -161,9 +165,17 @@ export function Hosts() {
         </>
       ),
     },
+    {
+      id: 'throttled',
+      label: 'Throttled accts',
+      r: true,
+      title: 'Accounts it created that the relay throttled past its cap and nobody lifted (the leader’s count)',
+      render: (h) => (h.throttledAccounts ? <span className="mono sm s-warn">{fmtNum(h.throttledAccounts)}</span> : <span className="muted">—</span>),
+    },
     { id: 'lag', label: 'Read lag', r: true, title: 'How far the reader is behind the host’s stream', render: (h) => <span className={`mono sm${live(h) && h.lagMs > 60_000 ? ' s-warn' : ''}`}>{live(h) && h.lagMs ? fmtMs(h.lagMs) : '—'}</span> },
     { id: 'node', label: 'Reader', render: (h) => (live(h) ? <NodeTag view={view} id={h.node} /> : <span className="muted">—</span>) },
     { id: 'seq', label: 'Upstream seq', r: true, render: (h) => <span className="mono sm t2">{fmtNum(h.lastUpstreamSeq)}</span> },
+    { id: 'source', label: 'Source', title: 'How the relay found it', render: (h) => <SourceTag s={h.source} /> },
   ]
 
   return (
@@ -222,6 +234,7 @@ export function Hosts() {
             ]}
             onChange={(flag) => setUrl({ flag }, u)}
           />
+          <SourceSelect value={u.source} onChange={(source) => setUrl({ source }, u)} keys={(disc.data?.sources ?? []).map((s) => s.key)} />
         </div>
         <Loaded load={list}>
           {() => (
