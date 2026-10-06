@@ -18,5 +18,13 @@ export default defineConfig({
     modulePreload: { polyfill: false },
     assetsInlineLimit: 0,
   },
-  server: { port: 5790, proxy: { '/admin/api': { target, changeOrigin: false }, '/api/public': { target, changeOrigin: false } } },
+  server: {
+    port: 5790,
+    proxy: {
+      '/admin/api': { target, changeOrigin: false },
+      '/api/public': { target, changeOrigin: false },
+      // the console's tail (subscribeRepos) and requestCrawl; admin_demo serves neither
+      '/xrpc': { target, changeOrigin: false, ws: true },
+    },
+  },
 })

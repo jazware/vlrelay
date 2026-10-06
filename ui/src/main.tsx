@@ -2,8 +2,9 @@ import { StrictMode, Suspense, lazy, useEffect } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles.css'
 import './relay.css'
+import './console.css'
 import { navigate, usePath } from './lib/router'
-import { AdminApp } from './pages/AdminApp'
+import { AdminApp } from './pages/admin/AdminApp'
 import { Public } from './pages/Public'
 
 // its own chunk: the docs' nav and page index aren't needed by the console
