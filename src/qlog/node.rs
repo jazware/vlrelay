@@ -1366,6 +1366,11 @@ impl Node {
         let mut c = self.core.lock();
         let ok =
             epoch > c.promised || (epoch == c.promised && c.leader.as_deref() == Some(from) && from != self.cfg.id);
+        if ok && epoch == c.promised {
+            // the candidate is still at it (a long bucket recovery): it's
+            // alive, so don't take over from it
+            c.last_heard = Instant::now();
+        }
         if ok && epoch > c.promised {
             self.step_down(&mut c, "promised a newer epoch");
             self.raise_promised(&mut c, epoch, from);
@@ -1775,6 +1780,22 @@ impl Node {
             return Ok(());
         };
         let mut stats = flush::RecoveryStats { read_ms: t0.elapsed().as_millis() as u64, ..Default::default() };
+        // A recovery can outlast the election timeout (at 100x a 10 s
+        // interval's salvage is over a GB): the members that promised hear
+        // from this candidate meanwhile, or they'd depose it and the next
+        // recovery would jump another H.
+        let keepalive = {
+            let n = self.clone();
+            let members: Vec<String> = answered.iter().map(|(id, _)| id.clone()).filter(|id| *id != n.cfg.id).collect();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(n.cfg.heartbeat).await;
+                    let mut rx = n.broadcast(Msg::Promise { epoch, from: n.cfg.id.clone() }, &members);
+                    while rx.recv().await.is_some() {}
+                }
+            })
+        };
+        let _stop = AbortOnDrop(keepalive);
         let from = p.flushed + 1;
         let mut by_commit = answered;
         by_commit.sort_by(|a, b| b.1.cmp(&a.1));
@@ -2402,6 +2423,14 @@ impl Node {
                 self.emit.emit(from, upto, events);
             }
         }
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

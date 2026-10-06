@@ -223,7 +223,7 @@ The member set lives in `qlog/leader` and only changes at a flush barrier, so no
 2. When it's caught up, the leader pauses commits, flushes to the commit index and CASes `qlog/leader` with epoch + 1 and the new member set.
 3. Commits resume under the new set, and the removed node is told to stop.
 
-The pause is one flush plus one CAS, under a second. Replacing a dead box is the same steps. (As built, [Phase 5](#membership-phase-5): a flush just before the pause leaves the barrier's own flush small, so commits pause for ~10-60 ms on a local MinIO; a removed leader hands the new epoch to a member instead of stopping.)
+The pause is one flush plus one CAS, under a second. Replacing a dead box is the same steps. (As built, [Phase 5](#membership-phase-5): a flush just before the pause leaves the barrier's own flush small, so commits pause for 6-13 ms on a local MinIO at 10x; a removed leader hands the new epoch to a member instead of stopping.)
 
 ### Placement
 
@@ -933,6 +933,94 @@ Consumers saw the cursor-to-crash window again: with a 30 s flush, ~70k events a
 - **Box replacement under load.** Wipe a box and bring it back as the same id (that works today, as the fresh-follower reset), and replace it with a new id (needs the above). Chaos: `replace-follower` and `replace-leader` under 10x, checked as now.
 - **Salvage holds everything past F' in memory.** That's fine at 10x, but ~1.7 GB at 100x with a 10 s flush. Stream it into segments while applying.
 - **Known flake, not from this lane:** `fakepds selftest_small` binds fixed ports at 39000+, inside the ephemeral range, and fails on benchbox while other processes hold connections there.
+
+### Membership (Phase 5)
+
+`Node::change_members` (`node.rs`), `POST /qlog/members` on a node's http port, and `qlog member add|remove|replace|set`, which finds the leader through `/qlog/status` and retries until `qlog/leader` holds the new set. As built:
+
+- **The member set is `qlog/leader`'s.** The record is `{epoch, leader, members, learners, addrs, since}`. `members` are the voters at that epoch, `since` is the epoch they took effect at, `learners` are replicated to without counting, and `addrs` fills in peer addresses that `--peer` doesn't name. Commit counting, the leader's quorum-heard check, the pre-vote, the promise round, the candidate's rank and the lost-quorum trigger's silent-member count all use the record's members. `--peer` is only an address book now, and `--members` (default: the node and its peers) is the bootstrap set the first CAS writes.
+  - A takeover reads the record first (it already did, for the CAS) and copies the set into the next epoch. A node the record doesn't name doesn't campaign. A learner waits for the change that makes it a member. Anything else was removed (or never added) and retires: it makes no more takeover attempts, so a retired box costs the bucket nothing, until a leader appends to it again.
+  - Followers don't learn the set from appends. They don't need it: only a candidate counts, and it reads the record.
+- **Learners.** `change_members` records the new ids as learners in `qlog/leader` at the same epoch (a CAS, so a takeover that read the record before it retries) and starts replicating to them. A takeover keeps replicating to the record's learners. A learner is a fresh follower (Phase 4's rule: an empty log starts at the leader's oldest local entry, which the bucket has everything below), it emits what's committed like any follower, and its acks never count: `advance_commit` counts only members, and the promise round asks only members.
+- **The switch at a flush barrier.** Once every learner is intact and holds the commit index:
+  1. A flush, so the barrier's own flush is small (`flush::Shared::request`: the flush loop applies up to the commit index and flushes at once instead of at its interval).
+  2. Appends pause (submits wait up to their 500 ms, then get "busy" and resend).
+  3. Drain: wait until everything appended has committed under the old set, and every learner and at least |new| - quorum(new) + 1 of the new set durably hold it. That last seq is the barrier B.
+  4. Flush to B.
+  5. CAS `qlog/leader` from (epoch e, old set) to (e + 1, new set, `since` e + 1). Then the leader leads e + 1 with the new set (`become_leader`), or, if it isn't in it, hands off (below).
+  6. Resume. Commits are paused from step 2 to here.
+
+  A failed CAS, or one whose answer was lost and whose record doesn't read back as ours, ends in a step-down, never a resume at e. Every abort before the CAS resumes at e with the old set and leaves the learners as learners. The change runs on its own task, so a caller that goes away (an HTTP client hanging up) can't cut it short between the CAS and the move to e + 1.
+- **Why one step from the old set to the new is safe here, without joint consensus.** Joint consensus exists because, in Raft, two configurations can each make decisions during a change. Here each epoch has exactly one set, the CAS decides which, and every decision is made by a leader of one epoch with that epoch's set:
+  - No entry is committed under the new set before the CAS: nobody leads e + 1 yet.
+  - No entry is committed under the old set after the CAS: the leader of e appends nothing after B, and it moves to e + 1 (or steps down) in the same locked step that ends the pause. Any later leader read the record, so it uses the new set or a later one.
+  - Every entry committed under the old set (at or below B) is in the bucket (step 4), so it survives whatever a later takeover asks. Beyond that, enough of the new set durably holds B that every quorum of the new set includes one (step 3), so a takeover's longest tail holds it too, and recovery from the bucket isn't needed for it.
+  - So every committed entry is held by every later quorum (or the bucket), which is the takeover rule's invariant, and no seq can be committed twice. The flush alone would be enough for safety. The holders condition makes the new set able to take over from its own logs at once, and the learners' catch-up makes it able to commit at once.
+- **Removed members are fenced by the epoch.** Nobody sends a removed member an append or a promise of e + 1 or later, so it never holds an entry of e + 1, never promises e + 1, and so is never counted after the switch. A takeover by it would need the record to name it, which the record no longer does, and the CAS is against the ETag of what was read, so a stale read can't win either. The members that remain promise e + 1 at its first append and refuse e from then on.
+- **Replacing the leader: a handoff.** A leader that isn't in the new set CASes e + 1 naming a member of the new set that holds B (a continuing member before a learner: it has the longer local log), steps down, retires, and sends it `Lead { epoch }` (a new wire message). That member checks the record names it at that epoch, then runs the takeover's promise round directly (`Node::won`, shared with the CAS path). If the message is lost, or the old leader dies after the CAS, the members time out and take over from the record as usual (e + 2), and the named member doesn't wait out the grace other candidates give a record that names someone else.
+- **No flush configured** (memory-only tests, `--flush-ms 0`): the same steps without the flushes. Safety then rests on the holders condition alone, which is the standard overlap argument.
+- **What stays manual.** A change that aborts leaves its learners in the record and replicated to; the operator retries it or sets the members back. Nothing removes a dead learner on its own.
+- **Salvage streaming.** Phase 4's recovery held all of (F', S] in memory before applying it. Now a task fetches committed chunks (4 MiB) from the best member and hands them over a two-slot channel; `flush::recover` applies each to the cloned state and adds it to a segment builder, PUTs a segment each time one reaches 64 MiB raw, and seals the state once the stream ends. So the recovering node holds one segment and two chunks, whatever the interval. A member that fails partway still leaves a dense committed prefix, which is kept (before, a failed fetch dropped that member's whole salvage).
+
+- **A long recovery keeps its members quiet.** Found by the 100x run below: salvaging a 10 s interval at 100x (1.2-1.7 GB) takes 3-5 s, longer than the 1 s election timeout. Another member then took over mid-recovery, and since the first attempt had already CASed its manifest, the next one jumped another H (Phase 4's "two recoveries in a row"). A recovering candidate now re-sends its promise every heartbeat, and a member that promised that candidate's epoch treats it as hearing from its leader. With it, each kill-two is one recovery and one jump.
+
+### Tests, chaos and numbers (Phase 5)
+
+In-tree (`cargo test --lib qlog`, 44 tests, looped 6 times clean; the whole crate's suite passes, `fakepds selftest_small` included now that it binds free ports below the ephemeral range):
+
+- replacing a follower under load, then killing the other old member (the leader commits with the new one alone);
+- replacing the leader under load: the handoff leads epoch + 1 itself;
+- 3 → 5 → 3 (two of five down and it carries on), ending on a different three;
+- a learner never counts (leader and learner alone commit nothing; one member and the learner elect nobody), and a removed member, still running, never leads (it and a new member alone elect nobody);
+- a crash at each of the four switch steps, replacing a follower and then the leader in turn, retried until the change lands;
+- the leader cut off before the barrier and after the barrier's flush;
+- a single node growing to three and back.
+
+Every removed member is checked to hold no entry and no promise from the epoch its removal took effect at (`since`). **Mutations:** counting learners' acks against the members' quorum fails the learner test (the leader and the learner commit alone); dropping the takeover's membership check fails it too (the learner campaigns). Dropping the barrier's flush or its holders condition is masked by the other (and by the not-intact rule for a learner that isn't caught up), which is the defense in depth the argument above intends, so no test fails on either alone.
+
+The harness (`tests/qlog/chaos.sh`) gets node slots: `SLOTS` ids (9, or more for long runs) of which `NODES` are the bootstrap members, every one with a proxy route to every other, and each id used once (a replacement is a new id on an empty disk). New scenarios: `replace-follower`, `replace-leader`, `grow-shrink` (3 → 4 → 3 → 5 → 3), `switch-crash` (nodes die at a random switch step, 35% a step) and `switch-fault` (a kill -9 of the leader, a follower or the learner, or a 3 s partition of the leader, at a random point of the change). `qlog member` drives each change and retries it until it lands. After each change the removed node stays up for 2 s and is checked against the leader's `members_since`, then retired (killed, disk gone). The checker holds removed nodes to consistency but not to the top.
+
+Runs on benchbox at 3,500/s (10x), 5.3 KB frames, 64 hosts, commitlogs on tmpfs with a 1 ms fsync, 2 s flushes, local MinIO:
+
+| run | changes | faults | distinct seqs | violations | removed members checked / counted after removal | manifest checks |
+|---|---|---|---|---|---|---|
+| replace-follower, 300 s | 5 | none | 1,050,017 | 0 | 5 / 0 | 12 + final |
+| replace-leader, 180 s | 6 (all by handoff) | none | 630,017 | 0 | 6 / 0 | 7 + final |
+| grow-shrink, 150 s | 7 (3 → 4 → 3 → 5 → 3 → 4 → 3 → 5) | none | 525,017 | 0 | 4 / 0 | 6 + final |
+| switch-crash, 240 s | 10 | 31 crashes: 16 in catch-up, 8 before the pause, 5 after the barrier's flush, 2 after the CAS | 840,086 | 0 | 10 / 0 | 10 + final |
+| switch-fault, 240 s | 10 | 5 leader partitions, 1 leader kill, 4 follower kills | 840,034 | 0 | 10 / 0 | 10 + final |
+| replace-follower (smoke), 60 s | 3 | none | 210,017 | 0 | 3 / 0 | 2 + final |
+| mixed-wipe (Phase 4 regression, streamed salvage), 180 s | 0 | wipes, kills, power cuts | 646,292 | 0 | | 8 + final |
+| kill-two, memory only, 35,000/s, 10 s flush, 90 s | 0 | 3 kill-two | 3,346,350 | 0 | | 3 + final |
+
+That's 8.1M distinct seqs, 41 membership changes and 38 removed members checked, with no violation. Every change landed (none needed the operator), every consumer stream was dense, and every manifest verified.
+
+| measured | |
+|---|---|
+| commits paused (pause to leading the new epoch) | 6-13 ms (median 7-12 by run), 50 ms max in switch-crash: the drain ~0 ms, the barrier's flush 5-12 ms, the CAS 0-2 ms |
+| emission pause, replacing a follower | none over the checker's 15 ms gap threshold in 6 of 8 changes without faults, 18-20 ms in the other two |
+| emission pause, replacing the leader (handoff) | 15-49 ms (n=6): the pause, the CAS, `Lead`, the promise round and the first commit |
+| emission pause, a change with a crash or a partition of the leader | ~1.0-2.1 s: the election timeout, as for any leader failure |
+| command to done | 0.6 s for a removal; 1-6.6 s for an addition, mostly the learner's catch-up |
+| learner catch-up at 10x | 0.4-6.1 s, growing with the leader's local log: 1.3 s for ~0.86 GB, 6.1 s for 4.2 GB (the default 4 GiB `--disk-retain-mb`), ~0.7 GB/s on loopback, while the load runs |
+| ack latency in the seconds a change runs, against the others (300 s run) | median per-second p50 1.30 / 1.32 ms, median p99 1.86 / 1.76 ms, worst p99 9.5 / 2.5 ms: the catch-up's disk reads on the leader, not the pause |
+| salvage at 100x, 10 s flush (memory only) | 220k-316k entries (1.2-1.7 GB) streamed into 4-5 segments; 2.9-4.6 s a recovery, of which applying them to the state is 2.3-3.7 s and the segment PUTs 0.5-0.7 s |
+
+### What changes the study (Phase 5)
+
+- **A membership change costs about one RTT and one small flush of commits, not "one flush plus one CAS, under a second".** The flush just before the pause makes the barrier's own flush a few ms of entries. On R2 the barrier is one manifest round (a segment PUT, a SlateDB checkpoint, the manifest CAS) plus the `qlog/leader` CAS, so budget ~0.6-1 s of paused commits there (~200 ms a round trip, Phase 4's estimate), and the pre-flush can move the segment out of the pause entirely if that matters. The CAS here is 0-2 ms on a local MinIO.
+- **Replacing a box is mostly copying the leader's local log.** A learner starts at the leader's oldest local entry, so catch-up is the leader's disk window over the replication rate: 4 GiB in ~6 s on loopback, but ~35 s on a 1 Gb/s port and ~70 s on a VPS-1's 0.5 Gb/s, while it shares the leader's port with consumers. Two cheaper options if that bites: start a learner at F (the bucket holds everything below; its consumers then backfill from the bucket rather than its own disk), or rate-limit the catch-up. Neither is needed for correctness.
+- **Replacing the leader doesn't cost a takeover.** The handoff makes it a 15-50 ms pause instead of the ~1 s election timeout, so rolling every box (three replacements) costs ~0.1 s of emission at 10x.
+- **The bucket sees one more CAS per change** (two, with learners recorded first). Nothing on the request table moves.
+- **Membership is the operator's.** A dead box is replaced by `qlog member replace OLD NEW`; nothing removes members on its own, and a change that can't catch its learners up aborts with the old set intact.
+- **Recovery salvage is bounded in memory now**, one segment and two chunks however long the interval. At 100x with a 10 s flush the salvage itself takes 3-5 s, mostly the state apply, which is the same CPU the relay's re-ingest would spend. It holds the members off with promises while it runs.
+
+### What Phase 6 needs
+
+- **Wire `Store::counted` into the relay's quorum path and run an hour at today's rate (350/s)** to check the request-rate table (§2, "What a flush costs") against what the code sends: the flush, the state's compactor and GC polls, the manifest, and now `qlog/leader` (one GET and one CAS a takeover, two a membership change). `qlog node` already counts through `Store::counted("qlog")`, and `/qlog/status` has `requests_total`, so the hour run is `chaos.sh baseline --rate 350 --duration 3600` with `FLUSH_MS=30000` plus reading the totals.
+- **Bucket retention's deletes** (the `retain/qlog` report exists): segments older than the horizon, stale checkpoints, and old state paths once nothing lists them in `external_dbs`.
+- **The relay itself on the quorum log:** `cluster/forward.rs` submitting through `Client::submit_acked`, the DID state applied from committed entries, host shard assignment as log entries among the members the leader hears from (the study's "moves into the log" row), and membership reading the same `qlog/leader`.
+- Optional, from the numbers above: a learner that starts at F, or a rate limit on catch-up, for hosts on a 0.5-1 Gb/s port; parallel segment PUTs for 100x flushes on R2.
 
 ### Measuring a real host (OVH, Hetzner)
 
