@@ -6,8 +6,9 @@
 #
 #   tests/qlog/r2_guard_test.sh [CASE...]    # default: all but calibrate
 #
-# Cases: node-burst node-rate node-budget (the in-node guard alone, no
-# watchdog); wd-burst wd-rate wd-stale (the watchdog alone, nodes unarmed);
+# Cases: node-burst node-burst-a node-rate node-budget (the in-node guard
+# alone, no watchdog); wd-burst wd-burst-a wd-rate wd-stale (the watchdog
+# alone, nodes unarmed); the -a cases PUT, so Class A trips;
 # wd-restarts (kill -9s under the watchdog: counts summed per process, no
 # trip); calibrate (CAL_SEC, 2100, at 350/s with 30 s flushes and both
 # guards at the hour's numbers: neither may trip).
@@ -19,8 +20,8 @@ export QLOG_BASE=${QLOG_BASE:-4650} QLOG_NO_BUILD=1
 B=$QLOG_BASE
 bin=${CARGO_TARGET_DIR:-target}/dev-release/qlog
 root=${OUT:-$crate/dev/r2-guard-test}
-real="--budget-a 3500 --budget-b 12000 --budget-rate-a 2.4 --budget-rate-b 8.3 --budget-window-s 120 --budget-burst-a 150 --budget-burst-b 300"
-cases=${*:-node-burst node-rate node-budget wd-burst wd-rate wd-stale wd-restarts}
+real="--budget-a 3500 --budget-b 12000 --budget-rate-a 2.4 --budget-rate-b 8.3 --budget-window-s 120 --budget-burst-a 250 --budget-burst-b 300"
+cases=${*:-node-burst node-burst-a node-rate node-budget wd-burst wd-burst-a wd-rate wd-stale wd-restarts}
 fail=0
 
 # case name, seconds of load, scenario, watchdog (1/0), node flags, [extra env...]
@@ -106,9 +107,11 @@ PY
 for c in $cases; do
   case $c in
     node-burst) run node-burst 60 baseline 0 "$real --runaway get:200" ;;
+    node-burst-a) run node-burst-a 60 baseline 0 "$real --runaway put:30" ;;
     node-rate) run node-rate 180 baseline 0 "$real --runaway get:15" ;;
     node-budget) run node-budget 120 baseline 0 "--budget-a 30 --budget-b 12000" ;;
     wd-burst) run wd-burst 60 baseline 1 "--runaway get:100" ;;
+    wd-burst-a) run wd-burst-a 60 baseline 1 "--runaway put:10" ;;
     wd-rate) run wd-rate 200 baseline 1 "--runaway get:4" ;;
     wd-stale) DURING="sleep 20; pkill -STOP -f -- '^$bin node --id n2 '" run wd-stale 120 baseline 1 "" ;;
     wd-restarts) run wd-restarts 75 kill-leader 1 "$real" ;;

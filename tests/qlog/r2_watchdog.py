@@ -40,7 +40,7 @@ def parse():
     p.add_argument("--rate-a", type=float, default=2.4)
     p.add_argument("--rate-b", type=float, default=8.3)
     p.add_argument("--window-s", type=float, default=120)
-    p.add_argument("--burst-a", type=int, default=150)
+    p.add_argument("--burst-a", type=int, default=250)
     p.add_argument("--burst-b", type=int, default=300)
     p.add_argument("--poll-s", type=float, default=10)
     p.add_argument("--stale-s", type=float, default=30)

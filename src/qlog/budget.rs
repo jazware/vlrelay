@@ -262,7 +262,7 @@ mod tests {
             rate_a: Some(2.4),
             rate_b: Some(8.3),
             window: Duration::from_secs(120),
-            burst_a: Some(150),
+            burst_a: Some(250),
             burst_b: Some(300),
             burst_window: Duration::from_secs(10),
         }
@@ -343,6 +343,6 @@ mod tests {
         assert!(t <= 20.75, "{t}");
         // from the very first sample too
         let mut g = Guard::new(limits(), Counts::default());
-        assert!(g.check(Instant::now(), &c(151, 0)).unwrap().starts_with("Class A burst"));
+        assert!(g.check(Instant::now(), &c(251, 0)).unwrap().starts_with("Class A burst"));
     }
 }
