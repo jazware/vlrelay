@@ -173,7 +173,7 @@ export function Consumers() {
     { id: 'bytes', label: 'Bytes/s', r: true, sort: (a, b) => a.bytesPerSec - b.bytesPerSec, render: (c) => <span className="mono sm">{fmtBytes(c.bytesPerSec)}/s</span> },
   ]
 
-  const serving = (view?.nodes ?? []).filter((n) => !view?.single || n.id)
+  const serving = view?.nodes ?? []
   const P = (pol.data?.policy as { consumers?: Record<string, number> } | undefined)?.consumers
 
   return (
