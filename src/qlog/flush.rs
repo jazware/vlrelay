@@ -973,6 +973,12 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
             ord += 1;
             continue;
         }
+        // nothing above R is appended while this manifest is current: a
+        // segment past it is a later recovery's, whose manifest landed
+        // after this one was read
+        if ord >= m.next_ordinal && (h.first_seq as u64) > m.reserve {
+            break;
+        }
         if !m.continues(last, h.first_seq as u64) {
             bad(&mut v, format!("segment {ord} starts at {}, after {last}", h.first_seq));
         }
