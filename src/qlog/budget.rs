@@ -261,8 +261,8 @@ mod tests {
             b: Some(12000),
             rate_a: Some(2.4),
             rate_b: Some(8.3),
-            window: Duration::from_secs(30),
-            burst_a: Some(100),
+            window: Duration::from_secs(120),
+            burst_a: Some(150),
             burst_b: Some(300),
             burst_window: Duration::from_secs(10),
         }
@@ -291,6 +291,19 @@ mod tests {
     }
 
     #[test]
+    fn gc_passes_like_the_profiles_pass() {
+        // the 35-minute MinIO profile: passes of 35, 88 and 123 one-key
+        // DeleteObjects (Class A) within 5 s, a flush's 14 A on top
+        let mut g = Guard::new(limits(), Counts::default());
+        let r = run(&mut g, 3600.0, |t| {
+            let flush = if t % 30.0 < 0.25 { 14.3 * 4.0 } else { 0.0 };
+            let gc = if t % 600.0 < 5.0 && t > 300.0 { 130.0 / 5.0 } else { 0.0 };
+            (flush + gc, 1.66)
+        });
+        assert_eq!(r, None);
+    }
+
+    #[test]
     fn an_hour_at_the_expected_rate_with_flush_spikes_passes() {
         // Phase 6: 0.478 A and 1.66 B a second, the A arriving as ~14 at
         // each 30 s flush
@@ -313,13 +326,13 @@ mod tests {
     fn a_sustained_rate_trips_after_the_window() {
         let mut g = Guard::new(limits(), Counts::default());
         // 3 A/s is under the burst limit (30 a 10 s) but over 2.4/s
-        let (t, why) = run(&mut g, 120.0, |_| (3.0, 0.0)).unwrap();
+        let (t, why) = run(&mut g, 300.0, |_| (3.0, 0.0)).unwrap();
         assert!(why.starts_with("Class A rate"), "{why}");
-        assert!((30.0..=31.0).contains(&t), "{t}");
+        assert!((120.0..=121.0).contains(&t), "{t}");
         let mut g = Guard::new(limits(), Counts::default());
-        let (t, why) = run(&mut g, 120.0, |_| (0.0, 9.0)).unwrap();
+        let (t, why) = run(&mut g, 300.0, |_| (0.0, 9.0)).unwrap();
         assert!(why.starts_with("Class B rate"), "{why}");
-        assert!((30.0..=31.0).contains(&t), "{t}");
+        assert!((120.0..=121.0).contains(&t), "{t}");
     }
 
     #[test]
@@ -330,6 +343,6 @@ mod tests {
         assert!(t <= 20.75, "{t}");
         // from the very first sample too
         let mut g = Guard::new(limits(), Counts::default());
-        assert!(g.check(Instant::now(), &c(101, 0)).unwrap().starts_with("Class A burst"));
+        assert!(g.check(Instant::now(), &c(151, 0)).unwrap().starts_with("Class A burst"));
     }
 }

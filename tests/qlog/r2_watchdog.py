@@ -10,7 +10,7 @@ run on a breach.
 Rules (cluster totals, R2 classes; defaults are the 1-hour 350/s budget in
 tests/qlog/R2_HOUR.md):
   - cumulative Class A >= --budget-a or Class B >= --budget-b;
-  - the mean rate over the last --window-s (30) > --rate-a / --rate-b;
+  - the mean rate over the last --window-s (120) > --rate-a / --rate-b;
   - any one poll interval (--poll-s, 10) adding > --burst-a / --burst-b;
   - no status from some node for > --stale-s (30): it may be sending
     requests nobody can see, so that's a breach too.
@@ -39,8 +39,8 @@ def parse():
     p.add_argument("--budget-b", type=int, default=12000)
     p.add_argument("--rate-a", type=float, default=2.4)
     p.add_argument("--rate-b", type=float, default=8.3)
-    p.add_argument("--window-s", type=float, default=30)
-    p.add_argument("--burst-a", type=int, default=100)
+    p.add_argument("--window-s", type=float, default=120)
+    p.add_argument("--burst-a", type=int, default=150)
     p.add_argument("--burst-b", type=int, default=300)
     p.add_argument("--poll-s", type=float, default=10)
     p.add_argument("--stale-s", type=float, default=30)
