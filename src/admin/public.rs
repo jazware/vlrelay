@@ -120,12 +120,20 @@ pub fn quorum_health(q: &QuorumView) -> Health {
 
 /// The allow-list projection. `quorum` is the quorum log's view, if any.
 pub fn project(o: &Overview, quorum: Option<&QuorumView>) -> PublicStats {
-    let (nodes, healthy) = if o.by_node.is_empty() {
-        (1, 1)
-    } else {
-        (o.by_node.len() as u32, o.by_node.iter().filter(|n| !n.stale).count() as u32)
+    let quorum = quorum.filter(|q| !q.nodes.is_empty());
+    let (nodes, healthy) = match quorum {
+        _ if !o.by_node.is_empty() => {
+            (o.by_node.len() as u32, o.by_node.iter().filter(|n| !n.stale).count() as u32)
+        }
+        // no fleet numbers: the quorum log's members are the nodes
+        Some(q) => {
+            let current = q.nodes.iter().filter(|n| n.status.as_ref().is_none_or(|s| s["retired"] != true));
+            let (all, up) = current.fold((0, 0), |(a, u), n| (a + 1, u + u32::from(!n.stale)));
+            (all, up)
+        }
+        None => (1, 1),
     };
-    let quorum = quorum.filter(|q| !q.nodes.is_empty()).map(quorum_health);
+    let quorum = quorum.map(quorum_health);
     let health = match (healthy, quorum) {
         (0, _) | (_, Some(Health::Down)) => Health::Down,
         (h, q) if h < nodes || q == Some(Health::Degraded) => Health::Degraded,

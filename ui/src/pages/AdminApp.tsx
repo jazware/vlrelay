@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type JSX } from 'react'
+import { Fragment, useEffect, useRef, useState, type JSX } from 'react'
 import { ErrorNotice, Field, Notice, Spinner, Topbar } from '../components/ui'
 import { useAdminToken } from '../lib/hooks'
 import { Link, match, navigate } from '../lib/router'
@@ -14,18 +14,24 @@ import { Rules } from './Rules'
 import { Policy } from './Policy'
 import { AccountDetail, Accounts } from './Accounts'
 import { CaseDetail, Cases } from './Cases'
+import { Quorum } from './Quorum'
+import { Settings } from './Settings'
+import { Tuning } from './Tuning'
 
-/** `g` then the key jumps to the tab. */
+/** `g` then the key jumps to the tab. Grouped by what an operator is doing. */
 const TABS = [
-  { to: '/admin', label: 'Overview', key: 'o' },
-  { to: '/admin/hosts', label: 'Hosts', key: 'h' },
-  { to: '/admin/cases', label: 'Cases', key: 'c' },
-  { to: '/admin/consumers', label: 'Consumers', key: 's' },
-  { to: '/admin/cluster', label: 'Cluster', key: 'n' },
-  { to: '/admin/ops', label: 'Operations', key: 'b' },
-  { to: '/admin/accounts', label: 'Accounts', key: 'a' },
-  { to: '/admin/rules', label: 'Domain rules', key: 'r' },
-  { to: '/admin/policy', label: 'Policy', key: 'p' },
+  { to: '/admin', label: 'Overview', key: 'o', group: 'Traffic' },
+  { to: '/admin/hosts', label: 'Hosts', key: 'h', group: 'Traffic' },
+  { to: '/admin/consumers', label: 'Consumers', key: 's', group: 'Traffic' },
+  { to: '/admin/cases', label: 'Cases', key: 'c', group: 'Moderation' },
+  { to: '/admin/accounts', label: 'Accounts', key: 'a', group: 'Moderation' },
+  { to: '/admin/rules', label: 'Domain rules', key: 'r', group: 'Moderation' },
+  { to: '/admin/policy', label: 'Limits', key: 'p', group: 'Policy' },
+  { to: '/admin/tuning', label: 'Tuning', key: 't', group: 'Policy' },
+  { to: '/admin/cluster', label: 'Cluster', key: 'n', group: 'System' },
+  { to: '/admin/quorum', label: 'Quorum', key: 'q', group: 'System' },
+  { to: '/admin/ops', label: 'Operations', key: 'b', group: 'System' },
+  { to: '/admin/settings', label: 'Settings', key: ',', group: 'System' },
 ]
 
 export function AdminApp({ path }: { path: string }) {
@@ -79,6 +85,9 @@ export function AdminApp({ path }: { path: string }) {
   else if (p === '/admin/ops') page = <Ops />
   else if (p === '/admin/rules') page = <Rules />
   else if (p === '/admin/policy') page = <Policy />
+  else if (p === '/admin/tuning') page = <Tuning />
+  else if (p === '/admin/quorum') page = <Quorum />
+  else if (p === '/admin/settings') page = <Settings />
   else if (p === '/admin/accounts') page = <Accounts />
   else if ((m = match('/admin/accounts/:did', p))) page = <AccountDetail did={m.did} />
   else if (p === '/admin/cases') page = <Cases />
@@ -97,10 +106,17 @@ export function AdminApp({ path }: { path: string }) {
       </Topbar>
       <main className="console">
         <nav className="tabs" aria-label="Console">
-          {TABS.map((t) => (
-            <Link key={t.to} to={t.to} aria-current={current(t.to) ? 'page' : undefined} title={`g ${t.key}`}>
-              {t.label}
-            </Link>
+          {TABS.map((t, i) => (
+            <Fragment key={t.to}>
+              {t.group !== TABS[i - 1]?.group && (
+                <span className="tab-group" aria-hidden="true">
+                  {t.group}
+                </span>
+              )}
+              <Link to={t.to} aria-current={current(t.to) ? 'page' : undefined} title={`${t.group}: g ${t.key}`}>
+                {t.label}
+              </Link>
+            </Fragment>
           ))}
         </nav>
         {help && <Shortcuts onClose={() => setHelp(false)} />}

@@ -226,3 +226,14 @@ textarea.policy-json.invalid {
   color: var(--ink2);
   white-space: nowrap;
 }
+
+/* the moderation strip on Cases */
+.tiles.mod-strip {
+  margin-bottom: 8px;
+}
+.mod-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin: 0 0 18px;
+}

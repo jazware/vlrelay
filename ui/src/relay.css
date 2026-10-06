@@ -605,3 +605,23 @@ input.invalid {
   border-color: var(--danger);
   box-shadow: inset 3px 0 0 var(--danger);
 }
+
+/* ------------------------------------------------------------ tab groups */
+
+.tabs .tab-group {
+  align-self: center;
+  padding: 0 4px 0 14px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink3);
+  white-space: nowrap;
+}
+.tabs .tab-group:first-child {
+  padding-left: 0;
+}
+.tabs .tab-group:not(:first-child) {
+  border-left: 1px solid var(--rule2);
+  margin-left: 6px;
+}

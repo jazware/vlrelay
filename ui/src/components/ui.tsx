@@ -246,11 +246,11 @@ export function ThemeToggle() {
   )
 }
 
-export function Topbar({ where, children }: { where?: string; children?: ReactNode }) {
+export function Topbar({ where, home = '/admin', children }: { where?: string; home?: string; children?: ReactNode }) {
   return (
     <>
       <header className="topbar">
-        <Link to="/admin" className="wordmark" aria-label="vlRelay console">
+        <Link to={home} className="wordmark" aria-label={home === '/' ? 'vlRelay home' : 'vlRelay console'}>
           <I.Mark />
           vlRelay
           {where && <span className="where">{where}</span>}

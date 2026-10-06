@@ -1,0 +1,253 @@
+/* Quorum, Settings and Tuning. */
+
+/* ---- quorum */
+td.lagcell {
+  min-width: 120px;
+}
+td.lagcell .mono {
+  display: inline-block;
+  min-width: 48px;
+}
+td.lagcell .bar {
+  width: 64px;
+  vertical-align: middle;
+  margin-left: 6px;
+}
+.setdiff {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.setdiff .add {
+  color: var(--ok);
+  font-weight: 700;
+}
+.setdiff .del {
+  color: var(--danger);
+  text-decoration: line-through;
+}
+.dl.kv2 dd {
+  font-variant-numeric: tabular-nums;
+}
+.member-chips {
+  margin-bottom: 14px;
+}
+.member-chips .chip {
+  cursor: default;
+  font-size: 13.5px;
+  padding: 4px 6px 4px 11px;
+  color: var(--ink);
+}
+.member-chips .chip.new {
+  border-color: var(--ok);
+  box-shadow: inset 0 0 0 1px var(--ok);
+}
+.member-chips .chip button {
+  border: 0;
+  background: none;
+  color: var(--ink3);
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 4px;
+  cursor: pointer;
+  border-radius: 8px;
+}
+.member-chips .chip button:hover {
+  color: var(--danger);
+  background: var(--danger-wash);
+}
+.member-add {
+  align-items: flex-end;
+}
+.member-add .field {
+  margin-bottom: 0;
+}
+.member-add .btn {
+  margin-bottom: 1px;
+}
+.member-preview {
+  margin: 12px 0;
+}
+
+/* ---- settings */
+table.settings td {
+  vertical-align: top;
+}
+table.settings td.val {
+  max-width: 320px;
+  overflow-wrap: anywhere;
+}
+table.settings .changed {
+  color: var(--accent);
+  font-weight: 600;
+}
+table.settings td.help {
+  white-space: normal;
+  min-width: 320px;
+  color: var(--ink2);
+  font-size: 13px;
+  max-width: 460px;
+}
+.src {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: var(--sunk);
+  color: var(--ink2);
+}
+.src-flag {
+  background: var(--accent-wash);
+  color: var(--accent);
+}
+.src-env {
+  background: var(--amber-wash);
+  color: var(--amber);
+}
+.src-unset {
+  background: none;
+  color: var(--ink3);
+}
+
+/* ---- tuning */
+.tuning {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 18px;
+  align-items: start;
+}
+.tuning > .panel:nth-last-child(-n + 2) {
+  grid-column: 1 / -1;
+}
+@media (max-width: 1100px) {
+  .tuning {
+    grid-template-columns: 1fr;
+  }
+}
+.knobs {
+  display: flex;
+  flex-direction: column;
+}
+.knobs.pad {
+  padding: 4px 16px 8px;
+}
+.knob {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: 'label input' 'label def';
+  gap: 2px 16px;
+  padding: 10px 0;
+  border-top: 1px solid var(--rule2);
+}
+.knob:first-child {
+  border-top: 0;
+}
+.knob-label {
+  grid-area: label;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.knob-input {
+  grid-area: input;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+.knob-def {
+  grid-area: def;
+  text-align: right;
+  white-space: nowrap;
+}
+.knob-def .btn {
+  padding: 0 6px;
+  margin-left: 4px;
+}
+.knob.edited .knob-label b::after,
+tr.edited td:first-child::after,
+td.edited::before {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--amber);
+  margin-left: 6px;
+  vertical-align: middle;
+}
+td.edited::before {
+  margin: 0 6px 0 0;
+}
+.knob textarea {
+  width: 260px;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.unit-input {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.unit-input input {
+  width: 120px;
+  text-align: right;
+}
+.unit-input span {
+  color: var(--ink2);
+  font-size: 13px;
+}
+input.bad {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 1px var(--danger);
+}
+.tune-table td {
+  vertical-align: middle;
+}
+.tune-table .unit-input input {
+  width: 96px;
+}
+.unit-input input.wide,
+.tune-table .unit-input input.wide {
+  width: 140px;
+}
+.savebar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 8px -20px 0;
+  padding: 12px 20px;
+  background: var(--sheet);
+  border-top: 1px solid var(--rule);
+}
+/* sticky only with something to save, so it doesn't cover the page otherwise */
+.savebar.dirty {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  border-top: 2px solid var(--amber);
+}
+.savebar input[type='text'] {
+  flex: 1;
+  min-width: 200px;
+}
+@media (max-width: 760px) {
+  .savebar {
+    margin: 8px -12px 0;
+    padding: 10px 12px;
+  }
+  .knob {
+    grid-template-columns: 1fr;
+    grid-template-areas: 'label' 'input' 'def';
+  }
+  .knob-input {
+    align-items: flex-start;
+  }
+  .knob-def {
+    text-align: left;
+  }
+}
