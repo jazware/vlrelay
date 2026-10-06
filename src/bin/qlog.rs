@@ -12,6 +12,9 @@
 //!   qlog retain what bucket retention could delete below a horizon
 //!               (segments, checkpoints, old state paths), written to
 //!               `retain/qlog`; nothing is deleted
+//!   qlog member a membership change (add, remove, replace, set) through
+//!               the leader's `POST /qlog/members`, retried until
+//!               `qlog/leader` holds the new set
 
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
@@ -46,6 +49,25 @@ enum Cmd {
     Check(CheckArgs),
     Verify(VerifyArgs),
     Retain(RetainArgs),
+    Member(MemberArgs),
+}
+
+#[derive(Parser)]
+struct MemberArgs {
+    /// id=host:port of each node's http port: any that answers finds the
+    /// leader.
+    #[arg(long = "node")]
+    nodes: Vec<String>,
+    /// id=host:port of a new member's peer port, for a leader whose --peer
+    /// flags don't name it.
+    #[arg(long = "addr")]
+    addrs: Vec<String>,
+    /// Keep trying (a leader change, a crash mid-change) this long.
+    #[arg(long, default_value_t = 120)]
+    retry_secs: u64,
+    /// add ID | remove ID | replace OLD NEW | set ID,ID,...
+    op: String,
+    ids: Vec<String>,
 }
 
 #[derive(Parser)]
@@ -167,6 +189,11 @@ struct NodeArgs {
     /// quorum lost logs it and waits for an operator.
     #[arg(long)]
     no_auto_recover: bool,
+    /// The bootstrap member set (comma separated), written by the first
+    /// `qlog/leader` CAS; this node and its --peer ids by default. After
+    /// that, `qlog/leader` holds the set and `qlog member` changes it.
+    #[arg(long, value_delimiter = ',')]
+    members: Vec<String>,
 }
 
 #[derive(Parser)]
@@ -260,6 +287,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Check(a) => check(a).await,
         Cmd::Verify(a) => verify(a).await,
         Cmd::Retain(a) => retain(a).await,
+        Cmd::Member(a) => member(a).await,
     }
 }
 
@@ -272,6 +300,11 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
     cfg.stagger = Duration::from_millis(a.stagger_ms);
     cfg.rpc_timeout = Duration::from_millis(a.rpc_ms);
     cfg.auto_recover = !a.no_auto_recover;
+    if !a.members.is_empty() {
+        cfg.members = a.members.clone();
+        cfg.members.sort();
+        cfg.members.dedup();
+    }
     cfg.retain_bytes = a.retain_mb.unwrap_or(if a.commitlog.is_some() { 64 } else { 512 }) << 20;
     let store = a.s3.store()?;
     let die = |what: &str| {
@@ -291,9 +324,15 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
         let crash: Option<vlrelay::qlog::flush::CrashHook> = match crash_at.as_str() {
             "" | "mid-trim" => None,
             s => {
-                let only: Option<vlrelay::qlog::flush::Step> = if s == "any" { None } else { Some(s.parse().map_err(anyhow::Error::msg)?) };
+                use vlrelay::qlog::flush::Step;
+                let only: Option<Step> =
+                    if s == "any" || s == "switch-any" { None } else { Some(s.parse().map_err(anyhow::Error::msg)?) };
+                let switch_only = s == "switch-any";
+                let is_switch = |st: Step| {
+                    matches!(st, Step::SwitchCatchUp | Step::SwitchBeforePause | Step::SwitchFlushed | Step::SwitchCas)
+                };
                 Some(Arc::new(move |step| {
-                    if only.is_none_or(|o| o == step) && roll() {
+                    if only.is_none_or(|o| o == step) && (!switch_only || is_switch(step)) && roll() {
                         die(&format!("{step:?}"));
                     }
                     false
@@ -574,7 +613,13 @@ impl LoadCtx {
             *self.owed.lock() = Some((g2, r.0.iter().copied().collect(), Instant::now()));
             r
         };
-        tracing::warn!(generation = g2, resend = resend.len(), acked_before, cursors_ms, "load: a bucket recovery: hosts re-read from its cursors");
+        tracing::warn!(
+            generation = g2,
+            resend = resend.len(),
+            acked_before,
+            cursors_ms,
+            "load: a bucket recovery: hosts re-read from its cursors"
+        );
         self.rewinds.lock().push(Rewind {
             generation: g2,
             cursors_ms,
@@ -868,6 +913,8 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
     let mut stopping: Option<Instant> = None;
     let mut status_tick = tokio::time::interval(Duration::from_millis(500));
     let http = reqwest::Client::new();
+    // the leader's member set at the end; every node until it's known
+    let mut members: Vec<String> = nodes.iter().map(|(id, _)| id.clone()).collect();
     let mut gaps_file = std::fs::File::create(format!("{}/pauses.jsonl", a.out))?;
     loop {
         tokio::select! {
@@ -903,17 +950,37 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
                     stopping = Some(Instant::now());
                 }
                 if let Some(t) = stopping {
-                    // every node's commit is the same and each consumer has it
-                    let mut commits = Vec::new();
-                    for (_, addr) in &nodes {
+                    // every member's commit is the same and each consumer has
+                    // it (a removed node, or one never added, stops where it
+                    // stopped)
+                    let mut sts = Vec::new();
+                    for (id, addr) in &nodes {
                         let s: Option<serde_json::Value> = match http.get(format!("http://{addr}/qlog/status")).timeout(Duration::from_secs(1)).send().await {
                             Ok(r) => r.json().await.ok(),
                             Err(_) => None,
                         };
-                        commits.push(s.and_then(|v| v["commit"].as_u64()));
+                        sts.push((id.clone(), s));
                     }
-                    let done = commits.iter().all(|c| c.is_some() && *c == commits[0])
-                        && nodes.iter().all(|(id, _)| ck.last(id) == commits[0]);
+                    let leader = sts
+                        .iter()
+                        .filter_map(|(_, s)| s.as_ref())
+                        .filter(|s| s["role"] == "leader")
+                        .max_by_key(|s| s["epoch"].as_u64().unwrap_or(0));
+                    if let Some(l) = leader {
+                        members = l["members"]
+                            .as_array()
+                            .map(|v| v.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+                    }
+                    let commits: Vec<Option<u64>> = sts
+                        .iter()
+                        .filter(|(id, _)| members.contains(id))
+                        .map(|(_, s)| s.as_ref().and_then(|v| v["commit"].as_u64()))
+                        .collect();
+                    let done = leader.is_some()
+                        && !commits.is_empty()
+                        && commits.iter().all(|c| c.is_some() && *c == commits[0])
+                        && nodes.iter().filter(|(id, _)| members.contains(id)).all(|(id, _)| ck.last(id) == commits[0]);
                     if done || t.elapsed() > Duration::from_secs(60) {
                         if !done {
                             tracing::warn!(?commits, "check: nodes didn't converge within 60 s");
@@ -927,7 +994,7 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
     stop.store(true, Ordering::Release);
     let mut backfilled = None;
     if a.backfill
-        && let Some((id, addr)) = nodes.first()
+        && let Some((id, addr)) = nodes.iter().find(|(id, _)| members.contains(id))
         && let Some(upto) = ck.last(id)
     {
         let t = Instant::now();
@@ -953,7 +1020,7 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
     let last_by_node: HashMap<String, u64> =
         nodes.iter().map(|(id, _)| (id.clone(), ck.last(id).unwrap_or(0))).collect();
     for (id, l) in &last_by_node {
-        if *l != ck.max_seq {
+        if members.contains(id) && *l != ck.max_seq {
             ck.violations += 1;
             ck.messages.push(format!("{id}'s consumer ended at {l}, below the highest emitted seq {}", ck.max_seq));
         }
@@ -1055,4 +1122,81 @@ async fn retain(a: RetainArgs) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&r)?);
     }
     Ok(())
+}
+
+async fn member(a: MemberArgs) -> anyhow::Result<()> {
+    let nodes = pairs(&a.nodes)?;
+    let addrs: std::collections::BTreeMap<String, String> = pairs(&a.addrs)?.into_iter().collect();
+    let http = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(a.retry_secs);
+    let t0 = Instant::now();
+    let mut target: Option<Vec<String>> = None;
+    let mut attempts = 0u32;
+    loop {
+        let mut leader: Option<(u64, String, Vec<String>)> = None;
+        for (_, addr) in &nodes {
+            let Ok(r) = http.get(format!("http://{addr}/qlog/status")).timeout(Duration::from_secs(1)).send().await
+            else {
+                continue;
+            };
+            let Ok(v) = r.json::<serde_json::Value>().await else { continue };
+            let epoch = v["epoch"].as_u64().unwrap_or(0);
+            if v["role"] == "leader" && leader.as_ref().is_none_or(|l| l.0 < epoch) {
+                let m = v["members"]
+                    .as_array()
+                    .map(|v| v.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                leader = Some((epoch, addr.clone(), m));
+            }
+        }
+        if let Some((epoch, addr, current)) = &leader {
+            // the target is fixed from the first member set seen, so a retry
+            // after a change that landed is a no-op
+            let want = match &target {
+                Some(t) => t.clone(),
+                None => {
+                    let mut t = current.clone();
+                    match (a.op.as_str(), a.ids.as_slice()) {
+                        ("add", [id]) => t.push(id.clone()),
+                        ("remove", [id]) => t.retain(|m| m != id),
+                        ("replace", [old, new]) => {
+                            t.retain(|m| m != old);
+                            t.push(new.clone());
+                        }
+                        ("set", ids) if !ids.is_empty() => {
+                            t = ids.iter().flat_map(|s| s.split(',')).map(String::from).collect();
+                        }
+                        _ => anyhow::bail!("want: add ID | remove ID | replace OLD NEW | set ID,ID,..."),
+                    }
+                    t.sort();
+                    t.dedup();
+                    target = Some(t.clone());
+                    t
+                }
+            };
+            if *current == want {
+                println!(
+                    "{}",
+                    serde_json::json!({ "done": true, "epoch": epoch, "members": current, "attempts": attempts, "ms": t0.elapsed().as_millis() as u64 })
+                );
+                return Ok(());
+            }
+            attempts += 1;
+            let body = vlrelay::qlog::emit::MembersRequest { members: want.clone(), addrs: addrs.clone() };
+            match http.post(format!("http://{addr}/qlog/members")).json(&body).send().await {
+                Ok(r) => {
+                    let ok = r.status().is_success();
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    if ok {
+                        println!("{}", serde_json::json!({ "switch": v, "attempts": attempts }));
+                    } else {
+                        eprintln!("member: {addr}: {v}");
+                    }
+                }
+                Err(e) => eprintln!("member: {addr}: {e}"),
+            }
+        }
+        anyhow::ensure!(Instant::now() < deadline, "member: no change to {target:?} within {} s", a.retry_secs);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }

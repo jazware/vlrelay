@@ -9,6 +9,8 @@ import os
 import sys
 
 out = sys.argv[1]
+# every node id the run started (membership runs add new ones)
+slots = sorted({int(f[1:].split(".")[0]) for f in os.listdir(out) if f.startswith("n") and f.endswith(".log") and f[1:-4].isdigit()})
 
 
 def load(name, default=None):
@@ -48,7 +50,7 @@ if ld:
 print(f"  submit -> first consumer (any node): {q(check.get('e2e_first_us'))}")
 for n, h in sorted(check.get("e2e_by_node_us", {}).items()):
     print(f"  submit -> consumer of {n}: {q(h)}")
-for i in (1, 2, 3):
+for i in slots:
     s = load(f"status-n{i}.json", {})
     if s.get("role") == "leader":
         print(f"  leader n{i} append -> quorum commit (since it took over): {q(s.get('commit_us'))}")
@@ -76,7 +78,7 @@ try:
         for l in f:
             p = l.split()
             if len(p) >= 3 and p[1] in ("kill9", "isolate", "stop", "powercut"):
-                multi = ("kill-two", "kill-all", "power-cut-all", "wipe-all", "wipe-two", "single-wipe", "single-kill", "single-power-cut")
+                multi = ("kill-two", "kill-all", "power-cut-all", "wipe-all", "wipe-two", "single-wipe", "single-kill", "single-power-cut", "kill-learner", "isolate-leader", "kill-follower", "kill-leader")
                 kind = p[3] if len(p) > 3 and p[3] in multi else p[1]
                 # one fault on several nodes at once is one fault
                 if faults and faults[-1][1] == kind and int(p[0]) - faults[-1][0] < 200:
@@ -130,7 +132,7 @@ except OSError:
     pass
 
 # the flush: per leader, what a flush took and sent; the final manifest
-for i in (1, 2, 3):
+for i in slots:
     s = load(f"status-n{i}.json", {})
     fl = s.get("flush") if s else None
     if not fl or not fl.get("flushes"):
@@ -145,7 +147,7 @@ for i in (1, 2, 3):
         f"  n{i} per flush: {fl['entries'] / n:.0f} entries, {fl['segments'] / n:.2f} segments, {fl['raw_bytes'] / n / 2**20:.2f} MiB raw, "
         f"{fl['segment_bytes'] / n / 2**20:.3f} MiB stored; requests per flush: {reqs}"
     )
-for i in (1, 2, 3):
+for i in slots:
     s = load(f"status-n{i}.json", {})
     fl = (s or {}).get("flush") or {}
     tot = fl.get("requests_total")
@@ -175,7 +177,7 @@ try:
     import re
 
     flushes = []
-    for i in (1, 2, 3):
+    for i in slots:
         try:
             with open(os.path.join(out, f"n{i}.log")) as f:
                 for l in f:
@@ -209,7 +211,7 @@ try:
     import re
 
     recs = []
-    for i in (1, 2, 3):
+    for i in slots:
         try:
             with open(os.path.join(out, f"n{i}.log")) as f:
                 for l in f:
@@ -240,3 +242,69 @@ if rt:
         f"{len(pl.get('stale_segments', []))} stale; state paths: "
         + ", ".join(f"{x['path']}{' (current)' if x['current'] else ''}{' (referenced)' if x['referenced'] else ''}{' deletable' if x['deletable'] else ''} {x['bytes'] / 2**20:.1f} MiB, {len(x['stale_checkpoints'])} stale checkpoints" for x in pl.get("states", []))
     )
+
+# membership changes: each one's steps (the leader's view), the emission
+# pause around it, ack latency in its seconds, and the removed-member checks
+try:
+    sw = []
+    with open(os.path.join(out, "switches.jsonl")) as f:
+        for l in f:
+            if l.startswith("{"):
+                x = json.loads(l)
+                if "switch" in x:
+                    sw.append(x["switch"])
+    ev = []
+    with open(os.path.join(out, "events.log")) as f:
+        for l in f:
+            p = l.split()
+            if len(p) >= 2 and (p[1].startswith("switch-") or p[1] in ("removed-ok", "VIOLATION")):
+                ev.append((int(p[0]), p[1], " ".join(p[2:])))
+    if sw or ev:
+        print(f"membership changes: {sum(1 for e in ev if e[1] == 'switch-done')} done, {sum(1 for e in ev if e[1] == 'switch-FAILED')} failed; "
+              f"removed members checked {sum(1 for e in ev if e[1] == 'removed-ok')}, counted after removal {sum(1 for e in ev if e[1] == 'VIOLATION')}")
+    windows = []
+    start = None
+    for t, k, rest in ev:
+        if k == "switch-start":
+            start = (t, rest)
+        elif k in ("switch-done", "switch-FAILED") and start:
+            windows.append((start[0], t, start[1], k))
+            start = None
+    for a, b, what, k in windows:
+        hit = [p for p in pauses if p["from_ms"] <= b and p["to_ms"] >= a]
+        worst = max((p["ms"] for p in hit), default=0)
+        print(f"  {what}: {b - a} ms command to done ({k}); longest emission pause in it {worst} ms")
+    for x in sw:
+        if x.get("epoch") == x.get("from_epoch"):
+            continue
+        print(
+            f"  switch {x['from']} -> {x['to']} at epoch {x['epoch']} (leader {x['leader']}): learners caught up in {x['catch_up_ms']} ms, "
+            f"pre-flush {x['pre_flush_ms']} ms; paused {x['paused_ms']} ms = drain {x['drain_ms']} + flush {x['flush_ms']} + CAS {x['cas_ms']} (+ moving over); barrier at {x['flushed']}"
+        )
+    real = [x for x in sw if x.get("epoch") != x.get("from_epoch")]
+    if real:
+        def med(k):
+            v = sorted(x[k] for x in real)
+            return f"median {v[len(v) // 2]}, max {v[-1]}"
+        print(f"  over {len(real)} switches: catch-up ms {med('catch_up_ms')}; paused ms {med('paused_ms')}; drain {med('drain_ms')}; flush {med('flush_ms')}; CAS {med('cas_ms')}")
+    tl = []
+    try:
+        with open(os.path.join(out, "load.json.timeline.jsonl")) as f:
+            tl = [json.loads(l) for l in f if l.strip()]
+    except OSError:
+        pass
+    if windows and tl:
+        def inw(t):
+            return any(a - 1000 < t and t - 1000 < b for a, b, _, _ in windows)
+        def agg(xs):
+            if not xs:
+                return "-"
+            p50 = sorted(x["p50"] for x in xs)[len(xs) // 2] / 1000
+            p99 = sorted(x["p99"] for x in xs)[len(xs) // 2] / 1000
+            w99 = max(x["p99"] for x in xs) / 1000
+            return f"median per-second p50 {p50:.2f} ms, median p99 {p99:.2f} ms, worst p99 {w99:.2f} ms over {len(xs)} s"
+        print(f"  ack latency, seconds with a change running: {agg([x for x in tl if x['n'] and inw(x['t_ms'])])}")
+        print(f"  ack latency, other seconds: {agg([x for x in tl if x['n'] and not inw(x['t_ms'])])}")
+except (OSError, ValueError, KeyError):
+    pass
+

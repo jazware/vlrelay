@@ -116,6 +116,13 @@ pub enum Msg {
     Failed {
         reason: String,
     },
+    /// A membership change removed its leader, which CASed `qlog/leader`
+    /// to `epoch` naming the receiver: it collects promises and leads
+    /// without waiting out the election timeout.
+    Lead {
+        epoch: u64,
+        from: String,
+    },
 }
 
 impl Msg {
@@ -135,6 +142,7 @@ impl Msg {
             Msg::Failed { .. } => 12,
             Msg::Cursors => 13,
             Msg::CursorsResp { .. } => 14,
+            Msg::Lead { .. } => 15,
         }
     }
 
@@ -142,7 +150,9 @@ impl Msg {
     pub fn from_peer(&self) -> Option<&str> {
         match self {
             Msg::Append(a) => Some(&a.leader),
-            Msg::Promise { from, .. } | Msg::Fetch { from, .. } | Msg::Ping { from } => Some(from),
+            Msg::Promise { from, .. } | Msg::Fetch { from, .. } | Msg::Ping { from } | Msg::Lead { from, .. } => {
+                Some(from)
+            }
             _ => None,
         }
     }
@@ -226,6 +236,10 @@ pub fn encode(rid: u64, m: &Msg) -> Bytes {
         }
         Msg::NotLeader { hint } => put_str(&mut b, hint),
         Msg::Failed { reason } => put_str(&mut b, reason),
+        Msg::Lead { epoch, from } => {
+            b.put_u64(*epoch);
+            put_str(&mut b, from);
+        }
     }
     let n = (b.len() - 4) as u32;
     b[..4].copy_from_slice(&n.to_be_bytes());
@@ -236,7 +250,9 @@ fn entries_len(m: &Msg) -> usize {
     match m {
         Msg::Append(a) => a.entries.iter().map(|e| e.data.len() + e.cursors.len() + 24).sum(),
         Msg::FetchResp { entries, .. } => entries.iter().map(|e| e.data.len() + e.cursors.len() + 24).sum(),
-        Msg::Submit { frames, cursors, .. } => frames.iter().map(|(p, s)| p.len() + s.len() + 8).sum::<usize>() + cursors.len(),
+        Msg::Submit { frames, cursors, .. } => {
+            frames.iter().map(|(p, s)| p.len() + s.len() + 8).sum::<usize>() + cursors.len()
+        }
         _ => 0,
     }
 }
@@ -362,6 +378,7 @@ pub fn decode(body: Bytes) -> R<(u64, Msg)> {
         12 => Msg::Failed { reason: r.string()? },
         13 => Msg::Cursors,
         14 => Msg::CursorsResp { generation: r.u64()?, known: r.bool()?, cursors: r.bytes()? },
+        15 => Msg::Lead { epoch: r.u64()?, from: r.string()? },
         _ => return Err("unknown message"),
     };
     if r.0.has_remaining() {
@@ -445,6 +462,7 @@ mod tests {
             Msg::CursorsResp { generation: 3, known: true, cursors: Bytes::from_static(b"cc") },
             Msg::NotLeader { hint: "n1".into() },
             Msg::Failed { reason: "x".into() },
+            Msg::Lead { epoch: 6, from: "n4".into() },
         ];
         for (i, m) in msgs.into_iter().enumerate() {
             let b = encode(i as u64, &m);

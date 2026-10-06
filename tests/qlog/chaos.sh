@@ -44,12 +44,25 @@
 # reads the manifest's gaps (the R + 1 jump) and the load's summary (every
 # event sent must be emitted outside a gap); the load re-reads its hosts
 # from a recovery's cursors when an ack says one happened.
+#
+# Membership (Phase 5): SLOTS node ids (9 for these scenarios) of which the
+# first NODES are the bootstrap members; the rest start as new boxes when a
+# change needs one, and every id is used once. `qlog member` drives each
+# change through the leader and retries it until `qlog/leader` holds the new
+# set. replace-follower and replace-leader replace one member with a new id
+# every EVERY seconds; grow-shrink goes 3 -> 4 -> 3 -> 5 -> 3; switch-crash
+# replaces followers and leaders with nodes dying at random switch steps
+# (CRASH_AT=switch-any, CRASH_PROB 0.35); switch-fault replaces with a kill
+# -9 or a 3 s partition of the leader, a follower or the learner at a
+# random point of the change. After each change the removed node stays up
+# for 2 s and must hold no entry and no promise of the epoch the new set
+# took effect at; then it's retired (killed, its disk gone).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 crate="$(cd "$here/../.." && pwd)"
 cd "$crate"
 
-scenarios="baseline kill-leader kill-follower partition-leader partition-follower pause-leader mixed kill-two kill-all power-cut-leader power-cut-all mixed-durable flush-crash mid-trim mixed-flush wipe-all wipe-two mixed-wipe single-kill single-power-cut single-wipe single-mixed"
+scenarios="baseline kill-leader kill-follower partition-leader partition-follower pause-leader mixed kill-two kill-all power-cut-leader power-cut-all mixed-durable flush-crash mid-trim mixed-flush wipe-all wipe-two mixed-wipe single-kill single-power-cut single-wipe single-mixed replace-follower replace-leader grow-shrink switch-crash switch-fault"
 scenario=${1:-}
 [ -n "$scenario" ] && shift || true
 if [ -z "$scenario" ] || [ "$scenario" = list ]; then
@@ -72,11 +85,15 @@ done
 B=${QLOG_BASE:-3150}
 case $scenario in single-*) NODES=1 PROXY=0 ;; esac
 N=${NODES:-3}
+case $scenario in replace-* | grow-shrink | switch-*) SLOTS=${SLOTS:-9} ;; esac
+S=${SLOTS:-$N}
 ids=$(seq 1 "$N")
+slots=$(seq 1 "$S")
+members_flag=$(seq -s, -f 'n%g' 1 "$N")
 peer() { echo $((B + $1)); }
 http() { echo $((B + 10 + $1)); }
 ctl=$((B + 29))
-route() { echo $((B + 30 + 3 * ($1 - 1) + $2 - 1)); } # i dials j here
+route() { echo $((B + 50 + S * ($1 - 1) + $2 - 1)); } # i dials j here
 minio=$((B + 40))
 proxy=${PROXY:-1}
 export COMPOSE_PROJECT_NAME=vlrq-chaos-$B MINIO_PORT=$minio
@@ -96,9 +113,9 @@ log() { echo "$(ms) $*" | tee -a "$out/events.log"; }
 pids=()
 cleanup() {
   touch "$out/stop" 2>/dev/null || true
-  for i in $ids; do pkill -CONT -f "^$bin node --id n$i " 2>/dev/null || true; done
+  for i in $slots; do pkill -CONT -f "^$bin node --id n$i " 2>/dev/null || true; done
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
-  for i in $ids; do pkill -9 -f "^$bin node --id n$i " 2>/dev/null || true; done
+  for i in $slots; do pkill -9 -f "^$bin node --id n$i " 2>/dev/null || true; done
   wait 2>/dev/null || true
   [ "$cl_dir" = "$out" ] || rm -rf "$cl_dir"
   [ "${KEEP:-}" = 1 ] || docker compose -f "$here/compose.yml" down -v >/dev/null 2>&1 || true
@@ -110,8 +127,8 @@ docker compose -f "$here/compose.yml" run --rm minio-init >/dev/null
 
 if [ "$proxy" = 1 ]; then
   routes=()
-  for i in $ids; do for j in $ids; do
-    [ "$i" = "$j" ] || routes+=(--route "r$i$j:$(route "$i" "$j"):$(peer "$j")")
+  for i in $slots; do for j in $slots; do
+    [ "$i" = "$j" ] || routes+=(--route "r$i-$j:$(route "$i" "$j"):$(peer "$j")")
   done; done
   ulimit -n 65536 2>/dev/null || true
   python3 "$crate/tests/chaos/proxy.py" --control "$ctl" "${routes[@]}" >"$out/proxy.log" 2>&1 &
@@ -123,6 +140,7 @@ flush_ms=${FLUSH_MS:-2000}
 crash_at=${CRASH_AT:-} crash_prob=${CRASH_PROB:-0.05}
 case $scenario in
   flush-crash | mixed-flush) crash_at=${crash_at:-any} ;;
+  switch-crash) crash_at=${crash_at:-switch-any} crash_prob=${CRASH_PROB:-0.35} ;;
   mid-trim)
     crash_at=mid-trim crash_prob=${CRASH_PROB:-0.02}
     DISK_RETAIN_MB=${DISK_RETAIN_MB:-32}
@@ -141,38 +159,52 @@ supervise() {
   [ -n "${seg_mb:-}" ] && disk+=(--segment-mb "$seg_mb")
   disk+=(--flush-ms "$flush_ms" --headroom "${HEADROOM:-100000000}" --flush-segment-mb "${FLUSH_SEGMENT_MB:-64}")
   [ -n "$crash_at" ] && disk+=(--crash-at "$crash_at" --crash-prob "$crash_prob" --crash-stop-file "$out/no-more-crashes")
-  for j in $ids; do
+  for j in $slots; do
     [ "$i" = "$j" ] && continue
     if [ "$proxy" = 1 ]; then peers+=(--peer "n$j=127.0.0.1:$(route "$i" "$j")"); else peers+=(--peer "n$j=127.0.0.1:$(peer "$j")"); fi
   done
-  while [ ! -e "$out/stop" ]; do
+  while [ ! -e "$out/stop" ] && [ ! -e "$out/retired-n$i" ]; do
     set +e
     "$bin" node --id "n$i" --listen "127.0.0.1:$(peer "$i")" --http "127.0.0.1:$(http "$i")" "${peers[@]}" \
-      --s3-endpoint "http://127.0.0.1:$minio" --prefix "$prefix" "${disk[@]}" >>"$out/n$i.log" 2>&1
+      --members "$members_flag" --s3-endpoint "http://127.0.0.1:$minio" --prefix "$prefix" "${disk[@]}" >>"$out/n$i.log" 2>&1
     local rc=$?
     set -e
     echo "$(ms) exit n$i $rc" >>"$out/events.log"
-    [ -e "$out/stop" ] && break
+    [ -e "$out/stop" ] || [ -e "$out/retired-n$i" ] && break
     sleep "${RESTART_SEC:-1}"
     # a wipe holds the restart until the disk is gone
     while [ -e "$out/hold-n$i" ] && [ ! -e "$out/stop" ]; do sleep 0.05; done
   done
 }
 for i in $ids; do supervise "$i" & pids+=($!); done
+started="$ids"
+start_slot() {
+  supervise "$1" &
+  pids+=($!)
+  started="$started $1"
+}
 
 status() { curl -sf --max-time 1 "http://127.0.0.1:$(http "$1")/qlog/status" || echo '{}'; }
 leader() {
-  for i in $ids; do
+  for i in $slots; do
     if status "$i" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("role")=="leader" else 1)' 2>/dev/null; then
       echo "$i"; return
     fi
   done
   echo ""
 }
-follower() {
+# the leader's member set, as slot numbers
+members() {
   local l
   l=$(leader)
-  for i in $ids; do [ "$i" != "$l" ] && { echo "$i"; return; }; done
+  [ -n "$l" ] || return 0
+  status "$l" | python3 -c 'import json,sys; print(" ".join(m[1:] for m in json.load(sys.stdin).get("members", [])))'
+}
+follower() {
+  local l ms i
+  l=$(leader)
+  ms=$(members)
+  for i in ${ms:-$ids}; do [ "$i" != "$l" ] && { echo "$i"; return; }; done
 }
 nodepid() { pgrep -f "^$bin node --id n$1 " | head -1; }
 
@@ -184,7 +216,7 @@ done
 log "leader n$(leader)"
 
 nodes=() https=()
-for i in $ids; do nodes+=(--node "n$i=127.0.0.1:$(peer "$i")"); https+=(--node "n$i=127.0.0.1:$(http "$i")"); done
+for i in $slots; do nodes+=(--node "n$i=127.0.0.1:$(peer "$i")"); https+=(--node "n$i=127.0.0.1:$(http "$i")"); done
 # with no flush there's no bucket: a cursor older than the ring is outdated
 s3=(--s3-endpoint "http://127.0.0.1:$minio" --prefix "$prefix")
 "$bin" check "${https[@]}" --backfill "$([ "$flush_ms" != 0 ] && echo true || echo false)" --gap-ms "${GAP_MS:-15}" --stop-file "$out/stop" --acked "$out/acked.txt" --out "$out" \
@@ -208,7 +240,7 @@ fi
 # CPU and RSS per node every 5 s
 (
   while kill -0 "$loader" 2>/dev/null; do
-    for i in $ids; do
+    for i in $slots; do
       p=$(nodepid "$i" || true)
       [ -n "$p" ] && echo "$(ms) n$i $(awk '{print $14+$15}' "/proc/$p/stat" 2>/dev/null) $(awk '/VmRSS/{print $2}' "/proc/$p/status" 2>/dev/null)" >>"$out/resources.log"
     done
@@ -219,15 +251,15 @@ pids+=($!)
 
 isolate() {
   local k=$1
-  for j in $ids; do
+  for j in $slots; do
     [ "$j" = "$k" ] && continue
-    curl -sf -X POST "127.0.0.1:$ctl/r$k$j" -d '{"blackhole": true}' >/dev/null
-    curl -sf -X POST "127.0.0.1:$ctl/r$j$k" -d '{"blackhole": true}' >/dev/null
+    curl -sf -X POST "127.0.0.1:$ctl/r$k-$j" -d '{"blackhole": true}' >/dev/null
+    curl -sf -X POST "127.0.0.1:$ctl/r$j-$k" -d '{"blackhole": true}' >/dev/null
   done
 }
 heal() {
-  for i in $ids; do for j in $ids; do
-    [ "$i" = "$j" ] || curl -sf -X POST "127.0.0.1:$ctl/r$i$j" -d '{}' >/dev/null
+  for i in $slots; do for j in $slots; do
+    [ "$i" = "$j" ] || curl -sf -X POST "127.0.0.1:$ctl/r$i-$j" -d '{}' >/dev/null
   done; done
 }
 
@@ -313,6 +345,125 @@ fault() {
   esac
 }
 
+# ---- membership
+
+next_slot=$((N + 1))
+# a new box: a fresh id, started, answering its status port, in NEW (not
+# in a subshell: the supervisor must be this shell's child)
+new_box() {
+  [ "$next_slot" -le "$S" ] || return 1
+  local t=0
+  NEW=$next_slot
+  next_slot=$((next_slot + 1))
+  start_slot "$NEW"
+  until curl -sf --max-time 1 "http://127.0.0.1:$(http "$NEW")/qlog/status" >/dev/null; do
+    sleep 0.1; t=$((t + 1))
+    [ $t -lt 100 ] || break
+  done
+}
+# the change, retried by `qlog member` until qlog/leader holds the new set
+member() {
+  "$bin" member "${https[@]}" --retry-secs "${MEMBER_RETRY:-90}" "$@" 2>>"$out/member.log" | tee -a "$out/switches.jsonl" >/dev/null
+}
+# A removed node, still up, must hold no entry and no promise of the epoch
+# its removal took effect at; then the box goes (killed, disk gone).
+removed() {
+  local r=$1 l st
+  sleep 2
+  l=$(leader)
+  st=$(status "$r")
+  local since
+  since=$( [ -n "$l" ] && status "$l" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("members_since", 0))' || echo 0)
+  if echo "$st" | python3 -c '
+import json, sys
+s = json.load(sys.stdin); since = int(sys.argv[1])
+if not s:
+    sys.exit(0)
+ok = s["promised"] < since and s["last_epoch"] < since
+print("removed: promised %s last_epoch %s retired %s since %s" % (s["promised"], s["last_epoch"], s.get("retired"), since), file=sys.stderr)
+sys.exit(0 if ok else 1)' "$since" 2>>"$out/events.log"; then
+    log "removed-ok n$r since $since"
+  else
+    log "VIOLATION removed n$r counted after epoch $since"
+    touch "$out/removed-violation"
+  fi
+  touch "$out/retired-n$r"
+  local p
+  p=$(nodepid "$r" || true)
+  [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
+  while [ -n "$(nodepid "$r" || true)" ]; do sleep 0.02; done
+  rm -rf "$cl_dir/cl-n$r"
+  log "retired n$r"
+}
+# switch-fault: something goes wrong at a random point of the change
+switch_fault() {
+  local new=$1 kind p who
+  sleep "0.$((RANDOM % 10))$((RANDOM % 10))"
+  set -- kill-leader isolate-leader kill-learner kill-follower
+  shift $((RANDOM % 4)); kind=$1
+  case $kind in
+    kill-leader) who=$(leader) ;;
+    isolate-leader) who=$(leader) ;;
+    kill-learner) who=$new ;;
+    kill-follower) who=$(follower) ;;
+  esac
+  [ -n "$who" ] || { log "skip $kind: nobody"; return; }
+  case $kind in
+    isolate-leader)
+      log "isolate n$who $kind"; isolate "$who"; sleep 3; heal; log "heal n$who" ;;
+    *)
+      p=$(nodepid "$who" || true)
+      [ -n "$p" ] && { log "kill9 n$who $kind"; kill -9 "$p" 2>/dev/null || true; } ;;
+  esac
+}
+replace() {
+  local kind=$1 old new fpid=
+  if [ "$kind" = replace-leader ]; then old=$(leader); else old=$(follower); fi
+  [ -n "$old" ] || { log "skip $kind: no leader"; return; }
+  new_box || { log "skip $kind: no ids left"; return; }
+  new=$NEW
+  log "switch-start $kind n$old n$new"
+  [ "$scenario" = switch-fault ] && { switch_fault "$new" & fpid=$!; }
+  if member replace "n$old" "n$new"; then log "switch-done $kind n$old n$new"; else log "switch-FAILED $kind n$old n$new"; fi
+  [ -n "$fpid" ] && wait "$fpid" || true
+  removed "$old"
+}
+grow_step=0
+grow_shrink() {
+  local ms new new2 l victims v
+  ms=$(members)
+  [ -n "$ms" ] || { log "skip grow-shrink: no leader"; return; }
+  l=$(leader)
+  case $((grow_step % 4)) in
+    0)
+      new_box || { log "skip grow: no ids left"; return; }
+      new=$NEW
+      log "switch-start add n$new"
+      member add "n$new" && log "switch-done add n$new" || log "switch-FAILED add n$new"
+      ;;
+    1 | 3)
+      # remove one (from 4) or two (from 5), the leader among them at random
+      set -- $ms; victims=$(printf '%s\n' "$@" | shuf -n $(( $# - 3 )) | tr '\n' ' ')
+      local set=()
+      for v in $ms; do case " $victims " in *" $v "*) ;; *) set+=("n$v") ;; esac; done
+      log "switch-start remove $(echo $victims)"
+      member set "$(IFS=,; echo "${set[*]}")" && log "switch-done remove $(echo $victims)" || log "switch-FAILED remove $(echo $victims)"
+      for v in $victims; do removed "$v"; done
+      ;;
+    2)
+      new_box || { log "skip grow: no ids left"; return; }
+      new=$NEW
+      new_box || { log "skip grow: no ids left"; return; }
+      new2=$NEW
+      local set=()
+      for v in $ms $new $new2; do set+=("n$v"); done
+      log "switch-start add n$new n$new2"
+      member set "$(IFS=,; echo "${set[*]}")" && log "switch-done add n$new n$new2" || log "switch-FAILED add n$new n$new2"
+      ;;
+  esac
+  grow_step=$((grow_step + 1))
+}
+
 kinds="kill-leader kill-follower partition-leader partition-follower pause-leader"
 wipe_kinds="kill-leader kill-two kill-all power-cut-all wipe-all wipe-two wipe-two partition-leader"
 single_kinds="single-kill single-power-cut single-power-cut single-wipe"
@@ -326,9 +477,13 @@ while [ $(($(date +%s) - start + 12)) -lt "$duration" ] && [ "$scenario" != base
     mixed-wipe) set -- $wipe_kinds; shift $((RANDOM % 8)); k=$1 ;;
     single-mixed) set -- $single_kinds; shift $((RANDOM % 4)); k=$1 ;;
     flush-crash | mid-trim) k=none ;;
+    switch-crash | switch-fault) set -- replace-follower replace-leader; shift $((RANDOM % 2)); k=$1 ;;
     *) k=$scenario ;;
   esac
-  if [ "$k" = none ]; then :; elif [ "$proxy" != 1 ] && [[ $k == partition-* ]]; then log "skip $k: PROXY=0"; else fault "$k"; fi
+  if [ "$k" = none ]; then :;
+  elif [[ $k == replace-* ]]; then replace "$k";
+  elif [ "$k" = grow-shrink ]; then grow_shrink;
+  elif [ "$proxy" != 1 ] && [[ $k == partition-* ]]; then log "skip $k: PROXY=0"; else fault "$k"; fi
   # let a killed node come back and catch up before the next fault
   sleep "$every"
 done
@@ -340,7 +495,7 @@ if [ "$flush_ms" != 0 ]; then
   # a node restarted by the supervisor gets the same flags, so give it time)
   sleep $(( (flush_ms / 1000) + 3 ))
 fi
-for i in $ids; do status "$i" >"$out/status-n$i.json"; done
+for i in $started; do status "$i" >"$out/status-n$i.json"; done
 touch "$out/stop"
 set +e
 wait "$checker"
@@ -349,9 +504,11 @@ if [ "$flush_ms" != 0 ]; then
   "$bin" verify "${s3[@]}" >"$out/verify.json" 2>>"$out/verify.log"
   vrc=$?
   [ $vrc = 0 ] || { echo "qlog chaos: the final manifest is inconsistent" >&2; rc=1; }
-  grep -q FAILED "$out/events.log" && { echo "qlog chaos: a mid-run verify failed" >&2; rc=1; }
+  grep -q "verify FAILED" "$out/events.log" && { echo "qlog chaos: a mid-run verify failed" >&2; rc=1; }
   "$bin" retain "${s3[@]}" --horizon-secs "${RETAIN_HORIZON_SEC:-30}" >"$out/retain.json" 2>>"$out/verify.log" || true
 fi
+[ -e "$out/removed-violation" ] && { echo "qlog chaos: a removed member counted after its removal" >&2; rc=1; }
+grep -q "switch-FAILED" "$out/events.log" && { echo "qlog chaos: a membership change never landed" >&2; rc=1; }
 set -e
 python3 "$here/report.py" "$out" | tee "$out/report.txt"
 exit $rc

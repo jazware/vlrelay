@@ -152,12 +152,36 @@ struct StatusParams {
     reset: bool,
 }
 
-/// subscribeRepos and `/qlog/status` for one node.
+/// subscribeRepos, `/qlog/status`, and `POST /qlog/members` (a membership
+/// change, on the leader) for one node.
 pub fn router(node: Arc<super::node::Node>) -> axum::Router {
     axum::Router::new()
         .route("/xrpc/com.atproto.sync.subscribeRepos", axum::routing::get(subscribe))
         .route("/qlog/status", axum::routing::get(status))
+        .route("/qlog/members", axum::routing::post(members))
         .with_state(node)
+}
+
+/// The member set wanted, and addresses for nodes the leader can't dial yet.
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct MembersRequest {
+    pub members: Vec<String>,
+    #[serde(default)]
+    pub addrs: std::collections::BTreeMap<String, String>,
+}
+
+async fn members(State(n): State<Arc<super::node::Node>>, axum::Json(r): axum::Json<MembersRequest>) -> Response {
+    use axum::http::StatusCode;
+    match n.change_members(r.members, r.addrs).await {
+        Ok(s) => axum::Json(s).into_response(),
+        Err(e) => {
+            let code = match e.downcast_ref::<super::node::NotLeading>() {
+                Some(_) => StatusCode::CONFLICT,
+                None => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (code, axum::Json(serde_json::json!({ "error": format!("{e:#}") }))).into_response()
+        }
+    }
 }
 
 async fn subscribe(

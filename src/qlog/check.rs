@@ -59,6 +59,9 @@ pub struct Checker {
     jumps: Vec<(String, u64, u64)>,
     /// Event (DID content id) -> the seqs it was emitted at.
     dids: HashMap<u64, Vec<u64>>,
+    /// Nodes a membership change removed: their logs stop where they were
+    /// removed, so they're held to consistency but not to the top.
+    removed: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -156,6 +159,10 @@ impl Checker {
     /// As `acked`, for an event identified by `did`.
     pub fn acked_event(&mut self, seq: u64, content: u64, did: u64) {
         self.acked.push((seq, content, Some(did)));
+    }
+
+    pub fn removed(&mut self, node: &str) {
+        self.removed.insert(node.to_string());
     }
 
     pub fn last(&self, stream: &str) -> Option<u64> {
@@ -266,7 +273,7 @@ impl Checker {
                         }
                     }
                 }
-                if self.max_seq > hi {
+                if self.max_seq > hi && !self.removed.contains(node) {
                     self.messages
                         .push(format!("{node}'s commit index {hi} is below the highest emitted seq {}", self.max_seq));
                     log_mismatches += 1;

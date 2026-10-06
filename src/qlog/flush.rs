@@ -57,6 +57,16 @@ pub enum Step {
     RecoverBeforeManifest,
     /// Bucket recovery: the manifest is written; the node doesn't lead yet.
     RecoverAfterManifest,
+    /// Membership change: learners are recorded and catching up.
+    SwitchCatchUp,
+    /// Membership change: learners caught up, commits not paused yet.
+    SwitchBeforePause,
+    /// Membership change: paused and flushed to the commit index, the new
+    /// set not CASed yet.
+    SwitchFlushed,
+    /// Membership change: `qlog/leader` holds the new set at epoch + 1, the
+    /// leader hasn't moved to it (or handed off) yet.
+    SwitchCas,
 }
 
 impl std::str::FromStr for Step {
@@ -71,6 +81,10 @@ impl std::str::FromStr for Step {
             "recover-sealed" => Step::RecoverSealed,
             "recover-before-manifest" => Step::RecoverBeforeManifest,
             "recover-after-manifest" => Step::RecoverAfterManifest,
+            "switch-catch-up" => Step::SwitchCatchUp,
+            "switch-before-pause" => Step::SwitchBeforePause,
+            "switch-flushed" => Step::SwitchFlushed,
+            "switch-cas" => Step::SwitchCas,
             _ => return Err(format!("unknown flush step {s}")),
         })
     }
@@ -256,10 +270,13 @@ struct Stats {
     last: Option<Manifest>,
 }
 
-/// The flush's counters, shared with `/qlog/status`.
+/// The flush's counters, shared with `/qlog/status`, and requests for a
+/// flush now (a membership change's barrier).
 #[derive(Default)]
 pub struct Shared {
     s: Mutex<Stats>,
+    want: std::sync::atomic::AtomicU64,
+    wake: tokio::sync::Notify,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -293,6 +310,17 @@ fn hist() -> hdrhistogram::Histogram<u64> {
 }
 
 impl Shared {
+    /// Asks the leader's flush loop to flush up to at least `seq` now,
+    /// rather than at its next interval.
+    pub fn request(&self, seq: u64) {
+        self.want.fetch_max(seq, std::sync::atomic::Ordering::AcqRel);
+        self.wake.notify_one();
+    }
+
+    fn wanted(&self) -> u64 {
+        self.want.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn status(&self, reset: bool) -> Status {
         let mut s = self.s.lock();
         let q = |h: &Option<hdrhistogram::Histogram<u64>>| h.as_ref().map(Quantiles::of).unwrap_or_default();
@@ -321,7 +349,6 @@ impl Shared {
         st
     }
 }
-
 
 /// Makes the manifest this epoch's. None: a newer epoch already wrote it.
 async fn fence(store: &Store, id: &str, epoch: u64, headroom: u64) -> anyhow::Result<Option<(Manifest, String)>> {
@@ -408,7 +435,12 @@ impl Leader {
         self.node.flush.s.lock().fences += 1;
         self.node.set_flushed(self.man.flushed, self.man.reserve);
         self.node.note_manifest(&self.man);
-        tracing::info!(epoch = self.epoch, flushed = self.man.flushed, reserve = self.man.reserve, "qlog flush: manifest fenced");
+        tracing::info!(
+            epoch = self.epoch,
+            flushed = self.man.flushed,
+            reserve = self.man.reserve,
+            "qlog flush: manifest fenced"
+        );
         if self.crash(Step::Fenced) {
             return Ok(());
         }
@@ -449,29 +481,40 @@ impl Leader {
         let mut next_flush = tokio::time::Instant::now() + self.o.interval;
         loop {
             let Some(commit) = self.leading() else { return Ok(()) };
+            // a requested flush covers everything committed when it's taken
+            let urgent = self.node.flush.wanted() > self.man.flushed;
             while st.applied() < commit {
                 let chunk = self.node.committed_chunk(st.applied() + 1, commit, 4 << 20).await?;
                 st.apply(&chunk).await?;
-                if tokio::time::Instant::now() >= next_flush {
+                if !urgent && tokio::time::Instant::now() >= next_flush {
                     break;
                 }
             }
             self.node.flush.s.lock().applied = st.applied();
-            if tokio::time::Instant::now() >= next_flush {
+            if urgent || tokio::time::Instant::now() >= next_flush {
                 next_flush = tokio::time::Instant::now() + self.o.interval;
-                match self.flush(st).await {
+                let done = match self.flush(st).await {
                     Ok(Outcome::Stop) => return Ok(()),
-                    Ok(Outcome::Retry) => self.node.flush.s.lock().aborted += 1,
-                    Ok(Outcome::Done | Outcome::Nothing) => {}
+                    Ok(Outcome::Retry) => {
+                        self.node.flush.s.lock().aborted += 1;
+                        false
+                    }
+                    Ok(Outcome::Done) => true,
+                    Ok(Outcome::Nothing) => false,
                     Err(e) => {
                         tracing::warn!(epoch = self.epoch, "qlog flush failed: {e:#}");
                         self.node.flush.s.lock().failed += 1;
+                        false
                     }
+                };
+                if urgent && !done {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 continue;
             }
             tokio::select! {
                 _ = commit_rx.changed() => {}
+                _ = self.node.flush.wake.notified() => {}
                 _ = tokio::time::sleep_until(next_flush) => {}
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
@@ -643,16 +686,31 @@ impl Leader {
                         // an ordinal at or past next_ordinal, and this one
                         // doesn't continue the log, so it's nobody's.
                         Head::Segment(h) if (h.first_seq as u64) <= self.man.flushed => {
-                            tracing::warn!(ord, first = h.first_seq, f = self.man.flushed, "qlog flush: deleting a stale segment in the way");
+                            tracing::warn!(
+                                ord,
+                                first = h.first_seq,
+                                f = self.man.flushed,
+                                "qlog flush: deleting a stale segment in the way"
+                            );
                             self.store.raw.delete(&path).await?;
                             continue;
                         }
                         Head::Segment(h) if h.first_seq as u64 == from => {
                             if h.last_seq as u64 > f {
-                                tracing::info!(ord, last = h.last_seq, f, "qlog flush: an existing segment reaches past F");
+                                tracing::info!(
+                                    ord,
+                                    last = h.last_seq,
+                                    f,
+                                    "qlog flush: an existing segment reaches past F"
+                                );
                                 return Ok(None);
                             }
-                            tracing::info!(ord, first = h.first_seq, last = h.last_seq, "qlog flush: adopted a segment an unfinished flush wrote");
+                            tracing::info!(
+                                ord,
+                                first = h.first_seq,
+                                last = h.last_seq,
+                                "qlog flush: adopted a segment an unfinished flush wrote"
+                            );
                             self.node.flush.s.lock().adopted += 1;
                             last = h.last_seq as u64;
                             out.push(SegRef { ordinal: ord, first: from, last, bytes: 0 });
@@ -688,8 +746,7 @@ async fn load_segment(store: &Store, ord: u64, cache: &mut SegCache) -> anyhow::
     let Some(segment::LogObject::Segment(_, ents)) = nodelog::read_object(store, LOG_ID, ord).await? else {
         return Ok(None);
     };
-    let es: Arc<Vec<Entry>> =
-        Arc::new(ents.into_iter().map(|e| Entry::new(e.epoch, e.seq as u64, e.frame)).collect());
+    let es: Arc<Vec<Entry>> = Arc::new(ents.into_iter().map(|e| Entry::new(e.epoch, e.seq as u64, e.frame)).collect());
     *cache = Some((ord, es.clone()));
     Ok(Some(es))
 }
@@ -878,7 +935,8 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
                 if l0 != m.flushed {
                     bad(&mut v, format!("checkpoint manifest's last_l0_seq {l0} isn't F {}", m.flushed));
                 }
-                let applied = kv.get(state::applied_key()).map(|b| u64::from_be_bytes(b[..8].try_into().unwrap_or([0; 8])));
+                let applied =
+                    kv.get(state::applied_key()).map(|b| u64::from_be_bytes(b[..8].try_into().unwrap_or([0; 8])));
                 if applied != Some(m.flushed) {
                     bad(&mut v, format!("state's _applied is {applied:?}, F is {}", m.flushed));
                 }
@@ -998,20 +1056,21 @@ pub struct RecoveryStats {
 /// The bucket side of a recovery by `epoch`, the leader of a quorum with
 /// no quorum of intact logs (docs/quorum.md, "Bucket recovery"): the
 /// state cloned from the manifest's checkpoint, the orphans and `salvage`
-/// (committed entries from F' + 1 on, densely, that a reachable node held)
-/// applied to it, the applied point jumped to R, sealed there; `salvage`
-/// uploaded as segments; then the manifest CASed with F = R, the gap
-/// `(S, R]` and the recovery's cursors. Seqs resume at R + 1. A crash or a
-/// lost CAS anywhere before the manifest leaves the old one in charge (the
-/// clone and segments are left for the next attempt or the retention
-/// report).
+/// (committed entries from F' + 1 on, densely, that a reachable node held,
+/// in chunks as they're fetched) applied to it and uploaded as segments
+/// as they arrive, the applied point jumped to R and sealed there; then
+/// the manifest CASed with F = R, the gap `(S, R]` and the recovery's
+/// cursors. Seqs resume at R + 1. A crash or a lost CAS anywhere before
+/// the manifest leaves the old one in charge (the clone and segments are
+/// left for the next attempt, which adopts the segments as orphans, or for
+/// the retention report).
 pub async fn recover(
     store: &Store,
     id: &str,
     epoch: u64,
     o: &Options,
     p: RecoveryPoint,
-    salvage: Vec<Entry>,
+    mut salvage: tokio::sync::mpsc::Receiver<Vec<Entry>>,
     stats: &mut RecoveryStats,
 ) -> anyhow::Result<Manifest> {
     let t0 = Instant::now();
@@ -1019,14 +1078,8 @@ pub async fn recover(
     let m = &p.manifest;
     anyhow::ensure!(m.epoch < epoch, "qlog recovery: the manifest is epoch {}'s, not older than {epoch}", m.epoch);
     let r = m.reserve;
-    let mut s = p.flushed;
-    for e in &salvage {
-        anyhow::ensure!(e.seq == s + 1, "qlog recovery: salvage isn't dense at {} after {s}", e.seq);
-        s = e.seq;
-    }
-    anyhow::ensure!(s <= r, "qlog recovery: salvage reaches {s}, past R {r}");
-    (stats.manifest_flushed, stats.orphans_to, stats.after, stats.base) = (m.flushed, p.flushed, s, r);
-    (stats.orphan_segments, stats.salvaged, stats.epoch) = (p.orphans.len() as u64, salvage.len() as u64, epoch);
+    (stats.manifest_flushed, stats.orphans_to, stats.base) = (m.flushed, p.flushed, r);
+    (stats.orphan_segments, stats.epoch) = (p.orphans.len() as u64, epoch);
     let rel = state::recovery_path(epoch);
     let mut st = State::recover(store, m.state.as_ref(), &rel).await?;
     stats.clone_ms = t0.elapsed().as_millis() as u64;
@@ -1036,52 +1089,49 @@ pub async fn recover(
             st.apply(chunk).await?;
         }
     }
-    for chunk in salvage.chunks(4096) {
-        st.apply(chunk).await?;
+    // Salvage is held one segment at a time: at 100x a whole interval of
+    // it is gigabytes.
+    let mut segments: Vec<SegRef> = p.orphans.iter().map(|(r, _)| r.clone()).collect();
+    let mut ord = m.next_ordinal + p.orphans.len() as u64;
+    let mut s = p.flushed;
+    let mut seg: Option<(SegmentBuilder, u64)> = None;
+    let mut put_us = 0u64;
+    while let Some(chunk) = salvage.recv().await {
+        for e in &chunk {
+            anyhow::ensure!(e.seq == s + 1, "qlog recovery: salvage isn't dense at {} after {s}", e.seq);
+            s = e.seq;
+        }
+        anyhow::ensure!(s <= r, "qlog recovery: salvage reaches {s}, past R {r}");
+        st.apply(&chunk).await?;
+        stats.salvaged += chunk.len() as u64;
+        for e in &chunk {
+            let (b, _) = seg.get_or_insert_with(|| (SegmentBuilder::for_log(LOG_ID), e.seq));
+            push(b, e);
+            if b.len() >= o.segment_bytes {
+                let (b, first) = seg.take().expect("just filled");
+                let t = Instant::now();
+                segments.push(put_recovery_segment(store, b, ord, first, e.seq).await?);
+                put_us += t.elapsed().as_micros() as u64;
+                ord += 1;
+            }
+        }
     }
+    if let Some((b, first)) = seg.take() {
+        let t = Instant::now();
+        segments.push(put_recovery_segment(store, b, ord, first, s).await?);
+        put_us += t.elapsed().as_micros() as u64;
+        ord += 1;
+    }
+    stats.after = s;
     let cursors = st.cursors().clone();
     st.jump(r).await?;
     let sref = st.seal().await?;
     st.close().await;
-    stats.apply_seal_ms = t1.elapsed().as_millis() as u64;
+    stats.segments_ms = put_us / 1000;
+    stats.apply_seal_ms = (t1.elapsed().as_micros() as u64).saturating_sub(put_us) / 1000;
     if crash(Step::RecoverSealed) {
         anyhow::bail!(Crash);
     }
-    let t2 = Instant::now();
-    let mut segments: Vec<SegRef> = p.orphans.iter().map(|(r, _)| r.clone()).collect();
-    let mut ord = m.next_ordinal + p.orphans.len() as u64;
-    let mut rest = &salvage[..];
-    while !rest.is_empty() {
-        let mut b = SegmentBuilder::for_log(LOG_ID);
-        let mut n = 0;
-        for e in rest {
-            push(&mut b, e);
-            n += 1;
-            if b.len() >= o.segment_bytes {
-                break;
-            }
-        }
-        let (first, last) = (rest[0].seq, rest[n - 1].seq);
-        rest = &rest[n..];
-        let obj = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-            let obj = b.seal(LOG_ID, ord, ord);
-            Ok(segment::compress(&obj, segment::compression_level())?.unwrap_or(obj))
-        })
-        .await??;
-        let bytes = obj.len() as u64;
-        store
-            .raw
-            .put_opts(
-                &nodelog::segment_path(store, LOG_ID, ord),
-                PutPayload::from(obj),
-                PutOptions { mode: PutMode::Create, ..Default::default() },
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("qlog recovery: segment {ord}: {e}"))?;
-        segments.push(SegRef { ordinal: ord, first, last, bytes });
-        ord += 1;
-    }
-    stats.segments_ms = t2.elapsed().as_millis() as u64;
     if crash(Step::RecoverBeforeManifest) {
         anyhow::bail!(Crash);
     }
@@ -1132,4 +1182,29 @@ pub async fn recover(
     }
     stats.total_ms = t0.elapsed().as_millis() as u64 + stats.read_ms;
     Ok(next)
+}
+
+async fn put_recovery_segment(
+    store: &Store,
+    b: SegmentBuilder,
+    ord: u64,
+    first: u64,
+    last: u64,
+) -> anyhow::Result<SegRef> {
+    let obj = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+        let obj = b.seal(LOG_ID, ord, ord);
+        Ok(segment::compress(&obj, segment::compression_level())?.unwrap_or(obj))
+    })
+    .await??;
+    let bytes = obj.len() as u64;
+    store
+        .raw
+        .put_opts(
+            &nodelog::segment_path(store, LOG_ID, ord),
+            PutPayload::from(obj),
+            PutOptions { mode: PutMode::Create, ..Default::default() },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("qlog recovery: segment {ord}: {e}"))?;
+    Ok(SegRef { ordinal: ord, first, last, bytes })
 }

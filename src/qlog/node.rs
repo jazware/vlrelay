@@ -30,9 +30,12 @@ use vlpds::store::Store;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub id: String,
-    /// Every member, this node included.
+    /// The bootstrap member set, this node included: what the first
+    /// `qlog/leader` CAS writes. From then on the set recorded there at the
+    /// current epoch is the one that votes and counts (`Core::members`).
     pub members: Vec<String>,
-    /// Where to dial each other member.
+    /// Where to dial each other node (members, learners, or nodes that may
+    /// become either); an address in `qlog/leader` fills in the rest.
     pub peers: HashMap<String, String>,
     pub heartbeat: Duration,
     pub election_timeout: Duration,
@@ -62,6 +65,11 @@ pub struct Config {
     /// that finds that only logs it and keeps retrying (an operator
     /// restarts one member with it on).
     pub auto_recover: bool,
+    /// A membership change waits this long for its learners to catch up...
+    pub catch_up_timeout: Duration,
+    /// ...and this long, with commits paused, for everything appended to
+    /// commit, the learners to hold it and the flush to cover it.
+    pub switch_timeout: Duration,
 }
 
 impl Config {
@@ -83,12 +91,14 @@ impl Config {
             flush: None,
             laggard_grace: Duration::from_secs(10),
             auto_recover: true,
+            catch_up_timeout: Duration::from_secs(300),
+            switch_timeout: Duration::from_secs(10),
         }
     }
+}
 
-    pub fn quorum(&self) -> usize {
-        self.members.len() / 2 + 1
-    }
+pub fn quorum(members: usize) -> usize {
+    members / 2 + 1
 }
 
 /// `qlog/leader`: one leader per epoch, decided by the bucket's CAS.
@@ -96,7 +106,21 @@ impl Config {
 pub struct LeaderRecord {
     pub epoch: u64,
     pub leader: String,
+    /// The voters at this epoch: quorums, promise rounds and the lost-quorum
+    /// trigger count these and nothing else.
     pub members: Vec<String>,
+    /// Nodes the leader replicates to that don't count until a membership
+    /// change makes them members (at epoch + 1).
+    #[serde(default)]
+    pub learners: Vec<String>,
+    /// Addresses an operator gave for nodes this cluster's `--peer` flags
+    /// may not name.
+    #[serde(default)]
+    pub addrs: BTreeMap<String, String>,
+    /// The epoch `members` took effect at (the bootstrap's, or a change's
+    /// epoch + 1): a member removed then never holds or promises it.
+    #[serde(default)]
+    pub since: u64,
 }
 
 fn leader_path(store: &Store) -> Path {
@@ -338,6 +362,19 @@ struct Core {
     /// rather than replaying the bucket from seq 1: nothing they emitted
     /// is behind it.
     fresh: HashSet<String>,
+    /// The member set at `epoch` as last read from `qlog/leader` (or set by
+    /// this node's own change): only these vote and count.
+    members: Vec<String>,
+    learners: Vec<String>,
+    members_since: u64,
+    /// Leader: replicas whose last answer said their log is intact.
+    peer_intact: HashSet<String>,
+    /// Leader: a membership change holds new appends at its barrier.
+    paused: bool,
+    switching: bool,
+    /// `qlog/leader` no longer names this node: it doesn't campaign until a
+    /// leader appends to it again (it was added back).
+    retired: bool,
 }
 
 pub struct Stats {
@@ -410,6 +447,44 @@ pub struct Status {
     pub lost_quorums: u64,
     /// The bucket recoveries this node ran, with their timings.
     pub recovered: Vec<flush::RecoveryStats>,
+    pub members: Vec<String>,
+    pub learners: Vec<String>,
+    pub members_since: u64,
+    pub retired: bool,
+    pub paused: bool,
+    /// The epoch of the last entry held (a removed member never holds one
+    /// from after its removal).
+    pub last_epoch: u64,
+    /// The membership changes this node ran as leader, with their timings.
+    pub switches: Vec<SwitchStats>,
+}
+
+/// One membership change, as the leader that ran it saw it.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SwitchStats {
+    pub from_epoch: u64,
+    pub epoch: u64,
+    pub from: Vec<String>,
+    pub to: Vec<String>,
+    /// Who leads `epoch`: this node, or the member it handed off to.
+    pub leader: String,
+    /// Recording the learners in `qlog/leader`.
+    pub record_ms: u64,
+    /// From the learners' first append to every one of them holding the
+    /// commit index.
+    pub catch_up_ms: u64,
+    /// The flush just before the pause, so the barrier's has little to do.
+    pub pre_flush_ms: u64,
+    /// Paused: until every appended entry committed and the learners held it...
+    pub drain_ms: u64,
+    /// ...then the flush to that point...
+    pub flush_ms: u64,
+    /// ...then the CAS to epoch + 1.
+    pub cas_ms: u64,
+    /// No new appends from the pause to leading `epoch` (or handing off).
+    pub paused_ms: u64,
+    pub flushed: u64,
+    pub at_ms: i64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -443,7 +518,13 @@ pub struct Node {
     head: watch::Sender<u64>,
     commit: watch::Sender<u64>,
     pub faults: Arc<Faults>,
-    ctl: HashMap<String, Arc<Rpc>>,
+    /// Where each other node is dialed: `--peer`, then addresses from
+    /// `qlog/leader` and membership changes.
+    addrs: Mutex<HashMap<String, String>>,
+    ctl: Mutex<HashMap<String, Arc<Rpc>>>,
+    /// A membership change's barrier: submits wait while it's set.
+    paused: watch::Sender<bool>,
+    switches: Mutex<Vec<SwitchStats>>,
     durability: Arc<dyn Durability>,
     pub emit: Arc<Emitter>,
     pub stats: Stats,
@@ -468,7 +549,8 @@ impl Node {
         durability: Arc<dyn Durability>,
         recovered: Option<Recovered>,
     ) -> anyhow::Result<Arc<Node>> {
-        let genesis = read_leader(&store).await?.is_none();
+        let record = read_leader(&store).await?.map(|(r, _)| r);
+        let genesis = record.is_none();
         let manifest = match &cfg.flush {
             Some(_) => flush::read_manifest(&store).await?.map(|(m, _)| m),
             None => None,
@@ -482,8 +564,16 @@ impl Node {
         }
         let (emitted, commit, log_last) = (log.base().1, log.commit(), log.last_seq());
         durability.note_commit(commit);
-        let ctl =
-            cfg.peers.iter().map(|(id, addr)| (id.clone(), Arc::new(Rpc::new(id, addr, faults.clone())))).collect();
+        let mut addrs = cfg.peers.clone();
+        if let Some(r) = &record {
+            for (id, a) in &r.addrs {
+                addrs.entry(id.clone()).or_insert_with(|| a.clone());
+            }
+        }
+        let (members, learners, members_since) = match &record {
+            Some(r) => (r.members.clone(), r.learners.clone(), r.since),
+            None => (cfg.members.clone(), Vec::new(), 0),
+        };
         let node = Arc::new(Node {
             core: Mutex::new(Core {
                 log,
@@ -521,13 +611,23 @@ impl Node {
                     .and_then(|m| m.recovery.as_ref())
                     .map(|r| (r.generation, encode_cursors(&r.cursors))),
                 fresh: HashSet::new(),
+                members,
+                learners,
+                members_since,
+                peer_intact: HashSet::new(),
+                paused: false,
+                switching: false,
+                retired: false,
             }),
             cfg,
             store,
             head: watch::channel(0).0,
             commit: watch::channel(commit).0,
             faults,
-            ctl,
+            addrs: Mutex::new(addrs),
+            ctl: Mutex::new(HashMap::new()),
+            paused: watch::channel(false).0,
+            switches: Mutex::new(Vec::new()),
             durability,
             emit,
             stats: Stats::default(),
@@ -580,6 +680,13 @@ impl Node {
             recoveries: self.stats.recoveries.load(Ordering::Relaxed),
             lost_quorums: self.stats.lost_quorums.load(Ordering::Relaxed),
             recovered: self.recovered.lock().clone(),
+            members: c.members.clone(),
+            learners: c.learners.clone(),
+            members_since: c.members_since,
+            retired: c.retired,
+            paused: c.paused,
+            last_epoch: c.log.last().0,
+            switches: self.switches.lock().clone(),
         }
     }
 
@@ -725,13 +832,21 @@ impl Node {
                     self.on_fetch(epoch, from_seq, max_bytes as usize).await
                 }
                 Msg::Ping { .. } => Msg::Pong,
+                Msg::Lead { epoch, .. } => {
+                    self.on_lead(epoch);
+                    Msg::Pong
+                }
                 Msg::Cursors => {
                     let c = self.core.lock();
                     match &c.recovery_cursors {
                         Some((g, b)) if *g == c.generation => {
                             Msg::CursorsResp { generation: *g, known: true, cursors: b.clone() }
                         }
-                        _ => Msg::CursorsResp { generation: c.generation, known: c.generation == 0, cursors: Bytes::new() },
+                        _ => Msg::CursorsResp {
+                            generation: c.generation,
+                            known: c.generation == 0,
+                            cursors: Bytes::new(),
+                        },
                     }
                 }
                 _ => continue,
@@ -765,43 +880,43 @@ impl Node {
         // under the submitter's timeout, so a busy leader isn't taken for a dead one
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut commits = self.commit.subscribe();
-        loop {
+        let mut paused = self.paused.subscribe();
+        let (rx, first, last, epoch, ticket) = loop {
             {
-                let c = self.core.lock();
-                if c.role != Role::Leader || c.pending_bytes < self.cfg.max_pending_bytes {
-                    break;
+                let mut c = self.core.lock();
+                if c.role != Role::Leader {
+                    return Msg::NotLeader { hint: c.leader.clone().filter(|l| *l != self.cfg.id).unwrap_or_default() };
+                }
+                if !c.paused && c.pending_bytes < self.cfg.max_pending_bytes {
+                    let epoch = c.epoch;
+                    let first = c.log.last_seq() + 1;
+                    if generation >= c.generation {
+                        merge_cursors(&mut c.pending_cursors, &cursors);
+                    }
+                    if frames.is_empty() {
+                        return Msg::Submitted { first, n: 0, generation: c.generation };
+                    }
+                    let mut ride = encode_cursors(&std::mem::take(&mut c.pending_cursors));
+                    for (p, s) in &frames {
+                        let seq = c.log.last_seq() + 1;
+                        c.log.append_with(epoch, wire::splice_seq(p, s, seq), std::mem::take(&mut ride));
+                    }
+                    let last = c.log.last_seq();
+                    let (tx, rx) = oneshot::channel();
+                    c.waiters.insert(last, tx);
+                    let bytes = c.log.range(first - 1, last).map(|e| e.data.len()).sum();
+                    c.pending.push_back((first, last, Instant::now(), bytes));
+                    c.pending_bytes += bytes;
+                    let ticket = self.sync(&mut c);
+                    break (rx, first, last, epoch, ticket);
                 }
             }
-            if tokio::time::timeout_at(deadline, commits.changed()).await.is_err() {
-                return Msg::Failed { reason: "busy: too much uncommitted".into() };
+            let busy = Msg::Failed { reason: "busy: too much uncommitted, or a membership change".into() };
+            tokio::select! {
+                _ = commits.changed() => {}
+                _ = paused.changed() => {}
+                _ = tokio::time::sleep_until(deadline) => return busy,
             }
-        }
-        let (rx, first, last, epoch, ticket) = {
-            let mut c = self.core.lock();
-            if c.role != Role::Leader {
-                return Msg::NotLeader { hint: c.leader.clone().filter(|l| *l != self.cfg.id).unwrap_or_default() };
-            }
-            let epoch = c.epoch;
-            let first = c.log.last_seq() + 1;
-            if generation >= c.generation {
-                merge_cursors(&mut c.pending_cursors, &cursors);
-            }
-            if frames.is_empty() {
-                return Msg::Submitted { first, n: 0, generation: c.generation };
-            }
-            let mut ride = encode_cursors(&std::mem::take(&mut c.pending_cursors));
-            for (p, s) in &frames {
-                let seq = c.log.last_seq() + 1;
-                c.log.append_with(epoch, wire::splice_seq(p, s, seq), std::mem::take(&mut ride));
-            }
-            let last = c.log.last_seq();
-            let (tx, rx) = oneshot::channel();
-            c.waiters.insert(last, tx);
-            let bytes = c.log.range(first - 1, last).map(|e| e.data.len()).sum();
-            c.pending.push_back((first, last, Instant::now(), bytes));
-            c.pending_bytes += bytes;
-            let ticket = self.sync(&mut c);
-            (rx, first, last, epoch, ticket)
         };
         self.stats.appended.fetch_add(last - first + 1, Ordering::Relaxed);
         self.head.send_replace(last);
@@ -828,11 +943,19 @@ impl Node {
         if c.role != Role::Leader {
             return;
         }
-        let mut v: Vec<u64> = std::iter::once(c.self_durable)
-            .chain(self.cfg.peers.keys().map(|p| c.matched.get(p).copied().unwrap_or(0)))
+        // only this epoch's members count: never a learner, never a member
+        // a membership change removed (and a leader outside its own set,
+        // mid-handoff, commits nothing)
+        if !c.members.contains(&self.cfg.id) {
+            return;
+        }
+        let mut v: Vec<u64> = c
+            .members
+            .iter()
+            .map(|m| if *m == self.cfg.id { c.self_durable } else { c.matched.get(m).copied().unwrap_or(0) })
             .collect();
         v.sort_unstable_by(|a, b| b.cmp(a));
-        let q = v[self.cfg.quorum() - 1].min(c.reserve);
+        let q = v[quorum(v.len()) - 1].min(c.reserve);
         // only this term's entries commit by count; the adopted tail was re-tagged
         if q <= c.log.commit() || c.log.epoch_at(q) != Some(c.epoch) {
             return;
@@ -886,14 +1009,17 @@ impl Node {
         // the adopted, re-tagged tail counts once it's on disk
         c.self_durable = commit;
         let ticket = self.sync(c);
-        c.matched = self.cfg.peers.keys().map(|p| (p.clone(), 0)).collect();
-        c.next = self.cfg.peers.keys().map(|p| (p.clone(), last + 1)).collect();
-        let now = Instant::now();
-        c.acked_at = self.cfg.peers.keys().map(|p| (p.clone(), now)).collect();
+        c.matched.clear();
+        c.next.clear();
+        c.acked_at.clear();
+        c.peer_intact.clear();
+        c.retired = false;
         self.stats.takeovers.fetch_add(1, Ordering::Relaxed);
-        tracing::info!(id = %self.cfg.id, epoch, last, commit, "qlog: leading");
-        for p in self.cfg.peers.keys() {
-            tokio::spawn(self.clone().replicate(p.clone(), epoch));
+        tracing::info!(id = %self.cfg.id, epoch, last, commit, members = ?c.members, learners = ?c.learners, "qlog: leading");
+        let replicas: Vec<String> =
+            c.members.iter().chain(&c.learners).filter(|p| **p != self.cfg.id).cloned().collect();
+        for p in replicas {
+            self.add_replica(c, p, epoch);
         }
         if let Some(o) = &self.cfg.flush {
             tokio::spawn(flush::lead(self.clone(), epoch, o.clone()));
@@ -914,6 +1040,16 @@ impl Node {
                 Err(_) => n.step_down(&mut c, "persisting the adopted tail failed"),
             }
         });
+    }
+
+    fn add_replica(self: &Arc<Self>, c: &mut Core, peer: String, epoch: u64) {
+        if c.matched.contains_key(&peer) {
+            return;
+        }
+        c.matched.insert(peer.clone(), 0);
+        c.next.insert(peer.clone(), c.log.last_seq() + 1);
+        c.acked_at.insert(peer.clone(), Instant::now());
+        tokio::spawn(self.clone().replicate(peer, epoch));
     }
 
     /// Stages the log's journaled changes; the ticket covers everything
@@ -954,7 +1090,11 @@ impl Node {
     }
 
     async fn replicate(self: Arc<Self>, peer: String, epoch: u64) {
-        let rpc = Rpc::new(&peer, &self.cfg.peers[&peer], self.faults.clone());
+        let Some(addr) = self.addrs.lock().get(&peer).cloned() else {
+            tracing::warn!(id = %self.cfg.id, peer, "qlog: no address for a replica, not replicating to it");
+            return;
+        };
+        let rpc = Rpc::new(&peer, &addr, self.faults.clone());
         let mut head = self.head.subscribe();
         let mut commit = self.commit.subscribe();
         let mut sent_commit = 0;
@@ -999,18 +1139,20 @@ impl Node {
                             }
                             Ok(None) => None,
                             Err(e) => {
-                                tracing::warn!(peer, next, "qlog: reading the bucket for a lagging follower failed: {e:#}");
+                                tracing::warn!(
+                                    peer,
+                                    next,
+                                    "qlog: reading the bucket for a lagging follower failed: {e:#}"
+                                );
                                 tokio::time::sleep(Duration::from_millis(200)).await;
                                 continue;
                             }
                         }
                     }
                     None => match self.durability.first_readable() {
-                        Some(f) if f + 1 > next && f < base => self
-                            .durability
-                            .read(f + 1, base, self.cfg.max_batch_bytes)
-                            .await
-                            .map(|r| (f + 1, r, true)),
+                        Some(f) if f + 1 > next && f < base => {
+                            self.durability.read(f + 1, base, self.cfg.max_batch_bytes).await.map(|r| (f + 1, r, true))
+                        }
                         _ => None,
                     },
                 },
@@ -1018,7 +1160,7 @@ impl Node {
             };
             let req = {
                 let c = self.core.lock();
-                if c.role != Role::Leader || c.epoch != epoch {
+                if c.role != Role::Leader || c.epoch != epoch || !c.matched.contains_key(&peer) {
                     return;
                 }
                 let next = c.next[&peer];
@@ -1100,7 +1242,15 @@ impl Node {
             self.step_down(&mut c, "a follower promised a newer epoch");
             return;
         }
+        if !c.matched.contains_key(peer) {
+            return;
+        }
         c.acked_at.insert(peer.to_string(), Instant::now());
+        if r.intact {
+            c.peer_intact.insert(peer.to_string());
+        } else {
+            c.peer_intact.remove(peer);
+        }
         if r.ok {
             c.fresh.remove(peer);
         } else if r.last_seq == 0 {
@@ -1142,6 +1292,7 @@ impl Node {
             c.leader = Some(a.leader.clone());
             c.role = Role::Follower;
             c.last_heard = Instant::now();
+            c.retired = false;
             c.flushed = c.flushed.max(a.flushed);
             c.reserve = c.reserve.max(a.reserve);
             c.generation = c.generation.max(a.generation);
@@ -1297,18 +1448,25 @@ impl Node {
                 self.durability.set_floor(floor);
                 match c.role {
                     Role::Leader => {
-                        let alive = 1 + c.acked_at.values().filter(|t| t.elapsed() < self.cfg.election_timeout).count();
-                        if alive < self.cfg.quorum() {
+                        let alive = c
+                            .members
+                            .iter()
+                            .filter(|m| {
+                                **m == self.cfg.id
+                                    || c.acked_at.get(*m).is_some_and(|t| t.elapsed() < self.cfg.election_timeout)
+                            })
+                            .count();
+                        if alive < quorum(c.members.len()) {
                             self.step_down(&mut c, "no quorum heard within the election timeout");
                         }
                         None
                     }
                     Role::Candidate => None,
-                    Role::Follower if c.electing => None,
+                    Role::Follower if c.electing || c.retired => None,
                     Role::Follower => {
                         let quiet = c.last_heard.elapsed();
                         // a single node has nobody to hear from: it leads at once
-                        let alone = self.cfg.members.len() == 1;
+                        let alone = c.members.len() == 1 && c.members[0] == self.cfg.id;
                         if (alone || quiet > self.cfg.election_timeout) && Instant::now() >= c.retry_at {
                             c.electing = true;
                             Some(Act::Takeover)
@@ -1369,7 +1527,7 @@ impl Node {
     }
 
     async fn probe(self: Arc<Self>, l: String) {
-        let dead = match self.ctl.get(&l) {
+        let dead = match self.rpc(&l) {
             Some(rpc) => matches!(
                 rpc.call(&Msg::Ping { from: self.cfg.id.clone() }, self.cfg.rpc_timeout).await,
                 Err(CallError::Refused | CallError::Io(_))
@@ -1411,9 +1569,31 @@ impl Node {
             None => (None, None),
         };
         let cur_epoch = cur.as_ref().map_or(0, |r| r.epoch);
+        // the set in force is the record's; --peer only bootstraps it
+        let (members, learners, addrs, since) = match &cur {
+            Some(r) => (r.members.clone(), r.learners.clone(), r.addrs.clone(), r.since),
+            None => (self.cfg.members.clone(), Vec::new(), BTreeMap::new(), 1),
+        };
+        self.learn_addrs(&addrs);
         {
             let mut c = self.core.lock();
             if self.heard_since_locked(&c, started) {
+                return Ok(());
+            }
+            if cur_epoch >= c.epoch {
+                c.members = members.clone();
+                c.learners = learners.clone();
+                c.members_since = since;
+            }
+            if !members.contains(&self.cfg.id) {
+                // A learner waits for the change that makes it a member; a
+                // node the record doesn't name at all was removed (or was
+                // never added) and stays out until a leader appends to it.
+                c.last_heard = Instant::now();
+                if !learners.contains(&self.cfg.id) && !c.retired {
+                    tracing::info!(id = %self.cfg.id, epoch = cur_epoch, ?members, "qlog: qlog/leader doesn't name this node: not campaigning");
+                    c.retired = true;
+                }
                 return Ok(());
             }
             if cur_epoch > c.seen_record && cur_epoch > c.epoch && cur.as_ref().is_some_and(|r| r.leader != self.cfg.id)
@@ -1426,8 +1606,7 @@ impl Node {
             c.seen_record = c.seen_record.max(cur_epoch);
         }
         let leader = cur.as_ref().map(|r| r.leader.as_str());
-        let rank =
-            self.cfg.members.iter().filter(|m| Some(m.as_str()) != leader).position(|m| *m == self.cfg.id).unwrap_or(0);
+        let rank = members.iter().filter(|m| Some(m.as_str()) != leader).position(|m| *m == self.cfg.id).unwrap_or(0);
         if rank > 0 {
             tokio::time::sleep(self.cfg.stagger * rank as u32).await;
             if self.heard_since(started) {
@@ -1437,16 +1616,18 @@ impl Node {
         // A minority never takes over: it can't tell "they're dead" from "I'm
         // cut off", and a CAS from it would only unseat the majority's
         // leader when the partition heals.
-        let mut rx = self.broadcast(Msg::Ping { from: self.cfg.id.clone() });
+        let q = quorum(members.len());
+        let others: Vec<String> = members.iter().filter(|m| **m != self.cfg.id).cloned().collect();
+        let mut rx = self.broadcast(Msg::Ping { from: self.cfg.id.clone() }, &others);
         let mut reachable = 0;
-        while reachable + 1 < self.cfg.quorum() {
+        while reachable + 1 < q {
             match rx.recv().await {
                 Some((_, Ok(Msg::Pong))) => reachable += 1,
                 Some(_) => {}
                 None => break,
             }
         }
-        if reachable + 1 < self.cfg.quorum() {
+        if reachable + 1 < q {
             tracing::debug!(id = %self.cfg.id, reachable, "qlog: can't reach a quorum, not taking over");
             return Ok(());
         }
@@ -1454,12 +1635,22 @@ impl Node {
             return Ok(());
         }
         let epoch = cur_epoch + 1;
-        let rec = LeaderRecord { epoch, leader: self.cfg.id.clone(), members: self.cfg.members.clone() };
+        let rec = LeaderRecord { epoch, leader: self.cfg.id.clone(), members: members.clone(), learners, addrs, since };
         if !cas_leader(&self.store, &rec, etag).await? {
             let mut c = self.core.lock();
             c.last_heard = Instant::now();
             return Ok(());
         }
+        self.won(epoch, members).await
+    }
+
+    /// `qlog/leader` names this node at `epoch` (its own CAS, or a removed
+    /// leader's handoff): promises from a quorum of `members`, the longest
+    /// tail among them, then lead (or recover from the bucket if no quorum
+    /// of intact logs can exist).
+    async fn won(self: &Arc<Self>, epoch: u64, members: Vec<String>) -> anyhow::Result<()> {
+        let q = quorum(members.len());
+        let others: Vec<String> = members.iter().filter(|m| **m != self.cfg.id).cloned().collect();
         let own = {
             let mut c = self.core.lock();
             if c.promised >= epoch {
@@ -1469,6 +1660,7 @@ impl Node {
             let me = self.cfg.id.clone();
             self.raise_promised(&mut c, epoch, &me);
             c.epoch = epoch;
+            c.members = members.clone();
             c.role = Role::Candidate;
             c.leader = Some(self.cfg.id.clone());
             self.sync(&mut c)
@@ -1495,8 +1687,8 @@ impl Node {
                 }
                 answered.push((self.cfg.id.clone(), c.log.commit()));
             }
-            let mut rx = self.broadcast(Msg::Promise { epoch, from: self.cfg.id.clone() });
-            while voters.len() < self.cfg.quorum() {
+            let mut rx = self.broadcast(Msg::Promise { epoch, from: self.cfg.id.clone() }, &others);
+            while voters.len() < q {
                 let Some((id, r)) = rx.recv().await else { break };
                 if let Ok(Msg::PromiseResp(p)) = r {
                     if p.promised > epoch {
@@ -1517,14 +1709,14 @@ impl Node {
                     }
                 }
             }
-            if voters.len() < self.cfg.quorum() {
+            if voters.len() < q {
                 // A member that didn't promise may hold an intact log; one
                 // that promised this epoch and isn't intact can't become
                 // intact behind our back (it refuses older leaders now).
                 // Only when even counting every silent member as intact
                 // falls short of a quorum has the quorum been lost.
-                let silent = self.cfg.members.len() - answered.len();
-                if voters.len() + silent < self.cfg.quorum() {
+                let silent = members.len() - answered.len();
+                if voters.len() + silent < q {
                     self.stats.lost_quorums.fetch_add(1, Ordering::Relaxed);
                     if self.cfg.flush.is_some() && self.cfg.auto_recover {
                         tracing::warn!(id = %self.cfg.id, epoch, intact = voters.len(), answered = answered.len(), "qlog: no quorum of intact logs can exist: bucket recovery");
@@ -1584,24 +1776,43 @@ impl Node {
         };
         let mut stats = flush::RecoveryStats { read_ms: t0.elapsed().as_millis() as u64, ..Default::default() };
         let from = p.flushed + 1;
-        let mut salvage = Vec::new();
         let mut by_commit = answered;
         by_commit.sort_by(|a, b| b.1.cmp(&a.1));
-        for (id, commit) in by_commit {
-            if commit < from {
-                break;
-            }
-            match self.committed_from(&id, epoch, from, commit).await {
-                Ok(es) if es.first().is_some_and(|e| e.seq == from) => {
-                    tracing::info!(id = %self.cfg.id, from = %id, first = from, last = commit, "qlog recovery: salvaged committed entries");
-                    salvage = es;
+        // The salvage streams into segments as it's fetched, two chunks
+        // ahead at most. A member that fails midway still leaves a dense,
+        // committed prefix, and that's what's kept.
+        let (tx, rx) = mpsc::channel::<Vec<Entry>>(2);
+        let n = self.clone();
+        let fetcher = tokio::spawn(async move {
+            for (id, commit) in by_commit {
+                if commit < from {
                     break;
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(id = %self.cfg.id, from = %id, "qlog recovery: salvage failed: {e:#}"),
+                let mut next = from;
+                while next <= commit {
+                    match n.committed_chunk_of(&id, epoch, next, commit).await {
+                        Ok(es) if es.first().is_some_and(|e| e.seq == next) => {
+                            next = es.last().expect("non-empty").seq + 1;
+                            if tx.send(es).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(_) => break,
+                        Err(e) => {
+                            tracing::warn!(id = %n.cfg.id, from = %id, next, "qlog recovery: salvage failed: {e:#}");
+                            break;
+                        }
+                    }
+                }
+                if next > from {
+                    tracing::info!(id = %n.cfg.id, from = %id, first = from, last = next - 1, "qlog recovery: salvaged committed entries");
+                    return;
+                }
             }
-        }
-        let m = flush::recover(&self.store, &self.cfg.id, epoch, &o, p, salvage, &mut stats).await?;
+        });
+        let m = flush::recover(&self.store, &self.cfg.id, epoch, &o, p, rx, &mut stats).await;
+        fetcher.abort();
+        let m = m?;
         let rec = m.recovery.clone().expect("a recovery manifest");
         let (after, base) = (rec.after, rec.base);
         // This incarnation's live consumers get everything up to S before the
@@ -1663,56 +1874,66 @@ impl Node {
         Ok(())
     }
 
-    /// Committed entries `[from, upto]` as `id` holds them (this node: its
-    /// own log; a member that promised `epoch`: fetched). Fewer if it holds
-    /// fewer; empty if it doesn't reach back to `from`.
-    async fn committed_from(&self, id: &str, epoch: u64, from: u64, upto: u64) -> anyhow::Result<Vec<Entry>> {
-        let mut out: Vec<Entry> = Vec::new();
-        let mut next = from;
+    /// One chunk of committed entries from `from` (at most `upto`) as `id`
+    /// holds them (this node: its own log; a member that promised `epoch`:
+    /// fetched). Empty if it doesn't reach back to `from`.
+    async fn committed_chunk_of(&self, id: &str, epoch: u64, from: u64, upto: u64) -> anyhow::Result<Vec<Entry>> {
         if id == self.cfg.id {
             let upto = upto.min(self.core.lock().log.commit());
-            while next <= upto {
-                let es = self.committed_chunk(next, upto, self.cfg.max_batch_bytes).await?;
-                let Some(l) = es.last() else { break };
-                next = l.seq + 1;
-                out.extend(es);
-            }
-            return Ok(out);
+            return self.committed_chunk(from, upto, self.cfg.max_batch_bytes).await;
         }
-        let rpc = self.ctl.get(id).ok_or_else(|| anyhow::anyhow!("unknown member {id}"))?;
-        while next <= upto {
-            let m = Msg::Fetch {
-                epoch,
-                from: self.cfg.id.clone(),
-                from_seq: next,
-                max_bytes: self.cfg.max_batch_bytes as u64,
-            };
-            let Msg::FetchResp { ok, base_seq, entries, .. } =
-                rpc.call(&m, self.cfg.rpc_timeout * 4).await.map_err(|e| anyhow::anyhow!("{e:?}"))?
-            else {
-                anyhow::bail!("unexpected reply to fetch");
-            };
-            anyhow::ensure!(ok, "{id} no longer promised to epoch {epoch}");
-            if base_seq >= next {
-                break;
-            }
-            let es: Vec<Entry> = entries.into_iter().take_while(|e| e.seq <= upto).collect();
-            let Some(l) = es.last() else { break };
-            anyhow::ensure!(es[0].seq == next, "{id} sent {} for {next}", es[0].seq);
-            next = l.seq + 1;
-            out.extend(es);
+        let rpc = self.rpc(id).ok_or_else(|| anyhow::anyhow!("unknown member {id}"))?;
+        let m =
+            Msg::Fetch { epoch, from: self.cfg.id.clone(), from_seq: from, max_bytes: self.cfg.max_batch_bytes as u64 };
+        let Msg::FetchResp { ok, base_seq, entries, .. } =
+            rpc.call(&m, self.cfg.rpc_timeout * 4).await.map_err(|e| anyhow::anyhow!("{e:?}"))?
+        else {
+            anyhow::bail!("unexpected reply to fetch");
+        };
+        anyhow::ensure!(ok, "{id} no longer promised to epoch {epoch}");
+        if base_seq >= from {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        let es: Vec<Entry> = entries.into_iter().take_while(|e| e.seq <= upto).collect();
+        anyhow::ensure!(es.first().is_none_or(|e| e.seq == from), "{id} sent {} for {from}", es[0].seq);
+        Ok(es)
+    }
+
+    fn rpc(&self, id: &str) -> Option<Arc<Rpc>> {
+        if let Some(r) = self.ctl.lock().get(id) {
+            return Some(r.clone());
+        }
+        let addr = self.addrs.lock().get(id)?.clone();
+        Some(
+            self.ctl
+                .lock()
+                .entry(id.to_string())
+                .or_insert_with(|| Arc::new(Rpc::new(id, &addr, self.faults.clone())))
+                .clone(),
+        )
+    }
+
+    fn learn_addrs(&self, a: &BTreeMap<String, String>) {
+        let mut m = self.addrs.lock();
+        for (id, addr) in a {
+            if *id != self.cfg.id {
+                m.entry(id.clone()).or_insert_with(|| addr.clone());
+            }
+        }
     }
 
     /// Sends `m` to every peer; replies arrive as they come. Each call runs
     /// to its end on its own task (a dropped call would leave its connection
     /// mid-frame), so a caller waits only for as many as it needs, not for a
     /// member that's down or cut off.
-    fn broadcast(&self, m: Msg) -> mpsc::UnboundedReceiver<(String, Result<Msg, CallError>)> {
+    fn broadcast(&self, m: Msg, to: &[String]) -> mpsc::UnboundedReceiver<(String, Result<Msg, CallError>)> {
         let (tx, rx) = mpsc::unbounded_channel();
-        for (id, rpc) in &self.ctl {
-            let (id, rpc, tx, m) = (id.clone(), rpc.clone(), tx.clone(), m.clone());
+        for id in to {
+            let Some(rpc) = self.rpc(id) else {
+                tracing::warn!(id = %self.cfg.id, peer = %id, "qlog: no address for a member");
+                continue;
+            };
+            let (id, tx, m) = (id.clone(), tx.clone(), m.clone());
             let t = self.cfg.rpc_timeout;
             tokio::spawn(async move {
                 let _ = tx.send((id, rpc.call(&m, t).await));
@@ -1727,7 +1948,7 @@ impl Node {
 
     /// Replaces our uncommitted tail with `best`'s log past our commit index.
     async fn adopt(self: &Arc<Self>, best: &str, epoch: u64) -> anyhow::Result<()> {
-        let rpc = self.ctl.get(best).ok_or_else(|| anyhow::anyhow!("unknown member {best}"))?;
+        let rpc = self.rpc(best).ok_or_else(|| anyhow::anyhow!("unknown member {best}"))?;
         let my_commit = self.core.lock().log.commit();
         let mut from = my_commit + 1;
         let mut got: Vec<Entry> = Vec::new();
@@ -1787,6 +2008,370 @@ impl Node {
         Ok(())
     }
 
+    // ---- membership (docs/quorum.md, "Membership changes")
+
+    /// A removed leader handed `epoch` to this node: if `qlog/leader` says
+    /// so, collect promises and lead now instead of after the timeout.
+    fn on_lead(self: &Arc<Self>, epoch: u64) {
+        {
+            let mut c = self.core.lock();
+            if c.promised >= epoch || c.electing || c.role != Role::Follower {
+                return;
+            }
+            c.electing = true;
+        }
+        let n = self.clone();
+        tokio::spawn(async move {
+            let r = async {
+                let Some((rec, _)) = read_leader(&n.store).await? else { anyhow::bail!("no qlog/leader") };
+                anyhow::ensure!(
+                    rec.epoch == epoch && rec.leader == n.cfg.id && rec.members.contains(&n.cfg.id),
+                    "qlog/leader is epoch {} naming {}, not {epoch} naming this node",
+                    rec.epoch,
+                    rec.leader
+                );
+                n.learn_addrs(&rec.addrs);
+                {
+                    let mut c = n.core.lock();
+                    c.members = rec.members.clone();
+                    c.learners = rec.learners.clone();
+                    c.members_since = rec.since;
+                    c.retired = false;
+                }
+                tracing::info!(id = %n.cfg.id, epoch, "qlog: handed leadership by a membership change");
+                n.won(epoch, rec.members).await
+            }
+            .await;
+            if let Err(e) = r {
+                tracing::warn!(id = %n.cfg.id, epoch, "qlog: handoff failed: {e:#}");
+            }
+            let mut c = n.core.lock();
+            c.electing = false;
+            if c.role == Role::Candidate {
+                n.step_down(&mut c, "handoff abandoned");
+            }
+        });
+    }
+
+    /// Changes the member set to `target` at a flush barrier, from the
+    /// leader. The steps, and why one step from the old set to the new is
+    /// safe there (no joint consensus):
+    ///
+    /// 1. Nodes in `target` that aren't members are recorded as learners in
+    ///    `qlog/leader` (same epoch) and replicated to. They don't count
+    ///    toward commits, promises or the lost-quorum trigger.
+    /// 2. Once each learner is intact and holds the commit index, a flush
+    ///    (so the barrier's own flush is short), then appends pause.
+    /// 3. Paused, until everything appended has committed under the old set
+    ///    and every learner (and enough of `target` for any quorum of it to
+    ///    include one) durably holds it: the last seq is the barrier B.
+    /// 4. The flush reaches B: everything committed is in the bucket, so no
+    ///    committed entry depends on which set a later takeover asks.
+    /// 5. `qlog/leader` CASes to epoch + 1 with `target`. Before it no entry
+    ///    is committed under `target`; after it none can be under the old
+    ///    set, since this leader moves to epoch + 1 (or steps down) without
+    ///    appending again at epoch, and every later leader reads the record.
+    /// 6. This node leads epoch + 1 with `target`, or, if it isn't in
+    ///    `target`, hands epoch + 1 to a member holding B and retires.
+    ///
+    /// Removed members never hold an entry of epoch + 1 or promise it (no
+    /// leader sends them either), so they never count after the switch,
+    /// and a takeover reads the record first, so they never campaign.
+    /// Runs to its end even if the caller goes away: a change cut short
+    /// after its CAS must not resume commits at the old epoch.
+    pub async fn change_members(
+        self: &Arc<Self>,
+        target: Vec<String>,
+        addrs: BTreeMap<String, String>,
+    ) -> anyhow::Result<SwitchStats> {
+        let n = self.clone();
+        tokio::spawn(async move { n.switch(target, addrs).await }).await?
+    }
+
+    async fn switch(
+        self: Arc<Self>,
+        mut target: Vec<String>,
+        addrs: BTreeMap<String, String>,
+    ) -> anyhow::Result<SwitchStats> {
+        target.sort();
+        target.dedup();
+        anyhow::ensure!(!target.is_empty(), "an empty member set");
+        let (epoch, from) = {
+            let mut c = self.core.lock();
+            anyhow::ensure!(c.role == Role::Leader, NotLeading(c.leader.clone().unwrap_or_default()));
+            anyhow::ensure!(!c.switching, "a membership change is already running");
+            if c.members == target {
+                return Ok(SwitchStats {
+                    from_epoch: c.epoch,
+                    epoch: c.epoch,
+                    from: target.clone(),
+                    to: target,
+                    leader: self.cfg.id.clone(),
+                    ..Default::default()
+                });
+            }
+            c.switching = true;
+            (c.epoch, c.members.clone())
+        };
+        let _guard = SwitchGuard(self.clone());
+        self.learn_addrs(&addrs);
+        let learners: Vec<String> = target.iter().filter(|m| !from.contains(m)).cloned().collect();
+        for l in &learners {
+            anyhow::ensure!(*l != self.cfg.id && self.addrs.lock().contains_key(l), "no address for {l}");
+        }
+        let mut st = SwitchStats {
+            from_epoch: epoch,
+            from: from.clone(),
+            to: target.clone(),
+            at_ms: chrono::Utc::now().timestamp_millis(),
+            ..Default::default()
+        };
+        tracing::info!(id = %self.cfg.id, epoch, ?from, ?target, ?learners, "qlog member change: starting");
+
+        // 1. learners
+        let t = Instant::now();
+        let (rec, etag) = self.own_record(epoch).await?;
+        let mut rec_addrs = rec.addrs.clone();
+        for (id, a) in &addrs {
+            rec_addrs.insert(id.clone(), a.clone());
+        }
+        if rec.learners != learners || rec_addrs != rec.addrs {
+            let next = LeaderRecord { learners: learners.clone(), addrs: rec_addrs.clone(), ..rec };
+            anyhow::ensure!(
+                cas_leader(&self.store, &next, Some(etag)).await?,
+                "qlog/leader moved: no longer leading {epoch}"
+            );
+        }
+        {
+            let mut c = self.core.lock();
+            anyhow::ensure!(c.role == Role::Leader && c.epoch == epoch, "no longer leading {epoch}");
+            c.learners = learners.clone();
+            for l in &learners {
+                self.add_replica(&mut c, l.clone(), epoch);
+            }
+        }
+        st.record_ms = t.elapsed().as_millis() as u64;
+        self.crash(flush::Step::SwitchCatchUp)?;
+
+        // 2. catch-up, then a flush so the barrier's is small
+        let t = Instant::now();
+        loop {
+            {
+                let c = self.core.lock();
+                anyhow::ensure!(c.role == Role::Leader && c.epoch == epoch, "no longer leading {epoch}");
+                let commit = c.log.commit();
+                if learners.iter().all(|l| c.peer_intact.contains(l) && c.matched.get(l).is_some_and(|m| *m >= commit))
+                {
+                    break;
+                }
+            }
+            anyhow::ensure!(
+                t.elapsed() < self.cfg.catch_up_timeout,
+                "learners {learners:?} didn't catch up within {:?}",
+                self.cfg.catch_up_timeout
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        st.catch_up_ms = t.elapsed().as_millis() as u64;
+        tracing::info!(id = %self.cfg.id, epoch, ms = st.catch_up_ms, "qlog member change: learners caught up");
+        let t = Instant::now();
+        let commit = self.core.lock().log.commit();
+        self.flush_to(epoch, commit, self.cfg.switch_timeout).await?;
+        st.pre_flush_ms = t.elapsed().as_millis() as u64;
+        self.crash(flush::Step::SwitchBeforePause)?;
+
+        // 3. the barrier
+        let paused_at = Instant::now();
+        {
+            let mut c = self.core.lock();
+            anyhow::ensure!(c.role == Role::Leader && c.epoch == epoch, "no longer leading {epoch}");
+            c.paused = true;
+        }
+        self.paused.send_replace(true);
+        let mut commit_rx = self.commit.subscribe();
+        let barrier = loop {
+            {
+                let c = self.core.lock();
+                anyhow::ensure!(c.role == Role::Leader && c.epoch == epoch, "no longer leading {epoch}");
+                let last = c.log.last_seq();
+                let holders = self.holders(&c, &target, last);
+                if c.log.commit() == last
+                    && learners.iter().all(|l| holders.contains(l))
+                    && holders.len() + quorum(target.len()) > target.len()
+                {
+                    break last;
+                }
+            }
+            let left = self.cfg.switch_timeout.saturating_sub(paused_at.elapsed());
+            anyhow::ensure!(!left.is_zero(), "the barrier didn't drain within {:?}", self.cfg.switch_timeout);
+            tokio::select! {
+                _ = commit_rx.changed() => {}
+                _ = tokio::time::sleep(Duration::from_millis(1).min(left)) => {}
+            }
+        };
+        st.drain_ms = paused_at.elapsed().as_millis() as u64;
+
+        // 4. the flush to the barrier
+        let t = Instant::now();
+        self.flush_to(epoch, barrier, self.cfg.switch_timeout.saturating_sub(paused_at.elapsed())).await?;
+        st.flush_ms = t.elapsed().as_millis() as u64;
+        st.flushed = barrier;
+        self.crash(flush::Step::SwitchFlushed)?;
+
+        // 5. the new set at epoch + 1
+        let t = Instant::now();
+        let (rec, etag) = self.own_record(epoch).await?;
+        let me_in = target.contains(&self.cfg.id);
+        let next_leader = if me_in {
+            self.cfg.id.clone()
+        } else {
+            // a continuing member before a learner: it has the longer local log
+            let c = self.core.lock();
+            let holders = self.holders(&c, &target, barrier);
+            holders
+                .iter()
+                .find(|h| from.contains(h))
+                .or_else(|| holders.first())
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("nobody in {target:?} holds the barrier"))?
+        };
+        let next = LeaderRecord {
+            epoch: epoch + 1,
+            leader: next_leader.clone(),
+            members: target.clone(),
+            learners: Vec::new(),
+            addrs: rec.addrs.clone(),
+            since: epoch + 1,
+        };
+        let landed = match cas_leader(&self.store, &next, Some(etag)).await {
+            Ok(ok) => ok,
+            // the PUT may have landed with its answer lost
+            Err(e) => {
+                tracing::warn!(id = %self.cfg.id, epoch, "qlog member change: the CAS failed: {e:#}");
+                matches!(read_leader(&self.store).await, Ok(Some((r, _))) if r == next)
+            }
+        };
+        if !landed {
+            // Whether or not it landed, commits at `epoch` can't resume: the
+            // record may already name the new set.
+            let mut c = self.core.lock();
+            if c.epoch == epoch {
+                self.step_down(&mut c, "a membership change's CAS failed");
+            }
+            anyhow::bail!("qlog/leader's CAS to epoch {} failed", epoch + 1);
+        }
+        st.cas_ms = t.elapsed().as_millis() as u64;
+        self.crash(flush::Step::SwitchCas)?;
+
+        // 6. lead the new set, or hand it off
+        {
+            let mut c = self.core.lock();
+            anyhow::ensure!(c.role == Role::Leader && c.epoch == epoch, "deposed during the switch");
+            c.members = target.clone();
+            c.learners.clear();
+            c.members_since = epoch + 1;
+            if me_in {
+                let me = self.cfg.id.clone();
+                self.raise_promised(&mut c, epoch + 1, &me);
+                self.become_leader(&mut c, epoch + 1);
+            } else {
+                self.step_down(&mut c, "removed by a membership change");
+                c.retired = true;
+                c.leader = Some(next_leader.clone());
+            }
+            c.paused = false;
+        }
+        self.paused.send_replace(false);
+        st.paused_ms = paused_at.elapsed().as_millis() as u64;
+        st.epoch = epoch + 1;
+        st.leader = next_leader.clone();
+        if !me_in {
+            self.hand_off(&next_leader, epoch + 1).await;
+        }
+        tracing::info!(
+            id = %self.cfg.id, from = ?st.from, to = ?st.to, epoch = st.epoch, leader = %st.leader,
+            catch_up_ms = st.catch_up_ms, pre_flush_ms = st.pre_flush_ms, drain_ms = st.drain_ms,
+            flush_ms = st.flush_ms, cas_ms = st.cas_ms, paused_ms = st.paused_ms, barrier,
+            end_ms = chrono::Utc::now().timestamp_millis(), "qlog member change: done"
+        );
+        self.switches.lock().push(st.clone());
+        Ok(st)
+    }
+
+    /// Who in `set` durably holds everything up to `seq`, as this leader
+    /// knows (itself included); intact replicas only.
+    fn holders(&self, c: &Core, set: &[String], seq: u64) -> Vec<String> {
+        set.iter()
+            .filter(|m| {
+                if **m == self.cfg.id {
+                    c.self_durable >= seq
+                } else {
+                    c.peer_intact.contains(*m) && c.matched.get(*m).is_some_and(|x| *x >= seq)
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// `qlog/leader` as this leader of `epoch` holds it, with its ETag; a
+    /// newer epoch there deposes it.
+    async fn own_record(&self, epoch: u64) -> anyhow::Result<(LeaderRecord, Option<String>)> {
+        let Some((rec, etag)) = read_leader(&self.store).await? else { anyhow::bail!("no qlog/leader") };
+        if rec.epoch != epoch || rec.leader != self.cfg.id {
+            let mut c = self.core.lock();
+            if c.epoch == epoch {
+                self.step_down(&mut c, "qlog/leader moved on");
+            }
+            anyhow::bail!("qlog/leader is epoch {} led by {}, not {epoch} led by this node", rec.epoch, rec.leader);
+        }
+        Ok((rec, etag))
+    }
+
+    /// Until the flush has committed a manifest at or past `seq` (no bucket:
+    /// at once).
+    async fn flush_to(&self, epoch: u64, seq: u64, within: Duration) -> anyhow::Result<()> {
+        if self.cfg.flush.is_none() {
+            return Ok(());
+        }
+        let t = Instant::now();
+        self.flush.request(seq);
+        loop {
+            {
+                let c = self.core.lock();
+                anyhow::ensure!(c.role == Role::Leader && c.epoch == epoch, "no longer leading {epoch}");
+                if c.flushed >= seq {
+                    return Ok(());
+                }
+            }
+            anyhow::ensure!(t.elapsed() < within, "the flush didn't reach {seq} within {within:?}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Chaos: the hook says die here. In-process that's stepping down (the
+    /// test then kills the node), the binary SIGKILLs itself.
+    fn crash(&self, step: flush::Step) -> anyhow::Result<()> {
+        if let Some(h) = self.cfg.flush.as_ref().and_then(|o| o.crash.as_ref())
+            && h(step)
+        {
+            let mut c = self.core.lock();
+            self.step_down(&mut c, "crash injected");
+            anyhow::bail!("crash injected at {step:?}");
+        }
+        Ok(())
+    }
+
+    async fn hand_off(&self, to: &str, epoch: u64) {
+        let Some(rpc) = self.rpc(to) else { return };
+        for _ in 0..5 {
+            if rpc.call(&Msg::Lead { epoch, from: self.cfg.id.clone() }, self.cfg.rpc_timeout).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tracing::warn!(id = %self.cfg.id, to, epoch, "qlog: the handoff went unanswered; the members take over after the timeout");
+    }
+
     // ---- emission
 
     /// Hands committed entries to the firehose, in order, as the commit
@@ -1816,6 +2401,36 @@ impl Node {
                 };
                 self.emit.emit(from, upto, events);
             }
+        }
+    }
+}
+
+/// A membership change asked of a node that isn't leading (the leader it
+/// follows, if known).
+#[derive(Debug)]
+pub struct NotLeading(pub String);
+
+impl std::fmt::Display for NotLeading {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "not the leader (the leader is {:?})", self.0)
+    }
+}
+
+impl std::error::Error for NotLeading {}
+
+/// Ends a membership change: its barrier lifts however it ends. Every path
+/// that reaches the CAS has moved to the new epoch or stepped down by then,
+/// so lifting it never resumes commits under the old set.
+struct SwitchGuard(Arc<Node>);
+
+impl Drop for SwitchGuard {
+    fn drop(&mut self) {
+        let mut c = self.0.core.lock();
+        c.switching = false;
+        if c.paused {
+            c.paused = false;
+            drop(c);
+            self.0.paused.send_replace(false);
         }
     }
 }

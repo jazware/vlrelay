@@ -9,7 +9,7 @@ use super::commitlog::{self, CommitLog};
 use super::emit::{Emitted, Emitter};
 use super::flush;
 use super::log::encode_cursors;
-use super::node::{Config, Durability, Faults, MemoryOnly, Node, Role};
+use super::node::{Config, Durability, Faults, LeaderRecord, MemoryOnly, Node, Role, SwitchStats, read_leader};
 use super::wire;
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -98,7 +98,19 @@ impl Cluster {
         cfg: Option<ConfigFn>,
         ring_bytes: usize,
     ) -> Cluster {
-        let ids: Vec<String> = (1..=n).map(|i| format!("n{i}")).collect();
+        Cluster::with_spares(n, 0, disk, cfg, ring_bytes).await
+    }
+
+    /// `n` members started, and `spares` more ids with addresses that only
+    /// start when a test starts them (to be added as learners).
+    async fn with_spares(
+        n: usize,
+        spares: usize,
+        disk: Option<(tempfile::TempDir, commitlog::Options)>,
+        cfg: Option<ConfigFn>,
+        ring_bytes: usize,
+    ) -> Cluster {
+        let ids: Vec<String> = (1..=n + spares).map(|i| format!("n{i}")).collect();
         let addrs = ids.iter().map(|id| (id.clone(), format!("127.0.0.1:{}", free_port()))).collect();
         let (tap, mut rx) = mpsc::unbounded_channel::<Emitted>();
         let checker = Arc::new(Mutex::new(Checker::new()));
@@ -130,7 +142,7 @@ impl Cluster {
             cfg,
             ring_bytes,
         };
-        for id in &ids {
+        for id in &ids[..n] {
             c.start(id).await;
         }
         c
@@ -271,11 +283,20 @@ impl Cluster {
         Client::new(self.ids.iter().map(|id| (id.clone(), self.addrs[id].clone())).collect())
     }
 
-    /// Waits until every running node has emitted the same, full commit.
+    /// The leader's member set (every running node without a leader).
+    fn members(&self) -> Vec<String> {
+        let mut st: Vec<_> = self.nodes.values().map(|r| r.node.status()).filter(|s| s.role == Role::Leader).collect();
+        st.sort_by_key(|s| s.epoch);
+        st.pop().map_or_else(|| self.nodes.keys().cloned().collect(), |s| s.members)
+    }
+
+    /// Waits until every running member has emitted the same, full commit
+    /// (a removed node stops where it was removed).
     async fn converge(&self, within: Duration) {
         let t = Instant::now();
         loop {
-            let st: Vec<_> = self.nodes.values().map(|r| r.node.status()).collect();
+            let members = self.members();
+            let st: Vec<_> = self.nodes.values().map(|r| r.node.status()).filter(|s| members.contains(&s.id)).collect();
             let top = st.iter().map(|s| s.last).max().unwrap_or(0);
             if st.iter().all(|s| s.emitted == top && s.commit == top) && st.iter().any(|s| s.role == Role::Leader) {
                 // the tap is asynchronous: wait for the checker to have seen
@@ -299,7 +320,11 @@ impl Cluster {
     }
 
     fn finish(&self, acked: &[(u64, u64)]) -> super::check::Report {
+        let members = self.members();
         let mut c = self.checker.lock();
+        for id in self.nodes.keys().filter(|id| !members.contains(id)) {
+            c.removed(id);
+        }
         for &(s, h) in acked {
             c.acked(s, h);
         }
@@ -341,8 +366,7 @@ impl Load {
                     let host = format!("t{w}");
                     let mut n = 0u64;
                     while !stop.load(Ordering::Acquire) {
-                        let cursors =
-                            if n > 0 { encode_cursors(&[(host.clone(), n)].into()) } else { Bytes::new() };
+                        let cursors = if n > 0 { encode_cursors(&[(host.clone(), n)].into()) } else { Bytes::new() };
                         let frames: Vec<(Bytes, Bytes)> =
                             (1..=batch as u64).map(|i| test_frame(&format!("did:q:{host}:{}", n + i), 64, 0)).collect();
                         let (first, cnt) = client.submit_with(frames.clone(), cursors).await;
@@ -580,7 +604,10 @@ fn status_line(c: &Cluster) -> String {
         .values()
         .map(|r| {
             let s = r.node.status();
-            format!("{} {:?} e{} base {} last {} commit {} emitted {} intact {} gen {} resets {}", s.id, s.role, s.epoch, s.base, s.last, s.commit, s.emitted, s.intact, s.generation, s.resets)
+            format!(
+                "{} {:?} e{} base {} last {} commit {} emitted {} intact {} gen {} resets {}",
+                s.id, s.role, s.epoch, s.base, s.last, s.commit, s.emitted, s.intact, s.generation, s.resets
+            )
         })
         .collect();
     v.sort();
@@ -776,12 +803,7 @@ async fn a_lagging_follower_catches_up_from_disk() {
 // ---- the flush (Phase 3)
 
 fn flush_opts() -> flush::Options {
-    flush::Options {
-        interval: Duration::from_millis(150),
-        headroom: 10_000_000,
-        segment_bytes: 32 << 10,
-        crash: None,
-    }
+    flush::Options { interval: Duration::from_millis(150), headroom: 10_000_000, segment_bytes: 32 << 10, crash: None }
 }
 
 /// Durable nodes that flush; `opts` per node id.
@@ -883,11 +905,9 @@ async fn flush_seals_log_state_and_cursors_at_one_point() {
 /// reservation holds back everything past it, on every node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commit_stops_at_the_reservation() {
-    let c = flushing(
-        |_| flush::Options { interval: Duration::from_secs(3600), headroom: 300, ..flush_opts() },
-        64 << 20,
-    )
-    .await;
+    let c =
+        flushing(|_| flush::Options { interval: Duration::from_secs(3600), headroom: 300, ..flush_opts() }, 64 << 20)
+            .await;
     let l = c.wait_leader(Duration::from_secs(5)).await;
     let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -1283,8 +1303,17 @@ impl HostLoad {
 }
 
 impl Cluster {
-    fn finish_recovered(&self, acked: &[(u64, u64, u64)], gaps: &[(u64, u64)], expected: &[u64]) -> super::check::Report {
+    fn finish_recovered(
+        &self,
+        acked: &[(u64, u64, u64)],
+        gaps: &[(u64, u64)],
+        expected: &[u64],
+    ) -> super::check::Report {
+        let members = self.members();
         let mut c = self.checker.lock();
+        for id in self.nodes.keys().filter(|id| !members.contains(id)) {
+            c.removed(id);
+        }
         for &(s, h, d) in acked {
             c.acked_event(s, h, d);
         }
@@ -1340,8 +1369,12 @@ async fn wiping_every_disk_recovers_from_the_bucket_at_r_plus_one() {
         }
         let l = c.wait_leader(Duration::from_secs(10)).await;
         let st = c.nodes[&l].node.status();
-        eprintln!("round {round}: {}
-{:?}", status_line(&c), c.recoveries());
+        eprintln!(
+            "round {round}: {}
+{:?}",
+            status_line(&c),
+            c.recoveries()
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
         eprintln!("round {round} +300ms: {}", status_line(&c));
         assert_eq!(st.generation, round + 1, "{st:?}");
@@ -1602,5 +1635,442 @@ async fn a_single_node_recovers_from_its_wal_and_from_the_bucket() {
     let (v, r, m) = settle_recovered(&c, load).await;
     eprintln!("{v:?}\n{r:?}\n{m:?}");
     assert_eq!(m.gaps.len(), 1);
+    c.shutdown();
+}
+
+// ---- membership (Phase 5)
+
+/// `n` durable, flushing members (the bootstrap set) and `spares` more ids
+/// that can be started and added.
+async fn members_cluster(
+    n: usize,
+    spares: usize,
+    opts: impl Fn(&str) -> flush::Options + Send + Sync + 'static,
+) -> Cluster {
+    let o = commitlog::Options {
+        segment_bytes: 256 << 10,
+        retain_bytes: 1 << 20,
+        memory_bytes: 64 << 10,
+        ..commitlog::Options::default()
+    };
+    let first: Vec<String> = (1..=n).map(|i| format!("n{i}")).collect();
+    let cfg = move |id: &str, addrs: &HashMap<String, String>| {
+        let mut k = config(id, addrs);
+        k.members = first.clone();
+        k.retain_bytes = 64 << 10;
+        k.flush = Some(opts(id));
+        k.switch_timeout = Duration::from_secs(5);
+        k.catch_up_timeout = Duration::from_secs(20);
+        k
+    };
+    Cluster::with_spares(n, spares, Some((tempfile::tempdir().unwrap(), o)), Some(Arc::new(cfg)), 64 << 20).await
+}
+
+impl Cluster {
+    /// A membership change on `id`, run on its own runtime (a kill takes
+    /// it down with the node, as with a process).
+    fn change_on(&self, id: &str, target: &[String]) -> tokio::task::JoinHandle<anyhow::Result<SwitchStats>> {
+        let n = self.nodes[id].node.clone();
+        let t = target.to_vec();
+        self.nodes[id].rt.spawn(async move { n.change_members(t, Default::default()).await })
+    }
+
+    async fn record(&self) -> LeaderRecord {
+        read_leader(&self.store).await.unwrap().unwrap().0
+    }
+
+    /// Until `qlog/leader` holds `target`: a change on whoever leads, again
+    /// after each one that fails.
+    async fn change_to(&self, target: &[&str], within: Duration) -> Vec<SwitchStats> {
+        let mut target: Vec<String> = target.iter().map(|s| s.to_string()).collect();
+        target.sort();
+        let t = Instant::now();
+        let mut done = Vec::new();
+        loop {
+            if self.record().await.members == target {
+                return done;
+            }
+            if let Some(l) = self.leader() {
+                match self.change_on(&l, &target).await {
+                    Ok(Ok(s)) => {
+                        eprintln!("change on {l}: {s:?}");
+                        done.push(s);
+                    }
+                    Ok(Err(e)) => eprintln!("change on {l}: {e:#}"),
+                    Err(e) => eprintln!("change on {l}: {e}"),
+                }
+            }
+            assert!(t.elapsed() < within, "no change to {target:?} within {within:?}: {}", status_line(self));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn commit_of(&self, id: &str) -> u64 {
+        self.nodes[id].node.status().commit
+    }
+
+    /// Until a node leads at least `epoch` (one of `among`).
+    async fn wait_leading(&self, among: &[String], within: Duration) -> (String, u64) {
+        let t = Instant::now();
+        loop {
+            if let Some(l) = self.leader()
+                && among.contains(&l)
+            {
+                return (l.clone(), self.nodes[&l].node.status().epoch);
+            }
+            assert!(t.elapsed() < within, "none of {among:?} leads within {within:?}: {}", status_line(self));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+fn others<'a>(all: &'a [&'a str], not: &[&str]) -> Vec<&'a str> {
+    all.iter().copied().filter(|x| !not.contains(x)).collect()
+}
+
+/// A removed member never holds an entry, or a promise, from the epoch that
+/// removed it on: no leader of that epoch or later can have counted it.
+fn assert_never_counted(c: &Cluster, id: &str, from_epoch: u64) {
+    if let Some(r) = c.nodes.get(id) {
+        let s = r.node.status();
+        assert!(s.promised < from_epoch && s.last_epoch < from_epoch, "{id} after its removal at {from_epoch}: {s:?}");
+        let since = c.nodes.values().map(|r| r.node.status()).find(|s| s.role == Role::Leader).map(|s| s.members_since);
+        assert!(since.is_none_or(|e| e >= from_epoch), "members since {since:?}, removed at {from_epoch}");
+    }
+}
+
+/// Replace a follower with a new id under load: the new box catches up as a
+/// learner, the switch moves the set at a flush barrier, the new member
+/// counts at once (the leader commits with it while the third is down) and
+/// the removed one, still running, never counts or campaigns again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacing_a_follower_under_load() {
+    let mut c = members_cluster(3, 1, |_| flush_opts()).await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let ids = ["n1", "n2", "n3"];
+    let rest = others(&ids, &[&l]);
+    let (gone, kept) = (rest[0], rest[1]);
+    c.start("n4").await;
+    let e0 = c.record().await.epoch;
+    let sw = c.change_to(&[&l, kept, "n4"], Duration::from_secs(20)).await;
+    let rec = c.record().await;
+    assert_eq!((rec.epoch, rec.leader.as_str()), (e0 + 1, l.as_str()), "{rec:?} {sw:?}");
+    assert!(rec.learners.is_empty());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.kill(kept);
+    let before = c.commit_of(&l);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(c.commit_of(&l) > before, "the leader and the new member don't commit: {}", status_line(&c));
+    c.start(kept).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_never_counted(&c, gone, e0 + 1);
+    assert!(c.nodes[gone].node.status().retired, "{}", status_line(&c));
+    let acked = load.stop().await;
+    settle_and_verify(&c, &acked).await;
+    assert_never_counted(&c, gone, e0 + 1);
+    c.shutdown();
+}
+
+/// Replace the leader with a new id under load: it hands epoch + 1 to a
+/// member holding the barrier, which leads without waiting out the timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacing_the_leader_hands_off_under_load() {
+    let mut c = members_cluster(3, 1, |_| flush_opts()).await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let ids = ["n1", "n2", "n3"];
+    let rest = others(&ids, &[&l]);
+    c.start("n4").await;
+    let e0 = c.record().await.epoch;
+    let target = [rest[0], rest[1], "n4"];
+    c.change_to(&target, Duration::from_secs(20)).await;
+    let t: Vec<String> = target.iter().map(|s| s.to_string()).collect();
+    let (nl, ne) = c.wait_leading(&t, Duration::from_secs(5)).await;
+    let rec = c.record().await;
+    // the handoff: the named member leads epoch + 1 itself, no timeout
+    assert_eq!((ne, rec.epoch, rec.leader.as_str()), (e0 + 1, e0 + 1, nl.as_str()), "{}", status_line(&c));
+    let st = c.nodes[&l].node.status();
+    assert!(st.retired && st.role == Role::Follower, "{st:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // n4 counts: the new leader commits with it alone
+    let other = if nl == rest[0] { rest[1] } else { rest[0] };
+    c.kill(other);
+    let before = c.commit_of(&nl);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(c.commit_of(&nl) > before, "{}", status_line(&c));
+    c.start(other).await;
+    let acked = load.stop().await;
+    settle_and_verify(&c, &acked).await;
+    assert_never_counted(&c, &l, e0 + 1);
+    c.shutdown();
+}
+
+/// 3 -> 5 -> 3 under load. With five members the quorum is three: two down
+/// and it carries on. Then back to three, a different three.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn growing_to_five_and_shrinking_back() {
+    let mut c = members_cluster(3, 2, |_| flush_opts()).await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.start("n4").await;
+    c.start("n5").await;
+    let all = ["n1", "n2", "n3", "n4", "n5"];
+    c.change_to(&all, Duration::from_secs(20)).await;
+    let e5 = c.record().await.epoch;
+    let down = others(&all, &[&l]);
+    c.kill(down[0]);
+    c.kill(down[1]);
+    let before = c.commit_of(&l);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(c.commit_of(&l) > before, "three of five don't commit: {}", status_line(&c));
+    c.start(down[0]).await;
+    c.start(down[1]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // the three left are the two spares and one original, maybe not the leader
+    let keep = ["n3", "n4", "n5"];
+    c.change_to(&keep, Duration::from_secs(20)).await;
+    let e3 = c.record().await.epoch;
+    assert!(e3 > e5);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    for gone in ["n1", "n2"] {
+        assert_never_counted(&c, gone, e3);
+    }
+    let acked = load.stop().await;
+    settle_and_verify(&c, &acked).await;
+    c.shutdown();
+}
+
+/// A learner holds the log but never counts: with only the leader and the
+/// learner up nothing commits, and with only one member and the learner up
+/// nobody takes over. A removed member, still running, never takes over
+/// either, even when it and a new member are all that's left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn learners_never_count_and_removed_members_never_lead() {
+    use flush::Step;
+    let armed: Arc<Mutex<Option<Step>>> = Arc::default();
+    let a = armed.clone();
+    let mut c = members_cluster(3, 1, move |_| {
+        let a = a.clone();
+        flush::Options {
+            crash: Some(Arc::new(move |s| {
+                let mut g = a.lock();
+                if *g == Some(s) {
+                    *g = None;
+                    return true;
+                }
+                false
+            })),
+            ..flush_opts()
+        }
+    })
+    .await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.start("n4").await;
+    // the change stops after the learner caught up: it stays a learner
+    *armed.lock() = Some(Step::SwitchBeforePause);
+    let all4: Vec<String> = ["n1", "n2", "n3", "n4"].iter().map(|s| s.to_string()).collect();
+    let r = c.change_on(&l, &all4).await.unwrap();
+    assert!(r.is_err(), "{r:?}");
+    c.kill(&l);
+    c.start(&l).await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    let rec = c.record().await;
+    assert_eq!(rec.learners, vec!["n4".to_string()], "{rec:?}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(c.commit_of("n4") > 0 && c.nodes["n4"].node.status().role == Role::Follower);
+    // only the leader and the learner
+    let ids = ["n1", "n2", "n3"];
+    let rest = others(&ids, &[&l]);
+    c.kill(rest[0]);
+    c.kill(rest[1]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (cl, c4) = (c.commit_of(&l), c.commit_of("n4"));
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!((c.commit_of(&l), c.commit_of("n4")), (cl, c4), "a learner counted: {}", status_line(&c));
+    c.start(rest[0]).await;
+    c.start(rest[1]).await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // only one member and the learner: nobody takes over
+    let rest = others(&ids, &[&l]);
+    c.kill(&l);
+    c.kill(rest[0]);
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    assert_eq!(c.leader(), None, "{}", status_line(&c));
+    c.start(&l).await;
+    c.start(rest[0]).await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    // now make n4 a member and remove one, which keeps running
+    let rest = others(&ids, &[&l]);
+    let (gone, kept) = (rest[0], rest[1]);
+    c.change_to(&[&l, kept, "n4"], Duration::from_secs(20)).await;
+    let e = c.record().await.epoch;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // the removed member and n4 are all that's left: nobody leads
+    c.kill(&l);
+    c.kill(kept);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(c.leader(), None, "{}", status_line(&c));
+    assert_never_counted(&c, gone, e);
+    c.start(&l).await;
+    c.start(kept).await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let acked = load.stop().await;
+    settle_and_verify(&c, &acked).await;
+    assert_never_counted(&c, gone, e);
+    c.shutdown();
+}
+
+/// A crash at every step of a membership change (catch-up, before the
+/// pause, after the barrier's flush, after the CAS), each killing the
+/// leader right there, replacing a follower and then the leader in turn;
+/// the change is retried on whoever leads until it lands. Nothing emitted
+/// is lost and every manifest stays consistent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crashes_at_every_switch_step_lose_nothing() {
+    use flush::Step;
+    let armed: Arc<Mutex<Option<Step>>> = Arc::default();
+    let (tx, mut rx) = mpsc::unbounded_channel::<(String, Step)>();
+    let (a, t) = (armed.clone(), tx.clone());
+    let mut c = members_cluster(3, 8, move |id| {
+        let (a, t, id) = (a.clone(), t.clone(), id.to_string());
+        flush::Options {
+            crash: Some(Arc::new(move |s| {
+                let mut g = a.lock();
+                if *g == Some(s) {
+                    *g = None;
+                    let _ = t.send((id.clone(), s));
+                    return true;
+                }
+                false
+            })),
+            ..flush_opts()
+        }
+    })
+    .await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    let steps = [Step::SwitchCatchUp, Step::SwitchBeforePause, Step::SwitchFlushed, Step::SwitchCas];
+    let mut spare = 4;
+    for (i, step) in steps.iter().cycle().take(8).enumerate() {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let l = c.wait_leader(Duration::from_secs(10)).await;
+        let mut members = c.record().await.members;
+        let new = format!("n{spare}");
+        spare += 1;
+        c.start(&new).await;
+        let out = if i % 2 == 0 { members.iter().find(|m| **m != l).unwrap().clone() } else { l.clone() };
+        members.retain(|m| *m != out);
+        members.push(new.clone());
+        members.sort();
+        *armed.lock() = Some(*step);
+        let mut h = c.change_on(&l, &members);
+        let mut done = None;
+        let fired = tokio::select! {
+            biased;
+            r = rx.recv() => Some(r.unwrap()),
+            r = &mut h => {
+                done = Some(r);
+                rx.try_recv().ok()
+            }
+            _ = tokio::time::sleep(Duration::from_secs(30)) => panic!("no change reached {step:?}: {}", status_line(&c)),
+        };
+        let Some((id, s)) = fired else {
+            // ended before the step (deposed by a takeover, say): no crash this round
+            armed.lock().take();
+            eprintln!("change ended before {step:?}: {done:?}");
+            let m: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+            c.change_to(&m, Duration::from_secs(30)).await;
+            c.kill(&out);
+            continue;
+        };
+        assert_eq!(id, l);
+        let r = match done {
+            Some(r) => r,
+            None => h.await,
+        };
+        assert!(r.unwrap().is_err());
+        c.kill(&id);
+        let v = verify(&c).await;
+        assert!(v.ok, "after a crash at {s:?}: {v:#?}");
+        c.start(&id).await;
+        let m: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+        c.change_to(&m, Duration::from_secs(30)).await;
+        let e = c.record().await.epoch;
+        eprintln!("crash at {s:?} on {id} replacing {out} with {new}: epoch {e}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // a removed node goes the way a replaced box does
+        c.kill(&out);
+    }
+    let acked = load.stop().await;
+    settle_and_verify(&c, &acked).await;
+    c.shutdown();
+}
+
+/// The leader cut off from every peer in the middle of a change: before the
+/// barrier (the change times out and the majority takes over with the
+/// learner still a learner) and after the barrier's flush (the CAS lands,
+/// and the majority of the new set takes over from the record).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partition_during_a_switch_loses_nothing() {
+    use flush::Step;
+    let armed: Arc<Mutex<Option<Step>>> = Arc::default();
+    let (tx, mut rx) = mpsc::unbounded_channel::<(String, Step)>();
+    let (a, t) = (armed.clone(), tx.clone());
+    let mut c = members_cluster(3, 2, move |id| {
+        let (a, t, id) = (a.clone(), t.clone(), id.to_string());
+        flush::Options {
+            crash: Some(Arc::new(move |s| {
+                let hit = {
+                    let mut g = a.lock();
+                    let hit = *g == Some(s);
+                    if hit {
+                        *g = None;
+                    }
+                    hit
+                };
+                if hit {
+                    // the test cuts this node off while the change waits here
+                    let _ = t.send((id.clone(), s));
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                false
+            })),
+            ..flush_opts()
+        }
+    })
+    .await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    for (step, new) in [(Step::SwitchBeforePause, "n4"), (Step::SwitchFlushed, "n5")] {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let l = c.wait_leader(Duration::from_secs(10)).await;
+        let mut members = c.record().await.members;
+        c.start(new).await;
+        let out = members.iter().find(|m| **m != l).unwrap().clone();
+        members.retain(|m| *m != out);
+        members.push(new.to_string());
+        members.sort();
+        *armed.lock() = Some(step);
+        let h = c.change_on(&l, &members);
+        let (id, _) = tokio::time::timeout(Duration::from_secs(20), rx.recv()).await.unwrap().unwrap();
+        c.isolate(&id);
+        let r = h.await.unwrap();
+        eprintln!("change with {id} cut off at {step:?}: {r:?}");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        c.heal();
+        let m: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+        c.change_to(&m, Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        c.kill(&out);
+    }
+    let acked = load.stop().await;
+    settle_and_verify(&c, &acked).await;
     c.shutdown();
 }
