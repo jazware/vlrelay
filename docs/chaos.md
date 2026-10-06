@@ -1,16 +1,64 @@
 # vlRelay chaos
 
-We break the cluster on purpose and check what survives. `tests/chaos/chaos.sh` runs the cluster e2e's three cores, edge and replica on MinIO under steady load, injects one fault schedule, then checks the same invariants after every scenario.
+We break the relay on purpose and check what survives. `tests/qlog/relay-chaos.sh` (`just relay-chaos`) runs the relay on the quorum log: a fakepds fleet feeding three `vlrelay` nodes on a local MinIO, one fault schedule under steady load, then the same checks after every scenario. `tests/qlog/chaos.sh` (`just qlog-chaos`) does the same for the bare quorum log (`qlog node`, `qlog load`), and its scenarios and results are in `docs/quorum.md`'s implementation notes.
 
 ```
-just chaos list
-just chaos kill9                      # or: tests/chaos/chaos.sh kill9 [--duration 100] [--rate 50] [--fake-rate 200]
-VLRELAY_BIN=/path/to/old/vlrelay just chaos zombie   # the same scenario on another build
-CHAOS_BASE=4150 just chaos minio-errors              # another port block, beside a running one
-CHAOS_PROFILE=dev-release just chaos soak --duration 3000   # optimized relay, as on benchbox
+just relay-chaos list
+just relay-chaos kill-leader                       # or: tests/qlog/relay-chaos.sh kill-leader [--rate 350] [--duration 90] [--every 15] [--hosts 16] [--dids 200]
+RQ_BASE=3650 just relay-chaos mixed-durable        # another port block, beside a running one
+CL_DIR=/dev/shm/rq FSYNC_DELAY_US=1000 just relay-chaos power-cut-all   # commitlogs on tmpfs with an emulated 1 ms fsync
+RETAIN_SECS=120 just relay-chaos mixed-flush       # with the leader's bucket retention on
 ```
 
 ## The setup
+
+- Upstreams. A fakepds fleet (`--hosts` 16, `--dids` 200, `--rate` 350 events/s by default) with its own PLC: real signed sync 1.1 commits, and a replay buffer so hosts can resend after a recovery.
+- Relays. Three `vlrelay` nodes (one for the `single-*` scenarios) with commitlogs (`--qlog-dir`, power cut on SIGUSR1), a 2 s flush (`FLUSH_MS`), the qlog admin token, and every fakepds host as `--host`. A supervisor loop restarts a node 1 s after it exits (`RESTART_SEC`), and a scenario can hold a node down or retire it. Bucket retention is off unless `RETAIN_SECS` is set.
+- Fault proxy (`proxy.py`, one route per direction between every pair of nodes), so a partition can cut a node's peer links without touching its bucket or its upstreams. `PROXY=0` (and the single-node scenarios) skips it.
+- Membership scenarios start spare slots (`SLOTS`, 9) so a replacement is a new id on an empty disk, and change members with `qlog member` and the admin token.
+- Ports. Each run takes a block from `RQ_BASE` (3550 by default), its docker project is `vlrq-relay-$RQ_BASE` and its output lands in `dev/state-relayq-$RQ_BASE/<scenario>`, so two runs can go side by side.
+
+## What's checked
+
+| Check | How |
+|---|---|
+| No seq emitted with two contents, dense streams | `qlog check --relay-frames` on every node's `subscribeRepos`, across nodes and restarts. Every stream is dense except across a bucket recovery's gap, and every member's consumer ends at the same commit. |
+| Backfill | The same checker runs a consumer from cursor 0 through the bucket. |
+| The bucket matches the log | `qlog verify` every `VERIFY_EVERY` (20) s and at the end: every manifest's state (the relay's DID records, the host table, cursors) equals the log replayed to F. |
+| No upstream event missing | `e2e_check` on the fakepds hosts against the relay, failing over between nodes with its cursor. Repeats after a recovery (the gap's events, sent again by their hosts) are counted, not failed. |
+| Membership changes land | Any `switch-FAILED` in the events log fails the run. |
+
+`tests/qlog/relay_report.py` summarizes a run: the checker's verdict, emission pauses after each fault, CPU and RSS, recoveries, bucket requests, `e2e_check`'s upstream-against-relay counts and latency, and each node's admissions and host table.
+
+## Scenarios
+
+| Scenario | Faults (every `--every` s, 15 by default) |
+|---|---|
+| `baseline` | none |
+| `kill-leader`, `kill-follower` | kill -9 the leader, or a follower (the supervisor restarts it) |
+| `down-follower`, `down-leader` | kill -9 and hold the node down `DOWN_SEC` (6) s, past `--qlog-host-failover-ms`, so its hosts move to the others with their cursors |
+| `kill-two`, `kill-all` | kill -9 the leader and a follower at once, or all three |
+| `power-cut-leader`, `power-cut-all` | SIGUSR1: the commitlog loses a random part of its unsynced tail plus a torn record, then the process dies |
+| `partition-leader`, `partition-follower` | cut the node's peer links for 5 s through the proxy, then heal |
+| `pause-leader` | SIGSTOP the leader for 3 s |
+| `mixed-durable` | a random pick of the kills, power cuts, partitions, the pause and `down-follower` |
+| `flush-crash` | no scheduled faults. Nodes crash at random points inside a flush (`--qlog-crash-at any`, `CRASH_PROB` 0.05) |
+| `mixed-flush` | `mixed-durable` plus the flush crashes |
+| `wipe-all`, `wipe-two` | kill and delete the commitlogs of all three, or of two (the survivor is the leader or a follower at random): a lost quorum, resumed from the bucket's last flush with a seq jump |
+| `mixed-wipe` | a random pick of kills, power cuts, wipes and a leader partition |
+| `replace-follower`, `replace-leader` | `qlog member replace` onto a new node with an empty disk, then retire the old one |
+| `grow-shrink` | alternately add a member, then remove members back down to three |
+| `single-kill`, `single-wipe` | one node (no peers): kill -9 it, or kill it and delete its commitlog |
+
+## Results
+
+Results go in `docs/quorum.md` under "Tests, chaos and numbers (Phase 7)". The four bugs relay chaos found on the way (two sockets on one host, a record released to the cache after it left pending, decide-then-append across two batches, a wiped node skipping seqs on backfill) are written up there under "The relay on the log (Phase 7)".
+
+## History: the lease cluster
+
+Everything below is the chaos work on the lease cluster, which the quorum log replaced. The harness (`tests/chaos/`), its scenarios and the code it found bugs in are deleted, and the page is kept as a record of what was tried and found.
+
+### The setup
 
 - **Upstreams.** devnet (`DEV_PDS=3` vlpds plus the reference PDS, 50 writes/s with handle changes and deactivations) and a fakepds fleet of 3 hosts (200 events/s, 100 accounts each, real signed sync 1.1 commits). fakepds serves the one PLC the relays use and hands every DID it doesn't own to devnet's PLC (`--plc-fallback`). Together that's about 370 events/s.
 - **Relays.** 3 cores, an edge and a replica on one MinIO prefix, TTL 3 s, 8 DID shards, 15 host shards. A supervisor loop restarts any node 1 s after it exits, as systemd's `Restart=always` would. A scenario can hold a node down.
@@ -18,7 +66,7 @@ CHAOS_PROFILE=dev-release just chaos soak --duration 3000   # optimized relay, a
 - **Checkers.** One `e2e_check` per stream: each core with failover to the other two, the edge and the replica.
 - **Ports.** Each run takes a block from `CHAOS_BASE` (3700 by default; 33xx, 34xx and 35xx belong to other workstreams' networks). Its docker project is `vlrelay-chaos-$CHAOS_BASE` and its state lives in `dev/state-chaos-$CHAOS_BASE`, so two runs can go side by side. `dev/up.sh` and `down.sh` gained `DEV_STATE` and `DEV_COMPOSE_EXTRA` for this.
 
-### What's checked after every scenario (`tests/chaos/report.py`)
+#### What's checked after every scenario (`tests/chaos/report.py`)
 
 | Invariant | How |
 |---|---|
@@ -31,7 +79,7 @@ CHAOS_PROFILE=dev-release just chaos soak --duration 3000   # optimized relay, a
 
 `e2e_check` gained three things for this: it skips upstream frames whose seq doesn't move forward (a replay), it follows an upstream's FutureCursor from cursor 0, and its JSON lists missing events with their upstream seqs.
 
-## Scenarios
+### Scenarios
 
 | Scenario | Faults (seconds into the load) |
 |---|---|
@@ -57,7 +105,7 @@ CHAOS_PROFILE=dev-release just chaos soak --duration 3000   # optimized relay, a
 
 **Clock skew** is skipped. The clocks that matter are `vlpds::tid::now_micros` (relay seq allocation and the watermarks) and the lease wall clock. vlpds's `ClusterConfig::clock_offset_ms` shims only the lease's `expires_ms`, and peers judge leases on their own monotonic clocks, so it changes nothing observable. A real test needs a process-wide offset in `now_micros` (an env var read once), which is vlpds core code, so it's left for the lead. It would test the 250 ms edge/replica `guard` assumption.
 
-## Results
+### Results
 
 Mac (M-series, 14 cores, load average 60-120 from other agents' builds the whole time, so latencies are pessimistic), dev build, 100 s of load per scenario, ~370 events/s, ~25-32k events per stream. "Before" is the tip this work started from (236cac3f); "after" is with the fixes below.
 
@@ -86,7 +134,7 @@ The "acked-but-lost" counts after the fixes are events rejected as `desynchroniz
 
 Variance is high. The machine was shared with other agents' builds, and the soak, a batch and a side run went at once, so take the latencies as upper bounds. `minio-errors` got three after-fix runs for that reason: one clean, one with 29 missing, one with 166. One more run on the newest build (with d6c95714) wedged with all streams at 0/s from 40 s to the end of the window. The nodes recovered on their own about 90 s later, after 30 s shard opens and 30 s drains of dead logs under the error rate. Whether the faster fail-stop makes `minio-errors` worse needs more runs.
 
-## Bugs found and fixed
+### Bugs found and fixed
 
 Each is its own commit with a regression test.
 
@@ -101,7 +149,7 @@ Each is its own commit with a regression test.
 
 Also: `new_account_deferred` kept its own reason label across a forward instead of turning into `owner_rejected` (f3f1ce85). The harness itself: fakepds `restart` fault and PLC fallback, `e2e_check` upstream replays/restarts and missing-event list, `DEV_STATE`/`DEV_COMPOSE_EXTRA` (53faa5ca, 9a9e7a15, e9fafa56, 67e5e7d2).
 
-## The robust-cluster pass
+### The robust-cluster pass
 
 Open issues 3, 4, 5, 7, 8 (second half) and 10 below, fixed in `cluster.rs`, `cluster/forward.rs`, `cluster/follow.rs`, `node/cluster.rs`, `node/adapters.rs` and `seq.rs`, plus three small opt-in or default-preserving changes to vlpds's `cluster.rs` (docs/cluster.md, "Failure handling", has the design and why each is safe). Same Mac and harness, again under load from other agents' builds. "Before" is 68f6fcb4 run beside it (`VLRELAY_BIN`) where a scenario was rerun, else the table above.
 
@@ -126,7 +174,7 @@ Still open from these runs:
 - `partition-peer`: the few events held on the cores until the heal (above). A follower that can't reach a live log's stream never falls back to the bucket while the lease is live (vlpds `remote::follow_log`); that fallback would fix this and the symmetric-partition stall.
 - A step-down is a fail-stop and a restart. Under an asymmetric link (we reach our own address, peers don't) the lease still rules.
 
-## Round 2: robust-pipeline
+### Round 2: robust-pipeline
 
 The soak's death spiral and open issues 1, 2, 8 (backpressure) and 9, plus what the reruns turned up. Each is its own commit.
 
@@ -143,7 +191,7 @@ The soak's death spiral and open issues 1, 2, 8 (backpressure) and 9, plus what 
 
 Harness: a raised fd limit (the fault proxy ran out of fds within minutes under Linux's default 1024, which voided the first benchbox soak: a3b3e70f), `CHAOS_PROFILE` (`dev-release` for soaks), `CHAOS_NO_BUILD`, `RELAY_EXTRA`, a 16 MiB lag bound in `consumers`, `vlpds_firehose_disconnects` in the metric dumps, `e2e_check` telling a restarted sequence from a replay (7cb08a55), and the e2e scripts honouring `DEV_STATE` (7769d8cc).
 
-### FutureCursor: replay from 0
+#### FutureCursor: replay from 0
 
 A host answers our cursor with `FutureCursor` when its sequence restarted below it: a PDS whose sequencer was wiped, or one restored from a backup. indigo marks the host idle and stops (docs/reference-notes.md). Resuming live, as we did, skips whatever the host emitted between its restart and our reconnect, and every account touched then desynchronizes on its next commit.
 
@@ -159,7 +207,7 @@ When the reconnect comes long after the restart, the host's window may no longer
 
 The cursor stays 0 through further reconnects and takeovers until acks move it. The old sequence's late acks no longer count, so they can't push the cursor back up. A `FutureCursor` in answer to cursor 0 is a broken host: it backs off.
 
-### Results
+#### Results
 
 Mac, dev build, same setup as above, one scenario at a time (load 40-100 from other agents). "Round 1" is the "after" column above. "Round 2" ran on this work alone; "rebased" on it rebased onto the robust-cluster pass (0886ce5b).
 
@@ -177,7 +225,7 @@ Before the stage ran detached, `kill9` showed a 25 s stall and a bystander exit 
 
 `just e2e` and `just e2e-cluster --duration 60` pass, before and after the rebase (on their own port block): single node 3,164 and 2,894 events matched, p50 27 ms; cluster 3,171 and 3,045 events identical on all five streams, worst pause 2.15 and 1.95 s after the kill -9. `cargo test --lib`: 147 pass after the rebase.
 
-### The soak, again
+#### The soak, again
 
 benchbox (Ryzen AI Max+ 395), dev-release build, `CHAOS_PROFILE=dev-release CHAOS_BASE=4600 RETENTION_H=1 SOAK_EVERY=240 RELAY_MEM_MB=2400 tests/chaos/chaos.sh soak --rate 50 --fake-rate 600 --accounts 60`, the whole harness under a systemd scope capped at 9-10 GB (the box is shared). ~700 events/s, a fault every 4 minutes. Three runs:
 
@@ -198,7 +246,7 @@ What held: memory stayed bounded through catch-up in both runs until the end, no
 Run 3's 7.3 GB process isn't explained. It's the one relay process that ever passed 2 GB in these runs, and `capped.sh` (which polls RSS) didn't catch it. A caller that gives up and retries while its detached batch runs on would pile up batches against a stuck stage; ef3f8c71 bounds that, but whether it was the cause is unproven. The next soak should run with the harness's checkers outside the relays' memory scope, so the scope's OOM can only mean the relays.
 
 
-## Found, not fixed (for the lead)
+### Found, not fixed (for the lead)
 
 These cross into code other workstreams own (node.rs pipeline internals, upstream, the merge, vlpds membership), or they're design decisions.
 
@@ -219,7 +267,7 @@ These cross into code other workstreams own (node.rs pipeline internals, upstrea
 15. **A relay process reached 7.3 GB in the round 2 soak** (run 3, above). Unexplained; ef3f8c71 bounds the one unbounded path this work added. The pipeline-fixes review found one more unbounded structure, the ack tracker behind a failed entry no replay ever brought back (fixed: a newer socket's higher seq settles it as skipped), but it can't explain 7.3 GB: an entry is well under 100 bytes, the run saw about 1.2M events in its 29 minutes, and its in-flight permits are released when each event is done, not when the cursor moves. Tens of MB at most.
 16. **A core can't start during bucket resets.** A LIST whose response body fails isn't retried at startup, so the core exits 1 and restarts every second until the fault ends (run 2 lost a minute of two cores this way).
 
-## The soak
+### The soak
 
 `CHAOS_BASE=3900 RETENTION_H=1 SOAK_EVERY=240 just chaos soak --duration 3900 --rate 50 --fake-rate 600 --accounts 60` on the Mac, with the build after the first four fixes (without c906521b and d6c95714). That's ~700 events/s for 65 minutes, 2.66M upstream events, a fault every 4 minutes. It ran beside the scenario batches on a machine at load 60-120.
 
@@ -246,7 +294,7 @@ Resources (60 s samples):
 
 No leak shows in the first 24 minutes. Memory is bounded by load, not by time. What the soak exposed is the missing bound on in-flight work during catch-up. That, and the takeovers slowing as shard histories grow, turn a few faults into a cluster that can't catch up. The fix is backpressure: stop reading an upstream once its host has too much in flight, and compact a shard's history so an open replays at most one span (or checkpoint the earlier owners' markers when it opens). Both live in node.rs and cluster. Note the soak ran the dev build (the relay crate at opt-level 0) on a loaded laptop, which lowered the catch-up throughput. A dev-release soak on benchbox is the next run to make, after the backpressure fix.
 
-## Harness notes
+### Harness notes
 
 - The proxy accepts a connection before it dials the target, so a dead node's peer port looks like a reset instead of a refusal. The relay's fast takeover (`ShardHost::refused`, ~1.6 s in docs/cluster.md) doesn't fire through it, and kill -9 costs TTL + skew instead: 3.2-5.2 s here. A load balancer or service mesh in front of the peer port would do the same.
 - A consumer socket to a SIGSTOPped node just hangs (no read timeout in `e2e_check`, nor in most real consumers), so the core checker attached to it reports nothing until the node fail-stops on waking.

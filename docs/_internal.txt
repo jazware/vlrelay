@@ -11,5 +11,4 @@ reference-notes.md      # how indigo's relay and the production firehose behave
 shadow.md               # the shadow run against real PDSes
 quorum.md               # quorum replication design and cost study (in progress)
 perf-log.md             # the perf bench, iteration by iteration
-cluster-internals.md    # how node.rs plugs into the cluster library
 policy-internals.md     # how the policy engine is wired into the node

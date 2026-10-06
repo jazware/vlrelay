@@ -2,7 +2,7 @@
 title: Design
 section: vlRelay
 order: 3
-summary: "Why vlRelay is shaped the way it is: what a relay has to do, where that's hard, what it takes from vlpds, and the decisions behind host shards, DID shards and one merged stream."
+summary: "Why vlRelay is shaped the way it is: what a relay has to do, where that's hard, what it takes from vlpds, and the decisions behind one replicated log with one leader and a bucket written in bulk."
 ---
 
 ```hero
@@ -25,7 +25,7 @@ facts:
   - { value: "~350", unit: events/s, label: Bluesky's average today, note: "~480 in the busiest hour; measured over 7 days", tone: amber }
   - { value: "56M", unit: repos, label: to keep state for, note: "~150 bytes each, ~8 GB of keys" }
   - { value: "~390", unit: GB, label: of raw events in 72 h, note: "~12 Mb/s × 72 h, before compression", tone: blue }
-  - { value: "100k", unit: events/s, label: the design target, note: "on 3 nodes of 8 cores and 32 GB; ~285× today", tone: violet }
+  - { value: "100×", label: what the log is sized for, note: "~35k events/s; past that the stream splits into several logs", tone: violet }
 ```
 
 A relay connects to every PDS it knows about, reads each one's `subscribeRepos` stream, checks the
@@ -35,10 +35,8 @@ commit follows the last one, plus a window of recent events so consumers can res
 cursor. It also answers a handful of sync endpoints (`listRepos`, `getRepoStatus`,
 `getLatestCommit`, `listHosts`, `getHostStatus` and `requestCrawl`).
 
-The original relays were archival. They kept every repo and could serve `getRepo` for anyone,
-which is what a new AppView needs to backfill without hammering every PDS. Sync 1.1 made that
-optional because it's expensive. vlRelay does both from the same binary, and the archival half is
-mostly vlpds's storage engine ([Archival mode](archival.md)).
+vlRelay is one of those. It keeps each account's sync state and 72 h of the stream, and it
+doesn't serve `getRepo`.
 
 ## Where it's hard
 
@@ -48,126 +46,142 @@ write path isn't the problem this time. These are:
 
 | Problem | Why it hurts on a single-box relay | What vlRelay does |
 |---|---|---|
-| Fan-out | Every consumer gets the whole stream. A few hundred consumers is several Gb/s of egress, and that's the real bill. | Pre-framed batches shared by every subscriber, so serving is mostly copying bytes into sockets. Edges and replicas add egress without adding ingest. |
-| Restarts break consumers | A restart or crash drops every websocket, and a disk loss can lose the backfill window. | Leases, fencing and replay. A planned handoff takes under a second, and the log is in the bucket. |
-| Cursor stability | A cursor only means something on the box that issued it, so you can't load-balance consumers. | A deterministic merge of every node's log, so every node emits the same events with the same seqs. |
-| Backfill | Catching up from an old cursor competes with live traffic for the same disk and NIC. | Immutable segments in the bucket, read without touching the live path. |
-| Thousands of upstreams | Each PDS is a websocket with its own failure modes: slow, flapping, replaying or abusive. | Host shards spread them, and the policy engine keeps them fair. |
+| Fan-out | Every consumer gets the whole stream. A few hundred consumers is several Gb/s of egress, and that's the real bill. | Pre-framed batches shared by every subscriber, so serving is mostly copying bytes into sockets. Every member serves the stream. |
+| Restarts break consumers | A restart or crash drops every websocket, and a disk loss can lose the backfill window. | A replicated log. Another node leads 50–120 ms after the leader dies, with nothing committed lost, and the bucket holds a copy of the log. |
+| Cursor stability | A cursor only means something on the box that issued it, so you can't load-balance consumers. | One leader gives every event its seq, and every node emits the same committed log. |
+| Backfill | Catching up from an old cursor competes with live traffic for the same disk and NIC. | Recent cursors read memory and the local log, and older ones read 64 MiB segments in the bucket. |
+| Thousands of upstreams | Each PDS is a websocket with its own failure modes: slow, flapping, replaying or abusive. | The leader's host table spreads them over the members, and the policy engine keeps them fair. |
 
 ## What it takes from vlpds
 
 | | Piece | How the relay uses it |
 |---|---|---|
-| take | Log segments with group commit | The relay's output stream is the log. Whatever checked events queued up during the last PUT become the next segment, written with `If-None-Match: *`. |
-| take | Leases, fences and fail-stop | Node leases own host shards and DID shards. A takeover fences the dead node's log, replays its tail and reconnects its hosts from their last checkpoint. |
-| take | Firehose merger and serving | Every node gets the same ordered stream, and the subscriber code (pre-framed batches, slow consumers, backfill from the bucket) is most of a relay's egress. |
-| take | SlateDB for state | Per-account sync state (rev, data CID, host, status, signing key) in one SlateDB per DID shard. |
-| take | Record storage, CAR import and export | Archival mode only. Mirrored repos use vlpds's layout as is. |
-| adapt | Sharding | DID shards carry over. Host shards are new, because one websocket carries all of a host's accounts. |
+| take | Log segments | The flush uploads the log as vlpds segments (64 MiB, zstd), which old cursors read back. |
+| take | Firehose serving | The subscriber code (pre-framed batches, slow consumers, backfill from the bucket) is most of a relay's egress. It serves one counted log. |
+| take | SlateDB for state | The accounts' records (rev, data CID, host, status, signing key) in one SlateDB, sealed at each flush. |
+| take | Conditional writes for fencing | `qlog/leader` is written by compare-and-swap, so each leader term has its own epoch and an old leader can't commit. |
 | adapt | Sync 1.1 checking | vlpds builds and signs commits. A relay checks other people's: the signature, and the inductive proof from the ops and `prevData`. |
+| new | The quorum log | Replication, commit at a majority, takeover and the flush. It's the "quorum in-memory durability" idea from vlpds's TODO, built here. |
+| leave | Node leases and the log merger | Liveness is peer heartbeats, and one log needs no merge. |
 | leave | Repo workers, OAuth, accounts, blobs, proxying | A relay never creates commits, and none of the rest applies. |
 
-## Two kinds of shard
+## One log, one leader
 
 ```diagram
-caption: Host shards and DID shards are owned independently. A DID that moves to another PDS arrives through a different host owner but still lands at the same DID owner, which decides whether the new host may speak for it.
+caption: A DID that moves to another PDS arrives through a different node, but every event goes to the one leader, which checks that the new host may speak for the account. Two nodes stand for any number.
 nodes:
-  - { id: h1, label: pds-a.example, sub: host shard 7, at: [0, 0], size: [9, 3], tone: muted }
-  - { id: h2, label: pds-b.example, sub: host shard 41, at: [0, 5], size: [9, 3], tone: muted }
-  - { id: n1, label: core 1, sub: owns host shard 7, at: [13, 0], size: [9, 3], tone: accent }
-  - { id: n2, label: core 2, sub: owns host shard 41, at: [13, 5], size: [9, 3], tone: accent }
-  - { id: n3, label: core 3, sub: "owns did:plc:abc's shard", at: [27, 2.5], size: [10, 3], tone: accent }
-  - { id: st, label: "account state", sub: "host = pds-b.example", at: [41, 2.5], size: [9, 3], shape: store, tone: amber }
+  - { id: h1, label: pds-a.example, sub: old PDS, at: [0, 0], size: [9, 3], tone: muted }
+  - { id: h2, label: pds-b.example, sub: new PDS, at: [0, 5], size: [9, 3], tone: muted }
+  - { id: n1, label: node n1, sub: reads pds-a, at: [13, 0], size: [9, 3], tone: accent }
+  - { id: n2, label: node n2, sub: reads pds-b, at: [13, 5], size: [9, 3], tone: accent }
+  - { id: lead, label: leader, sub: "checks did:plc:abc", at: [27, 2.5], size: [10, 3], tone: violet }
+  - { id: st, label: "account record", sub: "host = pds-b.example", at: [41, 2.5], size: [9, 3], shape: store, tone: amber }
 edges:
   - "h1 -> n1: old PDS"
   - "h2 -> n2: new PDS"
-  - "n1.r -> n3.l30: forward"
-  - "n2.r -> n3.l70: forward"
-  - "n3 <-> st: host check"
+  - "n1.r -> lead.l30: submit"
+  - "n2.r -> lead.l70: submit"
+  - "lead <-> st: host check"
 ```
 
-The two jobs have different natural keys. Subscriptions shard by host, so one node holds each
-PDS's socket. Sync state shards by DID, so each account's state changes in exactly one place.
-The cost is one extra in-region hop for events whose host and DID owners are different nodes,
-about two thirds of them on three nodes. That's a millisecond or two next to a segment PUT, and the
-forward path batches.
+Every node reads its share of the PDSes, and one leader keeps every account's record and gives
+every event its seq. Verifying is most of the CPU, so it stays spread over the members. Checking
+the chain and appending is cheap, so it happens in one place.
+
+With three nodes and every entry on all three, every node holds the whole log anyway. Per-account
+leaders would only spread the leader's share of the work. One log means the seq is assigned in one
+place, so there's no merge of several logs and no slowest log setting the pace. Past ~100× today's
+load the stream would split into several logs with a leader each and a merge, and nothing is built
+for that.
 
 Account migration races come out of this for free. For a while, both the old and the new PDS may
-send events for a DID. The DID owner accepts only the host its fresh DID document names, and
-re-resolves the document when that changes. Details: [Cluster](cluster.md).
+send events for a DID. The leader accepts only the host the account's fresh DID document names,
+and it takes a host's events only from the member its host table names, so two sockets on one PDS
+can't mix up an account's order. Details: [Cluster](cluster.md).
 
 ## Where each check runs
 
 | Where | Check |
 |---|---|
-| Host owner | Frame and CBOR well formed and under the size limits. The commit's signature verifies against the DID's cached signing key. The ops applied to the partial MST in the CAR give the commit's `data`. |
-| DID owner | The DID's current PDS (from its DID document) is the host the event came from. `rev` moves forward. `prevData` matches the stored data CID. The account isn't taken down or deactivated. |
+| The node reading the PDS | Frame and CBOR well formed and under the size limits. The commit's signature verifies against the DID's signing key. The ops applied to the partial MST in the CAR give the commit's `data`. |
+| The leader | The DID's current PDS (from its DID document) is the host the event came from. `rev` moves forward. `prevData` matches the stored data CID. The account isn't taken down or deactivated, and it's under its rate. |
 
 The stateless checks run before anything crosses the network, and they're most of the CPU (the
-signature alone is ~33 µs). The host owner keeps a read-through cache of signing keys, and the DID
-owner tells every peer to drop a key when it sees it change. A failed stateful check drops the
+signature alone is ~33 µs). Each node keeps a cache of DID documents. A signature that fails
+against a cached key refreshes the document and tries once more. A failed stateful check drops the
 event and marks the account desynchronized until a `#sync` resets it, which is how sync 1.1
 expects relays to recover.
 
 DID documents come from PLC (and `did:web`) through a cache with a cluster-wide budget
-(`cluster.plcLookupsPerSec`, 500 a second by default). A cold relay would resolve each of ~56M accounts once at that budget,
-about 31 hours, so a relay can seed the cache from the PLC directory's export instead
-([Policy](policy.md#plc-export-seeding)).
+(`cluster.plcLookupsPerSec`, 500 a second by default). A cold relay resolves each of ~56M accounts
+once at that budget, about 31 hours. Seeding the cache from the PLC directory's export would cut
+that, and it isn't built yet.
 
 ## Staying available
 
-- Each host owner checkpoints, per host, the last upstream seq whose events have all been acked
-  durable. It writes that to the bucket every 2 s and on handoff. When a node dies, its host
-  shards go to the others, and they reconnect to each PDS from the checkpoint. The PDS replays
-  the events in between, and the DID owners drop them as duplicates.
-- A DID shard takeover works exactly like vlpds's. The new owner fences the dead node's log,
-  replays its tail into the shard's state, then serves. Host owners retry their forwards against
-  the new owner.
-- Nothing is acked upstream or sent to consumers before it's durable in the bucket, so no
-  consumer ever sees an event that a crash then loses.
-- If a node isn't sure it may still write (its lease lapsed and a peer fenced its log, or its own
-  bucket path is too slow), it steps down and exits. Being unavailable for a while is
-  recoverable, but two nodes writing the same account's state isn't.
+- The leader appends each event and replicates it. Once two of the three nodes hold it on disk,
+  it's committed, and only then does any node emit it or count it against its PDS's cursor. So no
+  consumer ever sees an event that a takeover then loses.
+- When the leader dies, the others elect a new one in 50–120 ms (kill -9) or after 1 s of silence
+  (`--qlog-election-ms`) when it hangs. The new leader writes a new epoch to `qlog/leader`, opens
+  the records at the last flush and replays its own log before it takes events.
+- When a follower dies, consumers on other nodes don't notice. Its PDSes move to the others after
+  2 s and resume from their cursors, which ride in the log.
+- If two nodes lose their disks, the log resumes from the bucket's last flush. Seqs jump to the
+  flush's reservation (R = F + headroom), so no seq is ever reused, and the PDSes send the rest
+  again.
+- If the bucket stops taking flushes, the leader stops committing at R. That bounds the unflushed
+  tail. The headroom is 8.64M seqs by default (`--qlog-headroom`).
 
-## Three kinds of node
+## The bucket
 
-| Node | Bucket access | Gets live data from | Does |
-|---|---|---|---|
-| Core | read and write | its own shards, plus its peers' log streams | subscriptions, checks, state, its log, serving |
-| Edge | read | the cores' log streams over mTLS | serving only, inside the cluster |
-| Replica | read only | the bucket | serving only, anywhere that can read the bucket |
+| Path | What | Written |
+|---|---|---|
+| `qlog/leader` | the epoch, the leader and the members | at a takeover or a membership change |
+| `qlog/manifest` | F (the last seq flushed), R, the segments, the records' checkpoint, the cursors | every flush, last |
+| `qlog/state*` | one SlateDB: each account's record, the host table, the cursors, at exactly F | every flush |
+| `log/qlog/` | 64 MiB segments of the log, for old cursors | every flush |
+| `policy/`, `cases/` | the policy document, domain rules, audit logs and cases | when an operator or the driver changes them |
 
-Edges and replicas run the same serving code and emit the same seqs. A replica needs nothing but
-read-only credentials, so it can sit next to a big consumer in another region, isolate that
-consumer from everyone else, or keep serving everything up to the last durable segment while the
-cores are down. It can't become a writer, since it has no write credentials and no lease.
+The bucket is written in bulk every 30 s (`--qlog-flush-ms`), with the manifest written last as
+the commit point. At today's rate that's about 0.5 writes and 1.7 reads a second (measured over an
+hour), so requests cost ~$1 a month on R2 after its free tier. Liveness never touches the bucket,
+since the members heartbeat each other every 100 ms. Details: [Cluster](cluster.md#what-s-in-the-bucket).
 
 ## Scale
 
-The target is 100k events/s on 3 nodes with 8 cores, 32 GB of RAM and NVMe each. That's about
-285× Bluesky's average today and ~33k events/s per node. The design estimated CPU, memory and disk
-would fit and the network would decide the box. The benches agreed:
+The quorum log is sized for 100× today's load, about 35k events/s. What sets the ceiling at each
+step is measured on the log and modeled for the relay:
 
-- One 8-core node takes ~90–95k events/s cleanly, every event checked, at ~65–70 µs of CPU per
-  event. Three scaled-down nodes take ~98k/s, and the extrapolation to 3 × 8 cores leaves 1.6–2×
-  headroom ([Performance](perf.md)).
-- Memory isn't a concern: 4–6 GB per node at 100–120k events/s.
-- At 100k/s each core streams ~3.5 Gb/s each way to its peers, before consumers, and each
-  full-firehose consumer is another ~4.3 Gb/s. So the cores want 25 GbE, or consumers belong on
-  edges and replicas.
+- Replication is cheap. At 100× the leader spends ~6 µs an event on it, and three nodes with their
+  commitlogs on tmpfs commit 200k events/s with the leader at 1.8 cores.
+- Fsynced disk bandwidth is the real ceiling. Three nodes sharing one consumer NVMe topped out at
+  ~25k events/s. So 100× wants datacenter drives, and two members must never share a disk. 10× is
+  comfortable anywhere.
+- Verifying is the biggest CPU cost (~33 µs a signature), and every node does it for its own PDSes.
+  At today's load the leader needs ~0.1 vCPU (modeled).
+- At today's load a node's limits are RAM (~2.5 GB) and disk (~23 GB, with ~8.5 GB of account
+  state), both modeled. At 10× small VPSes run out of disk and port first.
+- Each full-firehose consumer pulls the whole stream. At 100× that's ~1.6 Gb/s a consumer, so the
+  network sizes the boxes long before the CPU does.
 
-Past 100k/s the full mesh (every core streams its log to every other core) stops scaling, and
-compressed or filtered outputs matter more than any host ([Cost](cost.md#what-1000x-would-need)).
+Past 100× the single log stops scaling, and compressed or filtered outputs matter more than any
+host ([Cost](cost.md)).
 
 ## Decisions
 
 | Question | Decision |
 |---|---|
-| Segment linger | 25 ms (`--linger-ms`). Time to firehose matters more than the PUT bill, which this costs a few hundred dollars a month. |
-| Where signatures are checked | On the host owner, with a read-through signing-key cache. |
-| Account migration races | The DID owner accepts events only from the host its fresh DID document names. |
-| Event size at 100k/s | Plan for today's mix (~4.5–5.3 KB), so the 100k target needs 10 GbE or better. |
-| Archive by default | Off. Archival reads go to the DID owner only, and edges and replicas serve streams only. |
+| One log or several | One, with one leader. Several logs and a merge only pay off past ~100×. |
+| When consumers see an event | At commit, once two of three hold it. A takeover never takes back an event a consumer saw. |
+| Commitlog or memory only | A commitlog on local NVMe (`--qlog-dir`), so two or three process deaths are an ordinary takeover. |
+| Bucket flush | 30 s (`--qlog-flush-ms`). A longer flush only widens what PDSes resend after two disks are lost. |
+| Liveness | Peer heartbeats. Bucket leases with a 10 s TTL would cost ~$56 a month on R2, more than everything else in the bucket. |
+| Segment size | 64 MiB. 8 MiB segments would cost ~$230 a month more at 100×. |
+| Account state | One SlateDB, written only from committed entries and sealed at exactly F. More shards multiply its requests. |
+| Where signatures are checked | On the node reading the PDS, with the DID document cache. |
+| Account migration races | The leader accepts events only from the host the fresh DID document names, read by the member the host table names. |
+| Archival | No. vlRelay is a sync 1.1 relay and doesn't serve `getRepo`. |
 | Compressed or filtered outputs | Not yet. Collection filtering eventually. |
 | Public segments for backfill | Not for now. They'd make backfill cheap, but the segment format would become an API. |
 | Relays as upstreams | No. An upstream that says it's a relay is refused and banned ([Compatibility](compat.md#relay-chaining)). |
@@ -176,12 +190,14 @@ compressed or filtered outputs matter more than any host ([Cost](cost.md#what-10
 
 | What breaks | What happens |
 |---|---|
-| A node dies | Its host shards move and reconnect from checkpoints. Its DID shards move, and their new owners fence its log and replay. Consumers on other nodes see a pause of ~1–2 s, and its own consumers reconnect anywhere. |
-| A node can't reach the bucket | Nothing is acked or emitted until it's durable. If its lease lapses and a peer fences it, it exits. |
-| A PDS replays or sends garbage | The DID owner drops duplicates by rev and CID. Failed checks count against the host's error budget, which can auto-throttle it. |
+| The leader dies | Another node leads in 50–120 ms, or ~1 s when the leader hangs or is cut off. Nothing committed is lost, and consumers see a short pause. |
+| A follower dies | Consumers on other nodes see nothing. Its PDSes move after 2 s and resume from their cursors, and its own consumers reconnect anywhere. |
+| Two nodes' disks are lost | The log resumes from the bucket's last flush with a seq jump, and the PDSes resend what came after it. |
+| The bucket is slow or down | Commits go on until the reservation R, then stop until a flush lands. |
+| A PDS replays or sends garbage | The leader answers duplicates without an entry. Failed checks count against the host's error budget, which can auto-throttle it. |
 | A spam wave from new hosts | New-host quotas cap each one, domain rules catch them as a group, and the cluster-wide new-account budget caps the total. |
 | PLC is slow or down | Cached keys keep known accounts flowing. Lookups wait for the budget instead of dropping events, and the backpressure reaches the host's socket. |
-| A slow consumer | It falls back to reading segments, and gets `ConsumerTooSlow` once it's too far behind. |
+| A slow consumer | It falls back to reading the local log and then segments, and gets `ConsumerTooSlow` once it's too far behind. |
 
 The original design-session document is in the repository next to these pages, with the cost
 estimates and open questions as they stood before the build.

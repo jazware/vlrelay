@@ -20,7 +20,7 @@ just buildtime      # time no-op and one-module-edit builds (scripts/buildtime.s
 just dev-up                 # MinIO, PLC, reference PDS, 2 vlpds upstreams (~5 s warm)
 just dev-seed 30            # 30 accounts round-robin across all upstreams (~1 s)
 just dev-load 50            # 50 writes/s until ^C (or: just dev-load 50 60 for 60 s)
-just relay                  # the relay against every upstream (once it has a CLI)
+just relay                  # a single-node relay against every upstream
 just e2e-check              # compare the relay's firehose with the upstreams'
 just dev-down               # stop everything and delete dev/state
 ```
@@ -57,7 +57,7 @@ The e2e starts the relay like this, and `just relay` does the same:
 vlrelay --listen 127.0.0.1:2980 \
         --memory \
         --plc-url http://127.0.0.1:2982 \
-        --linger-ms 25 \
+        --qlog-listen 127.0.0.1:0 \
         --host http://127.0.0.1:2984 --host http://127.0.0.1:2985 --host http://localhost:2983
 ```
 
@@ -65,22 +65,20 @@ vlrelay --listen 127.0.0.1:2980 \
 - `--memory` keeps everything in memory. The bucket form takes vlpds's flag names: `--s3-endpoint http://127.0.0.1:2990 --s3-bucket vlrelay --s3-access-key minioadmin --s3-secret-key minioadmin --prefix <run>`.
 - `--host URL` (repeatable) is an upstream to subscribe to. An `http://` origin means plain `ws://`, which the dev network needs. A bare hostname means `wss://`. `--crawl` (accept `requestCrawl`) can replace or add to it.
 - `--plc-url` resolves `did:plc` against the local directory, since none of these DIDs exist anywhere else.
-- `--linger-ms` is the segment linger (PLAN.md decision 1).
+- `--qlog-listen 127.0.0.1:0` puts the quorum log's peer port on a free loopback port. With no `--qlog-peer` the relay is a one-member quorum (docs/cluster.md), and without `--qlog-dir` its log is in memory only.
 
 The e2e checks the relay's `--help` for `--listen` and `--host`. Until both show up it prints `SKIP relay` and checks the upstreams against themselves instead, which still exercises the network, the load and the checker.
 
-The relay implements the contract (`src/main.rs`, pipeline in `src/node.rs`). Its other flags:
+The relay implements the contract (`src/main.rs`, pipeline in `src/node.rs`, the quorum log in `src/node/quorum.rs` and `src/qlog/`). Its other flags:
 
 - `--admin-token T` turns on `/admin` (the dashboard, from `--ui-dir` or this tree's `ui/dist`) and its API. Without it there's no `/admin`.
 - `--dev-mode` allows `ws://`, IPs, localhost and ports. An `http://` `--host` or a loopback `--plc-url` turns it on by itself.
-- `--did-shards N` (4 alone, 24 in a cluster) is the number of DID state shards, each a SlateDB. `--retention H` (72) is the log's replay window in hours.
+- `--qlog-flush-ms` (30000) is how often the leader flushes to the bucket, and `--qlog-retain-hours` (72) how long the bucket keeps log segments. The rest of the quorum flags are in docs/cluster.md and docs/operations/configuration.md.
 - `--lanes N` (64) and `--ingest-threads N` (cores, at most 16) size the pipeline. `--did-lookups-per-sec` (50) is the DID document budget.
 
 One listener serves `GET /xrpc/_health` (`{"version"}`), `subscribeRepos`, the sync API (`listRepos`, `getRepoStatus`, `getLatestCommit`, `listHosts`, `getHostStatus`), `requestCrawl` (with `--crawl`), `/admin` and Prometheus `/metrics`. Every response carries `Server: vlrelay/… (atproto-relay)`, so other relays won't crawl it. The relay's own series are `vlrelay_*`: events in by kind, accepted by kind, out, rejected by reason, duplicates by where they were caught, time to firehose and time to durable (histograms), time per pipeline stage, durable lag, hosts by status, consumers. vlpds's firehose and process series come with them.
 
-`just e2e-archival` is the archival mode's e2e on its own ports (docs/archival.md).
-
-`just e2e-reshard` splits a DID shard of a three-core cluster and merges the halves back, under load with archival on and the PLC export seeding, on its own ports (base 3680, nodes on 3700+; docs/cluster.md, "Resharding").
+`just e2e-policy` runs one relay against a fakepds fleet with faults (auto-throttle, cases, a ban rule, clean hosts left alone), `tests/e2e/policy.sh`.
 
 ## e2e_check
 
@@ -124,11 +122,11 @@ just e2e [--duration 60] [--rate 50] [--accounts 30]     # KEEP=1 leaves the net
 Two more flags:
 
 - `--bucket` runs the relay on the dev MinIO (`:2990`, a new prefix per run) instead of `--memory`.
-- `--restart-at S` kill -9s the relay S seconds into the load and starts it again on the same prefix. It implies `--bucket`. The checker's relay socket reconnects with its last cursor, so a gap or a duplicate across the restart fails the run.
+- `--restart-at S` kill -9s the relay S seconds into the load and starts it again on the same prefix. It implies `--bucket`. The relay runs without `--qlog-dir`, so the restart recovers from the bucket's last flush and the upstreams resend the rest. The checker's relay socket reconnects with its last cursor, so a missing event across the restart fails the run.
 
 ### Results
 
-Measured on the Mac (M-series, 14 cores), dev build (the relay crate at opt-level 0, dependencies at 2), three upstreams (two vlpds and the reference PDS).
+Measured on the Mac (M-series, 14 cores), dev build (the relay crate at opt-level 0, dependencies at 2), three upstreams (two vlpds and the reference PDS). These runs were on the old single node (node log, DID shards, a 25 ms segment linger), before the quorum log was the only mode, so the latencies and the restart below are that design's. They haven't been rerun since.
 
 | Run | Events | Missing | Extra | Reordered | Dups | Upstream → relay p50 / p90 / p99 / max |
 |---|---|---|---|---|---|---|
@@ -136,38 +134,21 @@ Measured on the Mac (M-series, 14 cores), dev build (the relay crate at opt-leve
 | `--duration 60 --rate 400 --accounts 60 --bucket` | 24,223 | 0 | 0 | 0 | 0 | 17 / 28 / 30 / 36 ms |
 | `--duration 60 --rate 50 --restart-at 20` | 3,168 | 0 | 0 | 0 | 0 | 29 / 32 / 265 / 869 ms |
 
-The floor is the 25 ms linger plus a MinIO PUT. Each run covers every event type: `#commit`, `#sync` (on reactivation), `#identity` (handle changes) and `#account` (deactivations).
+The floor there was the 25 ms linger plus a MinIO PUT. Each run covers every event type: `#commit`, `#sync` (on reactivation), `#identity` (handle changes) and `#account` (deactivations).
 
-In the restart run, the relay was back serving 1 s after the kill. It replayed 113 state deltas from the dead log in 0.6 s, and each upstream resumed from its last durable cursor. The upstreams then re-sent 112 events that were already in the log past those cursors. The relay dropped all of them (`vlrelay_events_duplicate_total{at="restart_log"}`), so the checker, resuming from its own cursor, saw no gap and no duplicate. The p99 is the events caught in the kill.
+In the restart run, the relay was back serving 1 s after the kill. It replayed 113 state deltas from the dead log in 0.6 s, and each upstream resumed from its last durable cursor. The upstreams then re-sent 112 events that were already in the log past those cursors, and the relay dropped all of them as duplicates, so the checker, resuming from its own cursor, saw no gap and no duplicate. The p99 is the events caught in the kill.
 
-Time per event in each stage, from `vlrelay_stage_busy_us_total` over the 400/s run (dev build, so upper bounds): strict parse 10 µs, verify (hashes, signature, MST inversion) 46 µs, apply (the DID owner's state step) 20 µs.
+Time per event in each stage, from `vlrelay_stage_busy_us_total` over the 400/s run (dev build, so upper bounds): strict parse 10 µs, verify (hashes, signature, MST inversion) 46 µs, apply (the state step, now the leader's) 20 µs.
 
-## Cluster e2e
-
-```
-just e2e-cluster [--duration 90] [--rate 50] [--accounts 30] [--no-ha]
-                 [--kill-at 20] [--restart-at 35] [--term-at 50] [--return-at 60]
-```
-
-`tests/e2e/cluster.sh` brings the network up with 4 upstreams (`DEV_PDS=3`), starts three core relays on one fresh MinIO prefix with peer mTLS (`--dev-mode` issues the certificates into `dev/state/peer-tls`), then an edge and a replica. It runs five checkers, one per relay stream, each with the same upstreams:
-
-- one per core, with `--relay a,b,c` listing all three cores in a different order. A socket that closes or can't connect moves to the next server with its cursor, so the consumers of a dead node reconnect elsewhere, as real ones would.
-- one on the edge and one on the replica.
-
-Each checker must report 0 missing, extra, reordered and duplicated events on its own. They also write every relay event (`--seq-out`) and every latency (`--lat-out`), and `tests/e2e/cluster_report.py` checks that all five streams carry the same events at the same relay seqs, then reports steady-state latency, the pause after each HA action, and when the survivors' logs show the shards moving.
-
-The HA schedule (seconds into the load): kill -9 the core with the most upstream sockets at `--kill-at`, start it again at `--restart-at`, SIGTERM the busiest of the other two at `--term-at`, start it again at `--return-at`. `--no-ha` runs steady state only.
-
-Ports: node i (cores 1-3, the edge 4, the replica 5) serves on `CLUSTER_PORT_BASE`+i (base 2960, so :2961-:2965) and listens for peers on +10+i. Every port in `dev/ports.sh` can be moved by env, and `COMPOSE_PROJECT_NAME` separates the docker half, so a cluster run can sit beside another worktree's e2e:
+## Chaos
 
 ```
-COMPOSE_PROJECT_NAME=vlrelay-cluster PLC_PORT=3182 REF_PDS_PORT=3105 PDS_BASE_PORT=3106 \
-  MINIO_PORT=3190 MINIO_CONSOLE_PORT=3191 CLUSTER_PORT_BASE=3160 HOST_SHARDS=15 just e2e-cluster
+just relay-chaos list
+just relay-chaos kill-leader [--rate 350] [--duration 90]
+just qlog-chaos list                  # the bare quorum log, no relay
 ```
 
-Which node owns which upstream follows from the hostnames' hashes, so the ports pick the split. With the ports above and 15 host shards the 4 upstreams land 2/1/1. With the defaults and 16 host shards they all land on one node. Env: `TTL_MS` (3000, the lease TTL), `HOST_SHARDS` (16), `KEEP=1`, `OUT` (`dev/state/e2e-cluster`, copied to `$TMPDIR/vlrelay-e2e-cluster-last`).
-
-Results (Mac, dev build, the ports above, `--duration 80`, about 110 s end to end): 4,173 events on every stream, 0 missing, extra, reordered or duplicated on all five, the same seqs on all five. Steady-state p50 33 ms on the cores (29.6 ms for one node on the same network and load) and ~308 ms on the edge and the replica. kill -9 paused events up to 1.6-1.8 s, a planned handoff up to 0.66-0.89 s, and a rejoin's rebalance up to 0.2-1.2 s. docs/cluster.md has the breakdown.
+`tests/qlog/relay-chaos.sh` runs a fakepds fleet into three relays on a local MinIO, each under a supervisor that restarts it, with peers dialing each other through a fault proxy, and checks every node's stream, the bucket's manifests and every upstream event. The scenarios, what's checked and the env knobs are in [chaos.md](chaos.md). It's the multi-node e2e: there's no separate cluster e2e on the dev network.
 
 ### Against real PDSes
 

@@ -33,7 +33,7 @@ facts:
 
 Does software written for Bluesky's relay work against vlRelay unchanged? To find out, we ran indigo's Go consumers, `goat`, `@atproto/sync`, Jetstream and indigo's relay itself against vlRelay on the local dev network, with indigo's relay beside it on the same upstreams and load, and compared the two.
 
-Everything works, `@atproto/sync` included. vlRelay's stream matches indigo's event for event, and on the same run it matches seq for seq. The first run found one thing that broke: TypeScript. vlRelay's seqs were bigger than 2^53, and `@atproto/sync` rejected every frame. vlRelay now serves dense seqs ([Stream seqs](seq.md)).
+Everything works, `@atproto/sync` included. vlRelay's stream matches indigo's event for event, and on the same run it matches seq for seq. The first run found one thing that broke: TypeScript. vlRelay's seqs were bigger than 2^53, and `@atproto/sync` rejected every frame. vlRelay serves dense seqs, which the leader assigns at commit ([Cluster](cluster.md#the-path-of-an-event)).
 
 ## How to run it
 
@@ -44,8 +44,8 @@ tests/compat/run.sh --keep       # leave the network and both relays up afterwar
 
 `run.sh` clones and builds indigo, goat, jetstream and jetstream-legacy into `tests/compat/scratch/` (ignored) the first time. It needs Go, Node 22+ (it uses Homebrew's `node` if the default one is older) and docker. Then it:
 
-1. Brings up the dev network on the 34xx ports (`tests/compat/env.sh`, compose project `vlrelay-compat`), so it can sit beside a default dev network or the cluster e2e. It seeds 30 accounts.
-2. Starts vlRelay on :3480 (`--memory`), a second vlRelay on :3478 with the dev-only `--retention-secs 10 --max-lag-mb 1` (so `OutdatedCursor` and `ConsumerTooSlow` can be reached), and indigo's relay on :3470 (sqlite, `--lenient-sync-validation` as in production, account limit 10,000) on the same three upstreams. It also starts jetstream-legacy on :3460 with vlRelay as its upstream.
+1. Brings up the dev network on the 34xx ports (`tests/compat/env.sh`, compose project `vlrelay-compat`), so it can sit beside a default dev network. It seeds 30 accounts.
+2. Starts vlRelay on :3480 (`--memory`), a second vlRelay on :3478 with dev-only 10 s retention and `--max-lag-mb 1` (so `OutdatedCursor` and `ConsumerTooSlow` can be reached), and indigo's relay on :3470 (sqlite, `--lenient-sync-validation` as in production, account limit 10,000) on the same three upstreams. It also starts jetstream-legacy on :3460 with vlRelay as its upstream.
 3. Starts consumers on both relays, runs `devnet load` for 60 s at 30 writes/s (handle changes and deactivations included), restarts Jetstream halfway, and waits.
 4. Tests cursors, account states, the sync API and relay chaining, then writes `scratch/run/summary.txt`.
 
@@ -87,7 +87,7 @@ Run on 2026-10-04 on a laptop (dev build): 60 s at 30 writes/s, 30 accounts on t
 
 | Difference | Class | Notes |
 |---|---|---|
-| seqs above 2^53 (`unix_micros << 8 \| writer`, ~4.6e17) | was ours wrong, fixed | It broke every JavaScript consumer that validates (all of `@atproto/sync`). vlRelay now serves dense seqs, the same on every node. vlpds as a PDS still emits the time-based seqs, since it's in production with stored cursors. |
+| seqs above 2^53 (`unix_micros << 8 \| writer`, ~4.6e17) | was ours wrong, fixed | It broke every JavaScript consumer that validates (all of `@atproto/sync`). vlRelay serves dense seqs, the same on every node. vlpds as a PDS still emits the time-based seqs, since it's in production with stored cursors. |
 | `#identity` keeps the handle, indigo strips it | deliberate | `SkipHandleVerification` makes indigo drop nearly every handle. 24 of 24 handles kept on vlRelay, 0 of 24 on indigo. `e2e_check` keys identity on the handle, so these show as 7-9 "missing" and "extra" on the indigo side. |
 | `FutureCursor` error frame on a future cursor | deliberate | Per the event-stream spec. indigo ignores the cursor and serves live (indigo#1328). indigo's consumer surfaces the frame through its `Error` callback, and the socket closes normally. |
 | vlRelay emits sooner | deliberate | p50 29 vs 46-60 ms. indigo writes to disk every 100 ms before it broadcasts. |
@@ -110,14 +110,14 @@ Run on 2026-10-04 on a laptop (dev build): 60 s at 30 writes/s, 30 accounts on t
 - indigo's relay ← vlRelay. Refused by design, twice over. The first dial sees `Server: vlrelay/0.1.0 (atproto-relay)` and the host goes to `banned`. Even without the ban, `CreateAccountHost` would refuse every account, since each DID document names a PDS and not us. indigo has no relay-upstream mode.
 - vlRelay ← indigo's relay. Before this work, vlRelay subscribed (it never looked at the upstream's `Server` header, although the must-match list says to), took 97 events in and rejected all 97 as `wrong_host`. `#identity` was rejected too: vlRelay checks host authority on `#identity`, and indigo doesn't. Fixed in `upstream/client.rs`: an upstream whose handshake `Server` contains `atproto-relay` is refused at connect, which covers `--host` and `requestCrawl` (crawl runs the same connect). Regression test: `upstream::client::tests::refuses_an_upstream_that_says_its_a_relay`.
 
-Should vlRelay support relay-as-upstream? Not as an upstream mode. Host authority ([Design](design.md#two-kinds-of-shard)) is what keeps a host from speaking for accounts it doesn't hold, and a relay upstream is exactly that, for every account. To support it, we'd need to trust the relay for authority (signatures prove who wrote a commit, not that it's the newest), to re-check every `#account` and `#identity` at the PDS (they aren't signed), and to dedupe against the same accounts arriving directly. The design's "other relays (opt.)" is better served by the two cheaper things it's really for:
+Should vlRelay support relay-as-upstream? Not as an upstream mode. Host authority ([Cluster](cluster.md#the-path-of-an-event)) is what keeps a host from speaking for accounts it doesn't hold, and a relay upstream is exactly that, for every account. To support it, we'd need to trust the relay for authority (signatures prove who wrote a commit, not that it's the newest), to re-check every `#account` and `#identity` at the PDS (they aren't signed), and to dedupe against the same accounts arriving directly. The design's "other relays (opt.)" is better served by the two cheaper things it's really for:
 
 - Bootstrap a host list by reading another relay's `listHosts` and crawling those PDSes directly. This needs no trust in the relay.
-- Mirror a vlRelay, which edges and replicas already do inside a cluster.
+- Mirror a vlRelay, which every member of a cluster already does.
 
 ## Follow-ups from the first run
 
-1. Seqs above 2^53: fixed. vlRelay serves a dense counter in merge order ([Stream seqs](seq.md)). It's the same on every node, edge and replica, and kept across restarts and takeovers through `seqck/` checkpoints in the bucket. `@atproto/sync` passes with 0 errors, and the seqs equal indigo's on the same run. vlpds's own PDS firehose is unchanged.
+1. Seqs above 2^53: fixed. vlRelay serves a dense counter that the leader assigns in commit order ([Cluster](cluster.md#the-path-of-an-event)). It's the same on every node, and kept across restarts and takeovers by the quorum log and its flushes to the bucket. `@atproto/sync` passes with 0 errors, and the seqs equal indigo's on the same run. vlpds's own PDS firehose is unchanged.
 2. `#identity` from any host: fixed. vlRelay refreshes the DID document and emits the event, as indigo does. Host authority still applies to `#commit`, `#sync` and `#account` (`state::tests::identity_event_refreshes_the_key`). Like indigo, another host's `#identity` doesn't create an account the relay hasn't seen: it's emitted with no state change, and the account is created (and meets its PDS's account cap) at that PDS's first event (`state::tests::foreign_identity_creates_no_account`).
 3. A refused relay upstream: banned, fixed. A permanent refusal at connect (`upstream::client::Refused`, today the `atproto-relay` Server header) bans the host through the policy engine's audited ban action, and its task stops. An operator unban is how to retry it (`node::policy::tests::a_relay_upstream_is_banned_not_retried`).
 4. 80 more events on `cursor=1`: not vlRelay replaying a backlog.

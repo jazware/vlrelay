@@ -7,14 +7,14 @@ summary: "Every limit the relay enforces, the domain rules, requestCrawl admissi
 
 ```hero
 diagram:
-  caption: Operators edit the policy through the dashboard with compare-and-swap writes, and every change gets an audit entry. Every node polls it every 10 s. Host owners enforce host limits, DID owners enforce account limits, and every serving node filters taken-down accounts out of replays.
+  caption: Operators edit the policy through the dashboard with compare-and-swap writes, and every change gets an audit entry. Every node polls it every 10 s. The node that reads a host enforces its limits, the leader enforces account limits, and every node filters taken-down accounts out of replays.
   nodes:
     - { id: op, label: Operator, sub: "`/admin` dashboard", at: [0, 4], size: [8, 3] }
     - { id: pol, label: "`policy/current.json`", sub: "versioned · If-Match", at: [12, 1], size: [11, 2.6], shape: store, tone: amber }
     - { id: audit, label: "`policy/audit/`", sub: one entry per version, at: [12, 7], size: [11, 2.6], shape: store, tone: amber }
-    - { id: host, label: Host owner, sub: "tiers · admission · rates", at: [28, 0], size: [10, 3], tone: accent }
-    - { id: did, label: DID owner, sub: "account cap · new accounts", at: [28, 4.5], size: [10, 3], tone: accent }
-    - { id: serve, label: Every serving node, sub: takedown filter, at: [28, 9], size: [10, 3], tone: blue }
+    - { id: host, label: Reading node, sub: "tiers · admission · rates", at: [28, 0], size: [10, 3], tone: accent }
+    - { id: did, label: Leader, sub: "account cap · new accounts", at: [28, 4.5], size: [10, 3], tone: accent }
+    - { id: serve, label: Every node, sub: takedown filter, at: [28, 9], size: [10, 3], tone: blue }
     - { id: cases, label: Cases, sub: spam trips · read lag, at: [42, 4.5], size: [8, 3], tone: danger }
   edges:
     - "op.r -> pol.l: PUT, CAS"
@@ -33,7 +33,8 @@ facts:
 
 The policy engine holds every limit the relay enforces, the domain rules, `requestCrawl`
 admission, the cluster-wide budgets, the spam counters and the cases. The engine decides and
-counts. The host owner enforces host limits and the DID owner enforces per-account ones. The
+counts. The node that reads a host enforces its host limits, and the leader enforces per-account
+ones when it checks each event against the account's record. The
 defaults follow indigo's relay wherever it has a number, and the operator dashboard edits all of
 it ([Admin API](admin-api.md)).
 
@@ -41,7 +42,7 @@ it ([Admin API](admin-api.md)).
 
 | Object | What | Written by |
 |---|---|---|
-| `policy/current.json` | The policy: tier limits, transitions, spam thresholds, cluster budgets, consumer limits, crawl rules, archival | operators |
+| `policy/current.json` | The policy: tier limits, transitions, spam thresholds, cluster budgets, consumer limits, crawl rules | operators |
 | `policy/audit/{version:020}.json` | One audit entry per policy version (who, when, note, every changed leaf) | the save that made the version |
 | `policy/domain-rules.json` | Domain rules, with their own version | operators |
 | `policy/domain-rules-audit/{version:020}.json` | The rules' audit log | the save |
@@ -233,50 +234,15 @@ account's current state: who, when, why) before the account changes, and the rel
 
 It also filters the replay window. A consumer whose cursor reaches back past a takedown doesn't
 get the account's earlier `#commit` and `#sync` frames, from the ring or from the bucket, on any
-core, edge or replica. Its `#account` and `#identity` frames pass, so consumers see the status
-change. Frames are skipped, not renumbered, so every node keeps the same seqs and consumers see a
-gap. Lifting the takedown lets the old frames replay again. indigo doesn't filter replay at all, so
-after a reversal both relays serve the same thing.
+node. Its `#account` and `#identity` frames pass, so consumers see the status change. Frames are
+skipped, not renumbered, so every node keeps the same seqs and consumers see a gap. Lifting the
+takedown lets the old frames replay again. indigo doesn't filter replay at all, so after a reversal
+both relays serve the same thing.
 
-Every serving node polls `policy/takedowns/` every 10 s, and edges and replicas read it the same
-way. The core that takes an account down applies it to its own filter before it appends the
-`#account`, so its consumers never see the `#account` and then the account's old commits. An
-empty filter does no parsing at all, and a non-empty one costs ~88 ns an event (about 1% of a
-core at 100k/s).
-
-## PLC export seeding
-
-A cold relay would resolve each of ~56M accounts once at the PLC lookup budget, about 31 hours at
-500/s. With `--plc-export`, it reads the PLC directory's `/export` instead and keeps, per
-did:plc, the latest op's `#atproto` key, its PDS host, whether it's a tombstone, and the op's
-`createdAt`. A DID document cache miss then costs no lookup.
-
-- History is split into `--plc-export-streams` time windows (4), each with its own cursor, read
-  side by side at `--plc-export-rate` requests a second (2, all windows together). The last window
-  has no end, and once every other window is done it's the live tail, polled every 2 s.
-- 429s and 5xxs back off (1 s doubling to 2 min, or the `Retry-After`). Progress is in
-  `vlrelay_plc_export{what}`, and `vlrelay_identity_lookups{outcome="seeded"}` counts the lookups
-  it saved.
-- The cursors checkpoint to `plc/export-checkpoint.json` every 10 s, so a restart re-reads at most
-  that interval. In a cluster the lowest-named live core reads the export and forwards each batch
-  to the DID owners, and a leadership change resumes from the checkpoint.
-- Validation is thin on purpose. A line must be a well-formed op of a known type for a valid
-  did:plc. The op chain isn't checked, since every commit is still verified against the seeded key
-  and a failure re-resolves from PLC. Every `#identity` also forces a fresh resolve.
-- Seeds live in the DID shard's SlateDB, about 100 bytes raw per DID for real hosts (~3 GB in SSTs
-  for 56M).
-
-The relay isn't the limit, plc.directory is. Its pages are about 0.7 KB an op, so the ~80M ops
-behind 56M DIDs (an estimate) are ~56 GB.
-
-| `--plc-export-rate` | Cold start | Download |
-|---|---|---|
-| 1/s | 22 h | 0.7 MB/s |
-| 2/s (default) | 11 h | 1.4 MB/s |
-| 5/s | 4.4 h | 3.5 MB/s |
-
-The rates plc.directory allows aren't documented. Start at the default and watch
-`vlrelay_plc_export{what="throttled"}`.
+The leader makes the takedown an entry in the log, which sets the account record's flag and
+carries the `#account`, so it commits like any event. Every node polls `policy/takedowns/` every
+10 s for its replay filter. An empty filter does no parsing at all, and a non-empty one costs
+~88 ns an event (about 1% of a core at 100k/s).
 
 ## Gaps
 
@@ -285,10 +251,10 @@ The rates plc.directory allows aren't documented. Start at the default and watch
   defaults ([Subscribe to the firehose](subscribing.md#falling-behind)).
 - A relay-throttled account stays throttled until an operator lifts it, even after its host drops
   below its cap or its cap is raised.
-- Without `--plc-export`, a cold start resolves every account once at the PLC budget, about 31
-  hours for 56M accounts.
-- The account cap and the per-host new-account rate are per node, so a host shard that moves starts
-  them over from the record's count.
+- A cold start resolves every account once at the PLC budget, about 31 hours for 56M accounts at
+  500/s. Seeding identities from the PLC directory's export isn't built on the quorum log yet.
+- The account cap and the per-host new-account rate are counted on the leader and aren't in the
+  bucket's host table, so they start over at a takeover.
 - Peers aren't nudged after a save. They pick changes up within 10 s, and a takedown reaches other
   nodes' replay filters within one poll.
 - The new-hosts counter is per UTC day. indigo uses a sliding 24 h window.

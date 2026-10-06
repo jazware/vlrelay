@@ -2,43 +2,42 @@
 title: Deploy
 section: Operations
 order: 101
-summary: "Building the image, one node on Docker Compose, a three-core cluster with peer mTLS, edges and replicas, and the proxy in front."
+summary: "Building the image, one node on Docker Compose, a three-node quorum cluster, the bucket's layout, the proxy in front and rolling upgrades."
 ---
 
 ```hero
 diagram:
-  caption: A production cluster. Three cores on separate machines share one bucket and prefix and talk over mTLS on the private network. A TLS proxy in front gives consumers wss:// and PDSes https://. Edges and replicas take consumers off the cores.
+  caption: A production cluster. Three nodes on separate machines share one bucket and prefix and replicate the log to each other over the peer port on the private network. A TLS proxy in front gives consumers wss:// and PDSes https://, and any node serves any consumer.
   nodes:
     - { id: pds, label: PDSes, sub: requestCrawl · streams, at: [0, 0], size: [8, 3], tone: muted, stack: true }
     - { id: cons, label: Consumers, sub: subscribeRepos, at: [0, 8], size: [8, 3], tone: blue, stack: true }
     - { id: proxy, label: TLS proxy, sub: "Caddy · nginx · an LB", at: [11, 4], size: [8, 3], tone: muted }
-    - { id: c1, label: core n1, sub: ":2980 · peer :2979", at: [23, 0], size: [9, 2.6], tone: accent }
-    - { id: c2, label: core n2, sub: ":2980 · peer :2979", at: [23, 4.2], size: [9, 2.6], tone: accent }
-    - { id: c3, label: core n3, sub: ":2980 · peer :2979", at: [23, 8.4], size: [9, 2.6], tone: accent }
-    - { id: edge, label: Edges · replicas, sub: more egress, at: [11, 12.5], size: [8, 3], tone: blue }
+    - { id: c1, label: node n1, sub: ":2980 · peer :2978", at: [23, 0], size: [9, 2.6], tone: accent }
+    - { id: c2, label: node n2, sub: ":2980 · peer :2978", at: [23, 4.2], size: [9, 2.6], tone: accent }
+    - { id: c3, label: node n3, sub: ":2980 · peer :2978", at: [23, 8.4], size: [9, 2.6], tone: accent }
     - { id: bucket, label: Bucket, sub: "one `--prefix`", at: [37, 4.2], size: [8, 2.6], shape: store, tone: amber }
   groups:
-    - { label: private network · peer mTLS, around: [c1, c2, c3], tone: accent }
+    - { label: private network · quorum log, around: [c1, c2, c3], tone: accent }
   edges:
     - "pds.r -> proxy.l30"
     - "cons.r -> proxy.l70"
     - proxy.r -> c1.l
-    - "proxy.r -> c2.l: any core"
+    - "proxy.r -> c2.l: any node"
     - proxy.r -> c3.l
     - c1.r -> bucket.l
     - c2.r -> bucket.l
     - c3.r -> bucket.l
-    - { from: edge.t, to: proxy.b, label: behind the same name, dash: true }
 facts:
-  - { value: "0", unit: local disk, label: needed by any node, note: "a node is the binary, bucket credentials and a port" }
-  - { value: "2980", label: public port, note: "firehose, sync API, /admin, /docs and /metrics; peers on 2979", tone: accent }
-  - { value: "24", unit: DID shards, label: in a new cluster, note: "splits evenly over 2, 3, 4, 6 and 8 cores; read once", tone: violet }
-  - { value: "~390", unit: GB, label: raw log at 72 h, note: "at ~330 events/s, before zstd's ~1.56×", tone: amber }
+  - { value: "1", unit: NVMe disk, label: per node, note: "`--qlog-dir`, the commitlog; the bucket holds the rest", tone: amber }
+  - { value: "2980", label: public port, note: "firehose, sync API, /admin, /docs, /metrics; peers on 2978", tone: accent }
+  - { value: "2 of 3", label: commit, note: "so one node at a time can be down or restarting", tone: violet }
+  - { value: "~390", unit: GB, label: raw log at 72 h, note: "at ~330 events/s, before zstd", tone: amber }
 ```
 
-A vlRelay node is one process and one bucket prefix. It keeps nothing on local disk, so a node is
-just the `vlrelay` binary (or the image), bucket credentials and a public port. Every flag is in
-[Configuration](configuration.md).
+A vlRelay node is one process, a local disk for its commitlog and one bucket prefix. Every node is
+a member of a quorum log. One node alone is a one-member log, and three nodes commit an event once
+two of them hold it. Every flag is in [Configuration](configuration.md), and
+[Cluster](../cluster.md) has the mechanism.
 
 ## The image
 
@@ -52,7 +51,7 @@ just docker-build vlrelay:dev 1      # with fakepds and e2e_check in the image t
 ```
 
 The image has three stages. A node stage builds the dashboard and the docs into
-`/usr/share/vlrelay/ui`. A Rust stage builds the release binary (fat LTO, no debug info, and no
+`/usr/share/vlrelay/ui`. A Rust stage builds the release binary (fat LTO and no
 `target-cpu=native`). The runtime is `debian:bookworm-slim` running as uid 10001 under `tini`. The
 UI is the last layer, so a UI-only or docs-only change rebuilds in seconds.
 
@@ -70,18 +69,43 @@ docker run --rm -p 2980:2980 vlrelay:local \
 ## The bucket
 
 vlRelay uses vlpds's store, so a bucket that works for vlpds works here. It needs strongly
-consistent conditional writes (`If-None-Match: *` for log segments and fences, `If-Match` for
-leases, assignments, host records and the policy). S3, R2, GCS, Tigris and MinIO all qualify.
-vlpds's [object store page](https://github.com/jazware/vlpds/blob/main/docs/operations/object-store.md)
+consistent conditional writes (`If-None-Match: *` and `If-Match`), which the flush manifest, the
+leader record and the policy use. S3, R2, GCS, Tigris and MinIO all qualify. vlpds's
+[object store page](https://github.com/jazware/vlpds/blob/main/docs/operations/object-store.md)
 covers choosing one, and its `vlpds-bucket-probe` checks a bucket before you trust it.
 
 One relay lives under one `--prefix` (default `vlrelay`). Every node of a cluster uses the same
-bucket and prefix, and two relays can share a bucket with different prefixes. The log keeps
-`--retention` hours of events for cursor replay (72 by default). At Bluesky's average of ~330
-events/s that's ~390 GB of raw events, or about 250 GB after zstd. [Cost](../cost.md) has the
-request and storage bill per provider.
+bucket and prefix, and two relays can share a bucket with different prefixes. The log's part of
+the prefix is written by the leader:
+
+| Path | What | Written |
+|---|---|---|
+| `qlog/leader` | the epoch, the leader and the members | at a takeover or a membership change |
+| `qlog/manifest` | the last seq flushed, the segments, the records' checkpoint, the cursors | every flush (`--qlog-flush-ms`, 30 s), last |
+| `qlog/state*` | one SlateDB: each account's record, the host table and the PDS cursors | every flush |
+| `log/qlog/` | 64 MiB segments of the log, for old cursors | every flush |
+| `retain/qlog` | what retention deleted | every retention pass |
+
+The policy, domain rules, takedowns (`policy/`) and cases (`cases/`) sit next to them, written by
+whichever node an operator or the policy engine changes them on.
+
+The leader deletes segments older than `--qlog-retain-hours` (72) every
+`--qlog-retain-every-secs` (600). At Bluesky's average of ~330 events/s, 72 hours is ~390 GB of
+raw events, and less after zstd (`--log-compression`). At today's rate the bucket sees about 0.5
+writes and 1.7 reads a second. [Cost](../cost.md) has the bill per provider.
 
 ## One node
+
+A node with no `--qlog-peer` is a one-member quorum log. Its commitlog on `--qlog-dir` is the
+write-ahead log, and it flushes to the bucket on the same schedule as a cluster.
+
+```bash
+vlrelay --node-id n1 --qlog-dir /var/lib/vlrelay/qlog \
+        --s3-endpoint ... --prefix relay1 --host pds.example.com --crawl
+```
+
+Without `--qlog-dir` the log is in memory only. A restart then resumes from the bucket's last
+flush, with a jump in the seqs, and the PDSes send the rest again.
 
 `deploy/single/docker-compose.yml` runs a node on a local MinIO:
 
@@ -98,94 +122,90 @@ UPSTREAM=morel.us-east.host.bsky.network VLRELAY_ADMIN_TOKEN=$(openssl rand -hex
 - The firehose is `ws://127.0.0.1:2980/xrpc/com.atproto.sync.subscribeRepos`, the dashboard is
   `http://127.0.0.1:2980/admin` (user `admin`, password the token) and these docs are at
   `http://127.0.0.1:2980/docs`.
-- `docker compose down` and `up` again resumes every host from its checkpointed cursor, since all
-  state is in the bucket. `down -v` deletes the MinIO volume and the relay with it.
+- The example passes no `--qlog-dir`, so its log is in memory. `docker compose down` and `up`
+  again resumes from the last flush in MinIO, with a seq jump. `down -v` deletes the MinIO volume
+  and the relay with it.
 
-For a real deployment, swap MinIO for your bucket (`VLRELAY_S3_*`) and drop the `minio` services.
+For a real deployment, swap MinIO for your bucket (`VLRELAY_S3_*`), drop the `minio` services,
+and mount a local disk for `--qlog-dir` (`VLRELAY_QLOG_DIR`), writable by uid 10001.
 
 ## A cluster
 
-A cluster is several core nodes on the same bucket and prefix. Each core holds a lease, owns some
-host shards and some DID shards, and merges every core's log into the same stream. A crashed
-core's shards move to the others after its lease lapses (`--lease-ttl-ms`, 10 s, plus a fifth of
-it), or within about a second if its peer port refuses connections. A SIGTERM'd core hands its
-shards over first. [Cluster](../cluster.md) has the mechanism and the HA measurements.
-
-Cores and edges talk to each other over mTLS on `--peer-listen` (2979). Each needs a certificate
-from a cluster CA, the shared `--internal-token` and an `--advertise-url` its peers can reach.
-vlRelay uses vlpds's peer TLS as is, so `vlpds admin tls` makes the files.
-
-`deploy/cluster/` runs three cores on one machine:
+Three nodes on separate machines, each with a local NVMe disk, the same bucket and the same
+`--prefix`. Give each node its own id, its peer port on the private network, and the other two as
+peers:
 
 ```bash
-cd deploy/cluster
-./certs.sh          # pki/ca.{crt,key} and pki/<node>/{ca.crt,<node>.crt,<node>.key} for n1 n2 n3 edge
-export VLRELAY_INTERNAL_TOKEN=$(openssl rand -hex 32) VLRELAY_ADMIN_TOKEN=$(openssl rand -hex 16)
-UPSTREAM=morel.us-east.host.bsky.network docker compose up -d --build
-docker compose --profile followers up -d      # an edge (:2984) and a replica (:2985)
+vlrelay --node-id n1 --listen 0.0.0.0:2980 \
+        --qlog-listen 10.0.0.1:2978 --qlog-peer n2=10.0.0.2:2978 --qlog-peer n3=10.0.0.3:2978 \
+        --qlog-dir /var/lib/vlrelay/qlog --qlog-admin-token "$QLOG_TOKEN" \
+        --s3-endpoint ... --prefix relay1 --host pds.example.com --crawl
 ```
-
-The cores serve on 127.0.0.1:2981-2983. They emit the same events with the same seqs, so a
-consumer can connect to any of them (or a load balancer over all three) and resume on another
-with its cursor.
-
-On real hosts, run one node per machine and give each:
 
 | What | Flag / env | Notes |
 |---|---|---|
-| Role | `--role core` (or `--cluster`) | |
-| Node id | `--node-id` / `VLRELAY_NODE_ID` | Unique, and the name on its certificate |
-| Peer listener | `--peer-listen` / `VLRELAY_PEER_LISTEN` | On the private network only |
-| Advertise URL | `--advertise-url` / `VLRELAY_ADVERTISE_URL` | `https://<private address>:2979`, the address on its certificate |
-| Peer TLS | `--peer-tls-dir` / `VLRELAY_PEER_TLS_DIR` | `ca.crt`, `<node-id>.crt`, `<node-id>.key` |
-| Token | `--internal-token` / `VLRELAY_INTERNAL_TOKEN` | The same on every core and edge |
+| Node id | `--node-id` / `VLRELAY_NODE_ID` | Unique per node. It's the member's name in `qlog/leader` |
+| Peer port | `--qlog-listen` / `VLRELAY_QLOG_LISTEN` | Replication and submits. On the private network only |
+| Peers | `--qlog-peer id=host:port` / `VLRELAY_QLOG_PEERS` | Each other node's `--qlog-listen`, repeatable or comma-separated |
+| Commitlog | `--qlog-dir` / `VLRELAY_QLOG_DIR` | A local NVMe disk. Commits wait on its fsync |
+| Membership token | `--qlog-admin-token` / `QLOG_ADMIN_TOKEN` | The same on every node. Without it membership changes are refused |
+| Admin token | `--admin-token` / `VLRELAY_ADMIN_TOKEN` | The dashboard's password, the same on every node |
 
-Make the certificates with a vlpds binary, and keep `ca.key` off the nodes:
+The peer port has no TLS or auth of its own, so keep it on a private network or a tunnel
+(WireGuard, Tailscale). The first start writes the member set to `qlog/leader`
+(`--qlog-members`, default this node and its peers). After that the bucket's record wins, and the
+set changes only through a membership change.
+
+In Docker, mount the commitlog and publish the peer port on the private address only:
 
 ```bash
-vlpds admin tls ca --out ./pki
-vlpds admin tls issue --ca ./pki/ca.crt --ca-key ./pki/ca.key --out ./pki \
-  --node-id n1 --host 10.0.0.1          # per node, 365 days (--days)
+docker run -d --name vlrelay --restart unless-stopped --stop-timeout 30 \
+  -p 2980:2980 -p 10.0.0.1:2978:2978 \
+  -v /var/lib/vlrelay/qlog:/var/lib/vlrelay/qlog \
+  -e VLRELAY_S3_ENDPOINT -e VLRELAY_S3_BUCKET -e VLRELAY_S3_ACCESS_KEY -e VLRELAY_S3_SECRET_KEY \
+  -e VLRELAY_ADMIN_TOKEN -e QLOG_ADMIN_TOKEN \
+  vlrelay:local --node-id n1 --qlog-listen 0.0.0.0:2978 \
+  --qlog-peer n2=10.0.0.2:2978 --qlog-peer n3=10.0.0.3:2978 \
+  --qlog-dir /var/lib/vlrelay/qlog --prefix relay1 --host pds.example.com --crawl
 ```
 
-Nodes reload changed certificate files without a restart. vlpds's
-[scaling and clustering page](https://github.com/jazware/vlpds/blob/main/docs/operations/scaling-and-clustering.md)
-covers renewal and CA rotation, and it's the same here.
+Every node reads the PDSes the leader's host table gives it, and every node serves the whole
+stream with the same seqs. So a consumer can connect to any node (or a load balancer over all
+three) and resume on another with its cursor. `--host` and `--crawl` work on any node, since a PDS
+admitted anywhere goes into the leader's host table.
 
-`--did-shards` and `--host-shards` only matter the first time a cluster starts on an empty prefix.
-After that the layout in the bucket wins. Each core takes at most its fair share,
-`ceil(shards / cores)`, so a shard count that doesn't spread can leave a core with no DID state,
-and then everything it reads is forwarded (4 shards over 3 cores goes 2/2/0). The cluster default
-of 24 splits evenly over 2, 3, 4, 6 and 8 cores and leaves none empty at 5. For 7 cores or more
-than 8, pick a multiple of the core count you expect. A shard can also be split or merged later
-([Resharding](../cluster.md#resharding)).
+### Changing the members
 
-### Edges and replicas
+Replacing a machine, or growing from one node to three, is a membership change. Start the new
+node with the others as `--qlog-peer`s. It joins as a learner, copies the leader's log, and the
+switch happens at a flush. Send the change from the dashboard's Quorum page, or from the admin API
+on any node:
 
-Both serve the merged firehose and `/xrpc/_health`, and neither takes upstreams or holds shards.
-They sit ~275 ms behind the cores (the merge guard plus polling).
+```bash
+curl -u admin:$VLRELAY_ADMIN_TOKEN -H 'content-type: application/json' \
+  -d '{"members": ["n1", "n2", "n4"], "addrs": {"n4": "10.0.0.4:2978"}}' \
+  https://relay.example.com/admin/api/cluster/quorum/members
+```
 
-- An edge (`--role edge`) follows every core's log over peer mTLS. It needs a certificate, the
-  token and bucket read access.
-- A replica (`--role replica`) follows the logs from the bucket alone. It needs read-only bucket
-  credentials and nothing else, so it can run anywhere that can read the bucket.
-
-Add them when consumers need more egress than the cores have. A full-firehose consumer costs ~1.6
-Gb/s at 33k events/s, so a NIC runs out long before the CPU ([Performance](../perf.md#fan-out)).
-To include them in a core's dashboard, pass their public URLs with `--admin-follower` on each core
-and give them the same `--admin-token` ([Admin API](../admin-api.md#on-a-cluster)).
+`members` is the whole set wanted, and `addrs` names a new node that the others' `--qlog-peer`
+flags don't. The `qlog` tool (`cargo run --release --bin qlog -- member`) does the same with
+`add ID`, `remove ID`, `replace OLD NEW` or `set ID,ID,...`. It finds the leader through each
+node's `/qlog/status` and retries across a leader change. Details:
+[Cluster](../cluster.md#changing-the-members).
 
 ## In front of it
 
 vlRelay serves plain HTTP. Put a TLS proxy (Caddy, nginx, a cloud load balancer) in front of
 `--listen` so consumers get `wss://` and PDSes can reach `requestCrawl` over `https://`.
 
-- `/metrics` has no auth. Keep it off the public side of the proxy and scrape it on the private
-  address.
+- `/metrics` and `/qlog/status` have no auth. Keep them off the public side of the proxy and
+  scrape them on the private address.
+- `POST /qlog/members` is on `--listen` too, behind the bearer `--qlog-admin-token`. Don't proxy
+  `/qlog/` at all.
 - `/admin` is behind the admin token (HTTP basic, user `admin`). It's fine to expose, but there's
   no reason to. `/docs` is public and static, and it's served even without `--admin-token`.
 - Proxy the websocket without buffering, and with an idle timeout of a minute or more.
-- The peer port (2979) belongs on the private network only.
+- The peer port (`--qlog-listen`, 2978) belongs on the private network only.
 - Name the proxy with `--trusted-proxy <CIDR,...>` (or `VLRELAY_TRUSTED_PROXIES`), and have it
   append the client's address to `X-Forwarded-For`. Per-IP limits (consumers per IP,
   `requestCrawl` calls per minute) key on that header's rightmost address that isn't a trusted
@@ -195,13 +215,20 @@ vlRelay serves plain HTTP. Put a TLS proxy (Caddy, nginx, a cloud load balancer)
 
 ## Shutting down and upgrading
 
-Send SIGTERM (`docker stop` does, and `tini` forwards it). A core marks its lease draining, hands
-its host shards over (cursors checkpointed), then its DID shards, fences its log and exits. Its
-consumers keep their sockets until the process exits and then resume elsewhere with their cursor.
-The compose files give it 30 s (`stop_grace_period`).
+Send SIGTERM (`docker stop` does, and `tini` forwards it). The node closes its PDS sockets and
+exits. Its consumers' sockets close with it, and they resume on another node with their cursor.
+Its PDSes move to the other nodes after `--qlog-host-failover-ms` (2 s) and resume from their
+cursors. If it was the leader, another node takes over, in 50-120 ms when the process is gone and
+after `--qlog-election-ms` (1 s) of silence when it hangs.
 
-So a rolling upgrade is one core at a time: stop it, start the new image, and wait for
-`/xrpc/_health` before the next. vlRelay doesn't have vlpds's feature levels yet, so there's no
-guard against a new version writing something an old one can't read.
+A rolling upgrade is one node at a time, since two of three must stay up to commit:
+
+1. Stop one node and start the new image on the same `--qlog-dir`.
+2. Wait for `/xrpc/_health`, then for the node to show as a member on the dashboard's Quorum page
+   (or in its `/qlog/status`) with its `commit` caught up to the leader's.
+3. Move on to the next. Doing the leader last costs one takeover instead of two.
+
+A one-node relay is down for the length of its restart. vlRelay doesn't have vlpds's feature
+levels yet, so there's no guard against a new version writing something an old one can't read.
 
 Prometheus series are on `/metrics` of every node, and [Monitoring](monitoring.md) lists them.

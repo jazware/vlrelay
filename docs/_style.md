@@ -26,7 +26,7 @@ name private hosts, paths and people, or that only make sense with the repo open
   served.
 
 When a page mixes the two (a public mechanism plus the Rust API that wires it), the public part
-stays here and the rest moves to an internal file such as `cluster-internals.md`.
+stays here and the rest moves to an internal file such as `policy-internals.md`.
 
 ## How it is built
 
@@ -61,7 +61,7 @@ stays here and the rest moves to an internal file such as `cluster-internals.md`
 
 2. Start the body with a ```` ```hero ```` block (below), then `##` sections. No `#` heading: the
    title comes from front matter.
-3. Link to other pages by file: `[resharding](cluster.md#resharding)`,
+3. Link to other pages by file: `[the path of an event](cluster.md#the-path-of-an-event)`,
    `[deploy](operations/deploy.md)`, `[overview](../overview.md)` from inside `operations/`.
    Anchors are the heading text, lowercased, with runs of other characters turned into `-`.
    vlpds pages are links to its source (`https://github.com/jazware/vlpds/blob/main/docs/…`).
@@ -427,7 +427,7 @@ Run `just docs-check` after every page.
 
 ## Avoiding duplication
 
-- The internal notes (`perf-log.md`, `cluster-internals.md`, `policy-internals.md`, `chaos.md`,
+- The internal notes (`perf-log.md`, `quorum.md`, `policy-internals.md`, `chaos.md`,
   `shadow.md`, `reference-notes.md`, `PLAN.md`) remain the deep log: every iteration, measurement
   and rejected alternative. The docs are the curated, current view: what's true now and what an
   operator or consumer needs.

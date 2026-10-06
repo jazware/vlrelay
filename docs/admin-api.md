@@ -7,25 +7,25 @@ summary: "The JSON API behind the /admin dashboard (overview, hosts, consumers, 
 
 ```hero
 diagram:
-  caption: The dashboard is a static page that calls /admin/api with the admin token. On a cluster, the node answering asks every other member for its numbers over the peer admin RPC and adds them up, so any core's dashboard shows the whole cluster.
+  caption: The dashboard is a static page that calls /admin/api with the admin token. Each node answers for itself (its hosts, consumers and numbers), asks the other members for their quorum status over the peer port, and sends account reads and takedowns through the leader. Policy and cases are shared in the bucket.
   nodes:
     - { id: ui, label: Dashboard, sub: "`/admin`", at: [0, 3], size: [8, 3], tone: accent }
     - { id: curl, label: curl, sub: "`-u admin:$TOKEN`", at: [0, 8], size: [8, 3] }
-    - { id: n1, label: core answering, sub: "`/admin/api/*`", at: [13, 5.5], size: [10, 3], tone: accent }
-    - { id: n2, label: other cores, sub: peer admin RPC · mTLS, at: [28, 2], size: [10, 3], tone: accent }
-    - { id: fol, label: edges · replicas, sub: "`--admin-follower`", at: [28, 9], size: [10, 3], tone: blue }
+    - { id: n1, label: node answering, sub: "`/admin/api/*`", at: [13, 5.5], size: [10, 3], tone: accent }
+    - { id: n2, label: other members, sub: status · peer port, at: [28, 2], size: [10, 3], tone: accent }
+    - { id: lead, label: leader, sub: records · takedowns, at: [28, 9], size: [10, 3], tone: violet }
     - { id: pol, label: "`policy/` `cases/`", sub: shared · CAS, at: [42, 5.5], size: [9, 2.6], shape: store, tone: amber }
   edges:
     - "ui.r -> n1.l30: Basic auth"
     - "curl.r -> n1.l70"
-    - "n1.r30 -> n2.l: report · hosts · accounts"
-    - "n1.r70 -> fol.l: report · consumers"
-    - { from: n2.r, to: pol.l30, label: edits, dash: true }
+    - "n1.r30 -> n2.l: quorum status"
+    - "n1.r70 -> lead.l: takedown entry"
+    - { from: n1.r, to: pol.l, label: edits, dash: true }
 facts:
   - { value: "Basic", label: "`admin:<token>`", note: "`--admin-token`; a bad or missing token is a 401", tone: accent }
   - { value: "camelCase", label: JSON, note: "times in unix ms (`…Ms`) unless a field says seconds" }
   - { value: "409", label: on a stale edit, note: "policy and rules carry the version they were edited from", tone: rust }
-  - { value: "1.5 s", label: before a member is stale, note: "its rows show dashes, and the page never waits on it", tone: blue }
+  - { value: "this node", label: answers, note: "accounts are the leader's; the cluster view asks every member", tone: blue }
 ```
 
 The dashboard (`ui/`) talks to JSON endpoints under `/admin/api/`. The wire types live in
@@ -42,31 +42,27 @@ public page at `/`, its stats (`/api/public/stats`, below) and `/docs` are still
 
 | Method | Path | Body / query | Returns |
 |---|---|---|---|
-| GET | `overview` | | `Overview`: events/s in and out, bytes/s, consumers, hosts connected/total and by status, rejects/s by reason, time to firehose p50/p99, log durability lag, open cases, the busiest hosts and 5 min of 1 s history for the charts. On a cluster also `byNode` (each node's share, stale ones flagged) and `streamEventsPerSec` |
-| GET | `hosts` | `q`, `tier`, `status`, `sort`, `desc`, `limit` (default 10,000), `offset` | `{total, hosts: HostRow[]}` |
-| GET | `hosts/{host}` | | `HostDetail`: the row, the limits in force, rejects by reason, a sample of recent rejects, 2 min of per-second events and rejects, operator actions, open cases |
-| POST | `hosts/{host}/action` | `{"action": "set-tier", "tier"}`, `{"action": "throttle", "eventsPerSec": n or null}`, `{"action": "suspend", "reason"}`, `{"action": "ban", "reason"}`, `{"action": "unban"}`, `{"action": "reconnect"}`, `{"action": "set-account-limit", "maxAccounts"}` (null: back to the tier's cap) | the updated `HostRow` |
+| GET | `overview` | | `Overview` for this node: events/s in and out, bytes/s, consumers, hosts connected/total and by status, rejects/s by reason, time to firehose p50/p99, commit lag, open cases, the busiest hosts and 5 min of 1 s history for the charts. `byNode` has this node's row, and `streamEventsPerSec` is the stream's own rate |
+| GET | `hosts` | `q`, `tier`, `status`, `sort`, `desc`, `limit` (default 10,000), `offset` | `{total, hosts: HostRow[]}`: every host in the leader's table, each with the `node` reading it. Only this node's hosts carry live numbers |
+| GET | `hosts/{host}` | | `HostDetail`: the row, the limits in force, rejects by reason, a sample of recent rejects, 2 min of per-second events and rejects, operator actions, open cases. The rates and rejects are this node's |
+| POST | `hosts/{host}/action` | `{"action": "set-tier", "tier"}`, `{"action": "throttle", "eventsPerSec": n or null}`, `{"action": "suspend", "reason"}`, `{"action": "ban", "reason"}`, `{"action": "unban"}`, `{"action": "reconnect"}`, `{"action": "set-account-limit", "maxAccounts"}` (null: back to the tier's cap) | the updated `HostRow`. `reconnect` works only on the node reading the host, and elsewhere it's a 400 naming that node |
 | GET, POST | `domain-rules` | POST `{pattern, effect, note}` | `DomainRule[]`, or the new rule |
 | PUT, DELETE | `domain-rules/{id}` | PUT as POST | the rule, or 204 |
 | GET, PUT | `policy` | PUT `{baseVersion, policy, note}` | `PolicyDoc` (version, policy, updated at/by) |
 | GET | `policy/audit` | | `PolicyAudit[]`, newest first |
 | GET, PUT | `policy/full` | PUT `{baseVersion, policy, note}` | `FullPolicyDoc`: the engine's whole document (tier limits, transitions, spam thresholds and actions, cluster budgets, consumer limits, crawl settings) |
-| GET | `domain-rules/audit` | | `PolicyAudit[]` of the domain rules, newest first |
-| GET | `consumers` | | `Consumer[]` |
-| POST | `consumers/{id}/kick` | `node` (ids are per node; default the node answering) | 204 |
-| GET | `cluster` | | nodes (role, lease, shards, rates, consumers, stream seq, CPU, memory, build, `stale`) and the owner of every host shard and DID shard |
-| GET | `ops/pipeline` | | `PipelineView`: per core the events in flight (read, not yet durable), the oldest one's age, the lane queue, restart-dedupe entries, paused readers and every pipeline gauge; the hosts with the most in flight or a paused reader |
-| GET | `ops/seq` | | `SeqView`: each node's stream head and newest seq checkpoint, and the recent 10 s boundaries with the seq each node counted, flagged where they disagree |
-| GET | `ops/archive` | | `ArchiveView`: archival mode and policy version, mirrored repos, fetch queue (queued, running), failed, retried, fetched bytes and records, mismatches, per core, and the newest fetch failures |
-| GET | `ops/plc` | | `PlcView`: the core reading the PLC export, ops read and their rate, written, throttled (429s), errors, caught up or not, per-window progress from the stored checkpoint, per core |
-| GET | `cluster/quorum` | | `QuorumView`: `{nodes: [{node, addr, stale, error, reportedMs, status}]}`, one per member, learner or retired node. `status` is the node's `/qlog/status` as it serialized it (snake_case: role, epoch, leader, last, commit, emitted, flushed F, reserve R, flush, members, learners, switches, recovered, counters, `commit_us`, disk), passed through so new fields show up. 404 on a relay that doesn't run the quorum log |
-| POST | `cluster/quorum/members` | `{members: [...], addrs?: {node: "host:port"}}`: the whole member set wanted, and addresses for nodes the leader can't dial yet | the leader's status after the change. Forwarded to the leader's `POST /qlog/members`; a new node joins as a learner, a removed one retires |
-| GET | `settings` | | `SettingsView`: `{binary, version, entries: [{flag, env, value, source, default, secret, set, help}]}` for every process flag. `source` is `flag`, `env`, `default` or `unset`. A secret (`hide_env_values`, or a name with token, secret, access_key or password) has `value` and `default` null and only says whether it's `set` |
 | GET | `policy/defaults` | | the full policy document as a fresh relay has it (`PolicyBody::default()`), for the Tuning page's defaults |
-| GET | `cluster/layout` | | the DID shard layout: `{version, shards: [{id, lo, hi, owner}], nextId, op}` (cluster core nodes only) |
-| POST | `cluster/reshard` | `{"op": "split", "shard", "at"?, "wait"?}`, `{"op": "merge", "left", "right", "wait"?}`, `{"op": "abort"}` | `{op, done?, layout}` (`done` with `wait`: the op flipped). See [Cluster](cluster.md#resharding) |
+| GET | `domain-rules/audit` | | `PolicyAudit[]` of the domain rules, newest first |
+| GET | `consumers` | | `Consumer[]`, this node's |
+| POST | `consumers/{id}/kick` | `node` (ids are per node; default this node) | 204. A consumer on another node is a 400 naming it |
+| GET | `cluster` | | `ClusterView`: each member from its quorum status (`role` is `leader`, `follower`, `candidate` or `unreachable`, plus its hosts, consumers, rates, commit lag, CPU, memory, stream seq and `stale`), the reading node of every host in the leader's table (`hostShards`), the leader as the one holder of account records (`didShards`), and the commit index (`lastSeq`) |
+| GET | `cluster/quorum` | | `QuorumView`: `{nodes: [{node, addr, stale, error, reportedMs, status}]}`, one per member or learner. `status` is the node's `/qlog/status` as it serialized it (snake_case: role, epoch, leader, last, commit, emitted, flushed F, reserve R, flush, members, learners, switches, recovered, counters, `commit_us`, disk), passed through so new fields show up |
+| POST | `cluster/quorum/members` | `{members: [...], addrs?: {node: "host:port"}}`: the whole member set wanted, and addresses for nodes the leader can't dial yet | the leader's status after the change. Sent to the leader with `--qlog-admin-token`, and a 400 when the node has none. A new node joins as a learner, and a removed one retires |
+| GET | `settings` | | `SettingsView`: `{binary, version, entries: [{flag, env, value, source, default, secret, set, help}]}` for every process flag. `source` is `flag`, `env`, `default` or `unset`. A secret (`hide_env_values`, or a name with token, secret, access_key or password) has `value` and `default` null and only says whether it's `set` |
+| GET | `ops/pipeline` | | `PipelineView`: this node's events in flight (read, not yet answered by the leader), the oldest one's age, the lane queue, paused readers and every pipeline gauge, and its hosts with the most in flight or a paused reader |
+| GET | `ops/plc` | | `PlcView` with `enabled: false`. PLC export seeding isn't built yet on the quorum log |
 | GET | `accounts` | `q`: a DID, a handle or a prefix | up to 100 `Account`s |
-| GET | `accounts/{did}` | | `Account`, with `archive` (wanted, mirrored, mirror rev, fetching, staging, last fetch error, takedown time) on an archiving relay |
+| GET | `accounts/{did}` | | `Account`: handle, host, the relay's status and the host's, takedown, rev |
 | POST | `accounts/{did}/takedown` | `{reason}` (required) | `Account` |
 | POST | `accounts/{did}/untakedown` | | `Account` |
 | GET | `cases` | `status`: open, acknowledged, resolved, dismissed | `Case[]`, worst severity first |
@@ -92,10 +88,7 @@ address or `localhost`, with a port (`127.0.0.1:30003`), which is how dev-networ
 On the relay (`node::admin::NodeAdmin`), consumers are the live `subscribeRepos` connections with
 their events/s, bytes/s and cursor lag, and a kick drops the socket at once. Account search takes a
 DID, a handle or a handle prefix ending in `*`, matched against the DID documents in the identity
-cache (every account with recent traffic).
-
-`GET /admin/api/archive` (archival's raw counters, this node's shards only) and `.../archive/fetch`
-belong to [archival mode](archival.md#endpoints). `ops/archive` is the cluster's summary.
+cache (every account with recent traffic on this node's hosts).
 
 ## Public stats
 
@@ -109,53 +102,36 @@ changes. The answer is cached for 1 s however many clients ask, carries
 | Field | What |
 |---|---|
 | `timeMs`, `version`, `uptimeSecs` | when the numbers were taken, the build, seconds since this process started serving |
-| `eventsInPerSec`, `eventsOutPerSec`, `streamEventsPerSec` | frames read from hosts, events sent to every consumer summed, and the merged stream's own rate |
+| `eventsInPerSec`, `eventsOutPerSec`, `streamEventsPerSec` | frames read from hosts, events sent, and the stream's own rate, on the node answering |
 | `timeToFirehoseP50Ms`, `timeToFirehoseP99Ms` | upstream receive to sent on subscribeRepos |
 | `hostsConnected`, `consumers` | counts only |
 | `lastSeq` | the newest firehose seq (any consumer sees it) |
-| `nodes`, `nodesHealthy` | node counts from the fleet report, or the quorum log's current members when there's no fleet report |
+| `nodes`, `nodesHealthy` | node counts from the overview's `byNode`, or the quorum log's current members when it's empty |
 | `health` | `ok`, `degraded` (serving with a node or member down) or `down` |
-| `quorum` | the quorum log's `ok`, `degraded` or `down` (a leader and a majority of members answering is serving), or null without one |
+| `quorum` | the quorum log's `ok`, `degraded` or `down` (a leader and a majority of members answering is serving) |
 | `history` | `{sampleSecs, t, eventsIn, eventsOut, ttfP50Ms, ttfP99Ms}`, the last 5 min at 1 s |
 
 No host names, IPs, DIDs, consumer addresses, reject samples, policy, case or node names are in it.
 
 ## On a cluster
 
-Any core node's dashboard shows the whole cluster. The node answering asks every other member for
-its own numbers over the peer admin RPC (`node::peer_admin`) and adds them up (`admin::fleet`):
+Each node's dashboard is that node's view. There's no fan-out to the other members, except for
+their quorum status:
 
-| Member | Found from | Asked at | Auth |
-|---|---|---|---|
-| core | the leases | its peer listener, `/internal/relay/v1/admin/{report,hosts,host,reconnect,consumers,kick,account,accounts,takedown}` | peer mTLS and the internal token |
-| edge, replica | `--admin-follower URL` on each core (repeatable or comma-separated; `VLRELAY_ADMIN_FOLLOWERS`) | its public listener, `/admin/api/node/{report,consumers,kick}` | the admin token (`--admin-token` on the follower, the same as the cores') |
+| What | Answered by |
+|---|---|
+| Overview, host numbers, host detail, pipeline | this node: the hosts it reads and its own rates |
+| Consumers and kicks | this node. Each member's dashboard lists its own consumers |
+| Hosts list | every host in the leader's table, with the node reading each one |
+| Reconnect | the node reading the host. Elsewhere it's a 400 naming that node |
+| Tier, throttle, suspend, ban, domain rules, policy, cases | any node, through the shared policy store in the bucket |
+| Cluster and Quorum pages | every member's `status`, asked over the peer port with an 800 ms timeout. A member that doesn't answer is `stale`, with the error, and the page never waits on it |
+| Accounts | the leader, which holds every account's record. On a follower an account read is a 400 naming the leader |
+| Takedown, untakedown | any node. The takedown goes to the leader as an entry on the log (the record's flag and the `#account` frame together). The `Account` in the answer is read from the leader's records, so on a follower the takedown is made and the call answers 400 naming the leader |
+| Membership changes | any node, which sends them to the leader with `--qlog-admin-token` |
 
-Followers answer on their public listener because a replica has no peer listener and a core's peer
-client only trusts origins that hold a lease. A core with no `--admin-token` still serves the peer
-routes, so a dashboard on another core can include it.
-
-- Totals are sums over the nodes that answered. Overview rates, bytes, consumers, hosts and
-  rejects add up. Time to firehose and durability lag take the worst node, and history adds the
-  per-second samples by time. `byNode` lists each node's share, so the totals equal the sum of the
-  rows. `eventsOutPerSec` sums every node's emits, and `streamEventsPerSec` is the stream's own rate.
-- Stale members. A member that errors or takes over 1.5 s is `stale` for that round, with the
-  error. Its rows show zeros (the UI shows dashes) and it's left out of the sums, so the page never
-  waits on a dead node. A killed core stays listed until its lease lapses, then drops off. A
-  follower stays listed (as stale) until it answers again. One round of reports is shared by the
-  requests of one refresh (0.8 s), so the pages don't multiply peer calls.
-- Hosts. Every host is listed once, from the core reading it (its host shard owner) with its
-  live rate. A host whose owner didn't answer shows this node's registry row with no rate, under the
-  owner's name. A host's detail page and a reconnect go to the owner. Tier, throttle, suspend and
-  ban go through the shared policy store as before.
-- Consumers are every node's, edges and replicas included, each with its `node`. Kicks go to
-  that node.
-- Accounts. An account's page and a takedown go to its DID shard's owner, which holds its state.
-  A handle search asks every core (handles are cached by the core reading the account's host) and
-  merges the answers.
-- Pipeline gauges are every `vlrelay_*` gauge whose name says in-flight, pending, queued,
-  backlog, paused, cap, dedupe or lag, read by name, so the in-flight caps and pause metrics the
-  pipeline adds show up without a dashboard change. `inflightCap` per host is null until the relay
-  has one.
+So to look at a member's consumers or a host's live numbers, open that member's dashboard. To
+read accounts, open the leader's.
 
 ## Demo backend
 
@@ -171,9 +147,9 @@ community PDSes are mid-sized and the rest is a long tail of self-hosted PDSes, 
 buggy implementations reject 25–45% of their frames, and seven spam hosts trip the policy's
 thresholds (account farms, forged signatures, single-account floods). A 1 s tick moves every rate
 with a compressed 20-minute "day" and the odd surge, so the totals land between ~45k and ~75k
-events/s. There are ~25 consumers (a couple replaying from old cursors), a 3-node cluster with 64
-host shards and 256 DID shards, and cases open when a host crosses a threshold. The quorum log is a
-3-member log at epoch 14 with two past membership changes and one bucket recovery; adding a member
-makes it a learner for ~20 s before it joins. Settings is a plausible production config, and the
-full policy document starts from the defaults with a few edits. Actions, rules, policy edits,
-membership changes and takedowns change the simulation, but nothing is persisted.
+events/s. There are ~25 consumers (a couple replaying from old cursors), 3 nodes, and cases open
+when a host crosses a threshold. The quorum log is a 3-member log at epoch 14 with two past
+membership changes and one bucket recovery. Adding a member makes it a learner for ~20 s before it
+joins. Settings is a plausible production config, and the full policy document starts from the
+defaults with a few edits. Actions, rules, policy edits, membership changes and takedowns change
+the simulation, but nothing is persisted.

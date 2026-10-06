@@ -2,155 +2,138 @@
 title: Overview
 section: vlRelay
 order: 1
-summary: An atproto relay whose only durable state is an object store. It subscribes to PDSes, checks every event against sync 1.1, and serves one firehose with the same seqs from every node.
+summary: An atproto relay on a replicated log. It subscribes to PDSes, checks every event against sync 1.1, and serves one firehose with the same seqs from every node, with the bucket as its cheap long-term copy.
 ---
 
 ```hero
 diagram:
-  caption: PDSes are spread over the core nodes by host. Each event hops to the node that owns its account, lands in that node's log in the bucket, and every node merges every log into the same stream. Edges and replicas serve that stream without taking any upstreams.
+  caption: Each node reads the PDSes the leader gives it, verifies their events and submits them to the leader. The leader checks each one against the account's record, gives it the next seq and replicates it, and every node emits it once two of the three hold it. Every 30 s the leader flushes the log and the records to the bucket. Three nodes stand for one to five.
   nodes:
-    - { id: pds, label: PDSes, sub: subscribeRepos, at: [0, 4.5], size: [8, 3], tone: muted, stack: true }
-    - { id: c1, label: core 1, sub: "host + DID shards · log", at: [12, 0], size: [9, 3], tone: accent }
-    - { id: c2, label: core 2, sub: "host + DID shards · log", at: [12, 4.5], size: [9, 3], tone: accent }
-    - { id: c3, label: core 3, sub: "host + DID shards · log", at: [12, 9], size: [9, 3], tone: accent }
-    - { id: pol, label: "`policy/`", sub: limits · rules · cases, at: [27, 0], size: [10, 2.6], shape: store, tone: amber }
-    - { id: ctl, label: "`nodes/` `hostck/`", sub: leases · host cursors, at: [27, 3.2], size: [10, 2.6], shape: store, tone: amber }
-    - { id: state, label: "`state/`", sub: SlateDB per DID shard, at: [27, 6.4], size: [10, 2.6], shape: store, tone: amber }
-    - { id: log, label: "`log/`", sub: "segments · 72 h", at: [27, 9.6], size: [10, 2.6], shape: store, tone: amber }
-    - { id: cons, label: Consumers, sub: AppViews · Jetstream, at: [0, 15.5], size: [8, 3], tone: blue }
-    - { id: edge, label: Edge, sub: follows cores over mTLS, at: [12, 15.5], size: [9, 3], tone: blue }
-    - { id: rep, label: Replica, sub: follows the bucket, at: [27, 15.5], size: [10, 3], tone: blue }
+    - { id: pds, label: PDSes, sub: subscribeRepos, at: [0, 5], size: [8, 3], tone: muted, stack: true }
+    - { id: n1, label: node n1, sub: "its PDSes · verify", at: [12, 0], size: [9, 3], tone: accent }
+    - { id: n2, label: leader n2, sub: "check chain · seq · append", at: [12, 5], size: [9, 3], tone: violet }
+    - { id: n3, label: node n3, sub: "its PDSes · verify", at: [12, 10], size: [9, 3], tone: accent }
+    - { id: pol, label: "`policy/`", sub: "limits · rules · cases", at: [27, 0], size: [10, 2.6], shape: store, tone: amber }
+    - { id: state, label: "`qlog/state`", sub: "records · hosts · cursors", at: [27, 3.4], size: [10, 2.6], shape: store, tone: amber }
+    - { id: log, label: "`log/qlog/`", sub: "segments · 72 h", at: [27, 6.8], size: [10, 2.6], shape: store, tone: amber }
+    - { id: cons, label: Consumers, sub: any node, at: [0, 14.5], size: [8, 3], tone: blue }
   groups:
-    - { label: vlRelay cores, around: [c1, c2, c3], tone: accent }
-    - { label: object store · the only durable state, around: [pol, ctl, state, log], tone: amber }
+    - { label: one quorum log · commit at 2 of 3, around: [n1, n2, n3], tone: accent }
+    - { label: the bucket, around: [pol, state, log], tone: amber }
   edges:
-    - pds.r30 -> c1.l
-    - "pds.r -> c2.l: by host"
-    - pds.r70 -> c3.l
-    - "c1 <-> c2: forward to DID owner"
-    - c2 <-> c3
-    - { from: c1.r30, to: pol.l, label: reload, dash: true }
-    - { from: c1.r70, to: ctl.l, label: lease CAS, dash: true }
-    - { from: c2.r, to: state.l, label: apply }
-    - "c3.r -> log.l: append, then ack"
-    - { from: c3.b, to: edge.t, label: log streams, tone: blue }
-    - { from: log.b, to: rep.t, label: segments, tone: blue, dash: true }
-    - { from: c3.l, to: cons.t, label: subscribeRepos, tone: blue }
-    - { from: edge.l, to: cons.r, tone: blue }
+    - "pds -> n1: ws"
+    - "pds -> n3: ws"
+    - "n1 -> n2: submit"
+    - "n3 -> n2: submit"
+    - { from: n1.r, to: pol.l, label: reload, dash: true }
+    - { from: n2.r, to: state.l, label: flush }
+    - { from: n2.r70, to: log.l, label: segments }
+    - { from: n2.b, to: cons.r, label: emit at commit, tone: blue, via: [[16.5, 16]] }
 facts:
-  - { value: "1", unit: bucket, label: is the only durable state, note: "log, per-account state, leases and policy in S3, R2, GCS or MinIO" }
-  - { value: "~94k", unit: events/s, label: on one 8-core node, note: "measured, every event checked; Bluesky averages ~350/s", tone: amber }
+  - { value: "2 of 3", label: commit, note: "nothing reaches a consumer before a quorum holds it", tone: accent }
   - { value: "1", unit: stream, label: with the same seqs on every node, note: "a consumer resumes on any node with its cursor", tone: blue }
-  - { value: "< 1 s", label: planned handoff, note: "on SIGTERM; a crash moves shards in ~1–2 s, ~12 s if the node hangs", tone: violet }
+  - { value: "50–120", unit: ms, label: emission pause when the leader dies, note: "kill -9; ~1 s when it hangs or is cut off", tone: violet }
+  - { value: "30 s", label: bucket flush, note: "`--qlog-flush-ms`; ~0.5 writes and ~1.7 reads a second today", tone: amber }
 ```
 
 vlRelay is an [atproto](https://atproto.com) relay written in Rust. It connects to PDSes, reads
 each one's `subscribeRepos` stream, checks every event against the sync 1.1 rules and re-emits
-them as one combined firehose. Its only durable state is an object store, so a node keeps nothing
-on local disk and losing one only costs its caches. Consumers see a normal relay: indigo's Go
-consumers, `goat`, `@atproto/sync` and Jetstream read it unchanged.
+them as one combined firehose. Consumers see a normal relay: indigo's Go consumers, `goat`,
+`@atproto/sync` and Jetstream read it unchanged.
 
-It's built from the parts of [vlpds](https://github.com/jazware/vlpds) that worked: its log,
-leases, firehose merger, SlateDB state and peer TLS. A relay's input is small (Bluesky's whole
-network averages ~350 events a second), so the hard parts are elsewhere. They're fan-out, keeping
-consumers' streams alive across restarts, cursors that work on any node, and thousands of
+Its nodes share one replicated log. One node leads, gives every event its seq and emits it once a
+majority holds it, so every node serves the same stream and a takeover keeps everything a consumer
+saw. The bucket (S3, R2, GCS or MinIO) gets the log and the accounts' records every 30 seconds,
+which makes it a cheap long-term copy (a few dollars a month in requests at today's load). A
+relay's input is small, since Bluesky's whole network averages ~350 events a second. So the hard
+parts are fan-out, streams that survive restarts, cursors that work on any node, and thousands of
 upstreams with their own failure modes. [Design](design.md) has the reasoning.
 
 ## The path of an event
 
 ```diagram
-caption: One event, from a PDS's socket to every consumer. The host owner does the stateless checks before anything crosses the network, and the DID owner does the stateful ones. Nothing reaches the firehose before it's durable in the bucket.
+caption: One event, from a PDS's socket to every consumer. The node that reads the PDS does the stateless checks before anything crosses the network, and the leader does the stateful ones. Nothing reaches the firehose before two of the three nodes hold it.
 nodes:
   - { id: pds, label: PDS, sub: "`#commit` frame", at: [0, 0], size: [7, 3], tone: muted }
-  - { id: host, label: Host owner, sub: parse · signature · MST proof, at: [12, 0], size: [10, 3], tone: accent }
-  - { id: did, label: DID owner, sub: host · rev · prevData, at: [27, 0], size: [9, 3], tone: accent }
-  - { id: seg, label: "`log/…` segment", sub: If-None-Match PUT, at: [40, 0], size: [9, 3], shape: store, tone: amber }
-  - { id: merge, label: Merger, sub: every node's logs, at: [40, 6.5], size: [9, 3], tone: blue }
-  - { id: subs, label: Consumers, sub: dense seq, at: [27, 6.5], size: [9, 3], tone: blue }
-  - { id: ack, label: Host cursor, sub: "acked · `hostck/`", at: [12, 6.5], size: [10, 3], tone: solid }
+  - { id: host, label: Reading node, sub: parse · signature · MST proof, at: [11, 0], size: [11, 3], tone: accent }
+  - { id: lead, label: Leader, sub: host · rev · prevData · seq, at: [26, 0], size: [10, 3], tone: violet }
+  - { id: fol, label: Followers, sub: commitlog, at: [40, 0], size: [9, 3], tone: accent, stack: true }
+  - { id: commit, label: Committed, sub: 2 of 3 hold it, at: [26, 6.5], size: [10, 3], tone: solid }
+  - { id: subs, label: Consumers, sub: every node emits, at: [40, 6.5], size: [9, 3], tone: blue }
+  - { id: ack, label: Host cursor, sub: moves past it, at: [11, 6.5], size: [11, 3] }
 edges:
   - "pds -> host: websocket"
-  - "host -> did: forward"
-  - "did -> seg: append"
-  - "seg -> merge: durable"
-  - "merge -> subs: subscribeRepos"
-  - { from: host.b, to: ack.t, label: once durable }
+  - "host -> lead: submit"
+  - "lead <-> fol: replicate, ack"
+  - { from: lead.b, to: commit.t, label: quorum }
+  - "commit -> subs: subscribeRepos"
+  - "commit -> ack: outcome"
 ```
 
-- The host owner reads the frame off the PDS's websocket. It checks the CBOR, the size limits,
-  the commit's signature against the account's cached signing key and the inductive proof (the
-  ops applied to the partial tree in the CAR give the commit's `data`). A signature check costs
-  ~33 µs of CPU, so one core checks ~30k events a second.
-- It forwards the event to the node that owns the account's DID shard. On three nodes about two
-  thirds of events take that hop, and the forward path batches them.
-- The DID owner runs the checks that need state. The event must come from the host the account's
-  DID document names, its `rev` must move forward, and its `prevData` must match the stored data
-  CID. Then it appends the event to its node's log. The log groups whatever queued up during the
-  last PUT into one segment (25 ms linger by default) and writes it with `If-None-Match: *`.
-- Once the segment is durable, the DID owner commits the account's new state and answers the host
-  owner, which only then counts the upstream event as done. The host's cursor is checkpointed to
-  the bucket every 2 s, so a takeover resumes the PDS's stream from there and the PDS replays the
-  rest.
-- Every node merges every node's log, and emits an event once every log's durable watermark has
-  passed it. So every node sends the same events in the same order.
+- A node reads the frame off the PDS's websocket. It checks the CBOR, the size limits, the
+  commit's signature against the account's signing key and the inductive proof (the ops applied
+  to the partial tree in the CAR give the commit's `data`). A signature check costs ~33 µs of CPU,
+  so one core checks ~30k events a second. Verifying is most of the CPU, so every node does it for
+  its own PDSes.
+- It submits the event to the leader in a batch. All of an account's events go through one batch
+  stream, so they reach the leader in the order the PDS sent them.
+- The leader runs the checks that need state. The event must come from the host the account's
+  DID document names, the account must be active, its `rev` must move forward, and its `prevData`
+  must match the record's data CID. Then the leader appends it under the next seq, with the
+  account's new record in the same entry, and replicates it.
+- Once two of the three nodes hold the entry on disk, it's committed. Every node emits it, and
+  the reading node moves its host's cursor past it. The cursors ride in the log too, so a node that
+  takes over a PDS resumes it from there and the PDS replays the rest.
 
 A failed check drops the event and counts against its host. A broken chain marks the account
-desynchronized until a `#sync` resets it, as sync 1.1 expects. Details: [Design](design.md),
-[Cluster](cluster.md).
+desynchronized until a `#sync` resets it, as sync 1.1 expects. A duplicate (the PDS sent it again
+after a reconnect) is answered without an entry. Details: [Cluster](cluster.md#the-path-of-an-event).
 
-## Host shards and DID shards
+## Hosts and the leader
 
-A node owns two kinds of shards, and each kind has one owner at a time.
+The leader keeps the host table: every PDS, its tier and the member that reads it. A host's reader
+is the live member with the highest rendezvous hash for it. So when a node goes quiet for 2 s
+(`--qlog-host-failover-ms`), only its own hosts move, and they resume from their cursors. `--host`
+and `requestCrawl` work on any node, since a host admitted anywhere goes into the leader's table.
 
-| | Host shards | DID shards |
-|---|---|---|
-| Decide | which node subscribes to which PDS | which node keeps each account's state and writes its events |
-| Keyed by | the hostname's hash, 64 shards | the DID's hash: 65,536 slots in shards, 24 in a cluster (4 alone) |
-| Owner keeps | the websockets, per-host limits, cursors | one SlateDB per shard: rev, data CID, host, status, key |
-| Moves when | a node joins, leaves or dies | the same, or an operator splits or merges a shard |
-
-The two jobs have different natural keys. One websocket carries a whole host's accounts, but an
-account's state has to change in exactly one place. Keeping them apart also makes account
-migration boring. When a DID moves to another PDS, its events start arriving through a different
-host owner, but they still land at the same DID owner, which decides whether the new host may
-speak for it.
-
-Ownership works the way it does in vlpds. Each node renews one lease, and shard assignments are
-compare-and-swap writes on objects in the bucket, so there's no consensus service to run.
-Details: [Cluster](cluster.md).
+The leader also holds every account's record (rev, data CID, host, status, signing key). The
+records live in one SlateDB that only committed entries write, and each flush seals it at exactly
+the flushed seq. So a new leader opens the records at the last flush and replays its own log from
+there, which takes tens of milliseconds. Details: [Cluster](cluster.md).
 
 ## One stream on every node
 
-Consumers see seqs 1, 2, 3, … like indigo's relay. The seq of an event is its position in the
-merged stream, and that's a pure function of what's in the bucket. So every core, edge and
-replica gives the same event the same seq without talking to each other, and a consumer can put
-the nodes behind a load balancer and resume on any of them. Old cursors are read back from sealed
-segments, which never change, so a consumer catching up from yesterday doesn't slow anyone's live
-stream. The log keeps 72 h (`--retention`).
+Consumers see seqs 1, 2, 3, … like indigo's relay. The leader gives each event its seq when it
+appends it, and every node emits the same committed log, so every node gives the same event the
+same seq. A consumer can put the nodes behind a load balancer and resume on any of them.
 
-Details: [Subscribe to the firehose](subscribing.md), [Stream seqs](seq.md).
+A node serves recent cursors from its in-memory ring (512 MiB, `--ring-mb`) and its local log, and
+older ones from the 64 MiB segments in the bucket. So a consumer catching up from yesterday doesn't
+slow anyone's live stream. The bucket keeps 72 h of log (`--qlog-retain-hours`).
+
+If two nodes lose their disks at once, the log resumes from the bucket's last flush with a jump in
+the seqs, and the PDSes send the rest again. Details: [Subscribe to the firehose](subscribing.md).
 
 ## How big it gets
 
 ```facts
-- { value: "~94k", unit: events/s, label: one 8-core node, note: "measured on MinIO, p99 time to firehose under 0.7 s, 0 rejects", tone: amber }
-- { value: "~98k", unit: events/s, label: three nodes of 3 cores + SMT, note: "measured on one box; 100k/s on 3 × 8 cores fits with headroom", tone: violet }
+- { value: "~350", unit: events/s, label: Bluesky's average today, note: "the leader needs ~0.1 vCPU for it (modeled)", tone: amber }
+- { value: "200k", unit: events/s, label: the quorum log's ceiling, note: "measured, 3 nodes, commitlogs on tmpfs; the leader used 1.8 cores", tone: violet }
 - { value: "~1.6", unit: Gb/s, label: per full-firehose consumer, note: "at 33k events/s; a NIC runs out long before the CPU", tone: blue }
-- { value: "~$1.0k", unit: /mo, label: one node at today's load, note: "modeled, OVH + R2, 100 consumers; 3 cores ~$3.4k", tone: rust }
+- { value: "~$19", unit: /mo, label: three nodes at today's load, note: "modeled, 3 OVH VPS-1 + R2, 30 s flush", tone: rust }
 ```
 
-| | Bluesky today | The design target |
-|---|---|---|
-| Events/s | ~350 average, ~480 in the busiest hour | 100k |
-| Nodes | 1, or 3 for high availability | 3 × 8 cores, 32 GB |
-| Busy cores, cluster-wide | well under 1 | ~50–60% of the cluster |
-| Firehose per consumer | ~15 Mb/s | ~4.3 Gb/s |
+CPU is cheap at relay rates. Verifying an event is the biggest cost, and every node does its own
+share. The log is cheap too. Replication costs the leader ~6 µs an event, and three nodes on tmpfs
+commit 200k events a second. On a real disk, fsynced bandwidth sets the ceiling. Three nodes
+sharing one consumer NVMe topped out at ~25k events a second, so 100× today's load wants
+datacenter drives and 10× is comfortable anywhere. Every full-firehose consumer pulls the whole
+stream, so egress is the bill wherever egress is metered. On small VPSes the hosts are the bill,
+since the bucket costs a few dollars a month. Details: [Performance](perf.md), [Cost](cost.md).
 
-CPU is cheap at relay rates. A node costs ~65–70 µs of CPU per event, and a third of that is the
-signature check. What sizes a relay is bandwidth: every full-firehose consumer pulls the whole
-stream, so egress is the bill wherever egress is metered. On unmetered hosts the bucket's
-requests are the biggest line, and they follow the number of logs and host shards, not the
-traffic. Details: [Performance](perf.md), [Cost](cost.md).
+The whole relay on the quorum log hasn't been pushed to its ceiling yet. The chaos runs drive it
+at today's rate through kill -9, partitions, pauses, power cuts, wiped disks and membership
+changes, and check every node's stream.
 
 ## Policy
 
@@ -158,33 +141,35 @@ Host tiers, per-host and per-account limits, domain rules, `requestCrawl` admiss
 cluster-wide budgets and the spam counters that open cases are one versioned document in the
 bucket. Every node reloads it within 10 s, and every change goes in an audit log. The defaults
 follow indigo's relay wherever it has a number. The operator dashboard at `/admin` edits it,
-throttles or bans hosts and takes down accounts. Details: [Policy](policy.md),
-[Admin API](admin-api.md).
+throttles or bans hosts and takes down accounts. A takedown is an entry in the log, so every node
+emits it in order. Details: [Policy](policy.md), [Admin API](admin-api.md).
 
-## One node or many
+## One node or three
 
-| | One node | A cluster |
+| | One node | Three nodes |
 |---|---|---|
-| Run with | no `--cluster` or `--role` | `--role core` on each node, plus peer mTLS |
-| DID shards | 4 | 24 (`--did-shards`, read once) |
-| When a node dies | its supervisor restarts it, and it resumes from the bucket | peers take its shards in ~1–2 s (~12 s if it hangs) |
-| More egress | | edges (mTLS) and replicas (read-only bucket access) |
+| Run with | no `--qlog-peer` | `--qlog-peer` for each other node, and `--qlog-dir` on NVMe |
+| Commit | its commitlog's fsync (the write-ahead log) | two of three on disk |
+| When a node dies | its supervisor restarts it, and it replays its commitlog | another node leads in 50–120 ms (~1 s if it hangs) |
+| When a disk dies | it resumes from the bucket's last flush, with a seq jump | nothing, unless two go at once |
 
-Going from one node to several doesn't need a migration. Start a core with the same bucket and
-`--prefix`, and it joins, takes its share of shards and merges every log. See
+One node is the same quorum log with one member, and it flushes to the bucket on the same
+schedule. So going to three is a membership change (`qlog member …` or the dashboard's Quorum
+page) with no migration. See [Cluster](cluster.md#changing-the-members) and
 [Deploy](operations/deploy.md).
 
 ## What isn't built
 
-- Archival mode (a full mirror of every repo, for `getRepo`) works, but it's off by default and
-  has gaps. See [Archival mode](archival.md).
+- Seeding the identity cache from the PLC directory's export isn't built yet, so a cold relay
+  resolves each account at the PLC budget.
+- The sync API's repo endpoints answer on the leader, and a follower names it.
 - There are no alert rules, Grafana dashboards or Ansible kit for vlRelay yet, and no published
   image. [Operations](operations/index.md) says what there is.
 - Compressed or filtered outputs (a zstd-framed stream, Jetstream-style collection filters) and
   public segments for backfill are designed but not built.
-- vlRelay is new and hasn't run in production. It has unit and differential tests, an e2e suite
-  on a local network (one node, a cluster under kill -9 and SIGTERM, policy faults, resharding,
-  archival) and a compatibility harness against indigo's tools ([Compatibility](compat.md)).
+- vlRelay is new and hasn't run in production. It has unit and differential tests, chaos runs on a
+  local network (one node and three, under kill -9, partitions, wiped disks and membership
+  changes) and a compatibility harness against indigo's tools ([Compatibility](compat.md)).
 
 ## Where to go next
 

@@ -2,7 +2,7 @@
 title: Performance
 section: Reference
 order: 302
-summary: "How many events a second a node and a cluster take with every event checked, where the CPU goes, what time to firehose looks like, and how many consumers a node can feed."
+summary: "How many events a second a node takes with every event checked, where the CPU goes, what the quorum log adds, and how many consumers a node can feed."
 ---
 
 ```hero
@@ -15,21 +15,21 @@ diagram:
     - { id: check, label: e2e_check, sub: "+ N-1 more consumers", at: [29, 6], size: [9, 3], tone: blue }
   edges:
     - "fleet -> relay: subscribeRepos"
-    - "relay.r -> minio.l: segment PUTs"
+    - "relay.r -> minio.l: bucket writes"
     - "relay.r -> check.l: firehose"
     - { from: fleet.b, to: check.b, label: the upstreams' own streams, dash: true, via: [[4.5, 11], [33.5, 11]] }
 facts:
   - { value: "~90–95k", unit: events/s, label: one 8-core node, note: "every event checked, 0 rejects, clean e2e", tone: amber }
   - { value: "~65–70", unit: µs, label: of CPU per event, note: "a third of it is the secp256k1 signature", tone: accent }
-  - { value: "~98k", unit: events/s, label: on 3 nodes of 3 cores + SMT, note: "100k on 3 × 8 cores fits with 1.6–2× headroom", tone: violet }
+  - { value: "~1.3", unit: ms, label: submit to consumer on the quorum log, note: "3 nodes on loopback at 350/s · 2 ms at 100x", tone: violet }
   - { value: "~1.6", unit: Gb/s, label: per full-firehose consumer, note: "at 33k events/s; ~0.025 cores each", tone: blue }
 ```
 
 The design target is 100k events/s on 3 nodes of 8 cores and 32 GB, so about 33k/s per node
-([Design](design.md#scale)). Bluesky's whole network averages ~350 events/s today. One node meets
-the per-node target on ~2.4 cores, and a scaled-down three-node cluster meets the whole target
-with room to spare. CPU sets the ceiling, and the network decides how many consumers a node can
-feed.
+([Design](design.md)). Bluesky's whole network averages ~350 events/s today. One node checks
+33k/s on ~2.4 cores. The quorum log itself costs little: it carried 200k events/s on three nodes
+in its own bench, at under 2 cores on the leader. CPU for verify sets the ceiling, and the network
+decides how many consumers a node can feed.
 
 ## The bench
 
@@ -55,7 +55,12 @@ Caveats:
 - Loopback stands in for the NIC.
 
 The full log, iteration by iteration with every table and profile, is in the repository next to
-these pages, with the bench scripts (`scripts/perf.sh`, `scripts/cluster-perf.sh`).
+these pages, with the bench script (`scripts/perf.sh`).
+
+The one-node numbers below were measured on the relay's earlier log, which PUT a segment to the
+bucket every 25 ms. Verify, parse and apply are the same code on the quorum log, so their costs
+carry over. The log's share and the time to firehose don't, and the quorum log's own numbers are
+in [The quorum log](#the-quorum-log).
 
 ## One node
 
@@ -72,22 +77,16 @@ where latency grows with any backlog. So the ceiling is the CPU.
 | zstd -1 on the segments (~5 on production frames) | ~9 |
 
 That's ~65–70 µs per event, linear in the rate, so 8 cores give ~115k/s with no headroom. The
-33k/s target takes ~2.4 of the 8 cores, with p99 ~100–140 ms and 0 rejects.
+33k/s target takes ~2.4 of the 8 cores, with 0 rejects. The last two rows were the earlier log's.
+On the quorum log the leader compresses segments when it flushes them, off the path to consumers.
 
-Time to firehose is linger plus one segment PUT. At 33k/s it's ~50–65 ms p50 and ~100–140 ms p99
-on disk MinIO, and 32 / 50 ms with the bucket in RAM. Above ~50k/s a segment seals on size
-(8 MiB, `--max-segment-mb`) before its 25 ms linger is up, and an 8 MiB PUT took 100–400 ms on this
-MinIO, so the p50 climbs to ~150–250 ms at 75–90k.
-
-What got it there, from ~50k/s as first measured:
+Changes from that work that still hold:
 
 | Change | Why |
 |---|---|
-| 32 segment PUTs in flight, up from 4 (`--log-inflight`) | Past ~40k/s segments seal on size, and 4 PUTs of ~100 ms each capped the log at ~40 segments a second |
-| jemalloc, without its oversize arena for 8 MiB segment buffers | libc malloc was 13% of samples, and page faults on fresh 8 MiB buffers another ~8% |
-| A committer per DID shard | One committer gave out at ~90–95k/s, and `vlrelay_ack_pending` showed it |
+| jemalloc, without its oversize arena for big segment buffers | libc malloc was 13% of samples, and page faults on fresh 8 MiB buffers another ~8% |
 | zstd -1 for segments (`--log-compression`) | Half of level 1's CPU for 0.6% more bytes |
-| SigV4 `UNSIGNED-PAYLOAD` on https endpoints | Each PUT hashed its whole 8 MiB body on a runtime worker |
+| SigV4 `UNSIGNED-PAYLOAD` on https endpoints | Each PUT hashed its whole body on a runtime worker |
 | Metric labels resolved once, foldhash for hot maps | SipHash ran about ten times per event |
 
 ## Compression
@@ -107,46 +106,40 @@ don't compress much. Over 8 MiB of production frames read off `bsky.network`, on
 all of it (~13% of the node) for 57% more bucket bytes and PUT bandwidth. That's a cost decision
 for the operator, so the default stops at -1.
 
-## A three-node cluster
+## The quorum log
 
-The bench box can't host three 8-core nodes and a fleet fast enough to load them, so the cluster
-was scaled down: 3 cores of 3 physical cores plus SMT each (6 hardware threads, 7 GB cap), on one
-MinIO, with peer mTLS on loopback. The same 6 threads also ran one node alone, so the cluster's
-cost per event compares with a single node's on identical hardware.
+The quorum log was benched on its own (`qlog load` and `qlog check`, three `qlog node` processes on
+one 16-core box over loopback), with ~5.3 KB frames, the network's mean. These are the log's
+costs: replicate, commit, emit. Verify and apply come on top, as in the table above.
 
-| Offered | Accepted/s | e2e TTF p50 / p99 | CPU (of 18 threads) | µs per event | Peer MB/s | RSS max | e2e |
-|---|---|---|---|---|---|---|---|
-| 33k | 34.2k | 181 / 484 ms | 5.57 | 163 | 521 | 1.7 GB | clean, all 3 streams identical |
-| 60k | 63.7k | 362 / 699 ms | 9.93 | 156 | 932 | 2.2 GB | clean |
-| 90k | 96.9k | 0.78 / 1.9 s | 14.47 | 149 | 1,304 | 4.3 GB | clean |
-| 120k | 120.8k | | 17.21 | 142 | 1,533 | 5.9 GB | out 104–115k/s, backlog growing |
+| | 350/s (today) | 3,500/s (10x) | 35,000/s (100x) |
+|---|---|---|---|
+| Leader append to quorum commit, p50 / p99 | 0.04 / 0.10 ms | 0.07 / 0.17 ms | 0.21 / 0.56 ms |
+| Submit to the first consumer, p50 / p99 | 1.23 / 2.29 ms | 1.33 / 2.45 ms | 1.98 / 3.48 ms |
+| CPU, leader / follower (cores) | 0.034 / 0.019 | 0.054 / 0.030 | 0.20 / 0.095 |
 
-- Every step that kept up was clean: 0 missing, reordered or duplicated events across 2.4–6.5M
-  events per step. At 33k, all three nodes' streams over the same window (847,161 events) had the
-  same events at the same seqs.
-- The three nodes take ~98k/s cleanly. At 120k they reach the CPU ceiling, and the merged stream
-  trails intake.
-- At 33k the cluster's time to firehose is p50 181 ms, against 55 ms for one node on the same
-  cores. A cluster node emits an event once every log's watermark has passed it, so the slowest
-  of three logs sets the pace. Each log also seals on linger at a third of the rate, which triples
-  the PUTs. From 90k up, MinIO's 410–819 ms PUTs dominate.
+Those are memory-only numbers. Most of the path to a consumer is the firehose's 2 ms batching
+tick, and a real placement adds the round trip between nodes (0.2 ms in one data center, ~3 ms
+across a metro). With a commitlog, the ack costs about one round trip plus 1–1.7 fsyncs. At
+3,500/s with a 1 ms fsync, submit to quorum ack was 1.26 / 1.92 ms (p50 / p99), and submit to the
+first consumer 2.42 / 3.54 ms.
 
-On the same threads, the cluster costs 142–156 µs per event and one node costs 89–94, about 1.65×.
-The extra ~55–65 µs is copies and TLS in proportion to the bytes on the peer links:
+Offered 200,000 events/s for 30 s, three nodes committed all of it (1 GB/s a node) with the
+commitlog on tmpfs, at 1.78 cores on the leader. With all three commitlogs on one consumer NVMe,
+fsync bandwidth capped it at ~25,000/s. So disk bandwidth with fsync, not CPU, sets the log's
+ceiling. 100x needs ~185 MB/s fsynced per node, which wants datacenter drives, and two members
+should never share a disk.
 
-| Cluster cost | Per event |
+| Fault, 3,500/s, commitlog | Emission pause (fault to the next new seq at any consumer) |
 |---|---|
-| Receiving and serving the log streams (every core streams its log to both peers) | ~20 µs |
-| The forward hop to the DID owner (two thirds of events): serialization ~8, HTTP/2 and TLS ~7.5 | ~15 µs per forwarded event |
-| Dense-seq renumbering | under 1 µs |
-| Peer bytes | 12.7–15.2 KB |
+| kill -9 the leader | 55 ms median, 61 max (72 / 88 on the NVMe) |
+| kill -9 a follower | 17 ms median, 38 max |
+| Partition or SIGSTOP the leader | ~1 s (`--qlog-election-ms`) |
+| kill -9 all three | ~2.4 s (a 1 s supervisor restart, recovery and the election) |
 
-Scaled to 3 × 8 cores, 100k events/s takes 50–60% of the cluster's CPU: 1.6× headroom if "8
-cores" means 8 vCPUs, ~2× if it means 8 physical cores. Memory is 4–6 GB per node at 100–120k.
-Three things qualify it. The time to firehose at 100k was MinIO-bound here (p50 0.8–1.4 s) and
-needs measuring on S3. The peer links carry ~3.5 Gb/s each way per node at 100k, before
-consumers. And host placement is by hash while ingest load follows hosts, so one core verified
-about half what another did.
+RAM with a commitlog is ~0.6 GB a node at 10x, mostly the firehose ring. The relay end to end on
+the quorum log (fakepds through verify, the leader's checks and the log) hasn't been benched at
+these rates yet.
 
 ## Fan-out
 
@@ -169,16 +162,17 @@ CPU tops out at 4 cores, or ~150 consumers. The NIC runs out first:
 | 25 GbE | ~15 |
 | 100 GbE | ~60 |
 
-So a node serving many consumers wants edges or replicas, not more cores. At today's ~350 events/s
-the same NIC feeds a hundred times more.
+So a node serving many consumers wants a faster NIC, or more members to spread consumers over
+(any member serves the stream), not more cores. At today's ~350 events/s the same NIC feeds a
+hundred times more.
 
 ## What's next
 
-- Compressed log streams between cores. Streaming sealed (zstd'd) segments to peers instead of raw
-  frames would cut the peer bytes by about a third, and the copy and TLS cost with them.
-- A DID owner's slow DID-document lookup holds its whole forward batch. When the fleet's PLC fell
-  behind at 150k offered, every node stalled. The host owner could pass the key it just resolved.
-- Cold DID lookups cost ~1.7× on a cluster, since the host owner and the DID owner each resolve.
-  `--plc-export` seeding covers this in production.
-- Host shards placed by load instead of by hash.
-- Time to firehose on S3 and R2, not MinIO.
+- The relay end to end on the quorum log at 10x and 100x, on real hosts and R2 instead of loopback
+  and MinIO.
+- Parallel segment PUTs in the flush, for 100x on R2.
+- Cold DID lookups cost about twice on a cluster, since the node that reads the event and the
+  leader each resolve. Seeding identities from the PLC directory's export would cover it, and it
+  isn't built on the quorum log yet.
+- Host placement by load. The leader's host table spreads hosts by hash, and a few big PDSes carry
+  most events.

@@ -1,5 +1,5 @@
 ---
-title: Quorum cluster
+title: Cluster
 section: vlRelay
 order: 5
 summary: "Every node reads its share of the PDSes and forwards each checked event to the leader, which checks its chain, gives it the next seq and emits it once two of the three nodes hold it. The bucket gets a flush every 30 s."
@@ -31,7 +31,7 @@ diagram:
     - { from: n2.b, to: cons.r, label: emit at commit, tone: blue, via: [[16.5, 16]] }
 facts:
   - { value: "2 of 3", label: commit, note: "nothing reaches a consumer before a quorum holds it", tone: accent }
-  - { value: "~60 ms", label: emission pause when the leader dies, note: "kill -9 at 10x; ~1 s when it hangs or is cut off", tone: violet }
+  - { value: "50-120 ms", label: emission pause when the leader dies, note: "kill -9 at 10x; ~1 s when it hangs or is cut off", tone: violet }
   - { value: "30 s", label: bucket flush, note: "`--qlog-flush-ms`; the log, the records and the host table at one seq", tone: amber }
   - { value: "2 s", label: a dead node's hosts move, note: "`--qlog-host-failover-ms`, then they resume from their cursors", tone: blue }
 ```
@@ -44,13 +44,13 @@ every node once two of the three hold it. The bucket gets everything up to one s
 seconds: the log as segments, the accounts' records, the host table and the PDS cursors, with one
 manifest written last. A consumer can connect to any node and resume on another with its cursor.
 
-It replaces the [lease cluster](cluster.md), which kept host bookkeeping and a log per node in the
-bucket and wrote it every few milliseconds. That one now needs `--legacy-cluster`.
+One node is the same thing with one member: its commitlog is the write-ahead log, it flushes to
+the bucket on the same schedule, and adding members later is a membership change.
 
 ## Running one
 
 ```bash
-vlrelay --quorum --node-id n1 --listen :2980 \
+vlrelay --node-id n1 --listen :2980 \
         --qlog-listen 10.0.0.1:2978 --qlog-peer n2=10.0.0.2:2978 --qlog-peer n3=10.0.0.3:2978 \
         --qlog-dir /var/lib/vlrelay/qlog --qlog-admin-token "$QLOG_TOKEN" \
         --s3-endpoint ... --prefix relay1 --host pds.example.com --crawl
@@ -58,7 +58,6 @@ vlrelay --quorum --node-id n1 --listen :2980 \
 
 | Flag | Default | What |
 |---|---|---|
-| `--quorum` | | Run on the quorum log. |
 | `--node-id ID` | `relay` | The member's name. Unique per node. |
 | `--qlog-listen ADDR` | `127.0.0.1:2978` | The peer port: replication, submits, members' questions. Keep it to the other nodes. |
 | `--qlog-peer ID=ADDR` | | Where to reach each other node (repeatable). |
@@ -120,7 +119,9 @@ flush: commits pause for about 10 ms. A removed node stops getting events and it
 At today's network rate that's about 0.5 write and 1.7 read requests a second, a few dollars a
 month on R2 before its free tier.
 
-## What isn't built
+## What a node answers for
 
-Archival mode, PLC export seeding, resharding (there's one set of records, on the leader), the
-sync API's repo endpoints on followers, and edges and replicas (any member serves the stream).
+The accounts' records are the leader's: the sync API's repo endpoints and the admin API's account
+pages answer on the leader, and a follower names it. Consumers, a host's socket and the pipeline
+numbers are each node's own. Any member serves the stream, so there are no separate edges or
+replicas.

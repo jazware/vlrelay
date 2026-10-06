@@ -2,6 +2,8 @@
 
 Internal: the public summary is [Performance](perf.md) (`/docs/perf`). This is the full log, iteration by iteration.
 
+Every iteration here ran on the old single node and the lease cluster (node logs, a 25 ms segment linger, DID shards, the full-mesh merge). Both are deleted, along with `scripts/cluster-perf.sh` and `just e2e-cluster`. The quorum log's own numbers are in `docs/quorum.md`'s implementation notes.
+
 How many events a second one relay node takes, and how fast they reach the firehose. The target in `docs/design.html` is 100k events/s on 3 nodes of 8 cores and 32 GB, so about 33k/s per node. Iteration 6 measures a 3-node cluster against the whole target.
 
 ## The bench

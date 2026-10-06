@@ -1,5 +1,7 @@
 # vlRelay: shadow run against real PDSes
 
+This run was on the old single node and the lease cluster (`--cluster`, `--linger-ms`, DID shards), which are deleted. `just e2e-cluster` below is gone too. The findings about real PDSes and production still hold.
+
 vlRelay ran on benchbox for 2 h 15 min on 2026-10-04 (14:09-16:25 UTC, a Sunday morning in the US)
 against ten real PDSes, read-only. One checker compared its firehose with the PDSes' own and with
 `wss://bsky.network` the whole time. The first 90 minutes were one node on MinIO with the default
@@ -255,7 +257,7 @@ Each bug found, and where it stands on the branch now. The run itself was on 06a
    has the same first-wave problem, which bsky.network handles by raising each big host's limit.
    vlRelay now has the same per-host override (`set-account-limit`), a warning on host detail for a
    host at its cap with a one-click raise to 1,000,000, and the accounts column marked on the Hosts
-   list. [Policy](policy.md#big-independent-pdses-and-the-account-cap) has the operator notes.
+   list. [Policy](policy.md#big-independent-pdses) has the operator notes.
    Accounts throttled before a raise still stay throttled until an untakedown, where indigo
    releases them.
 

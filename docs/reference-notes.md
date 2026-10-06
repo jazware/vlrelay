@@ -416,11 +416,11 @@ State and endpoints:
 
 Decided in the design doc:
 
-- Sync 1.1 is enforced. A failed `prevData` or inversion check drops the event and marks the account `desynchronized` until a `#sync` (or a fresh `getRepo` on archival shards) resets it. indigo only logs these.
-- Takedowns filter the replay window as well as the live stream, through the takedown list in the bucket (`policy/takedowns/current/`). Every core, edge and replica leaves a taken-down account's `#commit` and `#sync` frames out of the ring and segment backfill, without renumbering, and lets its `#account` and `#identity` through. Lifting the takedown lets the frames replay again, which is what indigo always serves. See [policy.md, State and the node](policy.md#state-and-the-node).
+- Sync 1.1 is enforced. A failed `prevData` or inversion check drops the event and marks the account `desynchronized` until a `#sync` resets it (archival mode's `getRepo` reset went with archival mode). indigo only logs these.
+- Takedowns filter the replay window as well as the live stream, through the takedown list in the bucket (`policy/takedowns/current/`). Every node leaves a taken-down account's `#commit` and `#sync` frames out of the ring and segment backfill, without renumbering, and lets its `#account` and `#identity` through. Lifting the takedown lets the frames replay again, which is what indigo always serves. See [policy-internals.md, State and the node](policy-internals.md#state-and-the-node).
 - A slow consumer falls back to reading segments, so catch-up doesn't trip `ConsumerTooSlow` before it reaches live.
-- The relay seq is the merge key of the node logs, so seqs are time-ordered ids with gaps instead of a dense counter. The spec allows gaps.
-- Account migrations: the DID owner only accepts events from the host its fresh DID document names, and re-resolves when that changes (PLAN decision 3). That's what indigo does too, but per DID owner instead of per host.
+- The relay seq is the merge key of the node logs, so seqs are time-ordered ids with gaps instead of a dense counter. The spec allows gaps. (Superseded: seqs became dense for `@atproto/sync`, and on the quorum log the leader assigns them at commit.)
+- Account migrations: the DID owner only accepts events from the host its fresh DID document names, and re-resolves when that changes (PLAN decision 3). That's what indigo does too, but per DID owner instead of per host. (On the quorum log the leader makes this check.)
 
 Proposed here, for the lead to confirm:
 
