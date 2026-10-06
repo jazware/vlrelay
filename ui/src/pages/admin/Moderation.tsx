@@ -3,12 +3,12 @@ import { DataTable, type Col } from '../../components/console/DataTable'
 import { hostActionDialog, BIG_HOST_CAP } from '../../components/console/hostActions'
 import { openPanel } from '../../components/console/nav'
 import { registerPalette, type PalItem } from '../../components/console/Palette'
-import { Bars, Chip, Empty, Glyph, HostName, Kbd, Loaded, Meter, NeedsVersion, PageHead, Panel, Sec, Seg, Src, TierTag } from '../../components/console/kit'
-import type { Account, Case, CaseStatus, DomainRule, HostRow, PolicyAudit } from '../../lib/api'
+import { Chip, Empty, Glyph, HostName, Kbd, Loaded, Meter, PageHead, Panel, Sec, Seg, Src, TierTag } from '../../components/console/kit'
+import type { Account, Case, CaseStatus, DomainRule, HostRow, PolicyAudit, SignalKey, SignalTop, TakedownEntry } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, dt, fmtNum, fmtSi, plural, shortDid } from '../../lib/console/fmt'
 import { useLivePoll } from '../../lib/console/live'
-import { capPoll, overviewPoll } from '../../lib/console/polls'
+import { overviewPoll } from '../../lib/console/polls'
 import { useSearch } from '../../lib/router'
 import { signalOfKind } from './Policy'
 import {
@@ -19,15 +19,18 @@ import {
   SEV_TONE,
   caseObs,
   casesPoll,
+  signalKeyRef,
   releaseDialog,
   ruleDialog,
   rulesAuditPoll,
   rulesPoll,
   takedownDialog,
+  takedownsPoll,
 } from './moderationDetail'
 
-// Cases, accounts and takedowns, domain rules and the accounts hosts created throttled. Every
-// row opens in the slide-over (case, acct, rule, host); every write is a confirm with its call.
+// Cases, the spam signals' heaviest keys, accounts and every takedown, domain rules and the
+// accounts hosts created throttled. Every row opens in the slide-over (case, acct, rule, host);
+// every write is a confirm with its call.
 
 type Filter = CaseStatus | 'all'
 const FILTERS: Filter[] = ['open', 'acknowledged', 'resolved', 'dismissed', 'all']
@@ -119,43 +122,103 @@ function Cases() {
   )
 }
 
+type SignalRow = { s: SignalTop; k?: SignalKey; r: number }
+
 function Signals() {
-  const all = casesPoll.use().data ?? []
   const sig = useLivePoll(A.spamSignals, 'signals', 10_000)
-  const open = all.filter((c) => (c.status === 'open' || c.status === 'acknowledged') && c.threshold > 0)
-  const byKind = new Map<string, Case>()
-  for (const c of open) {
-    const w = byKind.get(c.kind)
-    if (!w || c.observed / c.threshold > w.observed / w.threshold) byKind.set(c.kind, c)
-  }
-  const rows = [...byKind.values()]
-    .sort((a, b) => b.observed / b.threshold - a.observed / a.threshold)
-    .map((c) => {
-      const s = signalOfKind(c.kind)
-      const r = c.observed / c.threshold
-      return {
-        key: c.kind,
-        label: (
-          <>
-            {s?.label ?? c.kind[0].toUpperCase() + c.kind.slice(1).replace(/-/g, ' ')} <span className="muted">{s?.per ?? 'host'}</span>
-          </>
+  const v = sig.data
+  const rows: SignalRow[] = (v?.signals ?? [])
+    .filter((s) => s.enabled && s.limit > 0)
+    .map((s) => ({ s, k: s.top[0], r: s.top[0] ? s.top[0].estimate / s.limit : 0 }))
+    .sort((a, b) => b.r - a.r)
+  const off = (v?.signals ?? []).filter((s) => !s.enabled || s.limit <= 0).length
+  const cols: Col<SignalRow>[] = [
+    {
+      id: 'sig',
+      label: 'Signal',
+      render: ({ s }) => (
+        <span className="sm">
+          {signalOfKind(s.rule)?.label ?? s.rule.replace(/-/g, ' ')} <span className="muted">{s.per}</span>
+        </span>
+      ),
+    },
+    {
+      id: 'key',
+      label: 'Heaviest',
+      render: ({ s, k }) =>
+        !k ? <span className="muted sm">nothing counted</span> : s.per === 'account' && k.key.startsWith('did:') ? <span className="cx-did" title={k.key}>{shortDid(k.key)}</span> : <HostName host={k.host || k.key} />,
+    },
+    {
+      id: 'vs',
+      label: 'vs threshold',
+      r: true,
+      sort: (a, b) => a.r - b.r,
+      title: 'Its estimate against the threshold over the window (Space-Saving: it may overcount down to its lower bound)',
+      render: ({ s, k, r }) =>
+        k ? (
+          <span className="mono sm nowrap" title={`~${fmtNum(k.estimate)} (at least ${fmtNum(k.lower)}) of ${fmtNum(s.limit)} in ${s.windowSecs} s`}>
+            <Meter v={k.estimate} max={s.limit} k={r >= 1 ? 'err' : r > 0.7 ? 'warn' : 'ok'} /> {Math.round(r * 100)}%
+          </span>
+        ) : (
+          <span className="muted">—</span>
         ),
-        v: r,
-        fmt: `${Math.round(r * 100)}%`,
-        color: r >= 1 ? 'err' : r > 0.7 ? 'warn' : 'ok',
-        title: `${c.host}: ${caseObs(c)} (case ${c.id})`,
-        onClick: () => openPanel('case', String(c.id)),
-      }
-    })
+    },
+  ]
   return (
     <Panel
       title="Spam signals, live"
       to="/admin/policy"
-      src={<><Src>cases</Src> <Src isNew>policy/signals</Src></>}
-      right={<span className="muted sm">the worst open case per signal against its threshold</span>}
-      foot={sig.data && !sig.data.supported ? <NeedsVersion what="Every signal's heaviest key" endpoint={sig.data.endpoint}>Until then only signals with an open case show.</NeedsVersion> : <span>100% is the threshold. Hover for the key.</span>}
+      src={<Src>policy/signals</Src>}
+      right={v ? <span className="muted sm">on {v.node}</span> : undefined}
+      foot={<span>Each signal's heaviest key against its threshold; 100% trips it. Open a row for the host or account.{off ? ` ${plural(off, 'signal')} off (threshold 0).` : ''}</span>}
     >
-      {rows.length ? <Bars rows={rows} /> : <Empty>No signal has an open case.</Empty>}
+      <Loaded load={sig}>
+        {() => (
+          <DataTable
+            rows={rows}
+            cols={cols}
+            rowKey={(x) => x.s.rule}
+            open={({ s, k }) => (k ? signalKeyRef(s.per, k) : undefined)}
+            compact
+            label="Spam signals"
+            empty={<Empty>Every signal is off.</Empty>}
+          />
+        )}
+      </Loaded>
+    </Panel>
+  )
+}
+
+function Takedowns() {
+  const l = takedownsPoll.use()
+  const cols: Col<TakedownEntry>[] = [
+    { id: 'did', label: 'Account', render: (t) => <span className="cx-did" title={t.did}>{shortDid(t.did)}</span> },
+    { id: 'reason', label: 'Reason', className: 'wrap sm t2', render: (t) => t.reason || <span className="muted">—</span> },
+    { id: 'by', label: 'By', render: (t) => <span className="sm">{t.by}</span> },
+    { id: 'at', label: 'When', r: true, sort: (a, b) => a.atMs - b.atMs, render: (t) => <span className="sm muted" title={dt(t.atMs)}>{ago(t.atMs)}</span> },
+  ]
+  return (
+    <Panel
+      title="Takedowns"
+      src={<Src>takedowns</Src>}
+      right={l.data ? <span className="muted sm">{plural(l.data.length, 'account')}</span> : undefined}
+      foot={<span>Open one to reverse it. A takedown stops the account's events here; its PDS keeps the repo.</span>}
+    >
+      <Loaded load={l}>
+        {(rows) => (
+          <DataTable
+            rows={rows}
+            cols={cols}
+            rowKey={(t) => t.did}
+            open={(t) => ({ type: 'acct', id: t.did })}
+            dim={(t) => !t.takedown}
+            compact
+            label="Takedowns"
+            sort={{ id: 'at', asc: false }}
+            empty={<Empty>No account is taken down on this relay.</Empty>}
+          />
+        )}
+      </Loaded>
     </Panel>
   )
 }
@@ -166,7 +229,6 @@ function Lookup() {
   const [text, setText] = useState(q)
   useEffect(() => setText(q), [q])
   const l = useLivePoll(() => (q ? A.accounts(q) : Promise.resolve([] as Account[])), q, q ? 15_000 : 0)
-  const tds = useLivePoll(A.takedowns, 'takedowns', 0)
   const cols: Col<Account>[] = [
     { id: 'who', label: 'Account', render: (a) => (a.handle ? <span className="mono sm">{a.handle}</span> : <span className="cx-did">{shortDid(a.did)}</span>) },
     { id: 'host', label: 'Host', render: (a) => <span className="mono sm t2 trunc" style={{ display: 'inline-block', maxWidth: 160 }}>{a.host}</span> },
@@ -177,7 +239,6 @@ function Lookup() {
     <Panel
       title="Look up an account"
       src={<><Src>accounts?q=</Src> <Src>accounts/{'{did}'}</Src></>}
-      foot={tds.data && !tds.data.supported ? <NeedsVersion what="A list of every takedown" endpoint={tds.data.endpoint}>Look an account up to see or reverse its takedown.</NeedsVersion> : undefined}
     >
       <form
         className="cx-pn-b cx-form-row"
@@ -285,11 +346,16 @@ function Rules() {
   )
 }
 
+const SHOWN = 25
+
+/** The hosts with accounts created throttled, or at their cap (the next ones will be). */
 function Throttled() {
-  const cap = capPoll.use()
-  const thr = useLivePoll(A.throttledAccounts, 'thracc', 0)
-  const counts = thr.data?.supported ? thr.data.data : undefined
-  const rows = (cap.data?.hosts ?? []).filter((h) => h.maxAccounts > 0 && h.accounts >= h.maxAccounts)
+  const list = useLivePoll(() => A.hosts({ sort: 'accounts', desc: true }), 'throttled-accounts', 30_000, { keep: true })
+  const atCap = (h: HostRow) => h.maxAccounts > 0 && h.accounts >= h.maxAccounts
+  const rows = (list.data?.hosts ?? []).filter((h) => h.throttledAccounts > 0 || atCap(h)).sort((a, b) => b.throttledAccounts - a.throttledAccounts || b.accounts - a.accounts)
+  const total = rows.reduce((a, h) => a + h.throttledAccounts, 0)
+  const capped = rows.filter(atCap).length
+  const [all, setAll] = useState(false)
   const cols: Col<HostRow>[] = [
     {
       id: 'host',
@@ -301,7 +367,7 @@ function Throttled() {
         </span>
       ),
     },
-    { id: 'thr', label: 'Throttled accounts', r: true, render: (h) => <span className="mono">{counts ? fmtNum(counts[h.host] ?? 0) : '—'}</span> },
+    { id: 'thr', label: 'Throttled accounts', r: true, sort: (a, b) => a.throttledAccounts - b.throttledAccounts, render: (h) => <span className={`mono${h.throttledAccounts ? ' s-warn' : ' muted'}`}>{fmtNum(h.throttledAccounts)}</span> },
     {
       id: 'acc',
       label: 'Accounts / cap',
@@ -323,9 +389,11 @@ function Throttled() {
               Raise cap…
             </button>
           )}
-          <button type="button" className="cx-btn sm" onClick={() => releaseDialog(h.host, h.accounts >= h.maxAccounts)}>
-            Lift…
-          </button>
+          {h.throttledAccounts > 0 && (
+            <button type="button" className="cx-btn sm" onClick={() => releaseDialog(h.host, atCap(h))}>
+              Lift…
+            </button>
+          )}
         </span>
       ),
     },
@@ -333,23 +401,29 @@ function Throttled() {
   return (
     <Panel
       title="Accounts created throttled"
-      src={<><Src>hosts?sort=accounts</Src> <Src>hosts/{'{host}'}/release-throttled</Src></>}
-      right={rows.length ? <Chip k="warn">{plural(rows.length, 'host')} at cap</Chip> : undefined}
-      foot={
-        counts ? (
-          <span>Past a host’s cap, new accounts are created throttled and stay so after a raise until lifted.</span>
-        ) : (
-          <NeedsVersion what="How many accounts each host created throttled" endpoint="HostRow.throttledAccounts">
-            The hosts at their cap are the ones creating them. Past a cap, new accounts stay throttled after a raise until lifted.
-          </NeedsVersion>
-        )
+      src={<><Src>hosts · throttledAccounts</Src> <Src>hosts/{'{host}'}/release-throttled</Src></>}
+      right={
+        rows.length ? (
+          <span className="cx-form-row" style={{ gap: 6 }}>
+            {total > 0 && <Chip k="warn">{plural(total, 'account')}</Chip>}
+            {capped > 0 && <Chip k="err">{plural(capped, 'host')} at cap</Chip>}
+          </span>
+        ) : undefined
       }
+      foot={<span>Past a host’s cap, new accounts are created throttled and stay so after a raise until lifted. The counts are the leader’s.</span>}
     >
-      <Loaded load={cap}>
+      <Loaded load={list}>
         {() => (
-          <DataTable rows={rows} cols={cols} rowKey={(h) => h.host} open={(h) => ({ type: 'host', id: h.host })} compact label="Hosts at their account cap" empty={<Empty>No busy host is at its account cap.</Empty>} />
+          <DataTable rows={all ? rows : rows.slice(0, SHOWN)} cols={cols} rowKey={(h) => h.host} open={(h) => ({ type: 'host', id: h.host })} compact label="Hosts with throttled accounts" empty={<Empty>No host has accounts created throttled, and none is at its account cap.</Empty>} />
         )}
       </Loaded>
+      {rows.length > SHOWN && (
+        <div className="cx-pn-b">
+          <button type="button" className="cx-btn sm quiet" onClick={() => setAll(!all)}>
+            {all ? `Show the first ${SHOWN}` : `Show all ${fmtNum(rows.length)}`}
+          </button>
+        </div>
+      )}
     </Panel>
   )
 }
@@ -395,6 +469,7 @@ export function Moderation() {
           <Signals />
           <Lookup />
         </div>
+        <Takedowns />
         <Rules />
         <Throttled />
       </div>

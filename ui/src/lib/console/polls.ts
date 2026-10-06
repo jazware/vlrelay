@@ -1,4 +1,4 @@
-import { publicStats, type Case, type ClusterView, type Consumer, type FullPolicyDoc, type HostList, type Overview, type PolicyDoc, type PublicStats, type QCounts, type QRequests, type QuorumView, type SettingsView, type StoreView } from '../api'
+import { publicStats, type Case, type ClusterView, type Consumer, type DiscoveryView, type FullPolicyDoc, type HostList, type Overview, type PolicyDoc, type PublicStats, type QCounts, type QRequests, type QuorumHistory, type QuorumView, type SettingsView, type StoreView } from '../api'
 import * as A from './adminAdapter'
 import { createPoller } from './live'
 
@@ -36,22 +36,18 @@ export const overviewPoll = createPoller<Overview>(A.overview, 2000, {
 
 /** Bucket requests per second over the last minute, summed over the members that answer. */
 export type ReqRates = { windowSecs: number; total: QCounts; byPurpose: Record<string, QCounts>; byComponent: Record<string, QCounts>; byOp: Record<string, number> }
-/** A flush the console saw: F moved between two polls of the leader. */
-export type SeenFlush = { atMs: number; leader: string; flushed: number; reserve: number; flushes: number; entries: number; segmentBytes: number; rawBytes: number }
-/** An epoch change the console saw (it doesn't know what kind unless the status lists it). */
+/** An epoch change the console saw (a fallback for one no member's history lists). */
 export type SeenEpoch = { atMs: number; from: number; epoch: number; leader: string | null }
 
 const REQ_WINDOW_MS = 60_000
 const reqSamples = new Map<string, { at: number; r: QRequests }[]>()
 let reqRates: ReqRates | undefined
-const flushes: SeenFlush[] = []
 const epochs: SeenEpoch[] = []
-let lastLead: { id: string; flushes: number; entries: number; segmentBytes: number; rawBytes: number; flushed: number } | undefined
+let lastF: number | undefined
 let lastEpoch: number | undefined
 let fMovedAt: number | undefined
 
 export const requestRates = () => reqRates
-export const seenFlushes = () => flushes
 export const seenEpochs = () => epochs
 /** When the console last saw F move (to within a poll), or undefined before it has. */
 export const flushSeenAt = () => fMovedAt
@@ -111,25 +107,8 @@ function observeLeader(q: QuorumView, at: number) {
   if (!lead) return
   push('commit-p99', lead.commit_us?.p99 / 1000)
   push('commit-p50', lead.commit_us?.p50 / 1000)
-  const f = lead.flush
-  if (!f) return
-  const cur = { id: lead.id, flushes: f.flushes, entries: f.entries, segmentBytes: f.segment_bytes, rawBytes: f.raw_bytes, flushed: lead.flushed }
-  const prev = lastLead
-  lastLead = cur
-  if (!prev) return
-  if (cur.flushed !== prev.flushed) fMovedAt = at
-  if (prev.id !== cur.id || cur.flushes <= prev.flushes) return
-  flushes.unshift({
-    atMs: at,
-    leader: cur.id,
-    flushed: lead.flushed,
-    reserve: lead.reserve,
-    flushes: cur.flushes - prev.flushes,
-    entries: Math.max(0, cur.entries - prev.entries),
-    segmentBytes: Math.max(0, cur.segmentBytes - prev.segmentBytes),
-    rawBytes: Math.max(0, cur.rawBytes - prev.rawBytes),
-  })
-  if (flushes.length > 30) flushes.pop()
+  if (lastF !== undefined && lastF !== lead.flushed) fMovedAt = at
+  lastF = lead.flushed
 }
 
 export const quorumPoll = createPoller<A.Optional<QuorumView>>(A.quorum, 2000, {
@@ -141,6 +120,12 @@ export const quorumPoll = createPoller<A.Optional<QuorumView>>(A.quorum, 2000, {
     seriesVersion++
   },
 })
+
+/** Every member's leadership changes (GET cluster/quorum/history), for the leadership history. */
+export const historyPoll = createPoller<QuorumHistory>(A.quorumHistory, 5000)
+
+/** Host discovery's sources (the leader's, asked through any node). */
+export const discoveryPoll = createPoller<DiscoveryView>(A.discovery, 5000)
 
 /** The public stats: the page at / polls them, the console reads uptime from them. */
 export const publicPoll = createPoller<PublicStats>(publicStats, 2000)
