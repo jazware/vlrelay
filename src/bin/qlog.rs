@@ -34,7 +34,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    Node(NodeArgs),
+    Node(Box<NodeArgs>),
     Load(LoadArgs),
     Check(CheckArgs),
 }
@@ -161,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     match Cli::parse().cmd {
-        Cmd::Node(a) => node(a).await,
+        Cmd::Node(a) => node(*a).await,
         Cmd::Load(a) => load(a).await,
         Cmd::Check(a) => check(a).await,
     }
@@ -194,7 +194,6 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
                 memory_bytes: cfg.retain_bytes,
                 abort_on_error: true,
                 sync_delay: a.fsync_delay_us.map(Duration::from_micros),
-                ..commitlog::Options::default()
             };
             let (cl, r) = CommitLog::open(dir, o)?;
             if a.power_cut_on_usr1 {
@@ -465,7 +464,10 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
     }
     stop.store(true, Ordering::Release);
     for line in std::fs::read_to_string(&a.acked)?.lines() {
-        if let Some((s, d)) = line.split_once(' ') {
+        // a load generator killed mid-write leaves a last line without its did
+        if let Some((s, d)) = line.split_once(' ')
+            && !d.is_empty()
+        {
             ck.acked(s.parse()?, content_id(d.as_bytes()));
         }
     }

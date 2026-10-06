@@ -14,7 +14,7 @@ trap 'rm -rf "$dir"/qprobe.*' EXIT
 command -v fio >/dev/null || { echo "fsync_probe: needs fio (apt install fio)" >&2; exit 1; }
 
 echo "host $(hostname) kernel $(uname -r) $(nproc) cpus; $(df -hT "$dir" | awk 'NR==2{print $2" on "$1}')"
-for dev in /sys/block/*/queue/write_cache; do
+for dev in /sys/block/{nvme,sd,vd,xvd}*/queue/write_cache; do
   [ -e "$dev" ] && echo "  $(basename "$(dirname "$(dirname "$dev")")") write_cache: $(cat "$dev")"
 done
 

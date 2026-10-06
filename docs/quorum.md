@@ -1,6 +1,6 @@
 # vlRelay: quorum replication (design and cost study)
 
-The first pass at vlRelay's economics didn't pan out. Three nodes on OVH with R2 came to ~$3.4k a month, and ~$2.8k of that was bucket requests: segments sealed every 25 ms on every node, plus host bookkeeping in bucket objects every 2-5 s. A non-archival sync 1.1 relay on one node costs about $10-15 a month to run. This page is a design and cost study for a vlRelay that keeps its recent log in replicas instead of the bucket, and writes the bucket rarely and in bulk. The replication core (Phase 1) is built and measured, see [Implementation notes](#implementation-notes). The flush, the commitlog and the relay's wiring aren't built yet. `scripts/cost_model.py --quorum` generates every table above the notes.
+The first pass at vlRelay's economics didn't pan out. Three nodes on OVH with R2 came to ~$3.4k a month, and ~$2.8k of that was bucket requests: segments sealed every 25 ms on every node, plus host bookkeeping in bucket objects every 2-5 s. A non-archival sync 1.1 relay on one node costs about $10-15 a month to run. This page is a design and cost study for a vlRelay that keeps its recent log in replicas instead of the bucket, and writes the bucket rarely and in bulk. The replication core (Phase 1) and the commitlog (Phase 2) are built and measured, see [Implementation notes](#implementation-notes). The flush and the relay's wiring aren't built yet. `scripts/cost_model.py --quorum` generates every table above the notes.
 
 The idea is the one in vlpds's TODO ("Quorum in-memory durability"). A leader appends each event, replicates it to two other nodes and emits it once two of the three hold it. The bucket gets a flush every 10-60 s, and the host cursors ride in the same flush as the log they belong to. A relay suits this better than a PDS does, because the PDSes upstream are the source of truth. If the relay loses an unflushed tail, it asks each PDS to replay from its last flushed cursor. Losing a quorum costs a re-ingest and some time, and never a user's data. Jaz's call: the firehose holds every event back until a quorum has it, so consumers only see events that a takeover keeps.
 
@@ -243,7 +243,7 @@ The full latency picture (all assumed device and network numbers):
 |---|---|---|
 | datacenter NVMe with power-loss protection (AX42, ADVANCE-2, EC2 instance store) | 0.03-0.1 ms | up to 2 ms + 0.03-0.1 ms |
 | VPS virtual NVMe (OVH VPS, Hetzner Cloud) | 0.5-2 ms | up to 2 ms + 0.5-2 ms |
-| consumer NVMe without power-loss protection | 1-5 ms | up to 2 ms + 1-5 ms |
+| consumer NVMe without power-loss protection | 2.7 ms p50, 5.9 p99 (measured: benchbox's 970 EVO Plus, one writer; 5.5 ms with three) | up to 2 ms + ~3 ms |
 
 | follower placement | RTT | quorum ack, memory only | quorum ack, commitlog fsynced |
 |---|---|---|---|
@@ -262,7 +262,7 @@ Scylla's commitlog is the model for the second shape: every replica appends each
 |---|---|---|
 | Host cost | same hosts (every host on this page has local NVMe) | same, disk was already there |
 | RAM | ring plus the unflushed tail: up to ~16 GB at 100x with a 60 s flush | ring only (~3 GB at 100x) |
-| Ack latency | one RTT + group commit | the same plus an fsync on two of three nodes in parallel: +0.1 ms on datacenter NVMe, +0.5-2 ms on a VPS (assumed) |
+| Ack latency | one RTT + group commit | the same plus an fsync on two of three nodes in parallel: +0.1 ms on datacenter NVMe, +0.5-2 ms on a VPS (assumed). Measured on benchbox: RTT + 1-1.7x the device's fsync + ~0.3 ms ([Phase 2](#tests-chaos-and-numbers-phase-2)) |
 | One node lost | nothing lost | nothing lost |
 | A bad deploy or a shared bug kills all three processes | bucket recovery, jump, re-ingest | nothing lost: the page cache survives a process crash, even before the fsync |
 | Power loss on all three | bucket recovery, jump, re-ingest | nothing lost: any two disks hold every committed entry |
@@ -316,7 +316,7 @@ The knobs, in the order they matter:
 
 A single node uses the same flush and re-ingest model, with a local NVMe write-ahead log as its emit point.
 
-- Every event is appended to the WAL, which is the local log segments themselves. Group commit fsyncs every ~2 ms (or per batch) and emits what it covered. On a VPS that's ~2-4 ms from apply to emit (assumed fsync of 0.5-2 ms), on datacenter NVMe ~2 ms. indigo's relay, for comparison, emits after a buffered write every 100 ms with no fsync (reference notes).
+- Every event is appended to the WAL, which is the local log segments themselves. Group commit fsyncs every ~2 ms (or per batch) and emits what it covered. (Built in Phase 2 as `qlog::commitlog`: there's no fixed interval, and each fsync covers whatever arrived during the one before.) On a VPS that's ~2-4 ms from apply to emit (assumed fsync of 0.5-2 ms), on datacenter NVMe ~2 ms. indigo's relay, for comparison, emits after a buffered write every 100 ms with no fsync (reference notes).
 - The DID state and host cursors live on local disk (SlateDB over the local filesystem), with cursor entries in the WAL as in the cluster.
 - The bucket becomes a lagging copy. Every N seconds the node uploads 64 MiB segments and a manifest with the cursors, the state checkpoint and R, exactly as the leader does.
 
@@ -552,10 +552,142 @@ What the numbers say against the study's assumptions:
 Known gaps, for later phases:
 
 - The relay itself doesn't use the quorum log yet. The forward path, verify and state still run on the old node log. Wiring `cluster/forward.rs` to `Client::submit` (with its resend) and the DID state apply to committed entries is the integration step.
-- A follower more than `--retain-mb` behind is reset to the leader's base, and its stream jumps. Phase 3's bucket segments let it catch up instead.
+- A follower more than `--retain-mb` behind is reset to the leader's base, and its stream jumps. Phase 3's bucket segments let it catch up instead. (Phase 2: with a commitlog it's served from the leader's disk first, and only a follower behind the leader's disk retention is reset.)
 - The pre-vote and the probe treat any I/O error from the leader as "dead". A flaky link can cost an unneeded takeover (availability, not safety).
 - Nothing is flushed, and a lost quorum is unrecoverable until Phase 4. Until then it stops emission rather than reissuing seqs.
 - Membership is fixed (`--peer`).
+
+### The commitlog (Phase 2)
+
+`src/qlog/commitlog.rs` is the local log behind `node::Durability`, and the single node's WAL. It knows nothing about replication: a caller stages ops and waits for them to be durable.
+
+- **What's written.** The in-memory `Log` journals every change it makes: appends, truncations, resets, and restamps (written as a truncation plus the entries again, so the last record of a seq is always its current state). The node stages the journal under its lock, so the disk sees changes in exactly the order memory made them. Promises are journaled the same way, with whom they went to. The commit index rides along after each batch as a lower bound. Safety never needs it, but a restarted node can emit at once.
+- **Record format.** `len u32 | crc32 u32 | type u8 | payload`, little endian, the CRC over type and payload. Types: append `(epoch, seq, frame)`, truncate-after, reset, promise `(epoch, leader)`, commit, and a segment header `(magic, base epoch, base seq, promise in force)`. That's 25 bytes over each ~5.3 KB frame (0.5%).
+- **Group commit.** One writer thread drains everything staged, writes it with one `write`, `fdatasync`s, then publishes the batch's ticket. There's no linger: a batch is whatever arrived during the previous fsync. A follower acks, the leader counts itself, a candidate counts its own vote and anyone answers a promise only once their ticket is durable. Raising the promise on an append from a newer leader is journaled too, and that append's ack waits for it. A failed write or fsync poisons the log: nothing more is acked, and the binary aborts (after a failed fsync the page cache can't be trusted).
+- **Truncation and torn writes.** Truncations are records, not rewrites, so a crash can't half-apply one. Recovery replays the segments in order and stops the last segment at its first bad record (short, too long, a CRC mismatch or zeros). It truncates the file there and fsyncs it. Everything past the last fsync was never acked, so losing it is fine. A bad record in any segment but the last is corruption, and the node refuses to start.
+- **Segments and trimming.** A segment rolls at 64 MiB (`--segment-mb`). The new one starts at the commit index and repeats the uncommitted tail, so any later truncation lands inside it (nothing at or below the commit index is ever truncated) and older segments can be deleted on their own. A roll fsyncs the old segment, creates the new one and fsyncs the directory. Old segments go once they're wholly below the trim floor and the log is over `--disk-retain-mb` (4 GiB). The floor is `min(emitted, commit)` today, and Phase 3 lowers it to the flush point R.
+- **Recovery.** The node opens the commitlog before it starts and gets back its log, the promise and whom it went to, and the commit index. It loads the newest `--retain-mb` (plus anything uncommitted) into memory and indexes the rest on disk at 32 bytes an entry. A node that recovered a commitlog is intact at once, with no catch-up gate. Only a node whose commitlog is new or wiped, while `qlog/leader` exists, still starts "not intact". Its greeting is the first append's reply: its last seq and commit index, and the leader backs up to the commit index on a mismatch.
+- **Reads from disk.** The leader serves a follower that's behind its in-memory window from its commitlog, and a candidate's fetch the same way. These are committed entries, which never change, so the read takes the lock only to find them. Only a follower behind the leader's disk retention is still reset.
+- **Each node emits only what its own disk holds.** Emission stops at `min(commit, local durable)`. A follower can learn a commit index ahead of its own fsync, and without this rule a power cut could bring it back behind what its consumers had seen. With it, a consumer reconnects to a restarted node and carries on from its cursor with no step back. In every chaos run below, consumers resumed across restarts with no skip notice.
+- **Backpressure.** The leader takes no new submits while 256 MiB is uncommitted (`max_pending_bytes`). It waits up to 500 ms (under the submitter's 1 s timeout) and then answers "busy". Without this, a quorum slower than its submitters grows the leader's memory without bound. The first ceiling run on benchbox's shared disk reached 52 GB RSS before the kernel killed two nodes.
+- **RAM.** `--retain-mb` defaults to 64 with a commitlog (512 without). The firehose ring copies frames into its own websocket-framed batches (`MergedBatch`), so sharing bytes between the log and the ring would mean changing vlpds. With a 64 MiB log that copy is small, and it wasn't worth doing.
+- **The single node's WAL.** `CommitLog::open`, `stage`, `wait`, `note_commit`, `set_floor` and `read` are the whole API. A single node journals its log the same way, waits before it emits, and recovers the same way. Host cursors would be one more record type.
+
+### Tests, chaos and numbers (Phase 2)
+
+In-tree (`cargo test --lib qlog`, 20 tests): commitlog replay across truncations, restamps, promises and rollovers. A torn tail at three cut points, with garbage that looks like a record, is cut and appended past. Old segments go below the floor and the head stops reading. Integration tests run three nodes with commitlogs:
+
+- restarted nodes are intact at once and keep their logs;
+- kill -9 two nodes at once, then all three, six rounds;
+- power cuts on all three nodes at once under load, with a 3 ms fsync. Each node loses a random part of what it wrote since its last fsync and gets a torn record;
+- seeded random kills, power cuts (any number of nodes), restarts, partitions and heals;
+- a follower down for longer than the leader's 32 KiB in-memory window catches up from the leader's disk with no reset.
+
+Seeds 1-10 of the power-cut test, the durable random chaos and Phase 1's random chaos all pass with 0 violations. **The mutation:** with a follower acking before its fsync, the power-cut test fails on 4 of 5 seeds, with 84-1,440 violations ("seq N emitted with two contents": two followers ack, the commit index moves past the leader's own fsync, and all three disks lose it).
+
+The process harness (`tests/qlog/chaos.sh`) runs with commitlogs by default (`COMMITLOG=0` for memory only). It adds `kill-two`, `kill-all`, `power-cut-leader` and `power-cut-all` (SIGUSR1: the commitlog loses a random part of its unsynced tail plus a torn record, then SIGKILL), and `mixed-durable`. Results on benchbox, all three nodes' commitlogs on one 970 EVO Plus:
+
+| run | faults | distinct seqs | violations |
+|---|---|---|---|
+| kill-leader, 3,500/s | 7 x kill -9 | 350,402 | 0 |
+| kill-follower, 3,500/s | 7 x kill -9 | 350,017 | 0 |
+| kill-two, 3,500/s | 7 x kill -9 of the leader and a follower at once | 350,156 | 0 |
+| kill-all, 3,500/s | 7 x kill -9 of all three at once | 350,158 | 0 |
+| power-cut-leader, 3,500/s | 7 | 350,349 | 0 |
+| power-cut-all, 350/s | 7 x all three at once | 35,006 | 0 |
+| power-cut-all, 3,500/s | 7 x all three at once | 350,034 | 0 |
+| partition-leader, 350/s | 5 x isolated 5 s | 35,010 | 0 |
+| partition-follower, 3,500/s | 5 x isolated 5 s | 350,017 | 0 |
+| pause-leader, 350/s | 4 x SIGSTOP 3 s | 28,011 | 0 |
+| mixed, 3,500/s, 180 s | 6 kill -9, 4 partitions, 3 SIGSTOP | 630,627 | 0 |
+| mixed-durable, 3,500/s, 240 s | 4 kill-all, 4 kill-two, 3 kill -9, 4 power cuts (1 of all three), 3 partitions, 2 SIGSTOP | 840,644 | 0 |
+
+That's 4.0M seqs across 78 node kill -9s and 55 node power cuts, every acked seq emitted, nothing lost, duplicated or reissued. Recovery cut torn tails of 4-36 bytes. Every consumer resumed from its cursor with no skip notice and no hole. The measurement runs below add 10 more whole-cluster kills and power cuts and 21 leader kills and power cuts, also clean.
+
+Measured on benchbox (Ryzen 395, loopback). The disk is one consumer NVMe without power-loss protection, which three nodes share. `fsync_probe.sh` gives it 2.7 ms p50 for one writer and 5.5 ms for three. tmpfs stands in for a disk whose fsync costs nothing, an upper bound for datacenter NVMe with power-loss protection. "tmpfs + N ms" sleeps N ms before each fsync to emulate a device. Loads are as in Phase 1 (~5.3 KB frames, 5 ms submit ticks):
+
+| submit to quorum ack, p50 / p99 | 350/s | 3,500/s | 35,000/s |
+|---|---|---|---|
+| memory only (same build) | 0.11 / 0.23 ms | 0.20 / 0.38 | 0.55 / 1.40 |
+| commitlog on tmpfs | 0.14 / 0.69 | 0.23 / 0.78 | 0.88 / 1.79 |
+| commitlog, three nodes on one consumer NVMe (fsync 5.2-5.6 ms) | 8.5 / 21.7 | 9.3 / 17.8 | saturated: ~25,000/s committed (20,000/s: 27 / 65 ms, fsync 10 ms) |
+
+| emulated device fsync, 3,500/s | 0.1 ms | 0.5 ms | 1 ms | 2 ms | 2.7 ms (this NVMe, one node a disk) |
+|---|---|---|---|---|---|
+| submit to quorum ack, p50 / p99 | 0.37 / 0.91 | 0.76 / 1.23 | 1.26 / 1.92 | 2.27 / 3.12 | 2.96 / 3.17 |
+| submit to the first consumer, p50 / p99 | 1.52 / 2.68 | 1.96 / 3.13 | 2.42 / 3.54 | 3.44 / 5.10 | 4.14 / 5.28 |
+
+At 35,000/s with a 2 ms fsync the ack is 2.87 / 4.39 ms, with 175 events a group commit and one fsync per 5 ms tick.
+
+| | 350/s | 3,500/s | 35,000/s |
+|---|---|---|---|
+| CPU leader / follower, memory only (cores) | 0.035 / 0.019 | 0.059 / 0.030 | 0.20 / 0.10 |
+| CPU leader / follower, commitlog | 0.033-0.044 / 0.022-0.028 | 0.059-0.072 / 0.036-0.045 | 0.29 / 0.17 |
+| RSS a node, memory only (512 MiB log + 512 MiB ring) | 255 MB | 1.0 GB | 1.2-1.7 GB |
+| RSS a node, commitlog (64 MiB log + 512 MiB ring) | 220 MB | 0.57-0.60 GB | 0.73-0.80 GB |
+| events a group commit, p50 | 2 | 17-18 | 175 |
+
+Throughput ceilings (200,000/s offered for 30 s, 5.3 KB frames, three nodes):
+
+| | committed | notes |
+|---|---|---|
+| memory only | 200,000/s (1 GB/s a node) | ack p50 3.0 ms; leader 0.99 cores, followers 0.46 |
+| commitlog on tmpfs | 200,000/s | ack p50 5.8 ms, p99 62; leader 1.78 cores, followers 0.91 |
+| commitlog, three nodes on one consumer NVMe | ~25,000/s (~130 MB/s a node fsynced, ~400 MB/s on the drive) | fsync p50 13-15 ms, p99 70-240; backpressure held the leader at 3.6 GB RSS |
+
+The tmpfs ceiling run kept only 256 MiB of commitlog on each node, which is 0.25 s at 1 GB/s. One follower fell further behind than that three times and was reset, a counted gap in its stream (`emit_gaps`, which the checker reports as skipped seqs). That's the reset Phase 1 documents, now reached only past the leader's disk retention. Every acked seq was emitted with its content. Phase 3's catch-up from the bucket removes it, and keeping segments a live follower still needs would too.
+
+| fault, 3,500/s, commitlog | emission pause (fault to the next new seq at any consumer) |
+|---|---|
+| kill -9 the leader | 55 ms median, 61 max on tmpfs; 72 / 88 on the NVMe (Phase 1, memory only: 43-81) |
+| kill -9 a follower | 17 ms median, 38 max |
+| power cut of the leader | 79 ms median, 579 max |
+| kill -9 the leader and a follower | 1.5-2.3 s |
+| kill -9 all three | 2.36 s median, 2.70 max |
+| power cut of all three | 2.47 s median, 2.72 max |
+
+The two-node and three-node pauses are the supervisor's 1 s restart, recovery, and then the 1 s election timeout, since nobody is leading. A real deploy restarts faster or slower than that, and the rest is ~0.4 s. Recovery reads and checksums every retained segment: 0.65 s for 1.8 GB (24 segments), ~0.35 s a GB.
+
+What the numbers say against the study:
+
+- **The commitlog ack is about RTT + fsync + 0.3 ms** when group commits line up with arrivals, as they do under the 5 ms ticks here. When fsyncs run back to back, an event also waits out part of the one in flight. On the shared NVMe (5.5 ms fsync) the ack was 9.3 ms, ~1.7 fsyncs. The study's "+0.5-2 ms on a VPS" holds if VPS fsyncs are 0.5-2 ms, which is the thing to measure. Budget ack ≈ RTT + 1-1.7x fsync.
+- **Don't put two members on one disk.** Three nodes on one consumer NVMe fsync at 5.5 ms instead of 2.7, and they also share its write bandwidth. That's the shared-disk case here, not a deployment, but the same holds for VPSes that might land on one host's disk (another reason for spread placement).
+- **Disk bandwidth with fsync, not CPU, sets the ceiling.** On tmpfs, three nodes sustain 200,000/s (1 GB/s a node) at 1.75 cores on the leader, so the commitlog code isn't the limit. On a disk, one node a disk needs ~185 MB/s fsynced at 100x. This consumer drive manages 278 MB/s with one writer at 1 MiB fdatasyncs, so 100x is borderline on consumer NVMe even before the wear the study already flags. 100x wants datacenter drives, and 10x is comfortable anywhere.
+- **RAM drops to the ring.** A node with a commitlog sits at ~0.6 GB at 10x against ~1.0 GB memory-only (Phase 1's "2x the log window" note). That's the study's "ring only" row.
+- **Two- and three-process failures are now a normal takeover, as the study assumed.** Kill or power-cut two or all three and the cluster resumes in about two seconds with nothing lost and no jump. The only lost-quorum case left is losing two disks.
+- **Recovery time grows with what's kept on disk** (~0.35 s a GB). Phase 3's trimming at R keeps that to one flush interval plus a segment: at 100x with a 60 s flush that's ~11 GB, ~4 s. If that matters, a sealed segment could carry an index footer so recovery reads only the tail segment.
+- **One append in flight per follower caps a follower at `max_batch_bytes` (4 MiB) per RTT + fsync.** At a 2 ms fsync that's ~2 GB/s, ample. It only bit on the saturated shared disk (20 ms fsyncs, ~200 MB/s). Pipelining appends, or a larger batch, is the fix if a host's fsync is that slow.
+
+### Measuring a real host (OVH, Hetzner)
+
+Nothing here touches a cloud host or real R2. To run on candidate hosts, with Jaz's OK:
+
+1. **fsync**, on each box, on the disk the commitlog would use (no root, needs `fio`):
+   ```
+   tests/qlog/fsync_probe.sh /var/lib/vlrelay/probe
+   ```
+   It prints fdatasync p50, p99 and p99.9 for 4 KiB, 64 KiB and 1 MiB appends with one writer, 64 KiB with three, and the unsynced write ceiling. Run it three times at different hours: VPS disks are shared. A VPS whose fdatasync is well under 0.1 ms is acknowledging from a cache (hypervisor or controller), so don't count on it surviving a host power cut.
+2. **The cluster**, three boxes (an OVH VPS-2 in each of three locations, or three Hetzner CX33/CAX21 in a spread placement group):
+   - Build `qlog` for the target (`cargo build --profile dev-release --bin qlog`, or `docker buildx` for linux/amd64 on the Mac) and copy it over.
+   - On box 1, MinIO for `qlog/leader` only (one GET and one CAS a takeover): `docker compose -f tests/qlog/compose.yml up -d --wait minio && docker compose -f tests/qlog/compose.yml run --rm minio-init`.
+   - On each box `i`, with the peer port (3151) and the http port (3161) open to the others only:
+     ```
+     qlog node --id n$i --listen 0.0.0.0:3151 --http 0.0.0.0:3161 \
+       --peer nJ=<box J>:3151 --peer nK=<box K>:3151 \
+       --s3-endpoint http://<box 1>:3190 --prefix bench-$(date +%s) \
+       --commitlog /var/lib/vlrelay/qlog
+     ```
+   - From box 1 (or a fourth box in the leader's DC), the checker, then the load:
+     ```
+     qlog check --node n1=<box1>:3161 --node n2=<box2>:3161 --node n3=<box3>:3161 \
+       --stop-file stop --acked acked.txt --out . &
+     qlog load --node n1=<box1>:3151 --node n2=<box2>:3151 --node n3=<box3>:3151 \
+       --rate 3500 --duration 60 --acked acked.txt --out load.json
+     for i in 1 2 3; do curl -s <box$i>:3161/qlog/status > status-n$i.json; done; touch stop; wait
+     python3 tests/qlog/report.py .
+     ```
+   - Repeat at `--rate 350` and `35000`. Then kill -9 the leader's `qlog node` (and two, and all three) under `--rate 3500` and restart it, for the takeover pause and the restart recovery.
+   - `report.py` gives the ack and end-to-end latency, each node's fsync p50 and p99 with the group-commit sizes, CPU and RSS. Paste them under the benchbox numbers above, against the "tmpfs + N ms" row that matches the host's fsync.
 
 ## Inputs
 
@@ -571,7 +703,8 @@ Known gaps, for later phases:
 | Hosts on the network | 6,260 listed, 1,956 active, 89 bsky.network PDSes with 23.4M of 24.0M accounts | measured (listHosts, reference notes) |
 | RAM baseline | 2 GB a node plus the ring | assumed (shadow run: 1.1 GB at 60 events/s) |
 | Flush upload, detection and takeover | ~2 s, ~5 s | assumed |
-| fsync | 0.03-0.1 ms datacenter NVMe, 0.5-2 ms VPS, 1-5 ms consumer NVMe | assumed |
+| fsync | 0.03-0.1 ms datacenter NVMe, 0.5-2 ms VPS | assumed |
+| fsync, consumer NVMe | 2.7 ms p50, 5.9 ms p99 (fdatasync, one appending writer; 5.5 ms with three on one disk) | measured (benchbox, `tests/qlog/fsync_probe.sh`) |
 | RTT | 0.2 ms one DC, 3 ms one metro, 65 ms cross-region | assumed |
 | R2 PUT | ~200 ms p50 from benchbox | measured (vlpds `bench/results/spaces-r2-2026-10-05.md`) |
 | Segment size, read size, DID shards, group commit | 64 MiB, 8 MiB, 4, 2 ms | design |

@@ -43,8 +43,13 @@ pub struct Config {
     pub rpc_timeout: Duration,
     pub max_batch_bytes: usize,
     /// Committed and emitted entries kept in memory past this are dropped,
-    /// oldest first (a follower that far behind is reset to the base).
+    /// oldest first (older ones come from the commitlog, if there is one; a
+    /// follower behind both is reset to the base).
     pub retain_bytes: usize,
+    /// The leader takes no new submits while this much is uncommitted:
+    /// without it, a quorum slower than the submitters (a saturated disk)
+    /// grows the leader's memory without bound.
+    pub max_pending_bytes: usize,
 }
 
 impl Config {
@@ -62,6 +67,7 @@ impl Config {
             rpc_timeout: Duration::from_millis(500),
             max_batch_bytes: 4 << 20,
             retain_bytes: 512 << 20,
+            max_pending_bytes: 256 << 20,
         }
     }
 
@@ -289,7 +295,8 @@ struct Core {
     /// Submits waiting for their last seq to commit.
     waiters: BTreeMap<u64, oneshot::Sender<Result<(), String>>>,
     /// (first, last, appended at) per submit, for the commit latency.
-    pending: VecDeque<(u64, u64, Instant)>,
+    pending: VecDeque<(u64, u64, Instant, usize)>,
+    pending_bytes: usize,
 }
 
 pub struct Stats {
@@ -433,6 +440,7 @@ impl Node {
                 self_durable: 0,
                 waiters: BTreeMap::new(),
                 pending: VecDeque::new(),
+                pending_bytes: 0,
             }),
             cfg,
             store,
@@ -560,6 +568,20 @@ impl Node {
     /// quorum holds them (or failed if this node stops leading first; the
     /// sender then resends them to the next leader, under new seqs).
     pub async fn submit(self: &Arc<Self>, frames: Vec<(Bytes, Bytes)>) -> Msg {
+        // under the submitter's timeout, so a busy leader isn't taken for a dead one
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let mut commits = self.commit.subscribe();
+        loop {
+            {
+                let c = self.core.lock();
+                if c.role != Role::Leader || c.pending_bytes < self.cfg.max_pending_bytes {
+                    break;
+                }
+            }
+            if tokio::time::timeout_at(deadline, commits.changed()).await.is_err() {
+                return Msg::Failed { reason: "busy: too much uncommitted".into() };
+            }
+        }
         let (rx, first, last, epoch, ticket) = {
             let mut c = self.core.lock();
             if c.role != Role::Leader {
@@ -577,7 +599,9 @@ impl Node {
             let last = c.log.last_seq();
             let (tx, rx) = oneshot::channel();
             c.waiters.insert(last, tx);
-            c.pending.push_back((first, last, Instant::now()));
+            let bytes = c.log.range(first - 1, last).map(|e| e.data.len()).sum();
+            c.pending.push_back((first, last, Instant::now(), bytes));
+            c.pending_bytes += bytes;
             let ticket = self.sync(&mut c);
             (rx, first, last, epoch, ticket)
         };
@@ -620,11 +644,12 @@ impl Node {
         let now = Instant::now();
         {
             let mut h = self.stats.commit_us.lock();
-            while let Some(&(first, last, at)) = c.pending.front() {
+            while let Some(&(first, last, at, bytes)) = c.pending.front() {
                 if last > q {
                     break;
                 }
                 c.pending.pop_front();
+                c.pending_bytes -= bytes;
                 let _ = h.record_n((now - at).as_micros().max(1) as u64, last - first + 1);
             }
         }
@@ -648,6 +673,7 @@ impl Node {
             let _ = w.send(Err(format!("not leader: {why}")));
         }
         c.pending.clear();
+        c.pending_bytes = 0;
     }
 
     fn become_leader(self: &Arc<Self>, c: &mut Core, epoch: u64) {
