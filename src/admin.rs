@@ -197,6 +197,10 @@ pub struct HostRow {
     /// overview's top hosts only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<f64>,
+    /// Accounts it created that the relay throttled (past its cap) and no
+    /// operator has released, as the leader counts them.
+    #[serde(default)]
+    pub throttled_accounts: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -441,6 +445,10 @@ pub struct Consumer {
     pub bytes_per_sec: f64,
     /// Replaying from a cursor (true) or live.
     pub backfilling: bool,
+    /// Where its next events come from: `ring` (the firehose's memory, as
+    /// every live consumer), `disk` (the node's own log) or `bucket`.
+    #[serde(default)]
+    pub read_tier: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -488,7 +496,8 @@ pub struct NodeView {
     pub commit_lag_ms: f64,
     /// Cores busy over the last sample.
     pub cpu: f64,
-    pub mem_bytes: u64,
+    /// Resident memory; None where the platform doesn't say.
+    pub mem_bytes: Option<u64>,
     /// It didn't answer this round (down, hung or partitioned): the numbers
     /// above are 0, not its last ones.
     pub stale: bool,
@@ -856,6 +865,90 @@ pub struct StoreView {
     pub retention: Option<serde_json::Value>,
 }
 
+/// The cluster budgets against their use on the answering node.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyUsage {
+    pub node: String,
+    /// PLC (and did:web) document fetches a second, over the last sample.
+    pub plc_lookups_per_sec: f64,
+    /// `cluster.plcLookupsPerSec`, and this node's share of it.
+    pub plc_lookups_budget: f64,
+    pub plc_lookups_share: f64,
+    /// Misses the PLC export's seeds filled, a second.
+    pub seeded_per_sec: f64,
+    /// New accounts a minute, over the last sample (counted where the
+    /// account gate runs: the leader).
+    pub new_accounts_per_min: f64,
+    pub new_accounts_budget: f64,
+    pub new_hosts_today: u32,
+    pub new_hosts_per_day: u32,
+    /// The sample's window.
+    pub window_secs: f64,
+}
+
+/// The heaviest keys of each spam signal on the answering node.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalsView {
+    pub node: String,
+    pub signals: Vec<SignalTop>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalTop {
+    /// The rule (`host-new-accounts`, `account-records` ...).
+    pub rule: String,
+    /// `host` or `account`.
+    pub per: String,
+    pub limit: f64,
+    pub window_secs: u32,
+    pub enabled: bool,
+    /// Heaviest first (Space-Saving: `estimate` may overcount by up to
+    /// `estimate - lower`).
+    pub top: Vec<SignalKey>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalKey {
+    pub key: String,
+    pub host: String,
+    pub estimate: f64,
+    pub lower: f64,
+}
+
+/// Leadership changes across the members, newest first.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuorumHistory {
+    pub events: Vec<QuorumEvent>,
+    /// Members that didn't answer: their changes are missing.
+    pub stale: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuorumEvent {
+    pub node: String,
+    pub at_ms: i64,
+    /// `lead`, `step_down`, `recovery` or `membership`.
+    pub kind: String,
+    pub epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// How it led (`election`, `recovery`, `membership change`) or why it
+    /// stepped down; for a membership change, `a,b,c -> a,b,d`.
+    pub why: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct NodeQuery {
+    /// A member's id; default the answering node.
+    pub node: Option<String>,
+}
+
 // ---------------------------------------------------------------- source trait
 
 #[derive(Debug, thiserror::Error)]
@@ -956,6 +1049,32 @@ pub trait AdminSource: Send + Sync + 'static {
     fn release_throttled(&self, _host: &str, _by: &str) -> impl Future<Output = AdminResult<Released>> + Send {
         async { Err(AdminError::NotFound("this relay can't release throttled accounts".into())) }
     }
+    fn policy_usage(&self) -> impl Future<Output = AdminResult<PolicyUsage>> + Send {
+        async { Err(AdminError::NotFound("this relay doesn't report its budgets' use".into())) }
+    }
+    fn policy_signals(&self) -> impl Future<Output = AdminResult<SignalsView>> + Send {
+        async { Err(AdminError::NotFound("this relay doesn't report its spam signals".into())) }
+    }
+    /// Every account under a relay takedown, newest first.
+    fn takedowns(&self) -> impl Future<Output = AdminResult<Vec<crate::policy::takedowns::TakedownEntry>>> + Send {
+        async { Err(AdminError::NotFound("this relay doesn't list takedowns".into())) }
+    }
+    fn quorum_history(&self) -> impl Future<Output = AdminResult<QuorumHistory>> + Send {
+        async { Err(AdminError::NotFound("this relay doesn't run the quorum log".into())) }
+    }
+    /// A member's settings (None: this node's).
+    fn settings_of(&self, node: Option<&str>) -> impl Future<Output = AdminResult<SettingsView>> + Send {
+        async move {
+            match node {
+                None => self.settings().await,
+                Some(n) => Err(AdminError::NotFound(format!("no node {n}"))),
+            }
+        }
+    }
+    /// Asks the leader to flush now; its status after the flush.
+    fn flush_now(&self, _by: &str) -> impl Future<Output = AdminResult<serde_json::Value>> + Send {
+        async { Err(AdminError::NotFound("this relay doesn't run the quorum log".into())) }
+    }
     fn store(&self) -> impl Future<Output = AdminResult<StoreView>> + Send {
         async { Err(AdminError::NotFound("this relay keeps no object-store numbers".into())) }
     }
@@ -1028,6 +1147,11 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
         .route("/admin/api/hosts/{host}/release-throttled", post(release_throttled::<S>))
         .route("/admin/api/ops/tail", get(tail::<S>))
         .route("/admin/api/store", get(store::<S>))
+        .route("/admin/api/policy/usage", get(policy_usage::<S>))
+        .route("/admin/api/policy/signals", get(policy_signals::<S>))
+        .route("/admin/api/takedowns", get(takedowns::<S>))
+        .route("/admin/api/cluster/quorum/history", get(quorum_history::<S>))
+        .route("/admin/api/cluster/quorum/flush", post(flush_now::<S>))
         .route("/admin/api/domain-rules", get(rules::<S>).post(create_rule::<S>))
         .route("/admin/api/domain-rules/{id}", axum::routing::put(update_rule::<S>).delete(delete_rule::<S>))
         .route("/admin/api/policy", get(policy::<S>).put(update_policy::<S>))
@@ -1162,6 +1286,22 @@ async fn release_throttled<S: AdminSource>(State(c): Ax<S>, Path(h): Path<String
     tracing::info!(target: "vlrelay::audit", host = %h, by = BY, "release throttled accounts");
     Ok(Json(c.src.release_throttled(&h, BY).await?))
 }
+async fn policy_usage<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<PolicyUsage>> {
+    Ok(Json(c.src.policy_usage().await?))
+}
+async fn policy_signals<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<SignalsView>> {
+    Ok(Json(c.src.policy_signals().await?))
+}
+async fn takedowns<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Vec<crate::policy::takedowns::TakedownEntry>>> {
+    Ok(Json(c.src.takedowns().await?))
+}
+async fn quorum_history<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<QuorumHistory>> {
+    Ok(Json(c.src.quorum_history().await?))
+}
+async fn flush_now<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<serde_json::Value>> {
+    tracing::info!(target: "vlrelay::audit", by = BY, "flush now");
+    Ok(Json(c.src.flush_now(BY).await?))
+}
 async fn store<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<StoreView>> {
     Ok(Json(c.src.store().await?))
 }
@@ -1187,8 +1327,8 @@ async fn quorum_members<S: AdminSource>(
     tracing::info!(target: "vlrelay::audit", members = ?req.members, by = BY, "quorum members");
     Ok(Json(c.src.change_quorum_members(req, BY).await?))
 }
-async fn settings<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<SettingsView>> {
-    Ok(Json(c.src.settings().await?))
+async fn settings<S: AdminSource>(State(c): Ax<S>, Query(q): Query<NodeQuery>) -> AdminResult<Json<SettingsView>> {
+    Ok(Json(c.src.settings_of(q.node.as_deref().filter(|n| !n.is_empty())).await?))
 }
 /// What every policy field is on a fresh relay, for the Tuning page.
 async fn policy_defaults() -> AdminResult<Json<serde_json::Value>> {

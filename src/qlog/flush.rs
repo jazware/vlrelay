@@ -268,7 +268,29 @@ struct Stats {
     requests: BTreeMap<String, u64>,
     applied: u64,
     last: Option<Manifest>,
+    recent: std::collections::VecDeque<FlushRecord>,
 }
+
+/// One flush this leader made.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FlushRecord {
+    /// When its manifest was written.
+    pub at_ms: i64,
+    pub epoch: u64,
+    /// F after it.
+    pub flushed: u64,
+    pub entries: u64,
+    pub segments: u64,
+    /// Compressed segment bytes, and the frames' raw bytes.
+    pub bytes: u64,
+    pub raw_bytes: u64,
+    /// Seal to manifest CAS.
+    pub took_us: u64,
+    /// The applier's pause for the checkpoint.
+    pub seal_us: u64,
+}
+
+const RECENT_FLUSHES: usize = 32;
 
 /// The flush's counters, shared with `/qlog/status`, and requests for a
 /// flush now (a membership change's barrier).
@@ -305,6 +327,8 @@ pub struct Status {
     pub last_reserve: u64,
     /// When this leader's last manifest was written (None before its first).
     pub last_at_ms: Option<i64>,
+    /// This process's last flushes, oldest first.
+    pub recent: Vec<FlushRecord>,
 }
 
 fn hist() -> hdrhistogram::Histogram<u64> {
@@ -344,6 +368,7 @@ impl Shared {
             last_flushed: s.last.as_ref().map_or(0, |m| m.flushed),
             last_reserve: s.last.as_ref().map_or(0, |m| m.reserve),
             last_at_ms: s.last.as_ref().map(|m| m.at_ms).filter(|&t| t > 0),
+            recent: s.recent.iter().cloned().collect(),
         };
         if reset {
             s.duration_us = None;
@@ -635,6 +660,20 @@ impl Leader {
             }
         }
         s.last = Some(self.man.clone());
+        if s.recent.len() >= RECENT_FLUSHES {
+            s.recent.pop_front();
+        }
+        s.recent.push_back(FlushRecord {
+            at_ms: self.man.at_ms,
+            epoch: self.epoch,
+            flushed: self.man.flushed,
+            entries,
+            segments: self.man.segments.len() as u64,
+            bytes: self.man.segments.iter().map(|x| x.bytes).sum(),
+            raw_bytes: raw,
+            took_us: took,
+            seal_us,
+        });
         tracing::info!(
             flushed = f,
             reserve = self.man.reserve,

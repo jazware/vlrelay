@@ -20,6 +20,7 @@ use crate::policy::admin::PolicyAdmin;
 use crate::state::{AccountStatus, Upstream};
 use crate::types::Host;
 use crate::upstream::{HostStatus, HostView, Tier};
+use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -37,6 +38,15 @@ pub struct NodeAdmin {
     store_prev: Mutex<Option<(Instant, crate::qlog::bucket::Requests)>>,
     /// `retain/qlog`, read at most every [`RETAIN_TTL`].
     retain: tokio::sync::Mutex<Option<(Instant, Option<serde_json::Value>)>>,
+    /// (when, PLC fetches, seeded misses, new accounts) at the last usage
+    /// sample, for its rates.
+    usage_prev: Mutex<(Instant, u64, u64, u64)>,
+}
+
+fn usage_counts(n: &Node) -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = &n.identity.stats;
+    (s.fetches.load(Relaxed), s.seeded.load(Relaxed), super::metrics::NEW_ACCOUNTS.get())
 }
 
 const RETAIN_TTL: Duration = Duration::from_secs(30);
@@ -50,7 +60,7 @@ fn now_ms() -> i64 {
 }
 
 /// CPU seconds this process has used (user + system).
-fn cpu_seconds() -> f64 {
+pub(crate) fn cpu_seconds() -> f64 {
     // SAFETY: getrusage fills the struct it's handed.
     unsafe {
         let mut r: libc::rusage = std::mem::zeroed();
@@ -92,13 +102,18 @@ fn pipeline_gauges() -> BTreeMap<String, f64> {
 impl NodeAdmin {
     pub fn new(node: Arc<Node>, policy: Arc<PolicyHooks>) -> NodeAdmin {
         NodeAdmin {
-            node,
             policy,
             open_cases: Mutex::new(None),
             cpu: Mutex::new(None),
             settings: None,
-            store_prev: Mutex::new(None),
+            // primed now, so the first answer has a window
+            store_prev: Mutex::new(Some((Instant::now(), crate::qlog::bucket::requests()))),
             retain: tokio::sync::Mutex::new(None),
+            usage_prev: Mutex::new({
+                let (f, s, a) = usage_counts(&node);
+                (Instant::now(), f, s, a)
+            }),
+            node,
         }
     }
 
@@ -207,6 +222,7 @@ impl NodeAdmin {
             node: self.node.cfg.node_id.clone(),
             max_accounts: self.policy.limits(&h.record.hostname).and_then(|l| l.limits).map_or(0, |l| l.max_accounts),
             history: Vec::new(),
+            throttled_accounts: self.node.quorum.hosts.throttled(&h.record.hostname),
         }
     }
 
@@ -314,8 +330,9 @@ impl NodeAdmin {
     /// On the quorum log the leader makes the takedown: the record's flag
     /// and the `#account` announcing it are one entry.
     async fn set_takedown(&self, did: &str, takedown: bool, by: &str, reason: &str) -> AdminResult<admin::Account> {
-        self.policy.engine.takedowns.record(did, takedown, by, reason).await?;
+        let e = self.policy.engine.takedowns.record(did, takedown, by, reason).await?;
         self.node.serve.takedowns.apply_local(did, takedown);
+        self.node.serve.takedowns.note(e);
         match self.node.quorum.takedown(did, takedown).await {
             Ok(_) => {}
             Err(e) if format!("{e}").starts_with("no_account") => {
@@ -576,8 +593,22 @@ impl NodeAdmin {
                 events_per_sec: c.events_per_sec,
                 bytes_per_sec: c.bytes_per_sec,
                 backfilling: c.backfilling,
+                read_tier: self.read_tier(c.pos, c.backfilling).into(),
             })
             .collect()
+    }
+
+    /// Where a consumer at `pos` reads next: the firehose's ring, this
+    /// node's own log (memory or commitlog), or the bucket's segments.
+    fn read_tier(&self, pos: i64, backfilling: bool) -> &'static str {
+        let in_ring = self.node.serve.firehose().is_some_and(|f| f.from_ring(pos).1);
+        if !backfilling || in_ring {
+            "ring"
+        } else if pos as u64 + 1 >= self.node.quorum.qnode.readable_floor() {
+            "disk"
+        } else {
+            "bucket"
+        }
     }
 
     pub fn local_kick(&self, id: u64, by: &str) -> AdminResult<()> {
@@ -771,8 +802,22 @@ impl AdminSource for NodeAdmin {
     }
 
     /// This node's consumers (each member's dashboard lists its own).
+    /// Every member's consumers, asked over the peer protocol; a member
+    /// that doesn't answer is left out (the cluster view marks it stale).
     async fn consumers(&self) -> AdminResult<Vec<admin::Consumer>> {
-        Ok(self.local_consumers())
+        let mut out = Vec::new();
+        for (id, r) in self.node.quorum.ask_all("node:consumers", Bytes::new()).await {
+            if id == self.id() {
+                continue;
+            }
+            match r.ok().and_then(|b| serde_json::from_slice::<Vec<admin::Consumer>>(&b).ok()) {
+                Some(cs) => out.extend(cs),
+                None => tracing::debug!(node = %id, "a member's consumers didn't come back"),
+            }
+        }
+        out.extend(self.local_consumers());
+        out.sort_by(|a, b| (&a.node, a.id).cmp(&(&b.node, b.id)));
+        Ok(out)
     }
 
     async fn kick_consumer(&self, id: u64, by: &str) -> AdminResult<()> {
@@ -782,12 +827,132 @@ impl AdminSource for NodeAdmin {
     async fn kick_consumer_on(&self, node: Option<&str>, id: u64, by: &str) -> AdminResult<()> {
         match node.filter(|n| *n != self.id()) {
             None => self.local_kick(id, by),
-            Some(n) => Err(AdminError::BadRequest(format!("consumer {id} is on {n}: kick it from {n}'s dashboard"))),
+            Some(n) => {
+                let token = self.node.quorum.admin_token().ok_or_else(|| {
+                    AdminError::BadRequest(format!(
+                        "consumer {id} is on {n}: kicking it from here needs --qlog-admin-token on the nodes"
+                    ))
+                })?;
+                let body = serde_json::json!({ "token": token, "id": id, "by": by });
+                let b = self
+                    .node
+                    .quorum
+                    .ask_member(n, "node:kick", serde_json::to_vec(&body).unwrap_or_default().into())
+                    .await
+                    .map_err(|e| AdminError::BadRequest(format!("{n}: {e}")))?;
+                let v: serde_json::Value = serde_json::from_slice(&b).unwrap_or_default();
+                match v["error"].as_str() {
+                    None => Ok(()),
+                    Some(e) if e.starts_with("no connected") => Err(AdminError::NotFound(format!("{n}: {e}"))),
+                    Some(e) => Err(AdminError::BadRequest(format!("{n}: {e}"))),
+                }
+            }
         }
     }
 
     async fn settings(&self) -> AdminResult<admin::SettingsView> {
         self.settings.clone().ok_or_else(|| AdminError::NotFound("this node doesn't report its config".into()))
+    }
+
+    async fn settings_of(&self, node: Option<&str>) -> AdminResult<admin::SettingsView> {
+        match node.filter(|n| *n != self.id()) {
+            None => self.settings().await,
+            Some(n) => {
+                let b = self
+                    .node
+                    .quorum
+                    .ask_member(n, "node:settings", Bytes::new())
+                    .await
+                    .map_err(|e| AdminError::NotFound(format!("{n}: {e}")))?;
+                serde_json::from_slice(&b).map_err(|e| AdminError::Internal(anyhow::anyhow!("{n}'s settings: {e}")))
+            }
+        }
+    }
+
+    async fn policy_usage(&self) -> AdminResult<admin::PolicyUsage> {
+        let (f, sd, a) = usage_counts(&self.node);
+        let (secs, df, ds, da) = {
+            let mut p = self.usage_prev.lock();
+            let secs = p.0.elapsed().as_secs_f64();
+            let d = (f.saturating_sub(p.1), sd.saturating_sub(p.2), a.saturating_sub(p.3));
+            if secs >= STORE_WINDOW.as_secs_f64() {
+                *p = (Instant::now(), f, sd, a);
+            }
+            (secs, d.0, d.1, d.2)
+        };
+        let per = |n: u64| if secs > 0.0 { n as f64 / secs } else { 0.0 };
+        let e = &self.policy.engine;
+        let c = e.snapshot().policy.body.cluster.clone();
+        Ok(admin::PolicyUsage {
+            node: self.id().to_string(),
+            plc_lookups_per_sec: per(df),
+            plc_lookups_budget: c.plc_lookups_per_sec,
+            plc_lookups_share: e.budget(crate::policy::budget::BudgetKind::PlcLookupsPerSec),
+            seeded_per_sec: per(ds),
+            new_accounts_per_min: per(da) * 60.0,
+            new_accounts_budget: c.new_accounts_per_min,
+            new_hosts_today: e.new_hosts_today().await.map_err(AdminError::Internal)?,
+            new_hosts_per_day: c.new_hosts_per_day,
+            window_secs: secs,
+        })
+    }
+
+    async fn policy_signals(&self) -> AdminResult<admin::SignalsView> {
+        use crate::policy::signals::SpamRule;
+        let e = &self.policy.engine;
+        let spam = e.snapshot().policy.body.spam.clone();
+        let now = now_ms();
+        let signals = SpamRule::ALL
+            .iter()
+            .map(|&r| {
+                let t = r.threshold(&spam);
+                admin::SignalTop {
+                    rule: r.name().to_string(),
+                    per: if r.per_account() { "account" } else { "host" }.into(),
+                    limit: t.limit,
+                    window_secs: t.window_secs,
+                    enabled: t.enabled(),
+                    top: e
+                        .signals
+                        .top(r, 10, now)
+                        .into_iter()
+                        .map(|(key, host, estimate, lower)| admin::SignalKey { key, host, estimate, lower })
+                        .collect(),
+                }
+            })
+            .collect();
+        Ok(admin::SignalsView { node: self.id().to_string(), signals })
+    }
+
+    async fn takedowns(&self) -> AdminResult<Vec<crate::policy::takedowns::TakedownEntry>> {
+        Ok(self.node.serve.takedowns.list())
+    }
+
+    async fn quorum_history(&self) -> AdminResult<admin::QuorumHistory> {
+        let v = self.node.quorum.view().await;
+        let mut h = admin::QuorumHistory::default();
+        for n in v.nodes {
+            let Some(st) = n.status else {
+                h.stale.push(n.node);
+                continue;
+            };
+            for e in st["history"].as_array().into_iter().flatten() {
+                h.events.push(admin::QuorumEvent {
+                    node: n.node.clone(),
+                    at_ms: e["at_ms"].as_i64().unwrap_or(0),
+                    kind: e["kind"].as_str().unwrap_or("").to_string(),
+                    epoch: e["epoch"].as_u64().unwrap_or(0),
+                    from: e["from"].as_str().map(str::to_string),
+                    why: e["why"].as_str().unwrap_or("").to_string(),
+                });
+            }
+        }
+        h.events.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then_with(|| a.node.cmp(&b.node)));
+        Ok(h)
+    }
+
+    async fn flush_now(&self, _by: &str) -> AdminResult<serde_json::Value> {
+        self.node.quorum.flush_now().await.map_err(|e| AdminError::BadRequest(format!("{e:#}")))
     }
 
     /// Each member's status, asked over the peer protocol (addresses from
@@ -1094,6 +1259,32 @@ pub(crate) fn store_view(
         purposes,
         latency: store_latency(),
         retention,
+    }
+}
+
+impl crate::node::quorum::LocalAsk for NodeAdmin {
+    fn answer<'a>(&'a self, topic: &'a str, body: Bytes) -> futures::future::BoxFuture<'a, Option<Bytes>> {
+        Box::pin(async move {
+            let v = match topic {
+                "node:consumers" => serde_json::to_value(self.local_consumers()).ok()?,
+                "node:settings" => serde_json::to_value(self.settings.as_ref()?).ok()?,
+                "node:kick" => {
+                    let req: serde_json::Value = serde_json::from_slice(&body).ok()?;
+                    let ok = self.node.quorum.admin_token().is_some_and(|t| req["token"].as_str() == Some(t));
+                    if !ok {
+                        serde_json::json!({"error": "unauthorized"})
+                    } else {
+                        let by = req["by"].as_str().unwrap_or("admin");
+                        match self.local_kick(req["id"].as_u64()?, by) {
+                            Ok(()) => serde_json::json!({}),
+                            Err(e) => serde_json::json!({"error": e.to_string()}),
+                        }
+                    }
+                }
+                _ => return None,
+            };
+            serde_json::to_vec(&v).ok().map(Bytes::from)
+        })
     }
 }
 

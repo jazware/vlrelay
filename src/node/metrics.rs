@@ -38,6 +38,7 @@ lazy!(CONSUMERS: IntGauge = register_int_gauge!("vlrelay_consumers", "Connected 
 lazy!(HOST_READ_LAG_MAX: IntGauge = register_int_gauge!("vlrelay_host_read_lag_max_seconds", "The furthest any host reader is behind its host's stream: newest frame's age when read, plus the time since while held back by limits"));
 lazy!(HOSTS_LAGGING: IntGauge = register_int_gauge!("vlrelay_hosts_lagging", "Hosts whose reader is more than a minute behind"));
 lazy!(IDENTITY_CACHE: IntGauge = register_int_gauge!("vlrelay_identity_cache_entries", "DID documents in the identity cache"));
+lazy!(NEW_ACCOUNTS: IntCounter = register_int_counter!("vlrelay_new_accounts_total", "Newly created accounts the account gate admitted (what cluster.newAccountsPerMin budgets)"));
 lazy!(ACCOUNTS_THROTTLED: IntCounterVec = register_int_counter_vec!("vlrelay_accounts_throttled_total", "New accounts created throttled by policy, by why (host_cap)", &["why"]));
 lazy!(ACCOUNTS_DEFERRED: IntCounterVec = register_int_counter_vec!("vlrelay_accounts_deferred_total", "Events of new accounts dropped while a new-account budget was spent, by which (host_rate, cluster_budget)", &["why"]));
 lazy!(FORCED_LOOKUPS_REFUSED: IntCounter = register_int_counter!("vlrelay_forced_lookups_refused_total", "Fresh DID document fetches an event asked for that its host's budget refused (the cached document was used)"));

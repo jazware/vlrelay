@@ -49,6 +49,54 @@ pub(in crate::admin) struct Extra {
 }
 
 impl Extra {
+    /// Leadership changes in the shape the real relay merges from its
+    /// members' statuses: the switches as their leaders saw them, the
+    /// recovery, and the takeovers between (13 and 14 after a leader's
+    /// restart an hour and twenty minutes ago).
+    pub(in crate::admin) fn history(&self, now: i64) -> AdminResult<QuorumHistory> {
+        let hour = 3_600_000;
+        let mut events = Vec::new();
+        for w in &self.switches {
+            events.push(QuorumEvent {
+                node: w.leader.clone(),
+                at_ms: w.at_ms,
+                kind: "lead".into(),
+                epoch: w.epoch,
+                from: Some(w.leader.clone()),
+                why: "membership change".into(),
+            });
+        }
+        for r in &self.recoveries {
+            events.push(QuorumEvent {
+                node: self.leader.clone(),
+                at_ms: now - 30 * hour + r.generation as i64 * 1000,
+                kind: "lead".into(),
+                epoch: r.epoch,
+                from: None,
+                why: "recovery".into(),
+            });
+        }
+        let t = now - hour - 20 * 60_000;
+        events.push(QuorumEvent {
+            node: "relay-b".into(),
+            at_ms: t,
+            kind: "step_down".into(),
+            epoch: 13,
+            from: None,
+            why: "no quorum heard within the election timeout".into(),
+        });
+        events.push(QuorumEvent {
+            node: self.leader.clone(),
+            at_ms: t + 1_140,
+            kind: "lead".into(),
+            epoch: self.epoch,
+            from: Some("relay-b".into()),
+            why: "election".into(),
+        });
+        events.sort_by_key(|e| std::cmp::Reverse(e.at_ms));
+        Ok(QuorumHistory { events, stale: Vec::new() })
+    }
+
     /// (leader, epoch, members, learners)
     pub(in crate::admin) fn roles(&self) -> (String, u64, Vec<String>, Vec<String>) {
         (self.leader.clone(), self.epoch, self.members.clone(), self.learners.clone())
@@ -180,6 +228,7 @@ impl Extra {
             "paused": false,
             "last_epoch": self.epoch,
             "switches": [],
+            "requests": requests(leading, up_secs),
         });
         if leading {
             let flushes = up_secs / 2;
@@ -481,4 +530,34 @@ impl Extra {
         ];
         SettingsView { binary: "vlrelay".into(), version: env!("CARGO_PKG_VERSION").into(), entries }
     }
+}
+
+/// A member's bucket requests in `qlog::bucket::Requests`'s shape: the
+/// leader flushes, retains and reads the state; followers only read
+/// backfill and poll `qlog/leader`.
+fn requests(leading: bool, up_secs: u64) -> Value {
+    let n = |per_sec: f64| (per_sec * up_secs as f64) as u64;
+    let c = |a: f64, b: f64, free: f64| json!({"a": n(a), "b": n(b), "free": n(free)});
+    type Purposes = Vec<(&'static str, Value)>;
+    let (purposes, ops): (Purposes, Vec<(&str, f64)>) = if leading {
+        (
+            vec![
+                ("flush", c(0.07, 0.0, 0.0)),
+                ("state", c(0.31, 1.2, 0.04)),
+                ("leader", c(0.0005, 0.001, 0.0)),
+                ("retain", c(0.003, 0.002, 0.012)),
+                ("backfill", c(0.0, 0.42, 0.0)),
+            ],
+            vec![("flush/put", 0.07), ("state/put", 0.31), ("state/get", 1.2), ("backfill/get_range", 0.42)],
+        )
+    } else {
+        (vec![("leader", c(0.0, 0.001, 0.0)), ("backfill", c(0.0, 0.2, 0.0))], vec![("backfill/get_range", 0.2)])
+    };
+    let total = |k: &str| purposes.iter().map(|(_, v)| v[k].as_u64().unwrap_or(0)).sum::<u64>();
+    json!({
+        "total": {"a": total("a"), "b": total("b"), "free": total("free")},
+        "by_purpose": purposes.iter().map(|(p, v)| (p.to_string(), v.clone())).collect::<serde_json::Map<_, _>>(),
+        "by_component": purposes.iter().map(|(p, v)| (format!("{p}/data"), v.clone())).collect::<serde_json::Map<_, _>>(),
+        "by_op": ops.iter().map(|(o, r)| (o.to_string(), json!(n(*r)))).collect::<serde_json::Map<_, _>>(),
+    })
 }

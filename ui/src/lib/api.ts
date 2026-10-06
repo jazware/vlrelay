@@ -44,6 +44,8 @@ export type HostRow = {
   node: string
   /** The account cap in force (tier, or the host's own); 0 unknown. */
   maxAccounts: number
+  /** Accounts it created that the relay throttled past its cap (the leader's count). */
+  throttledAccounts: number
   /** Events/s, 1 s apart, oldest first: only on the overview's top hosts. */
   history?: number[]
 }
@@ -185,6 +187,8 @@ export type Consumer = {
   eventsPerSec: number
   bytesPerSec: number
   backfilling: boolean
+  /** Where its next events come from. */
+  readTier: 'ring' | 'disk' | 'bucket'
 }
 
 export type NodeView = {
@@ -209,7 +213,8 @@ export type NodeView = {
   /** Submit to the leader until committed. */
   commitLagMs: number
   cpu: number
-  memBytes: number
+  /** null where the platform doesn't report it */
+  memBytes: number | null
   /** It didn't answer this round: its numbers are 0, not its last ones. */
   stale: boolean
   error: string | null
@@ -572,3 +577,24 @@ export function errText(e: unknown): string {
   if (e instanceof Error) return e.message
   return String(e)
 }
+
+export type PolicyUsage = {
+  node: string
+  plcLookupsPerSec: number
+  plcLookupsBudget: number
+  plcLookupsShare: number
+  seededPerSec: number
+  newAccountsPerMin: number
+  newAccountsBudget: number
+  newHostsToday: number
+  newHostsPerDay: number
+  windowSecs: number
+}
+export type SignalKey = { key: string; host: string; estimate: number; lower: number }
+export type SignalTop = { rule: string; per: 'host' | 'account'; limit: number; windowSecs: number; enabled: boolean; top: SignalKey[] }
+export type SignalsView = { node: string; signals: SignalTop[] }
+export type TakedownEntry = { did: string; takedown: boolean; atMs: number; by: string; reason: string }
+export type QuorumEvent = { node: string; atMs: number; kind: 'lead' | 'step_down'; epoch: number; from?: string; why: string }
+export type QuorumHistory = { events: QuorumEvent[]; stale: string[] }
+/** One of the leader's flushes, in `status.flush.recent` (snake_case, as the status serializes). */
+export type FlushRecord = { at_ms: number; epoch: number; flushed: number; entries: number; segments: number; bytes: number; raw_bytes: number; took_us: number; seal_us: number }

@@ -123,6 +123,8 @@ pub struct TakedownSet {
     local_applies: AtomicU64,
     /// The version of each current object a poll has applied.
     seen: Mutex<HashMap<String, String>>,
+    /// Each account's latest action in full, for the admin API's list.
+    entries: Mutex<HashMap<Box<str>, TakedownEntry>>,
     polling: tokio::sync::Mutex<()>,
 }
 
@@ -137,6 +139,22 @@ impl TakedownSet {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Every account under a takedown as this node knows them, newest
+    /// first.
+    pub fn list(&self) -> Vec<TakedownEntry> {
+        let mut v: Vec<TakedownEntry> = self.entries.lock().values().filter(|e| e.takedown).cloned().collect();
+        v.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then_with(|| a.did.cmp(&b.did)));
+        v
+    }
+
+    /// The full entry of an action this node recorded.
+    pub fn note(&self, e: TakedownEntry) {
+        let mut m = self.entries.lock();
+        if m.get(e.did.as_str()).is_none_or(|p| p.at_ms <= e.at_ms) {
+            m.insert(e.did.as_str().into(), e);
+        }
     }
 
     /// An action this node just recorded ([`Takedowns::record`]). It wins
@@ -174,7 +192,13 @@ impl TakedownSet {
             let applied = match got {
                 Ok(Some((body, _))) => match serde_json::from_slice::<TakedownEntry>(&body) {
                     // a local apply since the list started is newer than anything it saw
-                    Ok(e) => self.set(&e.did, e.takedown, 0, |by| by <= started),
+                    Ok(e) => {
+                        let applied = self.set(&e.did, e.takedown, 0, |by| by <= started);
+                        if applied {
+                            self.note(e);
+                        }
+                        applied
+                    }
                     Err(e) => {
                         tracing::warn!(object = %m.location, "unreadable takedown object (skipped until it changes): {e}");
                         true

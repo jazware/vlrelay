@@ -312,6 +312,9 @@ impl Sim {
                 2 => format!("pds.{w}-{}.org", rng.pick(&["collective", "coop", "commons", "guild"])),
                 _ => format!("bsky.{w}.{}", rng.pick(&["net", "dev", "community"])),
             };
+            // WORDS wraps around before the 60th
+            let name =
+                if hosts.iter().any(|h| h.name == name) { name.replacen('.', &format!("{i}."), 1) } else { name };
             let accounts = (rng.range(7.5, 11.3)).exp() as u64;
             let rate = accounts as f64 * rng.range(0.0006, 0.0018);
             let tier = if accounts > 20_000 { "trusted" } else { "standard" };
@@ -527,6 +530,14 @@ impl Sim {
                 events_per_sec: 0.0,
                 bytes_per_sec: 0.0,
                 backfilling,
+                read_tier: if !backfilling {
+                    "ring"
+                } else if i % 2 == 0 {
+                    "disk"
+                } else {
+                    "bucket"
+                }
+                .into(),
             });
             self.next_consumer += 1;
         }
@@ -801,6 +812,7 @@ impl Sim {
                 events_per_sec: 0.0,
                 bytes_per_sec: 0.0,
                 backfilling: false,
+                read_tier: "ring".into(),
             });
         } else if self.rng.chance(0.008) && self.consumers.len() > 16 {
             let i = self.rng.below(self.consumers.len());
@@ -917,6 +929,7 @@ impl Sim {
             throttle: h.throttle,
             max_accounts: if h.tier == "trusted" { 10_000_000 } else { 100 },
             history: Vec::new(),
+            throttled_accounts: if h.tier == "trusted" { 0 } else { h.accounts.saturating_sub(100).min(5_000) },
             rule: self.rules.iter().find(|r| rule_matches(&r.pattern, &h.name)).map(|r| r.id),
             node: self.host_shards[h.shard].clone().unwrap_or_default(),
         }
@@ -1321,14 +1334,124 @@ impl AdminSource for Demo {
     }
 
     async fn kick_consumer(&self, id: u64, _by: &str) -> AdminResult<()> {
+        self.kick_consumer_on(None, id, _by).await
+    }
+
+    async fn kick_consumer_on(&self, node: Option<&str>, id: u64, _by: &str) -> AdminResult<()> {
         let mut s = self.sim.lock();
         let i = s
             .consumers
             .iter()
-            .position(|c| c.id == id)
+            .position(|c| c.id == id && node.is_none_or(|n| c.node == n))
             .ok_or_else(|| AdminError::NotFound(format!("no consumer {id}")))?;
         s.consumers.remove(i);
         Ok(())
+    }
+
+    async fn settings_of(&self, node: Option<&str>) -> AdminResult<SettingsView> {
+        let mut v = self.settings().await?;
+        if let Some(n) = node {
+            let (_, _, members, learners) = self.extra.lock().roles();
+            if !members.iter().chain(&learners).any(|m| m == n) {
+                return Err(AdminError::NotFound(format!("no node {n}")));
+            }
+            // the demo's nodes differ only in their names and addresses
+            for e in &mut v.entries {
+                match e.flag.as_str() {
+                    "--node-id" => e.value = Some(n.to_string()),
+                    "--qlog-listen" => e.value = Some(format!("0.0.0.0:{}", 2978)),
+                    _ => {}
+                }
+            }
+        }
+        Ok(v)
+    }
+
+    async fn policy_usage(&self) -> AdminResult<PolicyUsage> {
+        let (ev, new_per_min) = {
+            let s = self.sim.lock();
+            let ev = s.history.back().map_or(0.0, |x| x.ev_in);
+            (ev, s.hosts.iter().map(|h| h.new_accounts_per_hour).sum::<f64>() / 60.0)
+        };
+        let f = self.full_policy().await?.policy;
+        let c = &f["cluster"];
+        let today = self.admissions().await?.new_hosts_today;
+        Ok(PolicyUsage {
+            node: "relay-a".into(),
+            plc_lookups_per_sec: round2((ev / 400.0).min(480.0)),
+            plc_lookups_budget: c["plcLookupsPerSec"].as_f64().unwrap_or(500.0),
+            plc_lookups_share: c["plcLookupsPerSec"].as_f64().unwrap_or(500.0) / NODES.len() as f64,
+            seeded_per_sec: round2(ev / 90.0),
+            new_accounts_per_min: round2(new_per_min),
+            new_accounts_budget: c["newAccountsPerMin"].as_f64().unwrap_or(600.0),
+            new_hosts_today: today,
+            new_hosts_per_day: c["newHostsPerDay"].as_u64().unwrap_or(50) as u32,
+            window_secs: 10.0,
+        })
+    }
+
+    async fn policy_signals(&self) -> AdminResult<SignalsView> {
+        use crate::policy::signals::SpamRule;
+        let spam = crate::policy::doc::PolicyBody::default().spam;
+        let s = self.sim.lock();
+        let mut busy: Vec<&SimHost> = s.hosts.iter().collect();
+        busy.sort_by(|a, b| b.new_accounts_per_hour.total_cmp(&a.new_accounts_per_hour));
+        let signals = SpamRule::ALL
+            .iter()
+            .enumerate()
+            .map(|(k, &r)| {
+                let t = r.threshold(&spam);
+                let top = busy
+                    .iter()
+                    .skip(k)
+                    .take(5)
+                    .enumerate()
+                    .map(|(j, h)| {
+                        let est = round2(t.limit * (0.9 - 0.15 * j as f64).max(0.05));
+                        let key = if r.per_account() { fake_did(&format!("{}/{j}", h.name)) } else { h.name.clone() };
+                        SignalKey { key, host: h.name.clone(), estimate: est, lower: round2(est * 0.97) }
+                    })
+                    .collect();
+                SignalTop {
+                    rule: r.name().into(),
+                    per: if r.per_account() { "account" } else { "host" }.into(),
+                    limit: t.limit,
+                    window_secs: t.window_secs,
+                    enabled: t.enabled(),
+                    top,
+                }
+            })
+            .collect();
+        Ok(SignalsView { node: "relay-a".into(), signals })
+    }
+
+    async fn takedowns(&self) -> AdminResult<Vec<crate::policy::takedowns::TakedownEntry>> {
+        let s = self.sim.lock();
+        let mut v: Vec<crate::policy::takedowns::TakedownEntry> = s
+            .accounts
+            .iter()
+            .filter_map(|a| {
+                let t = a.takedown.as_ref()?;
+                Some(crate::policy::takedowns::TakedownEntry {
+                    did: a.did.clone(),
+                    takedown: true,
+                    at_ms: t.at_ms,
+                    by: t.by.clone(),
+                    reason: t.reason.clone(),
+                })
+            })
+            .collect();
+        v.sort_by_key(|e| std::cmp::Reverse(e.at_ms));
+        Ok(v)
+    }
+
+    async fn quorum_history(&self) -> AdminResult<QuorumHistory> {
+        self.extra.lock().history(self.sim.lock().now_ms)
+    }
+
+    async fn flush_now(&self, _by: &str) -> AdminResult<serde_json::Value> {
+        let q = self.quorum().await?;
+        Ok(q.nodes.into_iter().filter_map(|n| n.status).find(|s| s["role"] == "leader").unwrap_or_default())
     }
 
     async fn quorum(&self) -> AdminResult<QuorumView> {
@@ -1578,19 +1701,38 @@ impl AdminSource for Demo {
         };
         let seg = 64u64 << 20;
         let segments = 3 * 24 * 40;
+        let deletable: Vec<serde_json::Value> = (0..3u64)
+            .map(|k| {
+                let first = s.last_seq.saturating_sub(90_000_000) as u64 + k * 160_000;
+                serde_json::json!({"ordinal": 4_100 + k, "first": first, "last": first + 159_999,
+                                   "bytes": seg, "age_secs": 72 * 3600 + 600 - k * 200})
+            })
+            .collect();
         let retention = serde_json::json!({
+            "opened": {},
             "pruned_seq": s.last_seq.saturating_sub(90_000_000),
             "plan": {
                 "at_ms": now - 212_000,
                 "horizon_secs": 72 * 3600,
                 "flushed": s.last_seq - 8_000,
+                "reserve": s.last_seq - 8_000 + 8_640_000,
+                "next_ordinal": 4_100 + segments,
+                "gaps": [[s.last_seq - 55_120_400, s.last_seq - 46_480_400]],
                 "segments": segments,
                 "segment_bytes": segments * seg,
-                "deletable": [],
-                "deletable_bytes": 0,
-                "state": [{"path": "qlog/state", "current": true, "objects": 412, "bytes": 2_900_000_000u64}],
+                "deletable": deletable,
+                "deletable_bytes": 3 * seg,
+                "pruned_seq_after": s.last_seq.saturating_sub(89_520_000),
+                "stale_segments": [],
+                "states": [
+                    {"path": "qlog/state-e12", "current": true, "referenced": false, "objects": 412,
+                     "bytes": 2_900_000_000u64, "stale_checkpoints": [], "clone_checkpoints": 0, "deletable": false},
+                    {"path": "qlog/state", "current": false, "referenced": true, "objects": 96,
+                     "bytes": 610_000_000u64, "stale_checkpoints": [], "clone_checkpoints": 1, "deletable": false},
+                ],
             },
-            "applied": {"segments": 3, "segment_bytes": 3 * seg, "state_objects": 0, "state_bytes": 0, "kept": []},
+            "applied": {"segments": 3, "segment_bytes": 3 * seg, "pruned_seq": s.last_seq.saturating_sub(90_480_000),
+                        "state_paths": [], "state_objects": 0, "state_bytes": 0, "kept": []},
         });
         Ok(StoreView {
             node: "relay-a".into(),
@@ -1685,7 +1827,7 @@ impl AdminSource for Demo {
                     events_out_per_sec: round2(ev_out),
                     commit_lag_ms: round2(s.history.back().map(|x| x.dur).unwrap_or(0.0) * (0.85 + 0.1 * i as f64)),
                     cpu: round2((ev_in / 6_000.0 + ev_out / 400_000.0).min(7.6)),
-                    mem_bytes: (9.5e9 + ev_in * 6.0e4) as u64,
+                    mem_bytes: Some((9.5e9 + ev_in * 6.0e4) as u64),
                     stale: false,
                     error: None,
                     reported_ms: now,
@@ -1913,6 +2055,40 @@ mod tests {
         let q = d.quorum().await.unwrap();
         let st = q.nodes.iter().filter_map(|n| n.status.as_ref()).find(|s| s["role"] == "leader").unwrap();
         assert!(st["flush"]["last_at_ms"].as_i64().unwrap() > 0);
+        let mut names: Vec<&str> = Vec::new();
+        let all = d.hosts(HostQuery { limit: Some(10_000), ..Default::default() }).await.unwrap();
+        names.extend(all.hosts.iter().map(|h| h.host.as_str()));
+        let n = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), n, "a hostname twice");
+
+        let u = json(call("GET", "/admin/api/policy/usage", true).await.unwrap()).await;
+        assert!(u["plcLookupsBudget"].as_f64().unwrap() > 0.0 && u["newHostsPerDay"].as_u64().unwrap() > 0);
+        let sg = json(call("GET", "/admin/api/policy/signals", true).await.unwrap()).await;
+        assert_eq!(sg["signals"].as_array().unwrap().len(), 7);
+        assert!(
+            sg["signals"][0]["top"].as_array().unwrap().iter().all(|k| k["estimate"].as_f64() >= k["lower"].as_f64())
+        );
+        let td = json(call("GET", "/admin/api/takedowns", true).await.unwrap()).await;
+        assert!(td.as_array().unwrap().iter().all(|t| t["takedown"] == true));
+        let hist = json(call("GET", "/admin/api/cluster/quorum/history", true).await.unwrap()).await;
+        let ev = hist["events"].as_array().unwrap();
+        assert!(ev.iter().any(|e| e["kind"] == "lead" && e["why"] == "election"));
+        assert!(ev.windows(2).all(|w| w[0]["atMs"].as_i64() >= w[1]["atMs"].as_i64()));
+        let st = json(call("GET", "/admin/api/settings?node=relay-b", true).await.unwrap()).await;
+        assert!(st["entries"].as_array().unwrap().iter().any(|e| e["flag"] == "--node-id" && e["value"] == "relay-b"));
+        assert_eq!(call("GET", "/admin/api/settings?node=nope", true).await.unwrap().status(), StatusCode::NOT_FOUND);
+        let f = json(call("POST", "/admin/api/cluster/quorum/flush", true).await.unwrap()).await;
+        assert_eq!(f["role"], "leader");
+        let q = d.quorum().await.unwrap();
+        assert!(q.nodes.iter().filter_map(|n| n.status.as_ref()).all(|s| s["requests"]["total"].is_object()));
+        let cs = d.consumers().await.unwrap();
+        let other = cs.iter().find(|c| c.node != "relay-a").unwrap();
+        let uri = format!("/admin/api/consumers/{}/kick?node={}", other.id, other.node);
+        assert_eq!(call("POST", &uri, true).await.unwrap().status(), StatusCode::NO_CONTENT);
+        assert!(cs.iter().all(|c| !c.read_tier.is_empty()));
+
         let p = json(call("GET", "/admin/api/ops/plc", true).await.unwrap()).await;
         assert_eq!(p["enabled"], true);
         assert_eq!(p["windows"].as_array().unwrap().len(), 4);

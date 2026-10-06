@@ -521,6 +521,8 @@ pub struct Status {
     pub lost_quorums: u64,
     /// The bucket recoveries this node ran, with their timings.
     pub recovered: Vec<flush::RecoveryStats>,
+    /// This node's leadership changes, oldest first (the last 64).
+    pub history: Vec<RoleChange>,
     pub members: Vec<String>,
     pub learners: Vec<String>,
     pub members_since: u64,
@@ -538,6 +540,23 @@ pub struct Status {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay: Option<serde_json::Value>,
 }
+
+/// A leadership change on one node: it took over (`lead`, after an
+/// election, a handoff to it or a bucket recovery) or stepped down.
+#[derive(Clone, Debug, Serialize)]
+pub struct RoleChange {
+    pub at_ms: i64,
+    /// `lead` or `step_down`.
+    pub kind: &'static str,
+    pub epoch: u64,
+    /// For `lead`: the leader this node last followed, if any.
+    pub from: Option<String>,
+    /// For `lead`: `election`, `handoff` or `recovery`; for `step_down`,
+    /// why.
+    pub why: String,
+}
+
+const HISTORY_KEPT: usize = 64;
 
 /// One membership change, as the leader that ran it saw it.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -613,6 +632,7 @@ pub struct Node {
     /// reach the firehose in order (a recovery emits outside the emitter).
     emit_order: Mutex<()>,
     recovered: Mutex<Vec<flush::RecoveryStats>>,
+    history: Mutex<std::collections::VecDeque<RoleChange>>,
 }
 
 impl Node {
@@ -715,6 +735,7 @@ impl Node {
             flush: flush::Shared::default(),
             emit_order: Mutex::new(()),
             recovered: Mutex::new(Vec::new()),
+            history: Mutex::new(Default::default()),
         });
         node.emit.attach(&node);
         tracing::info!(id = %node.cfg.id, genesis, whole, promised, emitted, commit, "qlog: node up");
@@ -761,6 +782,7 @@ impl Node {
             recoveries: self.stats.recoveries.load(Ordering::Relaxed),
             lost_quorums: self.stats.lost_quorums.load(Ordering::Relaxed),
             recovered: self.recovered.lock().clone(),
+            history: self.history.lock().iter().cloned().collect(),
             members: c.members.clone(),
             learners: c.learners.clone(),
             members_since: c.members_since,
@@ -797,7 +819,7 @@ impl Node {
     }
 
     /// Committed entries above this are readable here (memory or disk).
-    pub(crate) fn readable_floor(&self) -> u64 {
+    pub fn readable_floor(&self) -> u64 {
         let base = self.core.lock().log.base().1;
         self.durability.first_readable().map_or(base, |d| d.min(base))
     }
@@ -1299,6 +1321,9 @@ impl Node {
         }
         tracing::warn!(id = %self.cfg.id, epoch = c.epoch, why, "qlog: stepping down");
         self.stats.step_downs.fetch_add(1, Ordering::Relaxed);
+        if c.role == Role::Leader {
+            self.note_role("step_down", c.epoch, None, why);
+        }
         c.role = Role::Follower;
         c.leader = None;
         c.last_heard = Instant::now();
@@ -1309,7 +1334,27 @@ impl Node {
         c.pending_bytes = 0;
     }
 
+    fn note_role(&self, kind: &'static str, epoch: u64, from: Option<String>, why: &str) {
+        let mut h = self.history.lock();
+        if h.len() >= HISTORY_KEPT {
+            h.pop_front();
+        }
+        h.push_back(RoleChange {
+            at_ms: chrono::Utc::now().timestamp_millis(),
+            kind,
+            epoch,
+            from,
+            why: why.to_string(),
+        });
+    }
+
     fn become_leader(self: &Arc<Self>, c: &mut Core, epoch: u64) {
+        self.become_leader_by(c, epoch, "election");
+    }
+
+    fn become_leader_by(self: &Arc<Self>, c: &mut Core, epoch: u64, how: &str) {
+        let from = c.leader.clone().filter(|l| *l != self.cfg.id);
+        self.note_role("lead", epoch, from, how);
         let last = c.log.last_seq();
         let commit = c.log.commit();
         c.log.restamp_after(commit, epoch);
@@ -2206,7 +2251,7 @@ impl Node {
             "qlog recovery: the bucket's log adopted, resuming above R"
         );
         self.recovered.lock().push(stats);
-        self.become_leader(&mut c, epoch);
+        self.become_leader_by(&mut c, epoch, "recovery");
         Ok(())
     }
 
@@ -2610,7 +2655,7 @@ impl Node {
             if me_in {
                 let me = self.cfg.id.clone();
                 self.raise_promised(&mut c, epoch + 1, &me);
-                self.become_leader(&mut c, epoch + 1);
+                self.become_leader_by(&mut c, epoch + 1, "membership change");
             } else {
                 self.step_down(&mut c, "removed by a membership change");
                 c.retired = true;

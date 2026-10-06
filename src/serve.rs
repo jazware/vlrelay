@@ -104,6 +104,9 @@ pub struct ConsumerSnapshot {
     pub start_cursor: Option<i64>,
     /// Newest seq it has been sent (0 = none yet).
     pub last_seq: i64,
+    /// Where it reads next from: its cursor while it has been sent
+    /// nothing, else `last_seq`.
+    pub pos: i64,
     /// How far its position trails the stream head, in seq time.
     pub lag_ms: f64,
     pub events_per_sec: f64,
@@ -197,6 +200,7 @@ impl Serve {
                     connected_since_ms: v.connected_at as i64,
                     start_cursor,
                     last_seq,
+                    pos,
                     lag_ms,
                     events_per_sec: rate.map_or(0.0, |r| r.events_per_sec),
                     bytes_per_sec: rate.map_or(0.0, |r| r.bytes_per_sec),

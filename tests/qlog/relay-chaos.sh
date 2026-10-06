@@ -157,7 +157,7 @@ supervise() {
   # 2 s flushes add an L0 each; at the 30 s default poll they outrun the
   # compactor and seals wait for L0 room
   extra+=(--qlog-state-compactor-poll-ms "${STATE_POLL_MS:-$(( flush_ms < 10000 ? 5000 : 30000 ))}")
-  [ "${PLC_EXPORT:-}" = 1 ] && extra+=(--plc-export --plc-export-rate "${PLC_RATE:-4}" --admin-token relayq)
+  [ "${PLC_EXPORT:-}" = 1 ] && extra+=(--plc-export --plc-export-rate "${PLC_RATE:-4}")
   [ -n "$crash_at" ] && extra+=(--qlog-crash-at "$crash_at" --qlog-crash-prob "$crash_prob" --qlog-crash-stop-file "$out/no-more-crashes")
   if [ -n "${RETAIN_SECS:-}" ]; then
     extra+=(--qlog-retain-secs "$RETAIN_SECS" --qlog-retain-every-secs "${RETAIN_EVERY:-60}")
@@ -172,7 +172,7 @@ supervise() {
     set +e
     RUST_LOG=${RELAY_LOG:-info,slatedb=warn} "$bin" --node-id "n$i" --listen "127.0.0.1:$(http "$i")" --qlog-listen "127.0.0.1:$(peer "$i")" "${peers[@]}" \
       --qlog-members "$members_flag" --qlog-dir "$cl_dir/cl-n$i" --qlog-power-cut-on-usr1 \
-      --qlog-flush-ms "$flush_ms" --qlog-headroom "${HEADROOM:-100000000}" --qlog-admin-token relayq \
+      --qlog-flush-ms "$flush_ms" --qlog-headroom "${HEADROOM:-100000000}" --qlog-admin-token relayq --admin-token relayq \
       --s3-endpoint "http://127.0.0.1:$minio" --s3-bucket vlrelay --s3-access-key minioadmin --s3-secret-key minioadmin \
       --prefix "$prefix" --plc-url "http://127.0.0.1:$fake_plc" --dev-mode "${hosts[@]}" "${extra[@]}" \
       >>"$out/n$i.log" 2>&1
@@ -438,6 +438,25 @@ while [ $(($(date +%s) - load_start + 12)) -lt "$duration" ] && [ "$scenario" !=
 done
 
 while [ $(($(date +%s) - load_start)) -lt "$duration" ]; do sleep 1; done
+# each node's consumers (the checker's sockets) as its admin API reports them
+for i in $started; do
+  curl -sf --max-time 2 -u admin:relayq "http://127.0.0.1:$(http "$i")/admin/api/consumers" >"$out/consumers-n$i.json" || true
+done
+python3 - "$out" $started <<'PY' || true
+import json, sys
+out, ids = sys.argv[1], sys.argv[2:]
+for i in ids:
+    try:
+        cs = json.load(open(f"{out}/consumers-n{i}.json"))
+    except Exception:
+        print(f"consumers: n{i} didn't answer")
+        continue
+    by = {}
+    for c in cs:
+        by.setdefault(c["node"], []).append(c)
+    rates = sum(1 for c in cs if c.get("eventsPerSec", 0) > 0)
+    print(f"consumers: n{i} lists {len(cs)} on {sorted(by)}, {rates} with a rate, tiers {sorted({c.get('readTier', '') for c in cs})}")
+PY
 touch "$out/no-more-crashes"
 # the fleet stops; the relay settles, flushes everything committed, and
 # every consumer reaches the same head

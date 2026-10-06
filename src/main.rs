@@ -372,6 +372,7 @@ async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<
         let policy = node.policy.clone().expect("the relay always runs the policy engine");
         Arc::new(NodeAdmin::new(node.clone(), policy).with_settings(settings))
     };
+    let _ = node.quorum.hooks.answers.set(admin_src.clone());
     let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
     if let Some(token) = token {
         app = app.merge(vlrelay::admin::app(admin_src.clone(), token, ui));

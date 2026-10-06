@@ -533,6 +533,9 @@ impl state::AccountGate for PolicyHooks {
             NewAccount::Admit
         };
         drop(c);
+        if verdict == NewAccount::Admit && rated {
+            super::metrics::NEW_ACCOUNTS.inc();
+        }
         if verdict == NewAccount::Defer {
             let mut d = self.deferred.lock();
             if d.len() >= DEFERRED_MAX {

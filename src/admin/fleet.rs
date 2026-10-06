@@ -319,6 +319,7 @@ mod tests {
             node: String::new(),
             max_accounts: 100,
             history: Vec::new(),
+            throttled_accounts: 0,
         }
     }
 

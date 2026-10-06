@@ -905,6 +905,14 @@ async fn flush_seals_log_state_and_cursors_at_one_point() {
     let l = c.wait_leader(Duration::from_secs(5)).await;
     let fs = c.nodes[&l].node.status().flush.unwrap();
     assert!(fs.last_at_ms >= Some(ck.at_ms), "the leader's status names the last flush's time: {fs:?}");
+    let r = fs.recent.last().expect("the leader's recent flushes");
+    assert!(r.flushed >= ck.flushed && r.at_ms >= ck.at_ms && r.took_us > 0, "{r:?}");
+    assert!(fs.recent.windows(2).all(|w| w[0].flushed <= w[1].flushed));
+    let h = c.nodes[&l].node.status().history;
+    assert!(
+        h.iter().any(|e| e.kind == "lead" && e.why == "election"),
+        "the leader's takeover isn't in its history: {h:?}"
+    );
     let cps = super::state::list_checkpoints(&c.store, super::state::DEFAULT_PATH).await.unwrap();
     assert_eq!(cps, vec![ck.state.unwrap().checkpoint], "stale checkpoints kept");
     c.shutdown();

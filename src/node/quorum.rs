@@ -328,6 +328,10 @@ pub struct HostTable {
     pub rows: BTreeMap<String, HostRow>,
     /// The newest cursor per host the leader has seen committed.
     pub cursors: BTreeMap<String, u64>,
+    /// Accounts each host created that the relay throttled (the leader's
+    /// count, sent with the table).
+    #[serde(default)]
+    pub throttled: BTreeMap<String, u64>,
 }
 
 /// A host's owner among `live`: the highest hash of (member, host), so a
@@ -421,6 +425,9 @@ pub struct RelayHooks {
     local: Mutex<serde_json::Value>,
     /// The PLC export job, for `leader:plc`.
     pub plc: std::sync::OnceLock<Arc<crate::plc_seed::job::PlcJob>>,
+    /// The node's own answers (`node:*`: its consumers, settings, kicks),
+    /// from its admin source.
+    pub answers: std::sync::OnceLock<Arc<dyn LocalAsk>>,
     /// Tests: each decision of every other batch (at random) takes this
     /// long (µs), as a batch with slow identity lookups does.
     #[cfg(test)]
@@ -467,6 +474,7 @@ impl RelayHooks {
             stats: HookStats::default(),
             local: Mutex::new(serde_json::Value::Null),
             plc: std::sync::OnceLock::new(),
+            answers: std::sync::OnceLock::new(),
             #[cfg(test)]
             slow_us: AtomicU64::new(0),
         })
@@ -983,8 +991,18 @@ impl Hooks for RelayHooks {
                         cursors.insert(String::from_utf8_lossy(&kv.key[2..]).into_owned(), u64::from_be_bytes(b));
                     }
                 }
+                let mut throttled: HashMap<String, HashSet<String>> = HashMap::new();
+                let mut it = db.scan_prefix(THROTTLED_PREFIX, ..).await?;
+                while let Some(kv) = it.next().await? {
+                    if kv.value.as_ref() == b"1"
+                        && let Some((h, d)) = throttled_from_key(&kv.key)
+                    {
+                        throttled.entry(h).or_default().insert(d);
+                    }
+                }
                 let mut i = term.inner.lock();
-                i.hosts = HostTable { epoch, version: 1, rows, cursors };
+                i.hosts = HostTable { epoch, version: 1, rows, cursors, throttled: BTreeMap::new() };
+                i.throttled = throttled;
             }
             let emitted = node.emitted();
             let mut next = applied + 1;
@@ -1129,8 +1147,33 @@ impl Hooks for RelayHooks {
             match topic {
                 "leader:hosts" => {
                     let t = self.term.read().clone()?;
-                    let table = t.inner.lock().hosts.clone();
+                    let table = {
+                        let i = t.inner.lock();
+                        let mut table = i.hosts.clone();
+                        table.throttled = i
+                            .throttled
+                            .iter()
+                            .filter(|(_, d)| !d.is_empty())
+                            .map(|(h, d)| (h.clone(), d.len() as u64))
+                            .collect();
+                        table
+                    };
                     serde_json::to_vec(&table).ok().map(Bytes::from)
+                }
+                "leader:flush" => {
+                    let want = self.cfg.admin_token.as_deref().filter(|t| !t.is_empty())?;
+                    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+                    if v["token"].as_str() != Some(want) {
+                        return serde_json::to_vec(&serde_json::json!({"error": "unauthorized"})).ok().map(Bytes::from);
+                    }
+                    let q = self.qnode()?;
+                    let top = q.status().commit;
+                    q.flush.request(top);
+                    let t = Instant::now();
+                    while q.status().flushed < top && t.elapsed() < Duration::from_secs(30) {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    serde_json::to_vec(&q.status()).ok().map(Bytes::from)
                 }
                 "leader:plc" => {
                     let r = match self.plc.get() {
@@ -1148,10 +1191,19 @@ impl Hooks for RelayHooks {
                     };
                     serde_json::to_vec(&r).ok().map(Bytes::from)
                 }
+                t if t.starts_with("node:") => match self.answers.get() {
+                    Some(l) => l.answer(t, body).await,
+                    None => None,
+                },
                 _ => None,
             }
         })
     }
+}
+
+/// What a member answers about itself over the peer protocol.
+pub trait LocalAsk: Send + Sync {
+    fn answer<'a>(&'a self, topic: &'a str, body: Bytes) -> BoxFuture<'a, Option<Bytes>>;
 }
 
 impl RelayHooks {
@@ -1419,6 +1471,12 @@ pub struct QuorumHosts {
 }
 
 impl QuorumHosts {
+    /// Accounts `host` created that the relay throttled, as the leader
+    /// counted them at the last poll.
+    pub fn throttled(&self, host: &str) -> u64 {
+        self.table.read().throttled.get(host).copied().unwrap_or(0)
+    }
+
     fn record(&self, h: &str) -> Option<state::HostRecord> {
         let row = self.table.read().rows.get(h).cloned();
         let local = self.local.read().get(h).cloned();
@@ -1758,6 +1816,56 @@ impl Glue {
         crate::admin::QuorumView { nodes: futures::future::join_all(asks).await }
     }
 
+    /// `topic` asked of member `id` (this node answers its own).
+    pub async fn ask_member(&self, id: &str, topic: &str, body: Bytes) -> Result<Bytes, String> {
+        if id == self.id {
+            let l = self.hooks.answers.get().ok_or("this node answers nothing yet")?;
+            return l.answer(topic, body).await.ok_or_else(|| format!("{id} has no answer to {topic}"));
+        }
+        let addr = self.qnode.addr_of(id).ok_or_else(|| format!("no address for {id}"))?;
+        crate::qlog::client::ask(&addr, topic, body, Duration::from_millis(1500)).await.map_err(|e| format!("{e:#}"))
+    }
+
+    /// `topic` asked of every member and learner at once.
+    pub async fn ask_all(&self, topic: &str, body: Bytes) -> Vec<(String, Result<Bytes, String>)> {
+        let st = self.qnode.status();
+        let mut ids: Vec<String> = st.members.iter().chain(&st.learners).cloned().collect();
+        ids.sort();
+        ids.dedup();
+        let asks = ids.into_iter().map(|id| {
+            let body = body.clone();
+            async move {
+                let r = self.ask_member(&id, topic, body).await;
+                (id, r)
+            }
+        });
+        futures::future::join_all(asks).await
+    }
+
+    /// The qlog admin token, for asks that change something.
+    pub fn admin_token(&self) -> Option<&str> {
+        self.setup.admin_token.as_deref().filter(|t| !t.is_empty())
+    }
+
+    /// Asks the leader to flush now (with the qlog admin token); its status
+    /// once F reached the commit index it had.
+    pub async fn flush_now(&self) -> anyhow::Result<serde_json::Value> {
+        let token = self
+            .admin_token()
+            .ok_or_else(|| anyhow::anyhow!("flushes on demand are off: start the nodes with --qlog-admin-token"))?;
+        let body = serde_json::json!({ "token": token });
+        let b = self
+            .client
+            .ask_leader("leader:flush", serde_json::to_vec(&body)?.into(), Duration::from_secs(40))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let v: serde_json::Value = serde_json::from_slice(&b)?;
+        if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+            anyhow::bail!("the leader refused: {e}");
+        }
+        Ok(v)
+    }
+
     /// A membership change, sent to the leader with the qlog admin token.
     pub async fn change_members(&self, req: crate::admin::QuorumMembersChange) -> anyhow::Result<serde_json::Value> {
         let token =
@@ -1860,7 +1968,7 @@ impl Glue {
     /// dashboards read them there).
     async fn sample(self: Arc<Self>, node: std::sync::Weak<Node>) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
-        let mut cpu = (process_cpu_secs(), Instant::now());
+        let mut cpu = (super::admin::cpu_seconds(), Instant::now());
         loop {
             tick.tick().await;
             let Some(n) = node.upgrade() else { return };
@@ -1868,7 +1976,7 @@ impl Glue {
                 tracing::debug!("host counts: {e:#}");
             }
             let last = n.dash.lock().history.back().cloned();
-            let now = (process_cpu_secs(), Instant::now());
+            let now = (super::admin::cpu_seconds(), Instant::now());
             let cores = (now.0 - cpu.0) / now.1.duration_since(cpu.1).as_secs_f64().max(0.001);
             cpu = now;
             *self.hooks.local.lock() = serde_json::json!({
@@ -1879,7 +1987,7 @@ impl Glue {
                 "bytes_out_per_sec": last.as_ref().map_or(0.0, |s| s.bytes_out),
                 "durable_lag_ms": last.as_ref().map_or(0.0, |s| s.durable_lag_ms),
                 "cpu": cores,
-                "mem_bytes": process_rss_bytes(),
+                "mem_bytes": vlpds::metrics::resident_bytes(),
                 "stream_seq": n.serve.head(),
             });
         }
@@ -1927,7 +2035,7 @@ impl Glue {
                     events_out_per_sec: f("events_out_per_sec"),
                     commit_lag_ms: f("durable_lag_ms"),
                     cpu: f("cpu"),
-                    mem_bytes: local["mem_bytes"].as_u64().unwrap_or(0),
+                    mem_bytes: local["mem_bytes"].as_u64(),
                     role,
                     stale: n.stale,
                     error: n.error.clone(),
@@ -1949,20 +2057,6 @@ impl Glue {
             nodes,
         }
     }
-}
-
-fn process_cpu_secs() -> f64 {
-    // utime + stime in clock ticks (fields 14 and 15 of /proc/self/stat)
-    let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
-    let rest = s.rsplit_once(')').map_or("", |(_, r)| r);
-    let f: Vec<&str> = rest.split_whitespace().collect();
-    let ticks = |i: usize| f.get(i).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
-    (ticks(11) + ticks(12)) / 100.0
-}
-
-fn process_rss_bytes() -> u64 {
-    let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
-    s.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok()).unwrap_or(0) * 4096
 }
 
 /// (µs, events) submitted to answered, for the dashboard's durable lag.
