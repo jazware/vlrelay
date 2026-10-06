@@ -195,7 +195,7 @@ With fewer than two members answering, nobody can commit, so emission stops. Not
 - A minority never recovers on its own. A node that can't reach the others can't tell "they're dead" from "I'm cut off", and if the other two are alive and carrying on, a bucket recovery from the minority would throw away their tail. So it waits.
 - Recovery is automatic once a quorum is reachable again, whatever its members still hold. A restarted node answers the promise with the tail it has (empty in memory-only, its commitlog otherwise). If two promise members have intact tails, it's the normal takeover. If not, it's the bucket recovery above, with the jump to R + 1.
 
-An operator can force bucket recovery from a single survivor (`admin quorum recover --force`, a sketch). Even then nothing is reissued, since the seqs start above R.
+An operator can force bucket recovery from a single survivor (`admin quorum recover --force`, a sketch). Even then nothing is reissued, since the seqs start above R. (As built, [Phase 4](#bucket-recovery-phase-4): the candidate recovers on its own once its promise round proves no quorum of intact logs can exist, counting silent members as intact; `--no-auto-recover` makes that wait for an operator.)
 
 ### Failover, case by case
 
@@ -790,14 +790,149 @@ What the numbers say:
 - **Leader RSS grows with the flush at 100x** (~1 GB more). That's the entries of one segment held while it's built and compressed, plus SlateDB's memtable for 333k DIDs. A 30 s flush at 100x would be ~3x the memtable. Budget ~1 GB for the state's memtable per 1M DIDs changed in an interval, or seal more often.
 - **The emit path and replication are unchanged** by cursors on entries. At one host-cursor update per second per host owner it's a few hundred bytes a second.
 
-### What Phase 4 needs
+### Bucket recovery (Phase 4)
 
-- **Recovery from the manifest.** Open `qlog/state` at the manifest's checkpoint, not at its latest. After a lost quorum the latest durable state can be past F, since the old leader kept applying and SlateDB flushes on its own, and that's the state-ahead-of-the-log case the study warns about. SlateDB has no restore. Either clone the checkpoint to a fresh path (`create_clone_builder_from_source(CloneSourceSpec::with_checkpoint(...))`) and have the manifest name the path, or reopen the same path and rewrite every key written past F. The clone is cleaner, but a clone references its parent's SSTs, so old paths can't be deleted until compaction has rewritten them.
-- **Salvage.** Segments past the manifest (`qlog verify` counts them as orphans) are committed entries, flushed by a dead flush. Recovery can adopt them with their seqs, the same rule the flush uses, before starting at R + 1.
-- **Seqs from R + 1.** The leader then has to commit a log whose first seq is R + 1. `Log::reset(epoch, R)` and an append from there, with followers reset to it, and the firehose's `start_floor` at R (consumers between F and R get the stream from R + 1, which the counted stream's grace already handles).
-- **Re-ingest from cursors.** The manifest's cursors are per host. The relay's host owners need to take them as their resume points, and the load generator's `--hosts` is ready to stand in for fakepds (`did:q:{run}-h{h}:{n}` events, cursors once a second).
-- **Single-node WAL mode** is the commitlog plus this flush with a quorum of one. A one-member config should commit at its own fsync (quorum 1), but nothing tests it yet, nor a disk loss on it.
-- **Bucket retention** (Phase 6, but recovery reads it): a `retain/` report before deleting segments, and the state's GC holding the manifest's checkpoint (it does: checkpoints have no expiry).
+`flush::recovery_point` and `flush::recover` (the bucket side), `Node::bucket_recover` (the node side), `State::recover` and `State::jump`. Phase 3 listed what this needed (the state from the manifest's checkpoint, salvage, seqs from R + 1, re-ingest, the single node, the retention report); as built:
+
+- **The trigger is the promise round, and it's automatic.** A candidate that has won `qlog/leader` collects promises as before. If fewer than a quorum of the members that promised are intact, it counts every member that didn't promise as possibly intact. Only when even that falls short of a quorum is the quorum lost, and then the candidate runs the bucket recovery itself.
+  - A member that promised this epoch and isn't intact can't become intact behind the candidate's back: it refuses older leaders now. So "intact that promised + silent < quorum" proves that no quorum of intact logs exists anywhere. That's the "never while an intact quorum could exist" rule.
+  - The candidate already has promises from a quorum (it needs pongs from one before its CAS), so a minority can't recover. A cut-off node never gets that far, as before.
+  - Wiping one disk while the leader is dead leaves one intact log answering and one member silent. That's 1 + 1 ≥ 2, so the candidate waits, and the dead leader's return makes a normal takeover (`no_recovery_while_a_silent_member_could_be_intact`).
+  - Mutation: with silent members left out of the count, that test fails, because the cluster recovers and jumps while the old leader's intact log is only down.
+  - "Not intact" is a node with a new or wiped commitlog while `qlog/leader` exists, or a memory-only node that restarted and hasn't caught up. So with commitlogs a lost quorum is two lost disks. Memory-only now recovers on its own after two process deaths (it used to stop).
+  - `--no-auto-recover` (`Config::auto_recover`) turns the trigger into a log line and a wait, for an operator who wants to decide. The default is automatic, since the proof above is what an operator would check.
+- **What a recovery keeps.** In order:
+  1. The manifest's F.
+  2. Orphan segments past it that continue the log densely. A flush that died before its CAS wrote them, and they're committed entries. F moves to their end, F'. Segments don't carry the entries' host cursors, so cursors stay at the manifest's, which only costs more re-ingest.
+  3. The longest committed prefix past F' that a member which promised holds. The members are tried by their commit index, and the entries are fetched with the existing `Fetch` (from the candidate's own log if it's the best).
+  - The result is S. Seqs `(S, R]` are skipped for good, and the log resumes at R + 1 under the recovery's epoch.
+  - A segment past the manifest that starts at or below F is a deposed leader's flush still running. It's deleted, so it can't take an ordinal the recovery or the next flush writes. The flush does the same when it finds one in its way.
+- **The state is a clone of the manifest's checkpoint.** `State::recover` clones it to `qlog/state-e{epoch}` (`create_clone_builder_from_source(CloneSourceSpec::with_checkpoint)`), applies the orphans and the salvage to the clone, and moves `_applied` to R with a write at SlateDB seqnum R (`State::jump`). Then it seals at R.
+  - Why a clone and not a rewrite: the clone is a new SlateDB manifest over the checkpoint's SSTs, so it's O(1) in the state's size (25-46 ms on a local MinIO). Rewriting every key changed past F in place would mean diffing the whole state, ~850 GB a node at 100x.
+  - The clone pins its source with a checkpoint of its own, and SlateDB lists the source as an external database until compaction has rewritten its SSTs. The chain is transitive: after several recoveries the current state listed two older paths. A clone cut short is resumed by SlateDB when the same epoch retries; another epoch leaves it for the retention report.
+  - `a_recovered_state_is_its_checkpoint_not_the_latest` keeps writing to the source after the checkpoint (with memtables uploading on their own) and checks that the clone holds exactly the checkpoint plus its own writes.
+  - `the_recovered_state_equals_replaying_the_bucket` stops the new leader's flush at its fence, so the recovery manifest stays current. `flush::verify` then holds for it: the segments replayed across the gap equal the state at R, `last_l0_seq` = R and `_applied` = R. It also crashes one recovery attempt at each step.
+- **The recovery manifest.** It has F = R, R' = R + H, the salvaged segments, the state at R, the cursors at S, and two new fields:
+  - `gaps`: every `(S, R]` so far, kept for good, so `verify` and readers walk the segments across them.
+  - `recovery`: `{generation, epoch, after: S, base: R, cursors, at_ms}`.
+
+  It's CASed against the ETag read at the start. Losing the CAS, or a crash anywhere before it, leaves the old manifest in charge. With F = R, the next flush writes `(R, F2]` with no special case, and the stale-segment rule covers a zombie's.
+- **Two recoveries in a row jump twice.** An attempt that dies after its manifest CAS may have led and committed above its R, for all the next candidate can tell, so the next one recovers from that manifest and skips another H. The checker and `verify` handle gaps that follow each other.
+- **The node side.** Under the emitter's ordering lock, the candidate does four things, then leads:
+  - If this process has live consumers and emitted less than S, it first emits up to S from the bucket, so its own consumers see no hole below the gap.
+  - It resets its log to `(epoch, R)`. The base takes the recovery's epoch, so a promise round prefers this log over an older one still on a member's disk.
+  - It sets `emitted` to R.
+  - It learns F, R' and the generation.
+
+  Followers are reset to R by the existing reset path. A follower with an empty log (`AppendResp.last_seq == 0`, a wiped or new disk) now starts at the leader's oldest local entry instead of replaying the bucket from seq 1. That's also the normal rejoin of a wiped box, with no recovery: such a follower has emitted nothing, so it has no hole to avoid. Otherwise every recovery would have waited for a follower to replay the whole bucket before anything committed.
+- **What consumers see.** The firehose needed nothing new: backfill already reads "what exists" up to the local tail's floor, and the counted stream doesn't require dense seqs.
+
+  | consumer | sees |
+  |---|---|
+  | live on a node that kept running | everything up to S (topped up from the bucket if needed), then R + 1 on: one jump over `(S, R]` |
+  | reconnecting at or below S | the bucket to S, then R + 1 on |
+  | reconnecting in `(S, R]` (it saw events the recovery lost) | R + 1 on |
+  | above R | `FutureCursor` after the 2 s grace, as before |
+
+  No seq is ever emitted with two contents. The events the jump skips come back from the hosts above R, so a consumer that saw them sees them again (a repeated rev for a sync 1.1 consumer, as §1 says).
+- **Re-ingest.** Each `Submitted` carries the leader's recovery generation, which also rides on appends and promises and is read from the manifest at start and at a fence. A host owner that sees a higher generation asks the leader for that recovery's cursors (`Cursors`), re-reads each host from there, and marks everything at or below them done.
+  - A submit carries the generation its cursors were computed under. The leader drops cursors from a submitter that hasn't rewound yet, since they may count events the recovery lost and would put the next manifest's cursors past the log.
+  - The load generator's hosts stand in for fakepds. Acks from before the rewind don't count, and events acked under the new generation aren't sent again.
+  - Duplicates have two sources. An event can be both at or below S (or emitted in the gap before the crash) and above R: these are bounded by what a host sent after its cursor, which is up to one cursor interval (1 s) plus everything emitted in `(S, crash]`. Separately, every resend of a batch whose ack was lost, with or without a recovery, makes one. The real relay drops both against the state with `check_chain`, and consumers drop repeated revs. The checker counts them and doesn't fail on them.
+
+### The single node (Phase 4)
+
+A config with no peers is a quorum of one: the commitlog is the WAL, an entry commits at its own fsync, and emission follows the local durable point as for any member. Two changes:
+
+- **It leads at once.** It has nobody to hear from, so it doesn't wait out the election timeout (the restart pause went from 2.2 s to 1.2-1.5 s, which is mostly the harness's 1 s restart delay).
+- **A wiped disk is a lost quorum.** Its commitlog is fresh, it isn't intact, and nobody is silent, so it recovers from the bucket at R + 1. kill -9 and power cuts replay the WAL as in Phase 2, with no jump.
+
+`a_single_node_recovers_from_its_wal_and_from_the_bucket` runs six kills and power cuts under load (no gap) and then a wipe (one gap). Everything the hosts sent is in the log.
+
+### Bucket retention (Phase 4: the report)
+
+`qlog retain` (`retain.rs`) writes `retain/qlog`. That's vlpds's per-log retention report: its `pruned_seq` is left as it is, because nothing is deleted, and the plan sits alongside. The plan lists:
+
+- **Segments that could go.** vlpds deletes oldest first, so it's the longest prefix of ordinals older than the horizon. They're all named by a manifest and at or below F, and the state checkpoint covers them. Also the `pruned_seq` that deleting them would raise.
+- **Stale segments** past the manifest.
+- **Every state path,** marked as current, referenced (an external database of the current state) or deletable, with stale `qlog-*` checkpoints and SlateDB's clone checkpoints.
+
+Nothing beyond Phase 3's checkpoint deletes was added. Every chaos run ends with the report: after mixed-wipe's eight recoveries, six old state paths were deletable and two were still referenced.
+
+### Tests, chaos and numbers (Phase 4)
+
+In-tree (`cargo test --lib qlog`, 37 tests, looped 8 times clean):
+
+- **The recovery tests:**
+  - wiping every disk twice under load;
+  - wiping two (the leader back in time keeps its quorum, and otherwise there's salvage from the survivor);
+  - no recovery while a silent member could be intact;
+  - orphan adoption;
+  - the recovered state equal to replaying the bucket, with a crash at each recovery step;
+  - the single node;
+  - the clone test in `state.rs`;
+  - the checker's own gap test.
+- **Mutations:** resuming at S + 1 instead of R + 1 gives 1,040 "seq N emitted with two contents" on the single node and fails the wipe-all test; leaving silent members out of the trigger fails the no-recovery test.
+- **Test-harness fixes the new tests exposed:** `converge` now waits for the checker's tap to reach the top, and test ports are unique per process. An OS-picked port came back to a cluster running alongside, whose leader then appended into another test's nodes.
+
+The checker (`check.rs`) now takes the manifest's gaps and the load's summary:
+
+- A stream may jump only across gaps.
+- An acked seq in a gap must have its event emitted again above it.
+- Every event the hosts sent must be emitted at a seq outside every gap.
+
+The chaos harness adds:
+
+- `wipe-all`;
+- `wipe-two` (survivor leader or follower at random);
+- `mixed-wipe` (kills, kill-two, kill-all, power-cut-all, wipes, partitions);
+- `single-kill`, `single-power-cut`, `single-wipe` and `single-mixed` (`NODES=1`).
+
+A wipe is kill -9, then the commitlog deleted before the supervisor restarts the node. Runs on benchbox at 3,500/s (10x), 5.3 KB frames, 64 hosts, commitlogs on tmpfs with a 1 ms fsync, local MinIO:
+
+| run | faults | recoveries | distinct seqs | violations | manifest checks |
+|---|---|---|---|---|---|
+| wipe-all, 2 s flush, 90 s | 5 wipe-all | 5 | 365,961 | 0 | 4 + final |
+| wipe-two, 2 s flush, 120 s | 8 wipe-two (4 survivor leaders, 4 followers) | 8 (5 with salvage, 2.4k-6.5k entries) | 463,204 | 0 | 5 + final |
+| mixed-wipe, 240 s | 2 wipe-all, 6 wipe-two, 3 kill-all, 1 kill-two, 2 power-cut-all, 3 partitions | 8 | 895,476 | 0 | 10 + final |
+| mixed-wipe with flush and recovery crashes (5% a step), 180 s | 19 injected crashes, 4 power-cut-all, 2 kill-two, 4 kill -9, 1 wipe-two, 2 partitions | 1 + crashed attempts | 635,842 | 0 | 8 + final |
+| single-mixed, 150 s | 4 kill -9, 12 power cuts, 1 wipe | 1 | 532,453 | 0 | 6 + final |
+| kill-two, memory only, 90 s | 5 kill-two | 5 (salvage 1.1k-5.8k each) | 341,081 | 0 | 4 + final |
+| wipe-all, 30 s flush, H = 8.64M, 170 s | 3 wipe-all | 3 | 818,301 | 0 | 6 + final |
+
+That's 4.05M distinct seqs, 31 recoveries and 0 violations. Every stream jumped only across gaps, and every acked seq lost in a gap came back above it: 200,812 of them in the 30 s run. Every event the hosts sent is in the final log outside the gaps. Every consumer from cursor 0 read the whole log through the bucket, across the gaps, and every manifest verified.
+
+| | measured (local MinIO) |
+|---|---|
+| recovery, bucket side: manifest and orphans read / state clone / apply, jump and seal / salvage segments / manifest CAS | 0-2 ms / 21-46 ms / 3-58 ms / 0-49 ms / 0-1 ms; 33-146 ms in all (the long ones salvaged 2-6k entries) |
+| emission pause, wipe-all (fault to the next new seq at any consumer) | 2.20-2.30 s: the harness's 1 s restart, the 1 s election timeout, ~40 ms of recovery |
+| emission pause, wipe-two | 1.3-3.0 s (median 3.0 s): the restart, the election timeout, and the 0.5 s rank stagger when a lower-ranked candidate goes first |
+| emission pause, single node: wipe / kill -9 / power cut | 1.21 s / 1.49 s median / 1.39 s median (1 s restart plus WAL replay or recovery) |
+| load: first new-generation ack to the recovery's cursors | 0-18 ms |
+| re-ingest at 10x, 2 s flush | 4.5k-12k events sent again, all acked again in 57-209 ms |
+| re-ingest at 10x, 30 s flush | 71k-81k events sent again (66k-77k of them acked before: the consumers' repeats), all acked again in 0.71-0.88 s |
+
+Consumers saw the cursor-to-crash window again: with a 30 s flush, ~70k events a recovery at 10x (~23 s of load, i.e. the interval since F plus the cursor lag). Retried batches gave another 5k-36k duplicates a run with or without recoveries, which is the forwarder's resend from Phase 1, never deduplicated in this harness.
+
+### What changes the study
+
+- **Recovery after a lost quorum is cheap on the bucket side, and the pause is detection.** The clone is O(1), so the state's size doesn't matter, and the whole bucket side was 33-146 ms. On R2, budget ~6 round trips: a manifest GET, a few SlateDB manifest reads and writes for the clone and seal, one PUT per salvaged segment, and the CAS. That's ~1-1.5 s at ~200 ms each. The study's ~5 s for detection and takeover is then mostly restart and timeout, as before.
+- **Re-ingest catch-up is CPU-bound in the real relay, not here.** The harness has no verify, so 81k events came back in under 1 s. The study's 12.7 s at a 30 s flush (2x headroom on verify and apply) stands for the relay. The storm size matched §2's table: ~71-81k events at 10x and 30 s against the 129.5k worst case (a crash right before a flush).
+- **The repeat window is the flush interval.** A consumer sees again everything emitted since F, as the study said, and a shorter flush shrinks it in proportion. Salvage from a surviving member shrinks it further: in wipe-two, salvage kept 2-6k entries a recovery, so the gap's acked losses were 0.
+- **A surviving leader back within its timeout keeps its quorum.** Two wiped followers restarted within the election timeout rejoin by the fresh-follower reset, with no recovery at all. The study's "two disks gone" row needs the two to be gone for longer than the timeout, or the survivor to be a follower.
+- **Each recovery costs H seqs, and a recovery that dies after its CAS costs another H.** At the default H (8.64M) that's still ~3,000 years of seqs at 100k/s for a recovery a day.
+- **Old state paths are retention's job.** Each recovery leaves the previous path, which stays referenced until compaction rewrites its SSTs (transitively: one state listed two older paths). Phase 6's deletes must check `external_dbs` before removing a path, as the report does.
+- **Memory-only now survives two process deaths**, by recovering with salvage from the survivor, at the cost of a jump. The commitlog still turns those into a normal takeover.
+- **The single node's restart pause** is the process restart plus the WAL replay (~0.35 s a GB). Disk loss costs a jump and the re-ingest of everything since F.
+
+### What Phase 5 needs
+
+- **Membership from the bucket.** `Config::members` comes from `--peer`, and the trigger counts silent members against it. With membership changes, the trigger, the quorum size and the promise round must use the member set in `qlog/leader` at the epoch. Otherwise a removed node, or a learner, could be counted as possibly intact or as a voter.
+- **Learners.** A new box joins as a fresh follower. It now starts at the leader's oldest local entry (no bucket replay) and is intact once it has matched the leader's last seq. A learner needs the same, without being counted in `advance_commit` or in promise rounds until the switch.
+- **The switch at a flush barrier.** Pause commits, flush to the commit index, CAS `qlog/leader` with epoch + 1 and the new set, then resume. The fence and manifest code already handle an epoch change with the content unchanged. The `Recovery` generation must carry across.
+- **Box replacement under load.** Wipe a box and bring it back as the same id (that works today, as the fresh-follower reset), and replace it with a new id (needs the above). Chaos: `replace-follower` and `replace-leader` under 10x, checked as now.
+- **Salvage holds everything past F' in memory.** That's fine at 10x, but ~1.7 GB at 100x with a 10 s flush. Stream it into segments while applying.
+- **Known flake, not from this lane:** `fakepds selftest_small` binds fixed ports at 39000+, inside the ephemeral range, and fails on benchbox while other processes hold connections there.
 
 ### Measuring a real host (OVH, Hetzner)
 
