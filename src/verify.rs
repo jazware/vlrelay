@@ -161,7 +161,7 @@ impl SigningKey {
             }
             [0x80, 0x24, key @ ..] if key.len() == 33 => {
                 let pk = p256::PublicKey::from_sec1_bytes(key).map_err(|_| KeyError("bad P-256 point"))?;
-                let pt = p256::elliptic_curve::sec1::ToEncodedPoint::to_encoded_point(&pk, false);
+                let pt = p256::elliptic_curve::sec1::ToSec1Point::to_sec1_point(&pk, false);
                 let b: [u8; 65] = pt.as_bytes().try_into().map_err(|_| KeyError("bad P-256 point"))?;
                 Ok(SigningKey::P256(Box::new(b)))
             }
@@ -192,7 +192,7 @@ impl SigningKey {
                     return false;
                 };
                 // libsecp256k1 rejects high-S itself, as atproto requires
-                secp256k1::SECP256K1.verify_ecdsa(&secp256k1::Message::from_digest(*digest), &s, pk).is_ok()
+                secp256k1::ecdsa::verify(&s, secp256k1::Message::from_digest(*digest), pk).is_ok()
             }
             SigningKey::P256(pt) => {
                 if !p256_low_s(sig64) {

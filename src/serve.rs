@@ -29,13 +29,13 @@ use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use vlpds::firehose::{self, ConnStats, Firehose, Source};
+use vlpds::firehose::{self, Firehose, Source, SubscriberView};
 use vlpds::store::Store;
 
 #[derive(Clone, Debug)]
@@ -91,8 +91,8 @@ pub struct Serve {
     seqs: seq::dense::DenseSeqs,
     pub store: Store,
     cfg: ServeConfig,
-    consumers: parking_lot::Mutex<BTreeMap<u64, Consumer>>,
-    next_consumer: AtomicU64,
+    /// Per-consumer rates by firehose connection id, sampled every second.
+    rates: parking_lot::Mutex<HashMap<u64, Rate>>,
 }
 
 /// A connected subscribeRepos consumer, as the operator sees it.
@@ -112,19 +112,13 @@ pub struct ConsumerSnapshot {
     pub backfilling: bool,
 }
 
-struct Consumer {
-    ip: IpAddr,
-    user_agent: String,
-    connected_since_ms: i64,
-    start_cursor: Option<i64>,
-    stats: Arc<ConnStats>,
+struct Rate {
     /// (events, bytes, when) at the last sample
     sampled: (u64, u64, Instant),
     events_per_sec: f64,
     bytes_per_sec: f64,
 }
 
-const USER_AGENT_MAX: usize = 200;
 /// vlpds's 256 MiB is half a second of a 100k/s stream of ~5.4 KB frames,
 /// less than a linger plus one slow PUT. A cluster merges three logs, each
 /// that far behind at times, and at 90k/s spilled every few seconds; the
@@ -146,6 +140,7 @@ impl Serve {
             max_per_ip: cfg.max_per_ip,
             write_idle: firehose::DEFAULT_WRITE_IDLE,
             runtime,
+            max_labelled: firehose::DEFAULT_MAX_LABELLED,
         };
         let fh = Firehose::new(opts);
         fh.set_max_queue_bytes(cfg.merge_queue_bytes);
@@ -161,8 +156,7 @@ impl Serve {
             seqs,
             store,
             cfg,
-            consumers: parking_lot::Mutex::new(BTreeMap::new()),
-            next_consumer: AtomicU64::new(1),
+            rates: parking_lot::Mutex::new(HashMap::new()),
         });
         tokio::spawn(sample_consumers(Arc::downgrade(&s)));
         if !s.cfg.takedown_poll.is_zero() {
@@ -187,14 +181,18 @@ impl Serve {
     /// The connected consumers, by id.
     pub fn consumers(&self) -> Vec<ConsumerSnapshot> {
         let head = self.firehose.last_emitted.load(Ordering::Acquire);
-        let m = self.consumers.lock();
-        m.iter()
-            .filter(|(_, c)| !c.stats.is_closed())
-            .map(|(&id, c)| {
-                let last_seq = c.stats.last_seq.load(Ordering::Relaxed);
-                let backfilling = c.stats.backfilling.load(Ordering::Relaxed);
+        let rates = self.rates.lock();
+        self.firehose
+            .subscribers()
+            .0
+            .into_iter()
+            .filter_map(|v| {
+                let id: u64 = v.conn.parse().ok()?;
+                let last_seq: i64 = v.last_seq.parse().unwrap_or(0);
+                let backfilling = v.state == "backfilling";
+                let start_cursor = v.cursor.as_deref().and_then(|c| c.parse().ok());
                 let pos = match (last_seq, backfilling) {
-                    (0, true) => c.start_cursor.unwrap_or(head),
+                    (0, true) => start_cursor.unwrap_or(head),
                     // live and sent nothing yet: nothing has been emitted since it joined at the head
                     (0, false) => head,
                     (s, _) => s,
@@ -202,48 +200,30 @@ impl Serve {
                 // stream seqs are counts; their log keys are time (key >> 8 is unix µs)
                 let key = |s: i64| self.firehose.key_at(s).unwrap_or(0) >> 8;
                 let lag_ms = if pos < head { (key(head) - key(pos)).max(0) as f64 / 1000.0 } else { 0.0 };
-                ConsumerSnapshot {
+                let rate = rates.get(&id);
+                Some(ConsumerSnapshot {
                     id,
-                    ip: c.ip,
-                    user_agent: c.user_agent.clone(),
-                    connected_since_ms: c.connected_since_ms,
-                    start_cursor: c.start_cursor,
+                    ip: v
+                        .ip
+                        .as_deref()
+                        .and_then(|ip| ip.parse().ok())
+                        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                    user_agent: v.user_agent,
+                    connected_since_ms: v.connected_at as i64,
+                    start_cursor,
                     last_seq,
                     lag_ms,
-                    events_per_sec: c.events_per_sec,
-                    bytes_per_sec: c.bytes_per_sec,
+                    events_per_sec: rate.map_or(0.0, |r| r.events_per_sec),
+                    bytes_per_sec: rate.map_or(0.0, |r| r.bytes_per_sec),
                     backfilling,
-                }
+                })
             })
             .collect()
     }
 
     /// Disconnects consumer `id`; false if it's unknown or already gone.
     pub fn kick(&self, id: u64) -> bool {
-        match self.consumers.lock().get(&id) {
-            Some(c) if !c.stats.is_closed() => {
-                c.stats.kick();
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn register(&self, ip: IpAddr, user_agent: String, start_cursor: Option<i64>) -> Arc<ConnStats> {
-        let stats = Arc::new(ConnStats::default());
-        let id = self.next_consumer.fetch_add(1, Ordering::Relaxed);
-        let c = Consumer {
-            ip,
-            user_agent,
-            connected_since_ms: chrono::Utc::now().timestamp_millis(),
-            start_cursor,
-            stats: stats.clone(),
-            sampled: (0, 0, Instant::now()),
-            events_per_sec: 0.0,
-            bytes_per_sec: 0.0,
-        };
-        self.consumers.lock().insert(id, c);
-        stats
+        self.firehose.kick(id)
     }
 
     /// Follows a log of this process (its watermark is read directly).
@@ -367,34 +347,36 @@ pub async fn real_ip(State(trusted): State<Arc<Vec<Cidr>>>, mut req: Request, ne
 
 async fn subscribe_repos(State(s): State<Arc<Serve>>, Query(q): Query<SubscribeParams>, req: Request) -> Response {
     let client = client_ip(req.extensions());
-    let ua = req.headers().get(axum::http::header::USER_AGENT).map(|v| String::from_utf8_lossy(v.as_bytes()));
-    let ua = ua.map(|u| u.chars().take(USER_AGENT_MAX).collect()).unwrap_or_default();
-    let ip = client.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-    let stats = s.register(ip, ua, q.cursor);
-    s.firehose.upgrade_tracked(req, q.cursor, None, client, Some(stats))
+    s.firehose.upgrade(req, q.cursor, None, client, None)
 }
 
-/// Per-consumer rates from the counters' deltas; forgets closed consumers.
+/// Per-consumer rates from the counters' deltas; forgets gone consumers.
 async fn sample_consumers(serve: Weak<Serve>) {
     let mut tick = tokio::time::interval(CONSUMER_SAMPLE);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         let Some(s) = serve.upgrade() else { return };
+        let live: Vec<SubscriberView> = s.firehose.subscribers().0;
         let now = Instant::now();
-        s.consumers.lock().retain(|_, c| {
-            if c.stats.is_closed() {
-                return false;
-            }
-            let (events, bytes) = (c.stats.events.load(Ordering::Relaxed), c.stats.bytes.load(Ordering::Relaxed));
-            let secs = now.duration_since(c.sampled.2).as_secs_f64();
+        let mut rates = s.rates.lock();
+        let mut next = HashMap::with_capacity(live.len());
+        for v in live {
+            let Ok(id) = v.conn.parse::<u64>() else { continue };
+            let mut r = rates.remove(&id).unwrap_or(Rate {
+                sampled: (v.events, v.bytes, now),
+                events_per_sec: 0.0,
+                bytes_per_sec: 0.0,
+            });
+            let secs = now.duration_since(r.sampled.2).as_secs_f64();
             if secs > 0.0 {
-                c.events_per_sec = (events - c.sampled.0) as f64 / secs;
-                c.bytes_per_sec = (bytes - c.sampled.1) as f64 / secs;
+                r.events_per_sec = v.events.saturating_sub(r.sampled.0) as f64 / secs;
+                r.bytes_per_sec = v.bytes.saturating_sub(r.sampled.1) as f64 / secs;
             }
-            c.sampled = (events, bytes, now);
-            true
-        });
+            r.sampled = (v.events, v.bytes, now);
+            next.insert(id, r);
+        }
+        *rates = next;
     }
 }
 
@@ -508,14 +490,22 @@ mod tests {
         let mut req = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos").into_client_request().unwrap();
         req.headers_mut().insert("user-agent", "x".repeat(300).parse().unwrap());
         let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-        let c = s.consumers();
+        let t = Instant::now();
+        let c = loop {
+            let c = s.consumers();
+            if !c.is_empty() || t.elapsed() > Duration::from_secs(5) {
+                break c;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
         assert_eq!(c.len(), 1);
-        assert_eq!(c[0].id, 1);
+        let id = c[0].id;
         assert_eq!(c[0].ip, addr.ip());
-        assert_eq!(c[0].user_agent, "x".repeat(USER_AGENT_MAX));
+        assert!(!c[0].user_agent.is_empty() && c[0].user_agent.len() < 300, "trimmed");
+        assert!(c[0].user_agent.bytes().all(|b| b == b'x'));
         assert_eq!((c[0].start_cursor, c[0].last_seq, c[0].lag_ms, c[0].backfilling), (None, 0, 0.0, false));
-        assert!(!s.kick(2));
-        assert!(s.kick(1));
+        assert!(!s.kick(id + 1));
+        assert!(s.kick(id));
         let closed = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match ws.next().await {
@@ -531,6 +521,6 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(5), "the kicked consumer is still listed");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(!s.kick(1));
+        assert!(!s.kick(id));
     }
 }

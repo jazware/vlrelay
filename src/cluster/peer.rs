@@ -188,6 +188,7 @@ pub fn spawn_listener_with(
         h2: vlpds::server::H2Profile::Peer,
         max_connections: vlpds::server::DEFAULT_MAX_CONNECTIONS,
         tls: Some(tls.server_config()),
+        drain: None,
     };
     let r = router(node).merge(extra).layer(middleware::from_fn_with_state(node.clone(), guard));
     tokio::spawn(async move {

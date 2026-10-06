@@ -39,7 +39,7 @@ impl Signer {
             Signer::P256(k) => {
                 use p256::ecdsa::signature::Signer as _;
                 let s: p256::ecdsa::Signature = k.sign(msg);
-                s.normalize_s().unwrap_or(s).to_bytes().into()
+                s.normalize_s().to_bytes().into()
             }
         }
     }
@@ -51,7 +51,7 @@ impl Signer {
         };
         match self {
             Signer::K256(k) => b.extend_from_slice(&k.public_key_sec1()),
-            Signer::P256(k) => b.extend_from_slice(k.verifying_key().to_encoded_point(true).as_bytes()),
+            Signer::P256(k) => b.extend_from_slice(k.verifying_key().to_sec1_point(true).as_bytes()),
         }
         format!("z{}", bs58::encode(b).into_string())
     }

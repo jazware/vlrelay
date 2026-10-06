@@ -235,11 +235,11 @@ async fn future_and_outdated_cursors() {
     let got = collect_for(&mut rx, Duration::from_millis(800)).await;
     let by_host = |h: &Host| got.iter().filter(|f| &f.host == h).map(|f| f.upstream_seq).collect::<Vec<_>>();
 
-    // the reset host answered 1000 with FutureCursor; we came back live
+    // the reset host answered 1000 with FutureCursor; we replay its new sequence from 0
     let r = m.host(&reset).unwrap();
     assert_eq!(r.record.errors.future_cursor, 1);
     assert_eq!(r.connects, 2);
-    assert_eq!(r.record.acked_seq, None);
+    assert!(r.record.acked_seq.is_some_and(|s| (0..=10).contains(&s)), "{:?}", r.record.acked_seq);
     assert!(by_host(&reset).iter().all(|s| *s <= 10));
 
     // the pruned host skipped us ahead with an info frame, no reconnect
