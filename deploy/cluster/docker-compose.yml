@@ -37,6 +37,8 @@ x-env: &env
   VLRELAY_PEER_TLS_DIR: /etc/vlrelay/tls
   VLRELAY_INTERNAL_TOKEN: ${VLRELAY_INTERNAL_TOKEN:?set VLRELAY_INTERNAL_TOKEN (shared by every peer)}
   VLRELAY_ADMIN_TOKEN: ${VLRELAY_ADMIN_TOKEN:?set VLRELAY_ADMIN_TOKEN (the dashboard password)}
+  # the lease cluster: the quorum log (--quorum) supersedes it
+  VLRELAY_LEGACY_CLUSTER: "true"
 
 services:
   minio:

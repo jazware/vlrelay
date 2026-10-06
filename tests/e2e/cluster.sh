@@ -18,6 +18,8 @@
 # (2960) and peers on CLUSTER_PORT_BASE+10+i. Env: KEEP=1, OUT
 # (${DEV_STATE:-dev/state}/e2e-cluster), TTL_MS (3000: node lease TTL), HOST_SHARDS (16).
 set -euo pipefail
+# the lease cluster (--role), which the quorum log supersedes
+export VLRELAY_LEGACY_CLUSTER=true
 here="$(cd "$(dirname "$0")" && pwd)"
 crate="$(cd "$here/../.." && pwd)"
 cd "$crate"

@@ -21,6 +21,8 @@
 # Own ports and compose project (base 3680, nodes on 3700+), so it runs
 # beside `just e2e-cluster`. Env: KEEP=1, OUT (dev/state/e2e-reshard).
 set -euo pipefail
+# the lease cluster (--role), which the quorum log supersedes
+export VLRELAY_LEGACY_CLUSTER=true
 here="$(cd "$(dirname "$0")" && pwd)"
 crate="$(cd "$here/../.." && pwd)"
 cd "$crate"

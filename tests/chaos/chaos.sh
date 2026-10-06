@@ -16,6 +16,8 @@
 # (dev: the cargo profile to build and run), CHAOS_NO_BUILD=1 (use what's built),
 # RELAY_EXTRA (more relay flags), CONSUMER_LAG_MB (16: consumers' lag bound).
 set -euo pipefail
+# the lease cluster (--role), which the quorum log supersedes
+export VLRELAY_LEGACY_CLUSTER=true
 # the fault proxy holds two fds per connection; Linux's default 1024 runs out
 # within minutes of a soak, and every route then hangs
 ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
