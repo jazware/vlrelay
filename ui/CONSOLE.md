@@ -7,9 +7,9 @@ The console at `/admin` and the public page at `/` share one look, "exchange": a
 | Path | What |
 | --- | --- |
 | `src/console.css` | Tokens and every console class. All classes start with `cx-` (or sit under one) because `styles.css` is global and owns `.btn`, `.tile`, `.seg`, `.empty`. The tokens live on `.cx`, so the public page uses them too (`.cx.cx-pubroot`). |
-| `src/components/console/` | The kit: `kit.tsx` (small parts, plus `HostName`, `TierTag`, `HostStatusChip`, `Bars`, `Jack`), `DataTable.tsx` (client or server sort), `Drawer.tsx`, `dialogs.tsx`, `toast.tsx`, `LiveTail.tsx`, `Exchange.tsx` (the overview canvas), `Palette.tsx`, `Shell.tsx`, `sections.tsx` (the IA), `nav.ts`, `hostActions.tsx` (every host action behind a confirm). |
+| `src/components/console/` | The kit: `kit.tsx` (small parts, plus `HostName`, `TierTag`, `HostStatusChip`, `Bars`, `Jack`), `DataTable.tsx` (client or server sort), `Drawer.tsx`, `dialogs.tsx`, `toast.tsx`, `LiveTail.tsx`, `Exchange.tsx` (the overview canvas), `LogRail.tsx` (the quorum log rail), `Palette.tsx`, `Shell.tsx`, `sections.tsx` (the IA), `nav.ts`, `hostActions.tsx` (every host action behind a confirm). |
 | `src/lib/console/` | Data: `live.ts` (pause, stale, `createPoller`, `useLivePoll`), `polls.ts` (the shared polls, and client-side series for values the API has no history for), `relay.ts` (nodes, colours, the quorum's health), `firehose.ts` (the subscribeRepos tail), `adminAdapter.ts` (every endpoint), `fmt.ts`. |
-| `src/pages/admin/` | `AdminApp.tsx` routes. `Overview.tsx` and `Hosts.tsx` are built on the kit, `hostDetail.tsx` registers the `host` detail kind, `relayUi.tsx` holds the banners they share. The other sections render the classic pages from `src/pages/` inside `<Legacy>`. |
+| `src/pages/admin/` | `AdminApp.tsx` routes. `Overview.tsx`, `Hosts.tsx`, `Consumers.tsx`, `Quorum.tsx` and `Store.tsx` are built on the kit. `hostDetail.tsx` registers the `host` detail kind, `quorumDetail.tsx` `node` and `epoch`, `Consumers.tsx` `consumer`. `relayUi.tsx` holds the banners they share, `quorumUi.tsx` the member rows, epoch changes and the membership dialog, `logPages.css` the classes the log pages add. The other sections render the classic pages from `src/pages/` inside `<Legacy>`. |
 | `src/pages/Public.tsx` | The public page. It reads only `/api/public/stats`. |
 
 ## Building a section
@@ -25,7 +25,8 @@ The kit's parts are documented in the vlpds CONSOLE.md. What differs here:
 
 - `DataTable serverSort={{ id, asc, sortable, onSort }}` for tables the server sorts and pages (Hosts). Duplicate row keys get a suffix instead of breaking React.
 - `useLivePoll(fetch, key, ms, { keep })` is a poll owned by one component (a host's detail, one page of hosts). It pauses with space. `keep` keeps the last rows while a new filter loads.
-- `seriesOf(key)` (`polls.ts`) is a series the console builds from its own polls: the stream's rate, the commit latency, each busy host's rate. It fills in while the page is open.
+- `seriesOf(key)` (`polls.ts`) is a series the console builds from its own polls: the stream's rate, the commit latency, each busy host's rate, each consumer's rate, bucket requests per second. It fills in while the page is open.
+- The quorum poll also keeps what the statuses only have as counters: `requestRates()` (bucket requests per second over the last minute, by purpose, component and op, summed over the members that answer), `seenFlushes()` (F moving between two polls of the leader), `seenEpochs()` (the epoch moving) and `flushSeenAt()`. They start empty on each page load.
 - `NeedsVersion what endpoint` stands in for a panel whose endpoint isn't there yet (below).
 
 ## The adapter and what the backend lane owes
@@ -37,11 +38,20 @@ The kit's parts are documented in the vlpds CONSOLE.md. What differs here:
 | `GET hosts/admissions` | Hosts › Crawl admission: each requestCrawl's outcome (admitted, refused, banned, 429) with the reason and the tier it got, and `newHostsToday` against `cluster.newHostsPerDay` |
 | `GET ops/tail?host=&rejects=1` | The Overview tail's rejected and held frames (the firehose carries only what passed), and following one host at full rate. Today the tail can follow a DID, a handle or a collection at full rate, but not a host: frames don't name their PDS |
 | `overview.topHosts[].history` | A rate series per busy host, for the exchange's trunks and the Busiest hosts sparklines. Until then the console keeps its own from the 2 s polls |
-| `qlog status.flush.last_at_ms` | "Flushed N s ago" in the health line. The status has F but not when it moved |
-| `GET store/cost` | The monthly bill: node prices from config, bucket requests by class and storage, priced by provider. Object store & cost has only a placeholder until then |
+| `qlog status.flush.last_at_ms` | "Flushed N s ago" in the health line and Quorum's F tile. `A.flushedAt` reads it when the status has it, else when the console saw F move |
 | `POST hosts/{host}/release-throttled` | Lifting the accounts a host created throttled past its cap |
+| `qlog status.flush.recent` | Quorum › Flush: the leader's recent flushes (F, entries, bytes, how long). Until then the table lists the flushes the page saw |
+| `GET cluster/quorum/history` | Quorum › Leadership: takeovers and handoffs with their times and pauses. The statuses list membership changes (`switches`) and recoveries (`recovered`, no time) only, so a takeover shows as "new epoch" if the page was open for it |
+| `consumers[].readTier` | Consumers: where a replaying consumer reads from (ring, disk, bucket). Until then it says live or replaying |
+| `GET store/retention` | Object store › Retention: the last report (horizon, pruned seq, what it deleted, what's past the horizon). The status has the run and delete counts |
+| `GET store/prefixes` | Object store › What's stored: objects and bytes per prefix |
+| `qlog status.requests.latency_us` | Object store › Latency: PUT and GET latency by purpose. The flush's own timings are there already |
 
 Found while building this, for the backend lane:
+
+- On the quorum log `GET consumers` lists the sockets of the node the console talks to. The Consumers page says so ("this node"); its Serving nodes table counts every member's from `cluster`.
+- On a local quorum cluster (macOS) every consumer reports `eventsPerSec` and `bytesPerSec` 0, and `cluster` reports `cpu` and `memBytes` 0 (they read `/proc`). The node drawer shows a dash for 0 memory.
+- `admin_demo`'s consumer kick answers "no node relay-b" for a consumer on another demo node (it has no fleet).
 
 - On a relay without the quorum log or a cluster, `GET cluster` answers `Demo::cluster()`'s simulated three-node layout (`node/admin.rs`). The console ignores it when `/api/public/stats` counts one node and draws the single node the hosts name as their reader.
 - `GET ops/pipeline` is a 404 on `admin_demo`, so the Overview's "ack backlog" tile became "durability lag" from the overview's own history. Phase 2's Quorum page can bring the backlog back with an adapter fallback.
@@ -55,14 +65,14 @@ Found while building this, for the backend lane:
 | --- | --- | --- |
 | Overview | `/admin` | Built: banners (quorum held or degraded, a node not answering, throttled hosts falling behind, hosts at their account cap, a slow consumer), the health line, eight tiles, the exchange, rejects by reason, busiest hosts, the sampled tail, and a rail with the stream, members, consumers, open cases and the bill |
 | Hosts | `/admin/hosts` | Built: status tiles, the paged table (server-side filter, sort and page; the at-cap, lagging and erroring flags filter here over every match), the `host` drawer and full page with every host action, crawl admission (placeholder) and tiers. `/admin/hosts/<host>` still lands on the host |
-| Consumers | `/admin/consumers` | Classic page |
-| Quorum & cluster | `/admin/quorum` | Classic pages: Quorum log, Cluster (`/admin/cluster`), Operations (`/admin/ops`) |
-| Object store & cost | `/admin/store` | Placeholder |
+| Consumers | `/admin/consumers` | Built: slow-consumer and "this node" banners, tiles, serving nodes (consumers, sent/s, entries behind the commit), the connection table (rate against the stream, mode, `?node=` and `?q=` filters), the `consumer` drawer with the kick behind a typed confirm (`#id`), consumer limits, read tiers (placeholder). ⌘K finds consumers by id, client or IP |
+| Quorum & cluster | `/admin/quorum` | Built: banners, eight tiles, the log rail, leadership (ribbon and table from `switches`, `recovered` and the epochs the page saw; `epoch` drawer), members (`node` drawer), flush, host owners (one cell per host), counters, the ack backlog, and the membership dialog (typed `change members`; off without `--qlog-admin-token`). `/admin/cluster` lands here. Operations (`/admin/ops`) is still the classic page |
+| Object store | `/admin/store` | Built: request rates and totals by purpose and component (R2 classes, no prices), per member, flush latency, retention counts; the report, prefixes and request latency are placeholders |
 | Policy | `/admin/policy` | Classic pages: Limits, Tuning (`/admin/tuning`), Domain rules (`/admin/rules`) |
 | Moderation | `/admin/moderation` | Classic pages: Cases (`/admin/cases`, `/admin/cases/<id>`), Accounts (`/admin/accounts`, `/admin/accounts/<did>`) |
 | Settings | `/admin/settings` | Classic page |
 
-Phase 2 rebuilds the rest on the kit: Consumers (per node, read tier, kick behind a confirm; the lists answer for the node you reach until they're rebuilt over the qlog peer protocol, so label them "this node"), Quorum & cluster (the log rail, leadership history, members, membership changes, flush and counters), Object store & cost, Policy (one draft with a diff and a versioned save), Moderation (cases, accounts and takedowns as detail kinds) and Settings. Edges and replicas are gone for now, so their panels stay out until they come back.
+Phase 2 rebuilds the rest on the kit: Policy (one draft with a diff and a versioned save), Moderation (cases, accounts and takedowns as detail kinds) and Settings. Edges and replicas are gone for now, so their panels stay out until they come back.
 
 ## Keyboard
 

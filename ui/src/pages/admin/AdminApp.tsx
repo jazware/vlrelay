@@ -1,26 +1,25 @@
 import { useEffect, useState, type JSX, type ReactNode } from 'react'
 import { DetailPage, detailKind } from '../../components/console/Drawer'
-import { Empty, Glyph, NeedsVersion, PageHead, Panel, PanelBody } from '../../components/console/kit'
+import { Empty, Glyph } from '../../components/console/kit'
 import { Mark, Shell } from '../../components/console/Shell'
 import { SECTION, sectionOf, type Section } from '../../components/console/sections'
 import { ErrorNotice, Field, Spinner } from '../../components/ui'
 import { api, setAdminToken } from '../../lib/api'
-import { MISSING } from '../../lib/console/adminAdapter'
 import { useAdminToken } from '../../lib/hooks'
 import { Link, match } from '../../lib/router'
 import { AccountDetail, Accounts } from '../Accounts'
 import { CaseDetail, Cases } from '../Cases'
-import { Cluster } from '../Cluster'
-import { Consumers } from '../Consumers'
 import { Ops } from '../Ops'
 import { Policy } from '../Policy'
-import { Quorum } from '../Quorum'
 import { Rules } from '../Rules'
 import { Settings } from '../Settings'
 import { Tuning } from '../Tuning'
+import { Consumers } from './Consumers'
 import './hostDetail'
 import { Hosts } from './Hosts'
 import { Overview } from './Overview'
+import { Quorum } from './Quorum'
+import { Store } from './Store'
 
 // The operator console: the token gate, then the shell around one page per route. Sections
 // still on their pre-console pages render them inside <Legacy> until they're rebuilt
@@ -39,8 +38,7 @@ const crumb = (section: Section, last: ReactNode) => (
 type Tab = { to: string; label: string }
 const TABS: Partial<Record<Section['id'], Tab[]>> = {
   quorum: [
-    { to: '/admin/quorum', label: 'Quorum log' },
-    { to: '/admin/cluster', label: 'Cluster' },
+    { to: '/admin/quorum', label: 'Quorum & cluster' },
     { to: '/admin/ops', label: 'Operations' },
   ],
   policy: [
@@ -77,28 +75,6 @@ function Legacy({ section, path, children }: { section: Section; path: string; c
   )
 }
 
-function Store() {
-  const cost = MISSING.find(([e]) => e === 'GET store/cost')!
-  return (
-    <>
-      <PageHead title="Object store & cost" sub={<span>The bucket the quorum log flushes to, and what the relay costs to run.</span>} />
-      <div className="cx-grid2">
-        <Panel title="Monthly bill">
-          <NeedsVersion what="The cost model" endpoint={cost[0]} />
-        </Panel>
-        <Panel title="Where the numbers are today">
-          <PanelBody>
-            <p className="sm t2" style={{ margin: 0 }}>
-              Flushes, segment bytes and bucket requests by type are on the <Link to="/admin/quorum">Quorum log</Link> page (each member's <span className="mono">status.flush</span>), and the
-              bucket settings on <Link to="/admin/settings">Settings</Link>. This section gets its own page in the next pass.
-            </p>
-          </PanelBody>
-        </Panel>
-      </div>
-    </>
-  )
-}
-
 function route(p: string): Route {
   let m: Record<string, string> | null
   const S = SECTION
@@ -109,11 +85,10 @@ function route(p: string): Route {
     case '/admin/hosts':
       return { section: S.hosts, page: <Hosts /> }
     case '/admin/consumers':
-      return legacy(S.consumers, <Consumers />)
+      return { section: S.consumers, page: <Consumers /> }
     case '/admin/quorum':
-      return legacy(S.quorum, <Quorum />)
     case '/admin/cluster':
-      return legacy(S.quorum, <Cluster />, 'Cluster')
+      return { section: S.quorum, page: <Quorum /> }
     case '/admin/ops':
       return legacy(S.quorum, <Ops />, 'Operations')
     case '/admin/store':

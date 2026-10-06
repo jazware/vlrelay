@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { openDialog, FormDialog } from '../../components/console/dialogs'
 import { Exchange } from '../../components/console/Exchange'
-import { Banners, Bars, Empty, Glyph, HealthLine, HostName, Kbd, Loaded, LiveVal, NeedsVersion, PageHead, Panel, RRow, Spark, Src, Swatch, Tiles, type HealthCell, type TileSpec, type Tone } from '../../components/console/kit'
+import { Banners, Bars, Empty, Glyph, HealthLine, HostName, Kbd, Loaded, LiveVal, PageHead, Panel, RRow, Spark, Src, Swatch, Tiles, type HealthCell, type TileSpec, type Tone } from '../../components/console/kit'
 import { LiveTail } from '../../components/console/LiveTail'
 import { openPanel } from '../../components/console/nav'
 import { toast } from '../../components/console/toast'
@@ -327,9 +327,6 @@ export function Overview() {
               </RRow>
             ))}
             {cases.data && !cases.data.length && <Empty>No open cases.</Empty>}
-          </Panel>
-          <Panel title="Monthly bill" to="/admin/store" src={<Src isNew>store/cost</Src>}>
-            <NeedsVersion what="The bill" endpoint="GET store/cost" />
           </Panel>
           <div className="muted sm" style={{ padding: '0 2px' }}>
             {plural(o.hostsConnected, 'host')} connected · {plural(o.consumers, 'consumer')} · as of {ov.at ? ago(ov.at) : '—'}
