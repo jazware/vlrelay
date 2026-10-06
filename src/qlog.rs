@@ -14,15 +14,19 @@
 //!   (before a follower's ack, the leader counting itself, and a promise),
 //!   and the single node's WAL.
 //!
-//! Memory-only (`node::MemoryOnly`) remains for comparison. The bucket
-//! flush comes later.
+//! - `flush`: every interval the leader seals `state` at a committed seq F,
+//!   uploads the log to F as vlpds segments and CASes `qlog/manifest`.
+//!
+//! Memory-only (`node::MemoryOnly`) remains for comparison.
 
 pub mod check;
 pub mod client;
 pub mod commitlog;
 pub mod emit;
+pub mod flush;
 pub mod log;
 pub mod node;
+pub mod state;
 pub mod wire;
 
 #[cfg(test)]

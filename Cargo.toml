@@ -11,7 +11,7 @@ publish = false
 # crypto, MST, CAR and DID resolution. Factored into shared crates once the
 # relay settles which pieces it needs.
 # the public vlpds at the commit this one was exported against
-vlpds = { git = "https://github.com/jazware/vlpds", rev = "3cd358b3e2194a354239199a8d285d7d6352d834" }
+vlpds = { git = "https://github.com/jazware/vlpds", rev = "39b1b3a77caabfdaa38a7c68ba91c5dee5010752" }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws", "macros", "http2"] }
@@ -55,6 +55,8 @@ bs58 = "0.5"
 foldhash = "0.2"
 # the qlog commitlog's record checksums
 crc32fast = "1"
+# SlateDB checkpoint ids (the qlog flush manifest names one)
+uuid = "1"
 
 [[bin]]
 name = "vlrelay"

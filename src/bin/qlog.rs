@@ -5,7 +5,10 @@
 //!   qlog load   a host owner at --rate events/s: submits to the leader,
 //!               resends until acked, writes every ack (seq, did)
 //!   qlog check  a websocket consumer per node, the emission checker over
-//!               all of them, end-to-end latency and emission pauses
+//!               all of them, end-to-end latency and emission pauses, and
+//!               at the end a consumer from cursor 0 (the bucket backfill)
+//!   qlog verify the flush manifest's consistency (segments, state at F,
+//!               cursors at F) against the bucket
 
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
@@ -21,6 +24,7 @@ use vlrelay::qlog::check::{Checker, content_id};
 use vlrelay::qlog::client::{Client, info_name, parse_test_frame, test_frame};
 use vlrelay::qlog::commitlog::{self, CommitLog};
 use vlrelay::qlog::emit::{self, Emitter};
+use vlrelay::qlog::log::encode_cursors;
 use vlrelay::qlog::node::{Config, Durability, Faults, MemoryOnly, Node, Quantiles};
 
 #[global_allocator]
@@ -37,6 +41,43 @@ enum Cmd {
     Node(Box<NodeArgs>),
     Load(LoadArgs),
     Check(CheckArgs),
+    Verify(VerifyArgs),
+}
+
+#[derive(Parser)]
+struct S3Args {
+    #[arg(long)]
+    s3_endpoint: String,
+    #[arg(long, default_value = "vlrelay")]
+    s3_bucket: String,
+    #[arg(long, default_value = "minioadmin")]
+    s3_access_key: String,
+    #[arg(long, default_value = "minioadmin")]
+    s3_secret_key: String,
+    #[arg(long)]
+    prefix: String,
+}
+
+impl S3Args {
+    fn store(&self) -> anyhow::Result<vlpds::store::Store> {
+        let s3 = vlpds::store::S3Config {
+            endpoint: self.s3_endpoint.clone(),
+            bucket: self.s3_bucket.clone(),
+            access_key: self.s3_access_key.clone(),
+            secret_key: self.s3_secret_key.clone(),
+            region: "us-east-1".into(),
+        };
+        Ok(vlpds::store::Store::s3(&s3, &self.prefix, None, 8)?.counted("qlog"))
+    }
+}
+
+#[derive(Parser)]
+struct VerifyArgs {
+    #[command(flatten)]
+    s3: S3Args,
+    /// Retries past a race with a flush deleting the checkpoint just read.
+    #[arg(long, default_value_t = 5)]
+    attempts: u32,
 }
 
 #[derive(Parser)]
@@ -52,16 +93,27 @@ struct NodeArgs {
     /// id=host:port, once per other member (how this node dials it).
     #[arg(long = "peer")]
     peers: Vec<String>,
+    #[command(flatten)]
+    s3: S3Args,
+    /// Flush every this many ms (0: no flush, no reservation).
+    #[arg(long, default_value_t = 30_000)]
+    flush_ms: u64,
+    /// H: each manifest's R is F + H.
+    #[arg(long, default_value_t = 8_640_000)]
+    headroom: u64,
+    /// Raw bytes a bucket segment is cut at.
+    #[arg(long, default_value_t = 64)]
+    flush_segment_mb: usize,
+    /// Chaos: die (SIGKILL) at this flush step (fenced, sealed, segment,
+    /// before-manifest, after-manifest), with --crash-prob; or "mid-trim",
+    /// between two commitlog segment deletions; "any" picks every step.
     #[arg(long)]
-    s3_endpoint: String,
-    #[arg(long, default_value = "vlrelay")]
-    s3_bucket: String,
-    #[arg(long, default_value = "minioadmin")]
-    s3_access_key: String,
-    #[arg(long, default_value = "minioadmin")]
-    s3_secret_key: String,
+    crash_at: Option<String>,
+    #[arg(long, default_value_t = 0.05)]
+    crash_prob: f64,
+    /// No more injected crashes once this file exists.
     #[arg(long)]
-    prefix: String,
+    crash_stop_file: Option<std::path::PathBuf>,
     #[arg(long, default_value_t = 512)]
     ring_mb: usize,
     /// Committed log kept in memory for replication (default: 64 with a
@@ -121,6 +173,12 @@ struct LoadArgs {
     out: String,
     #[arg(long, default_value = "r")]
     run: String,
+    /// Upstream hosts the events come from (round robin): each event's DID
+    /// is `did:q:{run}-h{host}:{n}`, n counting from 1 per host, and about
+    /// once a second a submit carries every host's cursor (the events acked
+    /// so far without a gap).
+    #[arg(long, default_value_t = 64)]
+    hosts: u64,
 }
 
 #[derive(Parser)]
@@ -139,6 +197,10 @@ struct CheckArgs {
     /// Global emission pauses longer than this are logged.
     #[arg(long, default_value_t = 50)]
     gap_ms: u64,
+    /// At the end, one more consumer from cursor 0 on the first node, through
+    /// the bucket backfill, the node's local log and the ring.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    backfill: bool,
 }
 
 fn pairs(v: &[String]) -> anyhow::Result<Vec<(String, String)>> {
@@ -164,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Node(a) => node(*a).await,
         Cmd::Load(a) => load(a).await,
         Cmd::Check(a) => check(a).await,
+        Cmd::Verify(a) => verify(a).await,
     }
 }
 
@@ -176,16 +239,46 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
     cfg.stagger = Duration::from_millis(a.stagger_ms);
     cfg.rpc_timeout = Duration::from_millis(a.rpc_ms);
     cfg.retain_bytes = a.retain_mb.unwrap_or(if a.commitlog.is_some() { 64 } else { 512 }) << 20;
-    let s3 = vlpds::store::S3Config {
-        endpoint: a.s3_endpoint,
-        bucket: a.s3_bucket,
-        access_key: a.s3_access_key,
-        secret_key: a.s3_secret_key,
-        region: "us-east-1".into(),
+    let store = a.s3.store()?;
+    let die = |what: &str| {
+        eprintln!("qlog: crash injected at {what}");
+        // as sudden as a crash: no unwinding, no flush of anything
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
     };
-    let store = vlpds::store::Store::s3(&s3, &a.prefix, None, 8)?;
+    let crash_at = a.crash_at.clone().unwrap_or_default();
+    let prob = a.crash_prob;
+    let stop_file = a.crash_stop_file.clone();
+    let roll = move || {
+        use rand::Rng;
+        stop_file.as_ref().is_none_or(|f| !f.exists()) && rand::thread_rng().gen_bool(prob)
+    };
+    let roll2 = roll.clone();
+    if a.flush_ms > 0 {
+        let crash: Option<vlrelay::qlog::flush::CrashHook> = match crash_at.as_str() {
+            "" | "mid-trim" => None,
+            s => {
+                let only: Option<vlrelay::qlog::flush::Step> = if s == "any" { None } else { Some(s.parse().map_err(anyhow::Error::msg)?) };
+                Some(Arc::new(move |step| {
+                    if only.is_none_or(|o| o == step) && roll() {
+                        die(&format!("{step:?}"));
+                    }
+                    false
+                }))
+            }
+        };
+        cfg.flush = Some(vlrelay::qlog::flush::Options {
+            interval: Duration::from_millis(a.flush_ms),
+            headroom: a.headroom,
+            segment_bytes: a.flush_segment_mb << 20,
+            crash,
+        });
+    }
     let listener = tokio::net::TcpListener::bind(&a.listen).await?;
-    let emit = Emitter::new(&a.id, now_us() as u64, a.ring_mb << 20, None);
+    let emit = if a.flush_ms > 0 {
+        Emitter::with_store(&a.id, now_us() as u64, a.ring_mb << 20, None, store.clone())
+    } else {
+        Emitter::new(&a.id, now_us() as u64, a.ring_mb << 20, None)
+    };
     let (durability, recovered): (Arc<dyn Durability>, _) = match &a.commitlog {
         Some(dir) => {
             let o = commitlog::Options {
@@ -194,6 +287,13 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
                 memory_bytes: cfg.retain_bytes,
                 abort_on_error: true,
                 sync_delay: a.fsync_delay_us.map(Duration::from_micros),
+                mid_trim: (crash_at == "mid-trim").then(|| {
+                    commitlog::Hook(Arc::new(move || {
+                        if roll2() {
+                            die("mid-trim");
+                        }
+                    }))
+                }),
             };
             let (cl, r) = CommitLog::open(dir, o)?;
             if a.power_cut_on_usr1 {
@@ -235,6 +335,31 @@ struct LoadSummary {
     retries: u64,
     /// submit to ack (append, quorum commit, reply), per event, µs
     ack_us: Quantiles,
+    cursor_updates: u64,
+}
+
+/// Which events are acked with nothing missing below: [0, contig).
+#[derive(Default)]
+struct Acked {
+    contig: u64,
+    done: std::collections::BTreeMap<u64, u64>,
+}
+
+impl Acked {
+    fn ack(&mut self, from: u64, n: u64) {
+        self.done.insert(from, n);
+        while let Some(n) = self.done.remove(&self.contig) {
+            self.contig += n;
+        }
+    }
+
+    /// Each host's cursor: how many of its events are in [0, contig).
+    fn cursors(&self, run: &str, hosts: u64) -> std::collections::BTreeMap<String, u64> {
+        (0..hosts)
+            .filter(|h| self.contig > *h)
+            .map(|h| (format!("{run}-h{h}"), (self.contig - h - 1) / hosts + 1))
+            .collect()
+    }
 }
 
 async fn load(a: LoadArgs) -> anyhow::Result<()> {
@@ -268,6 +393,12 @@ async fn load(a: LoadArgs) -> anyhow::Result<()> {
     let mut last_report = Instant::now();
     let mut last_acked = 0u64;
     let mut tasks = tokio::task::JoinSet::new();
+    let track = Arc::new(Mutex::new(Acked::default()));
+    let mut pending_cursors = Bytes::new();
+    let mut cursor_updates = 0u64;
+    let mut last_cursors = Instant::now();
+    let window = Arc::new(Mutex::new(hdrhistogram::Histogram::<u64>::new_with_bounds(1, 120_000_000, 3)?));
+    let mut timeline = std::io::BufWriter::new(std::fs::File::create(format!("{}.timeline.jsonl", a.out))?);
     while t0.elapsed() < Duration::from_secs(a.duration) {
         tick.tick().await;
         owed += a.rate * a.tick_ms as f64 / 1000.0;
@@ -275,17 +406,32 @@ async fn load(a: LoadArgs) -> anyhow::Result<()> {
         owed -= n as f64;
         if n > 0 {
             let sent = now_us();
-            let dids: Vec<String> = (0..n).map(|i| format!("did:q:{}:{}", a.run, k + i as u64)).collect();
+            let dids: Vec<String> = (0..n as u64)
+                .map(|i| {
+                    let e = k + i;
+                    format!("did:q:{}-h{}:{}", a.run, e % a.hosts, e / a.hosts + 1)
+                })
+                .collect();
+            let k0 = k;
             k += n as u64;
             let frames: Vec<(Bytes, Bytes)> = dids.iter().map(|d| test_frame(d, a.pad, sent)).collect();
             submitted.fetch_add(n as u64, Ordering::Relaxed);
+            if last_cursors.elapsed() >= Duration::from_secs(1) {
+                last_cursors = Instant::now();
+                pending_cursors = encode_cursors(&track.lock().cursors(&a.run, a.hosts));
+                cursor_updates += 1;
+            }
+            let cursors = std::mem::take(&mut pending_cursors);
             let permit = slots.clone().acquire_owned().await?;
-            let (client, hist, ack_tx, acked) = (client.clone(), hist.clone(), ack_tx.clone(), acked.clone());
+            let (client, hist, ack_tx, acked, track, window) =
+                (client.clone(), hist.clone(), ack_tx.clone(), acked.clone(), track.clone(), window.clone());
             tasks.spawn(async move {
                 let t = Instant::now();
-                let (first, cnt) = client.submit(frames).await;
+                let (first, cnt) = client.submit_with(frames, cursors).await;
                 let us = t.elapsed().as_micros().max(1) as u64;
+                track.lock().ack(k0, n as u64);
                 let _ = hist.lock().record_n(us, cnt);
+                let _ = window.lock().record_n(us, cnt);
                 acked.fetch_add(cnt, Ordering::Relaxed);
                 let _ = ack_tx.send((first, dids));
                 drop(permit);
@@ -293,6 +439,20 @@ async fn load(a: LoadArgs) -> anyhow::Result<()> {
         }
         while tasks.try_join_next().is_some() {}
         if last_report.elapsed() >= Duration::from_secs(1) {
+            {
+                use std::io::Write;
+                let mut w = window.lock();
+                writeln!(
+                    timeline,
+                    "{{\"t_ms\":{},\"n\":{},\"p50\":{},\"p99\":{},\"max\":{}}}",
+                    now_us() / 1000,
+                    w.len(),
+                    w.value_at_quantile(0.5),
+                    w.value_at_quantile(0.99),
+                    w.max()
+                )?;
+                w.reset();
+            }
             let n = acked.load(Ordering::Relaxed);
             let h = hist.lock();
             tracing::info!(
@@ -320,7 +480,12 @@ async fn load(a: LoadArgs) -> anyhow::Result<()> {
         acked_per_sec: n as f64 / secs,
         retries: client.retries.load(Ordering::Relaxed),
         ack_us: Quantiles::of(&hist.lock()),
+        cursor_updates,
     };
+    {
+        use std::io::Write;
+        timeline.flush()?;
+    }
     std::fs::write(&a.out, serde_json::to_vec_pretty(&s)?)?;
     println!("{}", serde_json::to_string(&s)?);
     Ok(())
@@ -383,6 +548,41 @@ struct CheckOut {
     e2e_by_node_us: HashMap<String, Quantiles>,
     last_by_node: HashMap<String, u64>,
     pauses_ms: Vec<(i64, i64)>,
+    /// The consumer from cursor 0 at the end: (events, seconds).
+    backfilled: Option<(u64, f64)>,
+}
+
+/// Reads `addr`'s stream from cursor 0 up to `upto` into the checker as
+/// its own stream (dense, and each seq with the content every other
+/// consumer saw).
+async fn backfill_from_zero(addr: &str, upto: u64, ck: &mut Checker) -> anyhow::Result<u64> {
+    let url = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor=0");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
+    let mut n = 0u64;
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(30), ws.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("stalled after {n} events"))?
+            .ok_or_else(|| anyhow::anyhow!("closed after {n} events"))??;
+        let b = match m {
+            Message::Binary(b) => b,
+            Message::Ping(p) => {
+                ws.send(Message::Pong(p)).await?;
+                continue;
+            }
+            Message::Close(_) => anyhow::bail!("closed after {n} events"),
+            _ => continue,
+        };
+        if let Some((seq, did, _)) = parse_test_frame(&b) {
+            ck.observe("backfill", seq, content_id(did.as_bytes()));
+            n += 1;
+            if seq >= upto {
+                return Ok(n);
+            }
+        } else if let Some(name) = info_name(&b) {
+            anyhow::bail!("got #info {name} after {n} events");
+        }
+    }
 }
 
 async fn check(a: CheckArgs) -> anyhow::Result<()> {
@@ -463,6 +663,22 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
         }
     }
     stop.store(true, Ordering::Release);
+    let mut backfilled = None;
+    if a.backfill
+        && let Some((id, addr)) = nodes.first()
+        && let Some(upto) = ck.last(id)
+    {
+        let t = Instant::now();
+        let r = backfill_from_zero(addr, upto, &mut ck).await;
+        tracing::info!(node = %id, upto, secs = t.elapsed().as_secs_f64(), "check: consumer from cursor 0 done: {r:?}");
+        match r {
+            Ok(n) => backfilled = Some((n, t.elapsed().as_secs_f64())),
+            Err(e) => {
+                ck.violations += 1;
+                ck.messages.push(format!("the consumer from cursor 0 on {id} failed: {e:#}"));
+            }
+        }
+    }
     for line in std::fs::read_to_string(&a.acked)?.lines() {
         // a load generator killed mid-write leaves a last line without its did
         if let Some((s, d)) = line.split_once(' ')
@@ -486,6 +702,7 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
         e2e_by_node_us: by_node.iter().map(|(k, h)| (k.clone(), Quantiles::of(h))).collect(),
         last_by_node,
         pauses_ms: pauses,
+        backfilled,
         report,
     };
     std::fs::write(format!("{}/check.json", a.out), serde_json::to_vec_pretty(&out)?)?;
@@ -505,6 +722,27 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
         println!("  {m}");
     }
     if !out.report.ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn verify(a: VerifyArgs) -> anyhow::Result<()> {
+    let store = a.s3.store()?;
+    let mut tries = 0;
+    let v = loop {
+        tries += 1;
+        match vlrelay::qlog::flush::verify(&store).await {
+            Ok(v) => break v,
+            Err(e) if tries < a.attempts => {
+                tracing::warn!("verify: {e:#}, again");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    println!("{}", serde_json::to_string(&v)?);
+    if !v.ok {
         std::process::exit(1);
     }
     Ok(())

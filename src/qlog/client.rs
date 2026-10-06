@@ -136,7 +136,13 @@ impl Client {
 
     /// Submits `frames` until a leader commits them: (first seq, count).
     pub async fn submit(&self, frames: Vec<(Bytes, Bytes)>) -> (u64, u64) {
-        let m = Msg::Submit { frames };
+        self.submit_with(frames, Bytes::new()).await
+    }
+
+    /// As `submit`, carrying host cursors (`log::encode_cursors`) that
+    /// count only events already acked.
+    pub async fn submit_with(&self, frames: Vec<(Bytes, Bytes)>, cursors: Bytes) -> (u64, u64) {
+        let m = Msg::Submit { frames, cursors };
         loop {
             let Some(c) = self.conn().await else {
                 self.retries.fetch_add(1, Ordering::Relaxed);

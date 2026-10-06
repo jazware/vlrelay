@@ -7,6 +7,8 @@ use super::check::{Checker, content_id};
 use super::client::{Client, test_frame};
 use super::commitlog::{self, CommitLog};
 use super::emit::{Emitted, Emitter};
+use super::flush;
+use super::log::encode_cursors;
 use super::node::{Config, Durability, Faults, MemoryOnly, Node, Role};
 use super::wire;
 use bytes::Bytes;
@@ -26,7 +28,7 @@ struct Running {
     cl: Option<Arc<CommitLog>>,
 }
 
-type ConfigFn = Arc<dyn Fn(&str) -> Config + Send + Sync>;
+type ConfigFn = Arc<dyn Fn(&str, &HashMap<String, String>) -> Config + Send + Sync>;
 
 struct Cluster {
     ids: Vec<String>,
@@ -42,6 +44,7 @@ struct Cluster {
     disk: Option<(tempfile::TempDir, commitlog::Options)>,
     /// Overrides `config` for nodes started from now on.
     cfg: Option<ConfigFn>,
+    ring_bytes: usize,
 }
 
 fn free_port() -> u16 {
@@ -76,6 +79,15 @@ impl Cluster {
     }
 
     async fn with(n: usize, disk: Option<(tempfile::TempDir, commitlog::Options)>) -> Cluster {
+        Cluster::with_cfg(n, disk, None, 64 << 20).await
+    }
+
+    async fn with_cfg(
+        n: usize,
+        disk: Option<(tempfile::TempDir, commitlog::Options)>,
+        cfg: Option<ConfigFn>,
+        ring_bytes: usize,
+    ) -> Cluster {
         let ids: Vec<String> = (1..=n).map(|i| format!("n{i}")).collect();
         let addrs = ids.iter().map(|id| (id.clone(), format!("127.0.0.1:{}", free_port()))).collect();
         let (tap, mut rx) = mpsc::unbounded_channel::<Emitted>();
@@ -100,7 +112,8 @@ impl Cluster {
             checker,
             blocks: Vec::new(),
             disk,
-            cfg: None,
+            cfg,
+            ring_bytes,
         };
         for id in &ids {
             c.start(id).await;
@@ -121,7 +134,7 @@ impl Cluster {
                 faults.block(&[b]);
             }
         }
-        let emit = Emitter::new(id, inc, 64 << 20, Some(self.tap.clone()));
+        let emit = Emitter::with_store(id, inc, self.ring_bytes, Some(self.tap.clone()), self.store.clone());
         let (cl, recovered) = match &self.disk {
             Some((dir, o)) => {
                 let (cl, r) = CommitLog::open(&dir.path().join(id), o.clone()).unwrap();
@@ -134,7 +147,7 @@ impl Cluster {
             None => Arc::new(MemoryOnly),
         };
         let (cfg, store, addr, f) = (
-            self.cfg.as_ref().map_or_else(|| config(id, &self.addrs), |f| f(id)),
+            self.cfg.as_ref().map_or_else(|| config(id, &self.addrs), |f| f(id, &self.addrs)),
             self.store.clone(),
             self.addrs[id].clone(),
             faults.clone(),
@@ -289,12 +302,17 @@ impl Load {
             .map(|w| {
                 let (client, stop, acked, sent) = (client.clone(), stop.clone(), acked.clone(), sent.clone());
                 tokio::spawn(async move {
-                    let mut k = 0u64;
+                    // one host per submitter, its events numbered from 1; a
+                    // submit carries the cursor of every event acked before it
+                    let host = format!("t{w}");
+                    let mut n = 0u64;
                     while !stop.load(Ordering::Acquire) {
+                        let cursors =
+                            if n > 0 { encode_cursors(&[(host.clone(), n)].into()) } else { Bytes::new() };
                         let frames: Vec<(Bytes, Bytes)> =
-                            (0..batch).map(|i| test_frame(&format!("did:t:{w}:{k}:{i}"), 64, 0)).collect();
-                        k += 1;
-                        let (first, cnt) = client.submit(frames.clone()).await;
+                            (1..=batch as u64).map(|i| test_frame(&format!("did:q:{host}:{}", n + i), 64, 0)).collect();
+                        let (first, cnt) = client.submit_with(frames.clone(), cursors).await;
+                        n += batch as u64;
                         assert_eq!(cnt as usize, batch);
                         sent.fetch_add(cnt, Ordering::Relaxed);
                         {
@@ -360,7 +378,7 @@ async fn nothing_is_emitted_without_a_quorum() {
         let seq = leader.status().last + 1;
         lone.iter().map(|(p, s)| content_id(&wire::splice_seq(p, s, seq))).collect()
     };
-    let r = tokio::time::timeout(Duration::from_secs(3), leader.submit(lone)).await;
+    let r = tokio::time::timeout(Duration::from_secs(3), leader.submit(lone, Bytes::new())).await;
     assert!(!matches!(r, Ok(wire::Msg::Submitted { .. })), "an isolated leader acked: {r:?}");
     assert!(leader.status().emitted == before[&l], "the isolated leader emitted past its quorum");
     assert_ne!(leader.status().role, Role::Leader, "it stepped down");
@@ -693,10 +711,9 @@ async fn a_lagging_follower_catches_up_from_disk() {
     for id in c.ids.clone() {
         c.kill(&id);
     }
-    let addrs = c.addrs.clone();
     // a small in-memory window, so the lag is served from disk
-    let cfg = move |id: &str| {
-        let mut k = config(id, &addrs);
+    let cfg = move |id: &str, addrs: &HashMap<String, String>| {
+        let mut k = config(id, addrs);
         k.retain_bytes = 32 << 10;
         k
     };
@@ -719,5 +736,389 @@ async fn a_lagging_follower_catches_up_from_disk() {
     assert_eq!(st.emit_gaps, 0);
     let r = c.finish(&acked);
     assert_clean(&r);
+    c.shutdown();
+}
+
+// ---- the flush (Phase 3)
+
+fn flush_opts() -> flush::Options {
+    flush::Options {
+        interval: Duration::from_millis(150),
+        headroom: 10_000_000,
+        segment_bytes: 32 << 10,
+        crash: None,
+    }
+}
+
+/// Durable nodes that flush; `opts` per node id.
+async fn flushing(opts: impl Fn(&str) -> flush::Options + Send + Sync + 'static, ring_bytes: usize) -> Cluster {
+    let o = commitlog::Options {
+        segment_bytes: 256 << 10,
+        retain_bytes: 1 << 20,
+        memory_bytes: 64 << 10,
+        ..commitlog::Options::default()
+    };
+    let cfg = move |id: &str, addrs: &HashMap<String, String>| {
+        let mut k = config(id, addrs);
+        k.retain_bytes = 64 << 10;
+        k.flush = Some(opts(id));
+        k
+    };
+    Cluster::with_cfg(3, Some((tempfile::tempdir().unwrap(), o)), Some(Arc::new(cfg)), ring_bytes).await
+}
+
+/// The manifest's consistency check, retried past a race with the next
+/// flush deleting the checkpoint it named.
+async fn verify(c: &Cluster) -> flush::Verified {
+    let mut last = None;
+    for _ in 0..5 {
+        match flush::verify(&c.store).await {
+            Ok(v) => return v,
+            Err(e) => last = Some(e),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("verify kept failing: {:#}", last.unwrap());
+}
+
+/// Until the manifest's F is at least `seq`.
+async fn wait_flushed(c: &Cluster, seq: u64, within: Duration) -> flush::Manifest {
+    let t = Instant::now();
+    loop {
+        if let Some((m, _)) = flush::read_manifest(&c.store).await.unwrap()
+            && m.flushed >= seq
+        {
+            return m;
+        }
+        assert!(t.elapsed() < within, "F didn't reach {seq} within {within:?}: {}", status_line(c));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn settle_and_verify(c: &Cluster, acked: &[(u64, u64)]) -> flush::Verified {
+    c.converge(Duration::from_secs(15)).await;
+    let top = c.nodes.values().map(|r| r.node.status().commit).max().unwrap();
+    wait_flushed(c, top, Duration::from_secs(10)).await;
+    let v = verify(c).await;
+    assert!(v.ok, "manifest inconsistent: {v:#?}");
+    assert_eq!(v.flushed, top);
+    assert_eq!(v.entries, top, "the bucket doesn't hold the whole log");
+    let r = c.finish(acked);
+    assert_clean(&r);
+    v
+}
+
+/// Flushes under load and across a leader kill: every manifest describes
+/// one point (segments, state and cursors at F), and the final one the
+/// whole log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flush_seals_log_state_and_cursors_at_one_point() {
+    let mut c = flushing(|_| flush_opts(), 64 << 20).await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    for _ in 0..3 {
+        let m = wait_flushed(&c, 1, Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let v = verify(&c).await;
+        assert!(v.ok, "mid-run: {v:#?}");
+        assert!(v.flushed >= m.flushed && v.hosts > 0, "{v:#?}");
+        let l = c.wait_leader(Duration::from_secs(5)).await;
+        c.kill(&l);
+        c.start(&l).await;
+    }
+    let acked = load.stop().await;
+    let v = settle_and_verify(&c, &acked).await;
+    eprintln!("{v:?}");
+    assert_eq!(v.hosts, 4);
+    assert_eq!(v.orphans, 0);
+    let ck = flush::read_manifest(&c.store).await.unwrap().unwrap().0;
+    let cps = super::state::list_checkpoints(&c.store).await.unwrap();
+    assert_eq!(cps, vec![ck.state.unwrap().checkpoint], "stale checkpoints kept");
+    c.shutdown();
+}
+
+/// With no flush after the first, the commit index stops at R = H: the
+/// reservation holds back everything past it, on every node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_stops_at_the_reservation() {
+    let c = flushing(
+        |_| flush::Options { interval: Duration::from_secs(3600), headroom: 300, ..flush_opts() },
+        64 << 20,
+    )
+    .await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    for r in c.nodes.values() {
+        let st = r.node.status();
+        assert!(st.commit <= 300 && st.emitted <= 300, "{st:?}");
+    }
+    let st = c.nodes[&l].node.status();
+    assert_eq!((st.commit, st.reserve), (300, 300), "{st:?}");
+    assert!(st.last > 300, "the load didn't get past R: {st:?}");
+    drop(load);
+    c.shutdown();
+}
+
+/// A crash at each step of a flush (the leader killed right there, then
+/// restarted): the manifest stays consistent, a later flush picks up any
+/// segment the dead one left, and nothing emitted is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crashes_at_every_flush_step_leave_a_consistent_manifest() {
+    use flush::Step;
+    let armed: Arc<Mutex<Option<Step>>> = Arc::default();
+    let (tx, mut rx) = mpsc::unbounded_channel::<(String, Step)>();
+    let (a, t) = (armed.clone(), tx.clone());
+    let mut c = flushing(
+        move |id| {
+            let (a, t, id) = (a.clone(), t.clone(), id.to_string());
+            flush::Options {
+                crash: Some(Arc::new(move |s| {
+                    let mut g = a.lock();
+                    if *g == Some(s) {
+                        *g = None;
+                        let _ = t.send((id.clone(), s));
+                        return true;
+                    }
+                    false
+                })),
+                ..flush_opts()
+            }
+        },
+        64 << 20,
+    )
+    .await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    let steps = [Step::Sealed, Step::SegmentPut, Step::BeforeManifest, Step::AfterManifest, Step::Fenced];
+    for step in steps.iter().cycle().take(10) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        *armed.lock() = Some(*step);
+        if *step == Step::Fenced {
+            // fences happen at takeovers
+            let l = c.wait_leader(Duration::from_secs(5)).await;
+            c.kill(&l);
+            c.start(&l).await;
+        }
+        let (id, s) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no flush reached {step:?}: {}", status_line(&c)))
+            .unwrap();
+        c.kill(&id);
+        let v = verify(&c).await;
+        assert!(v.ok, "after a crash at {s:?}: {v:#?}");
+        eprintln!("crash at {s:?} on {id}: F {} orphans {}", v.flushed, v.orphans);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        c.start(&id).await;
+    }
+    let acked = load.stop().await;
+    let v = settle_and_verify(&c, &acked).await;
+    assert_eq!(v.orphans, 0, "{v:#?}");
+    c.shutdown();
+}
+
+/// A leader cut off mid-flush (stalled just before its manifest CAS) while
+/// the others take over: the new leader's fence makes the old flush lose
+/// its CAS, and the old leader deletes the checkpoint it made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_old_leaders_flush_loses_to_a_takeover() {
+    use flush::Step;
+    let hold: Arc<Mutex<Option<String>>> = Arc::default();
+    let (held_tx, mut held_rx) = mpsc::unbounded_channel::<String>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let go_rx = Arc::new(std::sync::Mutex::new(go_rx));
+    let h = hold.clone();
+    let mut c = flushing(
+        move |id| {
+            let (h, held_tx, go_rx, id) = (h.clone(), held_tx.clone(), go_rx.clone(), id.to_string());
+            flush::Options {
+                crash: Some(Arc::new(move |s| {
+                    if s == Step::BeforeManifest && h.lock().as_deref() == Some(id.as_str()) {
+                        *h.lock() = None;
+                        let _ = held_tx.send(id.clone());
+                        // the flush stalls here (a GC pause, a slow disk)
+                        let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(20));
+                    }
+                    false
+                })),
+                // the new leader's first flush comes well after its fence
+                interval: Duration::from_secs(1),
+                ..flush_opts()
+            }
+        },
+        64 << 20,
+    )
+    .await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    wait_flushed(&c, 1, Duration::from_secs(5)).await;
+    let old_epoch = c.nodes[&l].node.status().epoch;
+    *hold.lock() = Some(l.clone());
+    let held = tokio::time::timeout(Duration::from_secs(5), held_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(held, l);
+    c.isolate(&l);
+    // the old flush goes on once a new leader leads (and has fenced the
+    // manifest), before that leader's first flush
+    let t = Instant::now();
+    loop {
+        let led = c.nodes.iter().any(|(id, r)| {
+            let st = r.node.status();
+            *id != l && st.role == Role::Leader && st.epoch > old_epoch
+        });
+        if led {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(10), "no takeover: {}", status_line(&c));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let new = flush::read_manifest(&c.store).await.unwrap().unwrap().0;
+    go_tx.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (m, _) = flush::read_manifest(&c.store).await.unwrap().unwrap();
+    assert!(m.epoch >= new.epoch && m.leader != l, "the old leader's flush won: {m:?}");
+    assert_eq!(m.flushes, new.flushes, "a flush landed before the new leader's first: {m:?}");
+    let st = c.nodes[&l].node.status();
+    assert_ne!(st.role, Role::Leader, "{st:?}");
+    c.heal();
+    let acked = load.stop().await;
+    let v = settle_and_verify(&c, &acked).await;
+    eprintln!("{v:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (m, _) = flush::read_manifest(&c.store).await.unwrap().unwrap();
+    let cps = super::state::list_checkpoints(&c.store).await.unwrap();
+    assert_eq!(cps, vec![m.state.unwrap().checkpoint], "the losing flush's checkpoint was kept");
+    c.shutdown();
+}
+
+/// A consumer from cursor 0 on a node whose ring holds only the last few
+/// events, with the bucket behind the head: it's served the bucket up to F,
+/// the node's own log above F, then the ring, densely and with the content
+/// every submitter was acked for. A cursor at F and one just above it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_cursors_backfill_from_the_bucket_then_the_local_log() {
+    use futures::StreamExt;
+    let c = flushing(|_| flush::Options { interval: Duration::from_millis(700), ..flush_opts() }, 32 << 10).await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let acked = load.stop().await;
+    c.converge(Duration::from_secs(10)).await;
+    let m = flush::read_manifest(&c.store).await.unwrap().unwrap().0;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    let id = c.ids.iter().find(|i| **i != l).unwrap().clone();
+    let node = c.nodes[&id].node.clone();
+    let top = node.status().commit;
+    assert!(m.flushed > 0 && m.flushed + 500 < top, "want F well behind the head: F {} head {top}", m.flushed);
+    let by_seq: HashMap<u64, u64> = acked.iter().copied().collect();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    c.nodes[&id].rt.spawn(async move { axum::serve(listener, super::emit::router(node)).await });
+    for cursor in [0, m.flushed - 1, m.flushed, m.flushed + 1] {
+        let url = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor={cursor}");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let mut next = cursor + 1;
+        while next <= top {
+            let msg = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                .await
+                .unwrap_or_else(|_| panic!("stalled at {next} of {top} from cursor {cursor}"))
+                .unwrap()
+                .unwrap();
+            let tokio_tungstenite::tungstenite::Message::Binary(b) = msg else { continue };
+            let (seq, _, _) = super::client::parse_test_frame(&b)
+                .unwrap_or_else(|| panic!("not an event at {next}: {:?}", super::client::info_name(&b)));
+            assert_eq!(seq, next, "from cursor {cursor}");
+            if let Some(&want) = by_seq.get(&seq) {
+                assert_eq!(content_id(&b), want, "seq {seq} served with other content");
+            }
+            next += 1;
+        }
+    }
+    c.shutdown();
+}
+
+/// Seeded kills, power cuts and partitions while the leader flushes, with
+/// flushes also dying at random steps (`QLOG_SEED`): the checker stays
+/// clean, and every manifest seen describes one consistent point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flushing_random_chaos_keeps_every_manifest_consistent() {
+    let seed: u64 = std::env::var("QLOG_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let armed = Arc::new(AtomicBool::new(true));
+    let a = armed.clone();
+    let mut c = flushing(
+        move |id| {
+            let (t, id, a) = (tx.clone(), id.to_string(), a.clone());
+            flush::Options {
+                crash: Some(Arc::new(move |_| {
+                    if a.load(Ordering::Acquire) && rand::thread_rng().gen_bool(0.04) {
+                        let _ = t.send(id.clone());
+                        return true;
+                    }
+                    false
+                })),
+                ..flush_opts()
+            }
+        },
+        64 << 20,
+    )
+    .await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 8, Duration::from_millis(2));
+    let t = Instant::now();
+    let mut actions = Vec::new();
+    let mut verified = 0;
+    while t.elapsed() < Duration::from_secs(15) {
+        tokio::time::sleep(Duration::from_millis(rng.gen_range(200..900))).await;
+        while let Ok(id) = rx.try_recv() {
+            if c.nodes.contains_key(&id) {
+                c.kill(&id);
+                actions.push(format!("flush crash {id}"));
+            }
+        }
+        let down: Vec<String> = c.ids.iter().filter(|id| !c.nodes.contains_key(*id)).cloned().collect();
+        let id = c.ids[rng.gen_range(0..c.ids.len())].clone();
+        match rng.gen_range(0..7) {
+            0 if c.nodes.contains_key(&id) => {
+                c.kill(&id);
+                actions.push(format!("kill {id}"));
+            }
+            1 if c.nodes.contains_key(&id) => {
+                c.power_cut(&id, &mut rng);
+                actions.push(format!("power cut {id}"));
+            }
+            2 | 3 if !down.is_empty() => {
+                c.start(&down[0]).await;
+                actions.push(format!("start {}", down[0]));
+            }
+            4 if c.blocks.is_empty() => {
+                c.isolate(&id);
+                actions.push(format!("isolate {id}"));
+            }
+            5 => {
+                let v = verify(&c).await;
+                assert!(v.ok, "seed {seed} after {actions:?}: {v:#?}");
+                verified += 1;
+            }
+            _ => {
+                c.heal();
+            }
+        }
+    }
+    c.heal();
+    armed.store(false, Ordering::Release);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while let Ok(id) = rx.try_recv() {
+        c.kill(&id);
+    }
+    for id in c.ids.clone() {
+        if !c.nodes.contains_key(&id) {
+            c.start(&id).await;
+        }
+    }
+    let acked = load.stop().await;
+    let v = settle_and_verify(&c, &acked).await;
+    eprintln!("seed {seed}: {verified} mid-run verifies, {actions:?}\n{v:?}");
     c.shutdown();
 }

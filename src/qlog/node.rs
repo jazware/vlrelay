@@ -10,7 +10,8 @@
 
 use super::commitlog::{CommitLog, Recovered};
 use super::emit::Emitter;
-use super::log::{Entry, Log, Op};
+use super::flush;
+use super::log::{Entry, Log, Op, encode_cursors, merge_cursors};
 use super::wire::{self, Append, AppendResp, Msg, PromiseResp};
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -50,6 +51,9 @@ pub struct Config {
     /// without it, a quorum slower than the submitters (a saturated disk)
     /// grows the leader's memory without bound.
     pub max_pending_bytes: usize,
+    /// The bucket flush (segments, state at F, manifest); None: nothing is
+    /// flushed and nothing caps the commit index.
+    pub flush: Option<flush::Options>,
 }
 
 impl Config {
@@ -68,6 +72,7 @@ impl Config {
             max_batch_bytes: 4 << 20,
             retain_bytes: 512 << 20,
             max_pending_bytes: 256 << 20,
+            flush: None,
         }
     }
 
@@ -135,6 +140,10 @@ pub trait Durability: Send + Sync + 'static {
     fn written_last(&self) -> u64 {
         u64::MAX
     }
+    /// Entries above this are readable with `read` (None: no disk).
+    fn first_readable(&self) -> Option<u64> {
+        None
+    }
     /// Committed entries from `from` (see `CommitLog::read`), off the
     /// async runtime.
     fn read(&self, _from: u64, _upto: u64, _max_bytes: usize) -> BoxFuture<'_, Option<(u64, Vec<Entry>)>> {
@@ -195,6 +204,9 @@ impl Durability for Arc<CommitLog> {
     }
     fn written_last(&self) -> u64 {
         CommitLog::written_last(self)
+    }
+    fn first_readable(&self) -> Option<u64> {
+        Some(CommitLog::first_readable(self))
     }
     fn report(&self, reset: bool) -> Option<DiskStatus> {
         let st = &self.stats;
@@ -297,6 +309,14 @@ struct Core {
     /// (first, last, appended at) per submit, for the commit latency.
     pending: VecDeque<(u64, u64, Instant, usize)>,
     pending_bytes: usize,
+    /// The last committed manifest's F as this node knows it: its log keeps
+    /// everything above it (a takeover flushes and replays state from there).
+    flushed: u64,
+    /// The last committed manifest's R as known: the leader commits nothing
+    /// above it, so after a lost quorum seqs resume above anything emitted.
+    reserve: u64,
+    /// Submitted cursors waiting for an entry to ride on.
+    pending_cursors: BTreeMap<String, u64>,
 }
 
 pub struct Stats {
@@ -351,6 +371,9 @@ pub struct Status {
     pub disk_reads: u64,
     pub commit_us: Quantiles,
     pub disk: Option<DiskStatus>,
+    pub flushed: u64,
+    pub reserve: u64,
+    pub flush: Option<flush::Status>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -388,6 +411,7 @@ pub struct Node {
     durability: Arc<dyn Durability>,
     pub emit: Arc<Emitter>,
     pub stats: Stats,
+    pub flush: flush::Shared,
 }
 
 impl Node {
@@ -441,6 +465,9 @@ impl Node {
                 waiters: BTreeMap::new(),
                 pending: VecDeque::new(),
                 pending_bytes: 0,
+                flushed: 0,
+                reserve: if cfg.flush.is_some() { 0 } else { u64::MAX },
+                pending_cursors: BTreeMap::new(),
             }),
             cfg,
             store,
@@ -451,7 +478,9 @@ impl Node {
             durability,
             emit,
             stats: Stats::default(),
+            flush: flush::Shared::default(),
         });
+        node.emit.attach(&node);
         tracing::info!(id = %node.cfg.id, genesis, whole, promised, emitted, commit, "qlog: node up");
         tokio::spawn(node.clone().accept(listener));
         tokio::spawn(node.clone().ticker());
@@ -488,6 +517,9 @@ impl Node {
             disk_reads: self.stats.disk_reads.load(Ordering::Relaxed),
             commit_us: Quantiles::of(&self.stats.commit_us.lock()),
             disk,
+            flushed: c.flushed,
+            reserve: c.reserve,
+            flush: self.cfg.flush.as_ref().map(|_| self.flush.status(reset)),
         }
     }
 
@@ -496,6 +528,79 @@ impl Node {
         let c = self.core.lock();
         let (_, base) = c.log.base();
         c.log.range(base, c.log.commit()).map(|e| (e.seq, e.data.clone())).collect()
+    }
+
+    // ---- for the flush (flush.rs) and the firehose's local tail (emit.rs)
+
+    pub(crate) fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// Still leading `epoch`, and the commit index.
+    pub(crate) fn leading(&self, epoch: u64) -> Option<u64> {
+        let c = self.core.lock();
+        (c.role == Role::Leader && c.epoch == epoch).then(|| c.log.commit())
+    }
+
+    pub(crate) fn commit_rx(&self) -> watch::Receiver<u64> {
+        self.commit.subscribe()
+    }
+
+    /// Committed entries above this are readable here (memory or disk).
+    pub(crate) fn readable_floor(&self) -> u64 {
+        let base = self.core.lock().log.base().1;
+        self.durability.first_readable().map_or(base, |d| d.min(base))
+    }
+
+    pub fn emitted(&self) -> u64 {
+        self.core.lock().emitted
+    }
+
+    /// A committed manifest's F and R: the commit index may rise to R, and
+    /// the log may leave local disk up to F. Both only ever move up.
+    pub(crate) fn set_flushed(&self, flushed: u64, reserve: u64) {
+        let mut c = self.core.lock();
+        c.flushed = c.flushed.max(flushed);
+        c.reserve = c.reserve.max(reserve);
+        self.advance_commit(&mut c);
+    }
+
+    pub(crate) fn step_down_from(&self, epoch: u64, why: &str) {
+        let mut c = self.core.lock();
+        if c.epoch == epoch {
+            self.step_down(&mut c, why);
+        }
+    }
+
+    /// Committed entries from `from` to at most `upto`, about `max_bytes` of
+    /// them (at least one), from memory or the commitlog. Fails if this node
+    /// no longer holds `from`.
+    pub(crate) async fn committed_chunk(&self, from: u64, upto: u64, max_bytes: usize) -> anyhow::Result<Vec<Entry>> {
+        let base = {
+            let c = self.core.lock();
+            anyhow::ensure!(upto <= c.log.commit(), "qlog: {upto} isn't committed (commit {})", c.log.commit());
+            if from > upto {
+                return Ok(Vec::new());
+            }
+            let base = c.log.base().1;
+            if from > base {
+                let mut n = 0;
+                let mut out = Vec::new();
+                for e in c.log.range(from - 1, upto) {
+                    if !out.is_empty() && n + e.data.len() > max_bytes {
+                        break;
+                    }
+                    n += e.data.len();
+                    out.push(e.clone());
+                }
+                return Ok(out);
+            }
+            base
+        };
+        match self.durability.read(from, upto.min(base), max_bytes).await {
+            Some((_, es)) if !es.is_empty() => Ok(es),
+            _ => anyhow::bail!("qlog: seq {from} is no longer held on this node"),
+        }
     }
 
     async fn accept(self: Arc<Self>, listener: TcpListener) {
@@ -535,10 +640,10 @@ impl Node {
                 appender = Some(a.leader.clone());
             }
             let resp = match m {
-                Msg::Submit { frames } => {
+                Msg::Submit { frames, cursors } => {
                     let (n, tx) = (self.clone(), tx.clone());
                     tokio::spawn(async move {
-                        let r = n.submit(frames).await;
+                        let r = n.submit(frames, cursors).await;
                         let _ = tx.send(wire::encode(rid, &r));
                     });
                     continue;
@@ -567,7 +672,7 @@ impl Node {
     /// A host owner's events: appended, replicated, and answered once a
     /// quorum holds them (or failed if this node stops leading first; the
     /// sender then resends them to the next leader, under new seqs).
-    pub async fn submit(self: &Arc<Self>, frames: Vec<(Bytes, Bytes)>) -> Msg {
+    pub async fn submit(self: &Arc<Self>, frames: Vec<(Bytes, Bytes)>, cursors: Bytes) -> Msg {
         // under the submitter's timeout, so a busy leader isn't taken for a dead one
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut commits = self.commit.subscribe();
@@ -589,12 +694,14 @@ impl Node {
             }
             let epoch = c.epoch;
             let first = c.log.last_seq() + 1;
+            merge_cursors(&mut c.pending_cursors, &cursors);
             if frames.is_empty() {
                 return Msg::Submitted { first, n: 0 };
             }
+            let mut ride = encode_cursors(&std::mem::take(&mut c.pending_cursors));
             for (p, s) in &frames {
                 let seq = c.log.last_seq() + 1;
-                c.log.append(epoch, wire::splice_seq(p, s, seq));
+                c.log.append_with(epoch, wire::splice_seq(p, s, seq), std::mem::take(&mut ride));
             }
             let last = c.log.last_seq();
             let (tx, rx) = oneshot::channel();
@@ -634,7 +741,7 @@ impl Node {
             .chain(self.cfg.peers.keys().map(|p| c.matched.get(p).copied().unwrap_or(0)))
             .collect();
         v.sort_unstable_by(|a, b| b.cmp(a));
-        let q = v[self.cfg.quorum() - 1];
+        let q = v[self.cfg.quorum() - 1].min(c.reserve);
         // only this term's entries commit by count; the adopted tail was re-tagged
         if q <= c.log.commit() || c.log.epoch_at(q) != Some(c.epoch) {
             return;
@@ -696,6 +803,9 @@ impl Node {
         tracing::info!(id = %self.cfg.id, epoch, last, commit, "qlog: leading");
         for p in self.cfg.peers.keys() {
             tokio::spawn(self.clone().replicate(p.clone(), epoch));
+        }
+        if let Some(o) = &self.cfg.flush {
+            tokio::spawn(flush::lead(self.clone(), epoch, o.clone()));
         }
         self.head.send_replace(last);
         let n = self.clone();
@@ -766,11 +876,21 @@ impl Node {
                 let next = c.next.get(&peer).copied().unwrap_or(0);
                 (c.role == Role::Leader && c.epoch == epoch && next <= c.log.base().1).then(|| (next, c.log.base().1))
             };
-            // behind what's in memory: committed entries from the commitlog
+            // behind what's in memory: committed entries from the commitlog,
+            // from the oldest it still holds if it doesn't reach back to `next`
+            // (a reset there, never past what a takeover would flush from)
             let from_disk = match behind {
-                Some((next, base)) => {
-                    self.durability.read(next, base, self.cfg.max_batch_bytes).await.map(|r| (next, r))
-                }
+                Some((next, base)) => match self.durability.read(next, base, self.cfg.max_batch_bytes).await {
+                    Some(r) => Some((next, r, false)),
+                    None => match self.durability.first_readable() {
+                        Some(f) if f + 1 > next && f < base => self
+                            .durability
+                            .read(f + 1, base, self.cfg.max_batch_bytes)
+                            .await
+                            .map(|r| (f + 1, r, true)),
+                        _ => None,
+                    },
+                },
                 None => None,
             };
             let req = {
@@ -781,7 +901,8 @@ impl Node {
                 let next = c.next[&peer];
                 let (base_epoch, base_seq) = c.log.base();
                 let fresh = next <= c.log.last_seq() || c.log.commit() > sent_commit;
-                if let Some((from, (prev_epoch, entries))) = from_disk.filter(|(f, (_, e))| *f == next && !e.is_empty())
+                if let Some((from, (prev_epoch, entries), reset)) =
+                    from_disk.filter(|(f, (_, e), reset)| (*f == next || *reset) && !e.is_empty())
                 {
                     self.stats.disk_reads.fetch_add(1, Ordering::Relaxed);
                     Some(Append {
@@ -791,7 +912,9 @@ impl Node {
                         prev_seq: from - 1,
                         commit: c.log.commit(),
                         leader_last: c.log.last_seq(),
-                        reset: false,
+                        reset,
+                        flushed: c.flushed,
+                        reserve: c.reserve,
                         entries,
                     })
                 } else if !fresh && last_send.elapsed() < self.cfg.heartbeat {
@@ -811,6 +934,8 @@ impl Node {
                         commit: c.log.commit(),
                         leader_last: c.log.last_seq(),
                         reset,
+                        flushed: c.flushed,
+                        reserve: c.reserve,
                         entries: c.log.entries_from(prev_seq + 1, self.cfg.max_batch_bytes),
                     })
                 }
@@ -887,6 +1012,8 @@ impl Node {
             c.leader = Some(a.leader.clone());
             c.role = Role::Follower;
             c.last_heard = Instant::now();
+            c.flushed = c.flushed.max(a.flushed);
+            c.reserve = c.reserve.max(a.reserve);
             if !c.intact && c.need_upto.is_none() {
                 c.need_upto = Some(a.leader_last);
             }
@@ -1027,9 +1154,15 @@ impl Node {
             }
             let act = {
                 let mut c = self.core.lock();
-                let upto = c.emitted.min(self.durability.written_last());
+                let floor = self.trim_floor(&c);
+                // with no disk, memory is the only copy of the unflushed tail
+                let upto = if self.durability.first_readable().is_some() {
+                    c.emitted.min(self.durability.written_last())
+                } else {
+                    floor
+                };
                 c.log.trim(self.cfg.retain_bytes, upto);
-                self.durability.set_floor(c.emitted.min(c.log.commit()));
+                self.durability.set_floor(floor);
                 match c.role {
                     Role::Leader => {
                         let alive = 1 + c.acked_at.values().filter(|t| t.elapsed() < self.cfg.election_timeout).count();
@@ -1070,6 +1203,24 @@ impl Node {
                 None => {}
             }
         }
+    }
+
+    /// What may leave local disk: emitted, committed and flushed to the
+    /// bucket, and (leader) not still needed by a live follower catching up,
+    /// so it's served from disk rather than reset past.
+    fn trim_floor(&self, c: &Core) -> u64 {
+        let mut f = c.emitted.min(c.log.commit());
+        if self.cfg.flush.is_some() {
+            f = f.min(c.flushed);
+        }
+        if c.role == Role::Leader {
+            for (p, m) in &c.matched {
+                if c.acked_at.get(p).is_some_and(|t| t.elapsed() < LAGGARD_GRACE) {
+                    f = f.min(*m);
+                }
+            }
+        }
+        f
     }
 
     /// The leader's appends stopped coming over this connection: if its
@@ -1363,6 +1514,10 @@ impl Node {
         }
     }
 }
+
+/// A follower heard from within this long still holds the leader's disk
+/// trimming back to what it has matched.
+const LAGGARD_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub enum CallError {

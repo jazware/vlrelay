@@ -19,6 +19,11 @@ pub struct Append {
     pub leader_last: u64,
     /// Start over at `(prev_epoch, prev_seq)` unless that entry matches.
     pub reset: bool,
+    /// The last committed manifest's flushed seq F and reservation R, as the
+    /// leader knows them: a follower keeps its log above F (a takeover
+    /// flushes from there) and leads under R if it takes over.
+    pub flushed: u64,
+    pub reserve: u64,
     pub entries: Vec<Entry>,
 }
 
@@ -77,6 +82,10 @@ pub enum Msg {
     /// then `seq` and the leader's seq, then `suffix`).
     Submit {
         frames: Vec<(Bytes, Bytes)>,
+        /// The submitter's host cursors ([`super::log::encode_cursors`]),
+        /// each counting only events already acked: they ride on this
+        /// submit's first entry (or the next one appended).
+        cursors: Bytes,
     },
     Submitted {
         first: u64,
@@ -132,6 +141,8 @@ pub fn encode(rid: u64, m: &Msg) -> Bytes {
             b.put_u64(a.commit);
             b.put_u64(a.leader_last);
             b.put_u8(a.reset as u8);
+            b.put_u64(a.flushed);
+            b.put_u64(a.reserve);
             put_entries(&mut b, &a.entries);
         }
         Msg::AppendResp(r) => {
@@ -170,12 +181,13 @@ pub fn encode(rid: u64, m: &Msg) -> Bytes {
         }
         Msg::Ping { from } => put_str(&mut b, from),
         Msg::Pong => {}
-        Msg::Submit { frames } => {
+        Msg::Submit { frames, cursors } => {
             b.put_u32(frames.len() as u32);
             for (p, s) in frames {
                 put_bytes(&mut b, p);
                 put_bytes(&mut b, s);
             }
+            put_bytes(&mut b, cursors);
         }
         Msg::Submitted { first, n } => {
             b.put_u64(*first);
@@ -191,9 +203,9 @@ pub fn encode(rid: u64, m: &Msg) -> Bytes {
 
 fn entries_len(m: &Msg) -> usize {
     match m {
-        Msg::Append(a) => a.entries.iter().map(|e| e.data.len() + 20).sum(),
-        Msg::FetchResp { entries, .. } => entries.iter().map(|e| e.data.len() + 20).sum(),
-        Msg::Submit { frames } => frames.iter().map(|(p, s)| p.len() + s.len() + 8).sum(),
+        Msg::Append(a) => a.entries.iter().map(|e| e.data.len() + e.cursors.len() + 24).sum(),
+        Msg::FetchResp { entries, .. } => entries.iter().map(|e| e.data.len() + e.cursors.len() + 24).sum(),
+        Msg::Submit { frames, cursors } => frames.iter().map(|(p, s)| p.len() + s.len() + 8).sum::<usize>() + cursors.len(),
         _ => 0,
     }
 }
@@ -213,6 +225,7 @@ fn put_entries(b: &mut BytesMut, es: &[Entry]) {
         b.put_u64(e.epoch);
         b.put_u64(e.seq);
         put_bytes(b, &e.data);
+        put_bytes(b, &e.cursors);
     }
 }
 
@@ -251,7 +264,7 @@ impl Rd {
         let n = self.u32()? as usize;
         let mut out = Vec::with_capacity(n.min(1 << 16));
         for _ in 0..n {
-            out.push(Entry { epoch: self.u64()?, seq: self.u64()?, data: self.bytes()? });
+            out.push(Entry { epoch: self.u64()?, seq: self.u64()?, data: self.bytes()?, cursors: self.bytes()? });
         }
         Ok(out)
     }
@@ -271,6 +284,8 @@ pub fn decode(body: Bytes) -> R<(u64, Msg)> {
             commit: r.u64()?,
             leader_last: r.u64()?,
             reset: r.bool()?,
+            flushed: r.u64()?,
+            reserve: r.u64()?,
             entries: r.entries()?,
         }),
         2 => Msg::AppendResp(AppendResp {
@@ -307,7 +322,7 @@ pub fn decode(body: Bytes) -> R<(u64, Msg)> {
             for _ in 0..n {
                 frames.push((r.bytes()?, r.bytes()?));
             }
-            Msg::Submit { frames }
+            Msg::Submit { frames, cursors: r.bytes()? }
         }
         10 => Msg::Submitted { first: r.u64()?, n: r.u64()? },
         11 => Msg::NotLeader { hint: r.string()? },
@@ -352,8 +367,8 @@ mod tests {
     #[test]
     fn round_trip() {
         let ents = vec![
-            Entry { epoch: 3, seq: 9, data: Bytes::from_static(b"abc") },
-            Entry { epoch: 3, seq: 10, data: Bytes::new() },
+            Entry::new(3, 9, Bytes::from_static(b"abc")),
+            Entry { epoch: 3, seq: 10, data: Bytes::new(), cursors: Bytes::from_static(b"cur") },
         ];
         let msgs = vec![
             Msg::Append(Append {
@@ -364,6 +379,8 @@ mod tests {
                 commit: 7,
                 leader_last: 10,
                 reset: true,
+                flushed: 4,
+                reserve: 99,
                 entries: ents.clone(),
             }),
             Msg::AppendResp(AppendResp { ok: true, promised: 3, matched: 10, commit: 7, last_seq: 10, intact: false }),
@@ -381,7 +398,10 @@ mod tests {
             Msg::FetchResp { ok: true, base_epoch: 1, base_seq: 2, last_seq: 10, entries: ents },
             Msg::Ping { from: "n3".into() },
             Msg::Pong,
-            Msg::Submit { frames: vec![(Bytes::from_static(b"p"), Bytes::from_static(b"s"))] },
+            Msg::Submit {
+                frames: vec![(Bytes::from_static(b"p"), Bytes::from_static(b"s"))],
+                cursors: Bytes::from_static(b"c"),
+            },
             Msg::Submitted { first: 11, n: 2 },
             Msg::NotLeader { hint: "n1".into() },
             Msg::Failed { reason: "x".into() },

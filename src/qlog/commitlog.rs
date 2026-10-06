@@ -44,6 +44,9 @@ const T_TRUNCATE: u8 = 2;
 const T_RESET: u8 = 3;
 const T_PROMISE: u8 = 4;
 const T_COMMIT: u8 = 5;
+/// An append whose entry carries host cursors: `epoch, seq, clen u32,
+/// cursors, data`.
+const T_APPEND_C: u8 = 6;
 const T_HEADER: u8 = 0x10;
 
 #[derive(Clone, Debug)]
@@ -62,6 +65,18 @@ pub struct Options {
     /// Abort the process on a failed write or fsync: after a failed fsync
     /// the page cache can't be trusted to hold what was written.
     pub abort_on_error: bool,
+    /// Chaos: called between two segment deletions of one trim pass (a
+    /// crash there leaves the older ones gone and the newer ones in place).
+    pub mid_trim: Option<Hook>,
+}
+
+#[derive(Clone)]
+pub struct Hook(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for Hook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Hook")
+    }
 }
 
 impl Default for Options {
@@ -72,6 +87,7 @@ impl Default for Options {
             memory_bytes: 64 << 20,
             sync_delay: None,
             abort_on_error: false,
+            mid_trim: None,
         }
     }
 }
@@ -96,8 +112,10 @@ pub struct Recovered {
 struct Loc {
     epoch: u64,
     seg: u64,
+    /// Where the data starts; the cursors (`clen` bytes) sit right before it.
     off: u64,
     len: u32,
+    clen: u32,
 }
 
 /// Where every entry of the log lives on disk: the commitlog's own copy of
@@ -251,7 +269,17 @@ fn rec(buf: &mut Vec<u8>, ty: u8, parts: &[&[u8]]) -> usize {
 
 /// Appends an entry's record; returns where its data starts in `buf`.
 fn rec_append(buf: &mut Vec<u8>, e: &Entry) -> usize {
-    rec(buf, T_APPEND, &[&e.epoch.to_le_bytes(), &e.seq.to_le_bytes(), &e.data]) + 16
+    if e.cursors.is_empty() {
+        return rec(buf, T_APPEND, &[&e.epoch.to_le_bytes(), &e.seq.to_le_bytes(), &e.data]) + 16;
+    }
+    let clen = e.cursors.len() as u32;
+    rec(buf, T_APPEND_C, &[&e.epoch.to_le_bytes(), &e.seq.to_le_bytes(), &clen.to_le_bytes(), &e.cursors, &e.data])
+        + 20
+        + e.cursors.len()
+}
+
+fn loc_of(e: &Entry, seg: u64, off: u64) -> Loc {
+    Loc { epoch: e.epoch, seg, off, len: e.data.len() as u32, clen: e.cursors.len() as u32 }
 }
 
 fn rec_header(buf: &mut Vec<u8>, base_epoch: u64, base_seq: u64, p: &Promised) {
@@ -366,9 +394,24 @@ impl CommitLog {
                 let pl = &b[p.clone()];
                 let bad = |what: &str| anyhow::anyhow!("qlog commitlog: {} at {off}: {what}", path.display());
                 match ty {
-                    T_APPEND => {
+                    T_APPEND | T_APPEND_C => {
                         let (epoch, seq) = (u64_at(pl, 0), u64_at(pl, 8));
-                        let loc = Loc { epoch, seg: no, off: (p.start + 16) as u64, len: (pl.len() - 16) as u32 };
+                        let (head, clen) = if ty == T_APPEND_C {
+                            let clen = u32::from_le_bytes(pl[16..20].try_into().expect("4 bytes")) as usize;
+                            if 20 + clen > pl.len() {
+                                return Err(bad("a cursor length past the record"));
+                            }
+                            (20 + clen, clen)
+                        } else {
+                            (16, 0)
+                        };
+                        let loc = Loc {
+                            epoch,
+                            seg: no,
+                            off: (p.start + head) as u64,
+                            len: (pl.len() - head) as u32,
+                            clen: clen as u32,
+                        };
                         if !index.push(seq, loc) {
                             return Err(bad("an entry out of order"));
                         }
@@ -505,6 +548,11 @@ impl CommitLog {
         self.floor.fetch_max(seq, Ordering::Relaxed);
     }
 
+    /// Entries above this are readable (until trimmed further).
+    pub fn first_readable(&self) -> u64 {
+        self.shared.lock().index.base_seq
+    }
+
     /// The last seq written and in the index (readable).
     pub fn written_last(&self) -> u64 {
         self.shared.lock().index.last_seq()
@@ -580,9 +628,11 @@ fn resolve(segs: &[Seg], index: &Index, from: u64, to: u64) -> std::io::Result<R
 fn read_resolved(r: Resolved) -> std::io::Result<Vec<Entry>> {
     r.into_iter()
         .map(|(seq, l, f)| {
-            let mut data = vec![0u8; l.len as usize];
-            f.read_exact_at(&mut data, l.off)?;
-            Ok(Entry { epoch: l.epoch, seq, data: Bytes::from(data) })
+            let mut b = vec![0u8; (l.clen + l.len) as usize];
+            f.read_exact_at(&mut b, l.off - l.clen as u64)?;
+            let mut data = Bytes::from(b);
+            let cursors = data.split_to(l.clen as usize);
+            Ok(Entry { epoch: l.epoch, seq, data, cursors })
         })
         .collect()
 }
@@ -652,8 +702,7 @@ impl Writer {
             match op {
                 Op::Append(e) => {
                     let at = rec_append(&mut self.buf, e);
-                    let loc = Loc { epoch: e.epoch, seg: self.no, off: self.len + at as u64, len: e.data.len() as u32 };
-                    idx.push(IdxOp::Push(e.seq, loc));
+                    idx.push(IdxOp::Push(e.seq, loc_of(e, self.no, self.len + at as u64)));
                 }
                 Op::TruncateAfter(s) => {
                     rec(&mut self.buf, T_TRUNCATE, &[&s.to_le_bytes()]);
@@ -731,7 +780,14 @@ impl Writer {
         let mut s = cl.shared.lock();
         let floor = cl.floor.load(Ordering::Relaxed).min(s.written_commit);
         let mut total: u64 = s.segs.iter().map(|g| g.bytes).sum();
+        let mut n = 0;
         while s.segs.len() > 1 && total > cl.opts.retain_bytes && s.segs[1].base_seq <= floor {
+            if n > 0
+                && let Some(h) = &cl.opts.mid_trim
+            {
+                (h.0)();
+            }
+            n += 1;
             let g = s.segs.remove(0);
             let next_base = s.segs[0].base_seq;
             s.index.drop_upto(next_base);
@@ -764,7 +820,7 @@ impl Writer {
         let mut idx = Vec::with_capacity(tail.len());
         for e in &tail {
             let at = rec_append(&mut self.buf, e);
-            idx.push((e.seq, Loc { epoch: e.epoch, seg: no, off: at as u64, len: e.data.len() as u32 }));
+            idx.push((e.seq, loc_of(e, no, at as u64)));
         }
         let mut f = OpenOptions::new().append(true).create_new(true).open(&path)?;
         f.write_all(&self.buf)?;
@@ -794,7 +850,7 @@ mod tests {
     use super::*;
 
     fn e(epoch: u64, seq: u64, n: usize) -> Entry {
-        Entry { epoch, seq, data: Bytes::from(vec![(seq % 251) as u8; n]) }
+        Entry::new(epoch, seq, Bytes::from(vec![(seq % 251) as u8; n]))
     }
 
     fn opts() -> Options {
@@ -931,5 +987,45 @@ mod tests {
         let (_, got) = cl.read(from, 400, 1 << 20).unwrap();
         assert_eq!(got.len() as u64, 400 - from + 1);
         cl.halt();
+    }
+
+    /// A crash between two deletions of one trim pass: what's left is a
+    /// suffix of the segments, which opens and reads like any other.
+    #[tokio::test]
+    async fn a_crash_mid_trim_leaves_a_readable_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = Options { segment_bytes: 4096, retain_bytes: 8 << 10, memory_bytes: 8 << 10, ..Options::default() };
+        let mut log = Log::new();
+        log.journal();
+        let (cl, _) = CommitLog::open(dir.path(), o.clone()).unwrap();
+        for _ in 0..200 {
+            log.append(1, Bytes::from(vec![7u8; 500]));
+            log.set_commit(log.last_seq());
+            cl.note_commit(log.commit());
+            let t = cl.stage(log.take_journal());
+            cl.wait(t).await.unwrap();
+        }
+        cl.halt();
+        let before = std::fs::read_dir(dir.path()).unwrap().count();
+        o.mid_trim = Some(Hook(Arc::new(|| panic!("crash mid-trim"))));
+        let (cl, _) = CommitLog::open(dir.path(), o.clone()).unwrap();
+        cl.set_floor(150);
+        log.append(1, Bytes::from(vec![7u8; 500]));
+        cl.stage(log.take_journal());
+        let t = Instant::now();
+        while std::fs::read_dir(dir.path()).unwrap().count() == before {
+            assert!(t.elapsed() < Duration::from_secs(5), "nothing was trimmed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let left = std::fs::read_dir(dir.path()).unwrap().count();
+        o.mid_trim = None;
+        let (cl2, r) = CommitLog::open(dir.path(), o).unwrap();
+        assert_eq!(left, before - 1, "the hook stops it after one deletion");
+        assert!(r.log.last_seq() >= 200);
+        let from = cl2.first_readable() + 1;
+        let (_, got) = cl2.read(from, 200, 1 << 30).unwrap();
+        assert_eq!(got.last().unwrap().seq, 200);
+        cl2.halt();
+        drop(cl);
     }
 }

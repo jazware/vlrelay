@@ -122,3 +122,71 @@ try:
         print(f"  {n}: {cores:.3f} cores, max RSS {rss:.0f} MB")
 except OSError:
     pass
+
+# the flush: per leader, what a flush took and sent; the final manifest
+for i in (1, 2, 3):
+    s = load(f"status-n{i}.json", {})
+    fl = s.get("flush") if s else None
+    if not fl or not fl.get("flushes"):
+        continue
+    n = fl["flushes"]
+    reqs = ", ".join(f"{op} {c / n:.1f}" for op, c in sorted(fl.get("requests", {}).items()))
+    print(
+        f"  n{i} flush: {n} flushes ({fl['aborted']} retried, {fl['failed']} failed, {fl['adopted']} segments adopted, {fl['fences']} fences); "
+        f"took {q(fl['duration_us'])}; applier paused {q(fl['seal_us'])}"
+    )
+    print(
+        f"  n{i} per flush: {fl['entries'] / n:.0f} entries, {fl['segments'] / n:.2f} segments, {fl['raw_bytes'] / n / 2**20:.2f} MiB raw, "
+        f"{fl['segment_bytes'] / n / 2**20:.3f} MiB stored; requests per flush: {reqs}"
+    )
+v = load("verify.json")
+if v is not None:
+    print(
+        f"manifest: {'consistent' if v.get('ok') else 'INCONSISTENT'}: epoch {v['epoch']} F {v['flushed']} R {v['reserve']}, "
+        f"{v['segments']} segments ({v['orphans']} past it), {v['entries']} entries, {v['dids']} DIDs, {v['hosts']} host cursors"
+    )
+    for m in v.get("messages", [])[:10]:
+        print(f"  ! {m}")
+try:
+    with open(os.path.join(out, "verify.jsonl")) as f:
+        vs = [json.loads(l) for l in f if l.strip()]
+    print(f"  mid-run verifies: {len(vs)}, {sum(1 for x in vs if not x.get('ok'))} inconsistent")
+except OSError:
+    pass
+if check.get("backfilled"):
+    n, secs = check["backfilled"]
+    print(f"consumer from cursor 0 at the end: {n} events in {secs:.1f} s, dense and matching")
+
+# ack latency in the seconds a flush overlapped, against the others
+try:
+    import re
+
+    flushes = []
+    for i in (1, 2, 3):
+        try:
+            with open(os.path.join(out, f"n{i}.log")) as f:
+                for l in f:
+                    if "qlog flush: committed" in l:
+                        e = int(re.search(r"end_ms=(\d+)", l).group(1))
+                        ms = int(re.search(r" ms=(\d+)", l).group(1))
+                        flushes.append((e - ms, e))
+        except OSError:
+            pass
+    with open(os.path.join(out, "load.json.timeline.jsonl")) as f:
+        tl = [json.loads(l) for l in f if l.strip()]
+    if flushes and tl:
+        def overl(t):
+            return any(a - 1000 < t and t - 1000 < b for a, b in flushes)
+        inn = [x for x in tl if x["n"] and overl(x["t_ms"])]
+        outn = [x for x in tl if x["n"] and not overl(x["t_ms"])]
+        def agg(xs):
+            if not xs:
+                return "-"
+            p50 = sorted(x["p50"] for x in xs)[len(xs) // 2] / 1000
+            p99 = max(x["p99"] for x in xs) / 1000
+            mx = max(x["max"] for x in xs) / 1000
+            return f"median per-second p50 {p50:.2f} ms, worst per-second p99 {p99:.2f} ms, max {mx:.1f} ms over {len(xs)} s"
+        print(f"ack latency, seconds with a flush: {agg(inn)}")
+        print(f"ack latency, seconds without: {agg(outn)}")
+except (OSError, AttributeError, ValueError):
+    pass

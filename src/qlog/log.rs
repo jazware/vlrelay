@@ -8,13 +8,65 @@
 //! back an entry a consumer may have seen.
 
 use bytes::Bytes;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub epoch: u64,
     pub seq: u64,
     pub data: Bytes,
+    /// Host cursors riding on this entry ([`encode_cursors`]; empty: none).
+    /// Replicated and journaled with it, never emitted: a cursor counts only
+    /// events at lower seqs, so the state and a flush at any seq F hold
+    /// cursors that never get ahead of the log at F.
+    pub cursors: Bytes,
+}
+
+impl Entry {
+    pub fn new(epoch: u64, seq: u64, data: Bytes) -> Entry {
+        Entry { epoch, seq, data, cursors: Bytes::new() }
+    }
+}
+
+/// `n u32 | (len u16 | host | cursor u64)*`, little endian.
+pub fn encode_cursors(c: &BTreeMap<String, u64>) -> Bytes {
+    if c.is_empty() {
+        return Bytes::new();
+    }
+    let mut b = Vec::with_capacity(4 + c.iter().map(|(h, _)| h.len() + 10).sum::<usize>());
+    b.extend_from_slice(&(c.len() as u32).to_le_bytes());
+    for (h, v) in c {
+        b.extend_from_slice(&(h.len() as u16).to_le_bytes());
+        b.extend_from_slice(h.as_bytes());
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b.into()
+}
+
+/// The pairs of [`encode_cursors`]; malformed input yields what parsed.
+pub fn decode_cursors(b: &[u8]) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    if b.len() < 4 {
+        return out;
+    }
+    let n = u32::from_le_bytes(b[..4].try_into().expect("4 bytes")) as usize;
+    let mut i = 4;
+    for _ in 0..n {
+        let Some(l) = b.get(i..i + 2) else { break };
+        let l = u16::from_le_bytes(l.try_into().expect("2 bytes")) as usize;
+        let (Some(h), Some(v)) = (b.get(i + 2..i + 2 + l), b.get(i + 2 + l..i + 10 + l)) else { break };
+        out.push((String::from_utf8_lossy(h).into_owned(), u64::from_le_bytes(v.try_into().expect("8 bytes"))));
+        i += 10 + l;
+    }
+    out
+}
+
+/// Folds `b`'s cursors into `into`, keeping the highest per host.
+pub fn merge_cursors(into: &mut BTreeMap<String, u64>, b: &[u8]) {
+    for (h, v) in decode_cursors(b) {
+        let e = into.entry(h).or_default();
+        *e = (*e).max(v);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,8 +196,12 @@ impl Log {
 
     /// The leader's append: the next seq, under `epoch`.
     pub fn append(&mut self, epoch: u64, data: Bytes) -> u64 {
+        self.append_with(epoch, data, Bytes::new())
+    }
+
+    pub fn append_with(&mut self, epoch: u64, data: Bytes, cursors: Bytes) -> u64 {
         let seq = self.last_seq() + 1;
-        self.push(Entry { epoch, seq, data });
+        self.push(Entry { epoch, seq, data, cursors });
         seq
     }
 
@@ -290,7 +346,7 @@ mod tests {
     use rand::{Rng, SeedableRng};
 
     fn e(epoch: u64, seq: u64) -> Entry {
-        Entry { epoch, seq, data: Bytes::from(format!("{epoch}/{seq}")) }
+        Entry::new(epoch, seq, Bytes::from(format!("{epoch}/{seq}")))
     }
 
     #[test]

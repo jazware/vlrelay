@@ -15,8 +15,20 @@
 # SIGUSR1 is a power cut; 0: memory only), CL_DIR (where the commitlogs
 # go, OUT by default: /dev/shm for a device with no fsync cost),
 # DISK_RETAIN_MB, FSYNC_DELAY_US (emulates a slower device), RETAIN_MB,
+# RING_MB (the firehose ring: small, and old cursors come from the bucket),
 # QLOG_PROFILE (dev-release), QLOG_NO_BUILD=1, RESTART_SEC (1),
-# OUT (dev/state-qlog-$B/<scenario>), KEEP=1 (leave MinIO up).
+# OUT (dev/state-qlog-$B/<scenario>), KEEP=1 (leave MinIO up),
+# FLUSH_MS (2000; 0: no flush), HEADROOM (H, 100M), FLUSH_SEGMENT_MB (64),
+# CRASH_AT/CRASH_PROB (die at a flush step: fenced, sealed, segment,
+# before-manifest, after-manifest, any; or mid-trim), VERIFY_EVERY (20 s).
+#
+# With the flush on, `qlog verify` checks the manifest (segments, state
+# and cursors at one F) every VERIFY_EVERY seconds and at the end, and the
+# checker ends with a consumer from cursor 0 through the bucket backfill.
+# flush-crash dies at a random flush step (CRASH_AT=any, CRASH_PROB 0.05
+# a step);
+# mid-trim dies between commitlog segment deletions (small disk budget);
+# mixed-flush is mixed-durable with flush crashes on top.
 #
 # kill-two kills the leader and a follower at once, kill-all every node;
 # power-cut-* also makes each victim's commitlog lose a random part of what
@@ -26,7 +38,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 crate="$(cd "$here/../.." && pwd)"
 cd "$crate"
 
-scenarios="baseline kill-leader kill-follower partition-leader partition-follower pause-leader mixed kill-two kill-all power-cut-leader power-cut-all mixed-durable"
+scenarios="baseline kill-leader kill-follower partition-leader partition-follower pause-leader mixed kill-two kill-all power-cut-leader power-cut-all mixed-durable flush-crash mid-trim mixed-flush"
 scenario=${1:-}
 [ -n "$scenario" ] && shift || true
 if [ -z "$scenario" ] || [ "$scenario" = list ]; then
@@ -93,14 +105,28 @@ if [ "$proxy" = 1 ]; then
 fi
 
 commitlog=${COMMITLOG:-1}
+flush_ms=${FLUSH_MS:-2000}
+crash_at=${CRASH_AT:-} crash_prob=${CRASH_PROB:-0.05}
+case $scenario in
+  flush-crash | mixed-flush) crash_at=${crash_at:-any} ;;
+  mid-trim)
+    crash_at=mid-trim crash_prob=${CRASH_PROB:-0.3}
+    DISK_RETAIN_MB=${DISK_RETAIN_MB:-32}
+    seg_mb=8
+    ;;
+esac
 cl_dir=${CL_DIR:-$out}
 [ "$cl_dir" = "$out" ] || { rm -rf "$cl_dir"; mkdir -p "$cl_dir"; }
 supervise() {
   local i=$1 peers=() disk=()
   [ "$commitlog" = 1 ] && disk=(--commitlog "$cl_dir/cl-n$i" --power-cut-on-usr1)
   [ -n "${RETAIN_MB:-}" ] && disk+=(--retain-mb "$RETAIN_MB")
+  [ -n "${RING_MB:-}" ] && disk+=(--ring-mb "$RING_MB")
   [ -n "${DISK_RETAIN_MB:-}" ] && disk+=(--disk-retain-mb "$DISK_RETAIN_MB")
   [ -n "${FSYNC_DELAY_US:-}" ] && disk+=(--fsync-delay-us "$FSYNC_DELAY_US")
+  [ -n "${seg_mb:-}" ] && disk+=(--segment-mb "$seg_mb")
+  disk+=(--flush-ms "$flush_ms" --headroom "${HEADROOM:-100000000}" --flush-segment-mb "${FLUSH_SEGMENT_MB:-64}")
+  [ -n "$crash_at" ] && disk+=(--crash-at "$crash_at" --crash-prob "$crash_prob" --crash-stop-file "$out/no-more-crashes")
   for j in 1 2 3; do
     [ "$i" = "$j" ] && continue
     if [ "$proxy" = 1 ]; then peers+=(--peer "n$j=127.0.0.1:$(route "$i" "$j")"); else peers+=(--peer "n$j=127.0.0.1:$(peer "$j")"); fi
@@ -149,6 +175,17 @@ sleep 1
 "$bin" load "${nodes[@]}" --rate "$rate" --pad "$pad" --duration "$duration" --acked "$out/acked.txt" --out "$out/load.json" --run "$scenario" >"$out/load.log" 2>&1 &
 loader=$!
 pids+=($loader)
+
+s3=(--s3-endpoint "http://127.0.0.1:$minio" --prefix "$prefix")
+if [ "$flush_ms" != 0 ]; then
+  (
+    while kill -0 "$loader" 2>/dev/null; do
+      sleep "${VERIFY_EVERY:-20}"
+      "$bin" verify "${s3[@]}" >>"$out/verify.jsonl" 2>>"$out/verify.log" || echo "$(ms) verify FAILED" >>"$out/events.log"
+    done
+  ) &
+  pids+=($!)
+fi
 
 # CPU and RSS per node every 5 s
 (
@@ -229,20 +266,33 @@ sleep "$every"
 while [ $(($(date +%s) - start + 12)) -lt "$duration" ] && [ "$scenario" != baseline ]; do
   case $scenario in
     mixed) set -- $kinds; shift $((RANDOM % 5)); k=$1 ;;
-    mixed-durable) set -- $durable_kinds; shift $((RANDOM % 8)); k=$1 ;;
+    mixed-durable | mixed-flush) set -- $durable_kinds; shift $((RANDOM % 8)); k=$1 ;;
+    flush-crash | mid-trim) k=none ;;
     *) k=$scenario ;;
   esac
-  if [ "$proxy" != 1 ] && [[ $k == partition-* ]]; then log "skip $k: PROXY=0"; else fault "$k"; fi
+  if [ "$k" = none ]; then :; elif [ "$proxy" != 1 ] && [[ $k == partition-* ]]; then log "skip $k: PROXY=0"; else fault "$k"; fi
   # let a killed node come back and catch up before the next fault
   sleep "$every"
 done
 
 wait "$loader" || true
+touch "$out/no-more-crashes"
+if [ "$flush_ms" != 0 ]; then
+  # the last flush covers everything committed (no more injected crashes:
+  # a node restarted by the supervisor gets the same flags, so give it time)
+  sleep $(( (flush_ms / 1000) + 3 ))
+fi
 for i in 1 2 3; do status "$i" >"$out/status-n$i.json"; done
 touch "$out/stop"
 set +e
 wait "$checker"
 rc=$?
+if [ "$flush_ms" != 0 ]; then
+  "$bin" verify "${s3[@]}" >"$out/verify.json" 2>>"$out/verify.log"
+  vrc=$?
+  [ $vrc = 0 ] || { echo "qlog chaos: the final manifest is inconsistent" >&2; rc=1; }
+  grep -q FAILED "$out/events.log" && { echo "qlog chaos: a mid-run verify failed" >&2; rc=1; }
+fi
 set -e
 python3 "$here/report.py" "$out" | tee "$out/report.txt"
 exit $rc

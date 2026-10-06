@@ -7,7 +7,7 @@ use axum::extract::{Query, Request, State};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use tokio::sync::mpsc;
 use vlpds::firehose::{self, Firehose};
 use vlpds::nodelog::LogBatch;
@@ -36,6 +36,11 @@ pub struct Emitter {
     live: OnceLock<Live>,
     ordinal: AtomicU64,
     tap: Option<mpsc::UnboundedSender<Emitted>>,
+    /// Where the flush writes segments: cursors older than the ring are
+    /// backfilled from there, and above the last flush from the node's own
+    /// log (`set_local_tail`).
+    store: Option<vlpds::store::Store>,
+    owner: OnceLock<Weak<super::node::Node>>,
 }
 
 impl Emitter {
@@ -52,7 +57,26 @@ impl Emitter {
             live: OnceLock::new(),
             ordinal: AtomicU64::new(0),
             tap,
+            store: None,
+            owner: OnceLock::new(),
         })
+    }
+
+    /// As `new`, backfilling old cursors from the flushed bucket segments.
+    pub fn with_store(
+        node: &str,
+        incarnation: u64,
+        ring_bytes: usize,
+        tap: Option<mpsc::UnboundedSender<Emitted>>,
+        store: vlpds::store::Store,
+    ) -> Arc<Emitter> {
+        let mut e = Arc::into_inner(Emitter::new(node, incarnation, ring_bytes, tap)).expect("just made");
+        e.store = Some(store);
+        Arc::new(e)
+    }
+
+    pub(crate) fn attach(&self, node: &Arc<super::node::Node>) {
+        let _ = self.owner.set(Arc::downgrade(node));
     }
 
     /// The firehose, once this node has emitted anything (its start floor
@@ -71,6 +95,16 @@ impl Emitter {
                 start_floor: Some(after as i64),
                 ..firehose::Options::default()
             });
+            if let Some(store) = &self.store {
+                *fh.store.write() = Some(store.clone());
+                // one followed log never waits on another, so nothing queues;
+                // and a spill's read-back would want bucket ordinals, which
+                // these batches don't have
+                fh.set_max_queue_bytes(usize::MAX);
+                if let Some(n) = self.owner.get() {
+                    fh.set_local_tail(Arc::new(Tail(n.clone())));
+                }
+            }
             let (_, wm) = fh.add_remote(LOG_ID);
             let (tx, rx) = mpsc::unbounded_channel();
             fh.spawn_merger(rx);
@@ -83,6 +117,27 @@ impl Emitter {
         let ordinal = self.ordinal.fetch_add(1, Ordering::Relaxed);
         let _ = live.tx.send(LogBatch { log_id: LOG_ID.into(), ordinal, events });
         live.wm.store(upto as i64, Ordering::Release);
+    }
+}
+
+struct Tail(Weak<super::node::Node>);
+
+impl firehose::LocalTail for Tail {
+    fn floor(&self) -> i64 {
+        self.0.upgrade().map_or(i64::MAX, |n| n.readable_floor() as i64)
+    }
+
+    fn read(
+        &self,
+        after: i64,
+        until: i64,
+        max_bytes: usize,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<(i64, Bytes)>>> {
+        Box::pin(async move {
+            let n = self.0.upgrade().ok_or_else(|| anyhow::anyhow!("node gone"))?;
+            let es = n.committed_chunk(after as u64 + 1, until as u64, max_bytes).await?;
+            Ok(es.into_iter().map(|e| (e.seq as i64, e.data)).collect())
+        })
     }
 }
 

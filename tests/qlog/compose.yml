@@ -1,5 +1,6 @@
-# MinIO for the quorum log's chaos harness (chaos.sh): it only holds
-# qlog/leader, so tmpfs and a small cap are plenty.
+# MinIO for the quorum log's chaos harness (chaos.sh): qlog/leader, the
+# flush manifest, the state and the log segments (synthetic frames, which
+# compress to almost nothing), on tmpfs.
 services:
   minio:
     image: vlpds-minio:local
@@ -8,7 +9,7 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     tmpfs: /data
-    mem_limit: 512m
+    mem_limit: 6g
     ports:
       - "127.0.0.1:${MINIO_PORT}:9000"
     healthcheck:
