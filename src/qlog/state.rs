@@ -49,6 +49,11 @@ fn settings(l0_bytes: usize) -> slatedb::Settings {
         l0_sst_size_bytes: l0_bytes,
         // above the L0 size: with the WAL off, a cap below it stalls writes
         max_unflushed_bytes: (l0_bytes * 4).max(256 << 20),
+        // every seal uploads an L0, and an upload past this many waits for
+        // the compactor (seen as 1-5 s seals at 2 s flushes with the
+        // default 8); 32 is minutes of flushes at any interval used here
+        l0_max_ssts: 32,
+        l0_max_ssts_per_key: 32,
         ..Default::default()
     }
 }

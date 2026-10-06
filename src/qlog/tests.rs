@@ -1122,3 +1122,37 @@ async fn flushing_random_chaos_keeps_every_manifest_consistent() {
     eprintln!("seed {seed}: {verified} mid-run verifies, {actions:?}\n{v:?}");
     c.shutdown();
 }
+
+/// A follower down long enough that the leader's disk no longer reaches
+/// back to it catches up from the bucket segments, not by a reset (which
+/// would be a gap in its stream).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_behind_the_leaders_disk_catches_up_from_the_bucket() {
+    let mut c = flushing(|_| flush_opts(), 64 << 20).await;
+    for id in c.ids.clone() {
+        c.kill(&id);
+    }
+    let inner = c.cfg.clone().unwrap();
+    c.cfg = Some(Arc::new(move |id: &str, addrs: &HashMap<String, String>| {
+        let mut k = inner(id, addrs);
+        k.laggard_grace = Duration::from_millis(500);
+        k
+    }));
+    for id in c.ids.clone() {
+        c.start(&id).await;
+    }
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    let f = c.ids.iter().find(|id| **id != l).unwrap().clone();
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(1));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.kill(&f);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    c.start(&f).await;
+    let acked = load.stop().await;
+    settle_and_verify(&c, &acked).await;
+    let st = c.nodes[&f].node.status();
+    let reads: u64 = c.nodes.values().map(|r| r.node.status().bucket_reads).sum();
+    assert!(reads > 0, "nothing was served from the bucket (the leader's disk reached back): {}", status_line(&c));
+    assert_eq!((st.resets, st.emit_gaps), (0, 0), "{st:?}");
+    c.shutdown();
+}

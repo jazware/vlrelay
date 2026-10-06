@@ -149,7 +149,7 @@ if v is not None:
         print(f"  ! {m}")
 try:
     with open(os.path.join(out, "verify.jsonl")) as f:
-        vs = [json.loads(l) for l in f if l.strip()]
+        vs = [json.loads(l) for l in f if l.startswith("{")]
     print(f"  mid-run verifies: {len(vs)}, {sum(1 for x in vs if not x.get('ok'))} inconsistent")
 except OSError:
     pass

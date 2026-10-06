@@ -597,6 +597,68 @@ impl Leader {
     }
 }
 
+/// A segment read back from the bucket: (ordinal, its entries).
+pub(crate) type SegCache = Option<(u64, Arc<Vec<Entry>>)>;
+
+async fn load_segment(store: &Store, ord: u64, cache: &mut SegCache) -> anyhow::Result<Option<Arc<Vec<Entry>>>> {
+    if let Some((o, es)) = cache
+        && *o == ord
+    {
+        return Ok(Some(es.clone()));
+    }
+    let Some(segment::LogObject::Segment(_, ents)) = nodelog::read_object(store, LOG_ID, ord).await? else {
+        return Ok(None);
+    };
+    let es: Arc<Vec<Entry>> =
+        Arc::new(ents.into_iter().map(|e| Entry::new(e.epoch, e.seq as u64, e.frame)).collect());
+    *cache = Some((ord, es.clone()));
+    Ok(Some(es))
+}
+
+/// Flushed entries from `from` to at most `upto`, about `max_bytes` (at
+/// least one), with the epoch of `from - 1`, read from the bucket segments:
+/// what a follower further behind than the leader's disk catches up from,
+/// instead of being reset past it. None: the bucket doesn't hold `from`.
+pub(crate) async fn read_bucket(
+    store: &Store,
+    cache: &mut SegCache,
+    from: u64,
+    upto: u64,
+    max_bytes: usize,
+) -> anyhow::Result<Option<(u64, Vec<Entry>)>> {
+    if from == 0 || from > upto {
+        return Ok(None);
+    }
+    let ord = vlpds::backfill::seek(store, LOG_ID, from as i64 - 1).await?;
+    let Some(seg) = load_segment(store, ord, cache).await? else { return Ok(None) };
+    let Some(first) = seg.first().map(|e| e.seq) else { return Ok(None) };
+    if first > from {
+        return Ok(None);
+    }
+    let i = (from - first) as usize;
+    let prev_epoch = if i > 0 {
+        seg[i - 1].epoch
+    } else if from == 1 {
+        0
+    } else {
+        let mut c = None;
+        match load_segment(store, ord - 1, &mut c).await? {
+            Some(p) if p.last().is_some_and(|e| e.seq == from - 1) => p.last().expect("checked").epoch,
+            _ => return Ok(None),
+        }
+    };
+    let mut n = 0;
+    let mut out = Vec::new();
+    for e in seg[i..].iter().take_while(|e| e.seq <= upto) {
+        if !out.is_empty() && n + e.data.len() > max_bytes {
+            break;
+        }
+        n += e.data.len();
+        out.push(e.clone());
+    }
+    Ok(Some((prev_epoch, out)))
+}
+
 #[derive(Debug)]
 struct Crash;
 

@@ -54,6 +54,9 @@ pub struct Config {
     /// The bucket flush (segments, state at F, manifest); None: nothing is
     /// flushed and nothing caps the commit index.
     pub flush: Option<flush::Options>,
+    /// A follower heard from within this long still holds the leader's disk
+    /// trimming back to what it has matched.
+    pub laggard_grace: Duration,
 }
 
 impl Config {
@@ -73,6 +76,7 @@ impl Config {
             retain_bytes: 512 << 20,
             max_pending_bytes: 256 << 20,
             flush: None,
+            laggard_grace: Duration::from_secs(10),
         }
     }
 
@@ -332,6 +336,8 @@ pub struct Stats {
     /// Batches served from the commitlog (a follower or a candidate behind
     /// what's in memory).
     pub disk_reads: AtomicU64,
+    /// Batches a lagging follower was served from the bucket segments.
+    pub bucket_reads: AtomicU64,
 }
 
 impl Default for Stats {
@@ -345,6 +351,7 @@ impl Default for Stats {
             emit_gaps: AtomicU64::new(0),
             promise_rounds: AtomicU64::new(0),
             disk_reads: AtomicU64::new(0),
+            bucket_reads: AtomicU64::new(0),
         }
     }
 }
@@ -369,6 +376,7 @@ pub struct Status {
     pub emit_gaps: u64,
     pub promise_rounds: u64,
     pub disk_reads: u64,
+    pub bucket_reads: u64,
     pub commit_us: Quantiles,
     pub disk: Option<DiskStatus>,
     pub flushed: u64,
@@ -515,6 +523,7 @@ impl Node {
             emit_gaps: self.stats.emit_gaps.load(Ordering::Relaxed),
             promise_rounds: self.stats.promise_rounds.load(Ordering::Relaxed),
             disk_reads: self.stats.disk_reads.load(Ordering::Relaxed),
+            bucket_reads: self.stats.bucket_reads.load(Ordering::Relaxed),
             commit_us: Quantiles::of(&self.stats.commit_us.lock()),
             disk,
             flushed: c.flushed,
@@ -868,13 +877,16 @@ impl Node {
         let mut commit = self.commit.subscribe();
         let mut sent_commit = 0;
         let mut last_send = Instant::now() - self.cfg.heartbeat;
+        let mut seg_cache: flush::SegCache = None;
         loop {
             head.borrow_and_update();
             commit.borrow_and_update();
-            let behind = {
+            let (behind, flushed) = {
                 let c = self.core.lock();
                 let next = c.next.get(&peer).copied().unwrap_or(0);
-                (c.role == Role::Leader && c.epoch == epoch && next <= c.log.base().1).then(|| (next, c.log.base().1))
+                let b = (c.role == Role::Leader && c.epoch == epoch && next <= c.log.base().1)
+                    .then(|| (next, c.log.base().1));
+                (b, c.flushed)
             };
             // behind what's in memory: committed entries from the commitlog,
             // from the oldest it still holds if it doesn't reach back to `next`
@@ -882,6 +894,29 @@ impl Node {
             let from_disk = match behind {
                 Some((next, base)) => match self.durability.read(next, base, self.cfg.max_batch_bytes).await {
                     Some(r) => Some((next, r, false)),
+                    // behind the disk too: from the bucket, if it's flushed
+                    None if self.cfg.flush.is_some() && next <= flushed => {
+                        match flush::read_bucket(
+                            &self.store,
+                            &mut seg_cache,
+                            next,
+                            flushed.min(base),
+                            self.cfg.max_batch_bytes,
+                        )
+                        .await
+                        {
+                            Ok(Some(r)) => {
+                                self.stats.bucket_reads.fetch_add(1, Ordering::Relaxed);
+                                Some((next, r, false))
+                            }
+                            Ok(None) => None,
+                            Err(e) => {
+                                tracing::warn!(peer, next, "qlog: reading the bucket for a lagging follower failed: {e:#}");
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                continue;
+                            }
+                        }
+                    }
                     None => match self.durability.first_readable() {
                         Some(f) if f + 1 > next && f < base => self
                             .durability
@@ -1215,7 +1250,7 @@ impl Node {
         }
         if c.role == Role::Leader {
             for (p, m) in &c.matched {
-                if c.acked_at.get(p).is_some_and(|t| t.elapsed() < LAGGARD_GRACE) {
+                if c.acked_at.get(p).is_some_and(|t| t.elapsed() < self.cfg.laggard_grace) {
                     f = f.min(*m);
                 }
             }
@@ -1514,10 +1549,6 @@ impl Node {
         }
     }
 }
-
-/// A follower heard from within this long still holds the leader's disk
-/// trimming back to what it has matched.
-const LAGGARD_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub enum CallError {

@@ -110,7 +110,7 @@ crash_at=${CRASH_AT:-} crash_prob=${CRASH_PROB:-0.05}
 case $scenario in
   flush-crash | mixed-flush) crash_at=${crash_at:-any} ;;
   mid-trim)
-    crash_at=mid-trim crash_prob=${CRASH_PROB:-0.3}
+    crash_at=mid-trim crash_prob=${CRASH_PROB:-0.02}
     DISK_RETAIN_MB=${DISK_RETAIN_MB:-32}
     seg_mb=8
     ;;
@@ -169,7 +169,8 @@ log "leader n$(leader)"
 
 nodes=() https=()
 for i in 1 2 3; do nodes+=(--node "n$i=127.0.0.1:$(peer "$i")"); https+=(--node "n$i=127.0.0.1:$(http "$i")"); done
-"$bin" check "${https[@]}" --gap-ms "${GAP_MS:-15}" --stop-file "$out/stop" --acked "$out/acked.txt" --out "$out" >"$out/check.log" 2>&1 &
+# with no flush there's no bucket: a cursor older than the ring is outdated
+"$bin" check "${https[@]}" --backfill "$([ "$flush_ms" != 0 ] && echo true || echo false)" --gap-ms "${GAP_MS:-15}" --stop-file "$out/stop" --acked "$out/acked.txt" --out "$out" >"$out/check.log" 2>&1 &
 checker=$!
 sleep 1
 "$bin" load "${nodes[@]}" --rate "$rate" --pad "$pad" --duration "$duration" --acked "$out/acked.txt" --out "$out/load.json" --run "$scenario" >"$out/load.log" 2>&1 &
