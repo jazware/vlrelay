@@ -3,6 +3,7 @@
 
     python3 scripts/cost_model.py          # every table, as markdown
     python3 scripts/cost_model.py --json   # the scenario numbers
+    python3 scripts/cost_model.py --quorum # the quorum design study's tables (docs/quorum.md)
 
 Inputs are measured unless marked "code" (counted from the source, not measured) or
 "assumed". Each one names its doc. Prices are list prices with the date and URL they came
@@ -337,7 +338,404 @@ def table(head, rows):
     print()
 
 
+# ================================================================ quorum mode (docs/quorum.md)
+# A design study: nothing below is built. The relay runs one stream log, sequenced by a leader
+# and replicated to 3 nodes (or a single node with a local NVMe WAL). The bucket is a lagging
+# copy written in big flushes, each committed by one manifest that carries the host cursors.
+# Labels as above: measured, code (counted from the source) or assumed.
+Q_LOADS = [("today", 1), ("10x", 10), ("100x", 100)]
+Q_FLUSHES = [10, 30, 60]
+Q_SEG_B = 64 * MIB          # design: zstd bytes per bucket segment, cut by size as the log fills
+Q_DID_SHARDS = 4            # design: the leader's DID state shards (the single node's default today)
+Q_MANIFEST_A = 1            # design: one CAS PUT per flush, cursors and host rows inline
+# Steady control-plane requests, cluster-wide (A/s, B/s). "peers": liveness over the private
+# network and a bucket CAS only on an epoch change (design). The lease rows are vlpds's lease
+# loop as measured there (CTL_*_PER_NODE at TTL 10 s, a third of it at TTL 30 s).
+Q_CTL = {
+    "peers": (0.0, 0.0),
+    "vlpds leases, TTL 30 s": (CTL_A_PER_NODE, CTL_B_PER_NODE),
+    "vlpds leases, TTL 10 s": (3 * CTL_A_PER_NODE, 3 * CTL_B_PER_NODE),
+}
+Q_US_HA = US_CLUSTER_THREAD # assumed: the same hops as iteration 6 (a forward, two copies of every frame)
+Q_LEADER_SHARE = 0.5        # assumed: the leader carries half the cluster's CPU (every apply, both copies out)
+Q_US_SINGLE = US_SINGLE_THREAD  # measured, iteration 6: one node on SMT threads (a vCPU is a thread)
+Q_BASE_RAM_GB = 2.0         # assumed: shadow run 1.1 GB RSS at 60 events/s with the 512 MB ring full
+Q_DID_ROW_B = 250           # memtable bytes per DID update until a flush (243.6 B, tests/state_bulk.rs)
+Q_OS_DISK_GB = 10           # assumed
+Q_MIN_LOCAL_H = 1           # design: every node keeps at least 1 h of log on local disk for catch-up
+Q_UPLOAD_S = 2.0            # assumed: a flush's upload time
+Q_DETECT_S = 5.0            # assumed: from a crash to re-requesting from the PDSes
+BSKY_HOSTS, BSKY_SHARE = 89, 23.4 / 24.0  # listHosts 2026-10-04: 89 *.host.bsky.network hold 23.4M of 24.0M accounts
+R2_FREE = (1e6, 10e6, 10.0) # Class A, Class B, GB-month free every month (developers.cloudflare.com/r2/pricing, 2026-10-06)
+HZ_OVER_TB = 1.20           # Hetzner traffic past the included 20 TB, $/TB (as the 10G uplink addon above)
+GROUP_COMMIT_S = 0.002      # design: WAL group commit window
+# Hosts with local NVMe. usd is the monthly list price. port_peer: replication shares the public
+# port (False on OVH dedicated, whose vRack is a second NIC). quota_tb: outbound TB/mo included.
+QHOSTS = {
+    "ovh-vps1": dict(name="OVH VPS-1", usd=4.54, vcpu=2, ram=4, disk=40, gbps=0.5, quota_tb=None, port_peer=True, dev="vps",
+                     src="us.ovhcloud.com/vps (2026-10-06): 2 vCores, 4 GB, 40 GB NVMe, 500 Mb/s, unlimited traffic"),
+    "ovh-vps2": dict(name="OVH VPS-2", usd=8.50, vcpu=4, ram=8, disk=75, gbps=1, quota_tb=None, port_peer=True, dev="vps",
+                     src="same page: 4 vCores, 8 GB, 75 GB NVMe, 1 Gb/s"),
+    "ovh-vps3": dict(name="OVH VPS-3", usd=12.32, vcpu=6, ram=12, disk=100, gbps=2, quota_tb=None, port_peer=True, dev="vps",
+                     src="same page: 6 vCores, 12 GB, 100 GB NVMe, 2 Gb/s"),
+    "ovh-vps4": dict(name="OVH VPS-4", usd=23.37, vcpu=8, ram=24, disk=200, gbps=3, quota_tb=None, port_peer=True, dev="vps",
+                     src="same page: 8 vCores, 24 GB, 200 GB NVMe, 3 Gb/s"),
+    "ovh-adv2": dict(name="OVH ADVANCE-2", usd=198, vcpu=16, ram=64, disk=960, gbps=3, quota_tb=None, port_peer=False, dev="dc",
+                     src="cost.md price; 2 x 960 GB NVMe in RAID 1 assumed; 25 Gb/s vRack"),
+    "hz-cx33": dict(name="Hetzner CX33", usd=9.99, vcpu=4, ram=8, disk=80, gbps=1, quota_tb=20, port_peer=True, dev="vps",
+                    src="costgoat.com Hetzner listing (2026-09-05): EUR 8.49 / $9.99, EU only, listed as not orderable; port assumed"),
+    "hz-cax21": dict(name="Hetzner CAX21 (ARM)", usd=12.49, vcpu=4, ram=8, disk=80, gbps=1, quota_tb=20, port_peer=True, dev="vps",
+                     src="same listing: EUR 10.49 / $12.49, EU only"),
+    "hz-cpx22": dict(name="Hetzner CPX22", usd=22.99, vcpu=2, ram=4, disk=80, gbps=1, quota_tb=20, port_peer=True, dev="vps",
+                     src="same listing: EUR 19.49 / $22.99, every region"),
+    "hz-ax42": dict(name="Hetzner AX42", usd=109, vcpu=16, ram=64, disk=1920, gbps=1, quota_tb=None, port_peer=True, dev="dc",
+                    src="cost.md price; hetzner.com AX matrix (2026-10-06): 2 x 1.92 TB datacenter NVMe"),
+    "hz-ax42-10g": dict(name="Hetzner AX42 + 10G", usd=109 + 48, vcpu=16, ram=64, disk=1920, gbps=10, quota_tb=20, port_peer=True, dev="dc",
+                        src="AX42 + the 10G uplink addon ($48, 20 TB out included, then $1.20/TB), cost.md prices"),
+    "aws-c7gd-l": dict(name="AWS c7gd.large", usd=0.0907 * 730, vcpu=2, ram=4, disk=118, gbps=0.94, quota_tb=None, port_peer=True, dev="dc",
+                       aws=True, src="$0.0907/h on demand (search listings, 2026-10-06); 118 GB instance NVMe; 0.94 Gb/s baseline (assumed)"),
+    "aws-c7gd-xl": dict(name="AWS c7gd.xlarge", usd=0.1814 * 730, vcpu=4, ram=8, disk=237, gbps=1.88, quota_tb=None, port_peer=True, dev="dc",
+                        aws=True, src="$0.1814/h on demand; 237 GB instance NVMe; 1.88 Gb/s baseline (assumed)"),
+}
+Q_HA_HOSTS = ["ovh-vps1", "ovh-vps2", "ovh-vps3", "ovh-vps4", "ovh-adv2", "hz-cx33", "hz-cax21", "hz-ax42", "hz-ax42-10g",
+              "aws-c7gd-l", "aws-c7gd-xl"]
+Q_SINGLE_HOSTS = ["ovh-vps1", "ovh-vps2", "ovh-vps3", "ovh-vps4", "hz-cx33", "hz-cax21", "hz-cpx22", "hz-ax42", "hz-ax42-10g", "ovh-adv2"]
+# Edge boxes for consumers that don't fit on the nodes' ports (as in the egress section above).
+Q_EDGE_OPTS = {"ovh": ["ovh-adv2", "ovh-adv2-5g", "ovh-scale-10g", "ovh-scale-25g"], "hz": ["hetzner-ax42", "hetzner-ax42-10g"],
+               "aws": ["aws-c7gn2x"]}
+# fsync of a small append, by device class (all assumed: no device here was measured).
+Q_FSYNC_MS = {"dc": (0.03, 0.1), "vps": (0.5, 2.0), "consumer": (1.0, 5.0)}
+Q_DEV_NAME = {"dc": "datacenter NVMe with power-loss protection (AX42, ADVANCE-2, EC2 instance store)",
+              "vps": "VPS virtual NVMe (OVH VPS, Hetzner Cloud)", "consumer": "consumer NVMe without power-loss protection"}
+Q_RTT_MS = {"one DC": 0.2, "one metro (FSN-NBG, RBX-GRA)": 3.0, "cross-region (Vint Hill-Us-west)": 65.0}  # assumed
+R2_PUT_P50_MS = 200         # measured: vlpds bench/results/spaces-r2-2026-10-05.md, from benchbox
+
+
+def q_bucket(mult, flush_s, store, *, seg_b=Q_SEG_B, shards=Q_DID_SHARDS, ctl="peers", bucket="full",
+             nodes=3, free_tier=True, retention_s=RETENTION_S):
+    """Bucket requests and storage of the quorum design. bucket: "full" (72 h of log, state, cursors),
+    "dr" (state and cursors only, the log stays on local disk) or "none"."""
+    r = RATE_AVG * mult
+    zps = r * FRAME_B / ZSTD_RATIO
+    out = {"a": 0.0, "b": 0.0, "seg_puts": 0.0, "gb": 0.0}
+    if bucket != "none":
+        seg = (zps / seg_b + 1.0 / flush_s) if bucket == "full" else 0.0  # full segments + the flush's partial one
+        out["seg_puts"] = seg
+        out["a"] = seg + (Q_MANIFEST_A + shards * FLUSH_A) / flush_s
+        out["b"] = shards * FLUSH_B / flush_s + shards * POLL_B_PER_SHARD
+        dids = DIDS_TODAY * mult
+        state = dids * DID_STATE_B * TRANSIENT / GB + PLC_DIDS_TODAY * mult * PLC_SEED_B_PER_DID * TRANSIENT / GB
+        out["gb"] = state + (zps * retention_s / GB if bucket == "full" else 0.0)
+    if nodes > 1:
+        ca, cb = Q_CTL[ctl]
+        out["a"] += ca
+        out["b"] += cb
+    st = STORES[store]
+    a_mo, b_mo, gb = out["a"] * MONTH_S, out["b"] * MONTH_S, out["gb"]
+    if store == "r2" and free_tier:
+        a_mo, b_mo, gb = max(0.0, a_mo - R2_FREE[0]), max(0.0, b_mo - R2_FREE[1]), max(0.0, gb - R2_FREE[2])
+    out["req_usd"] = a_mo / 1e6 * st["a"] + b_mo / 1e6 * st["b"]
+    out["storage_usd"] = store_storage(st, gb)
+    out["usd"] = out["req_usd"] + out["storage_usd"]
+    return out
+
+
+def q_needs(mult, flush_s, ha=True, durable="commitlog", consumers=10):
+    """What one node needs: vCPUs, RAM GB, disk GB, port Gb/s (the busiest node: the leader)."""
+    r, peak, prov = RATE_AVG * mult, RATE_PEAK_HOUR * mult, RATE_PEAK_HOUR * mult * BURST
+    ingest = r * FRAME_B * 8 / 1e9
+    threads = prov * (Q_US_HA * Q_LEADER_SHARE if ha else Q_US_SINGLE) * 1e-6
+    tail = peak * (flush_s + Q_UPLOAD_S) * FRAME_B / GB if (ha and durable == "memory") else 0.0
+    memtable = peak * flush_s * Q_DID_ROW_B / GB
+    ram = Q_BASE_RAM_GB + max(RING_B / GB, tail) + memtable
+    state = DIDS_TODAY * mult * DID_STATE_B * TRANSIENT / GB
+    log_h = r * FRAME_B / ZSTD_RATIO * 3600 / GB
+    disk = Q_OS_DISK_GB + state + Q_MIN_LOCAL_H * log_h
+    per_node_consumers = consumers / 3 if ha else consumers
+    port_public = ingest / (3 if ha else 1) + per_node_consumers * ingest
+    port_peer = 2 * ingest if ha else 0.0  # the leader sends every frame to both followers
+    return {"vcpu": threads / CPU_TARGET, "ram": ram, "tail_gb": tail, "disk": disk, "state_gb": state, "log_gb_h": log_h,
+            "port_public": port_public, "port_peer": port_peer, "ingest": ingest,
+            "out_tb": per_node_consumers * ingest / 8 * MONTH_S / 1e3}
+
+
+def q_fit(h, n):
+    """Why a host can't carry a node's needs, or None if it can."""
+    why = []
+    if n["vcpu"] > h["vcpu"]:
+        why.append(f"CPU {n['vcpu']:.1f}/{h['vcpu']}")
+    if n["ram"] > 0.8 * h["ram"]:
+        why.append(f"RAM {n['ram']:.1f}/{h['ram']} GB")
+    if n["disk"] > 0.85 * h["disk"]:
+        why.append(f"disk {n['disk']:,.0f}/{h['disk']:,} GB")
+    port = n["port_public"] + (n["port_peer"] if h["port_peer"] else 0.0)
+    if port > NIC_UTIL * h["gbps"]:
+        why.append(f"port {gbps(port)}/{h['gbps']:g} Gb/s")
+    return ", ".join(why) or None
+
+
+def q_edges(mult, consumers, provider):
+    """The cheapest edge boxes (cost.md's HOSTS) that carry `consumers` full firehoses."""
+    g = consumers * RATE_AVG * mult * FRAME_B * 8 / 1e9
+    tb = g / 8 * MONTH_S / 1e3
+    best = None
+    for k in Q_EDGE_OPTS[provider]:
+        h = HOSTS[k]
+        n = math.ceil(g / (h.get("sustained", h["gbps"]) * NIC_UTIL))
+        if provider == "aws":
+            bw = aws_egress(tb)
+        elif "included_tb" in h:
+            bw = n * max(0.0, tb / n - h["included_tb"]) * h["over_tb"]
+        else:
+            bw = 0.0
+        c = {"n": n, "usd": n * h["usd"] + bw, "sku": k}
+        if best is None or c["usd"] < best["usd"]:
+            best = c
+    return best
+
+
+def q_total(mult, flush_s, host, store, *, ha=True, durable="commitlog", consumers=10, bucket="full", ctl="peers", **kw):
+    """Monthly cost of one setup. Consumers ride on the nodes while their ports carry them, and
+    move to edge boxes (priced as in the egress section) when they don't."""
+    h = QHOSTS[host]
+    nodes = 3 if ha else 1
+    need = q_needs(mult, flush_s, ha, durable, consumers)
+    fit, edge = q_fit(h, need), None
+    if fit is not None and consumers:
+        bare = q_needs(mult, flush_s, ha, durable, 0)
+        if q_fit(h, bare) is None:
+            provider = "aws" if h.get("aws") else ("hz" if host.startswith("hz") else "ovh")
+            edge, need, fit = q_edges(mult, consumers, provider), bare, None
+    if bucket == "none":
+        bk = {"usd": 0.0, "req_usd": 0.0, "storage_usd": 0.0, "a": 0.0, "b": 0.0, "seg_puts": 0.0, "gb": 0.0}
+    else:
+        bk = q_bucket(mult, flush_s, store, bucket=bucket, nodes=nodes, ctl=ctl, **kw)
+    bw = 0.0
+    if h.get("quota_tb"):
+        bw += nodes * max(0.0, need["out_tb"] - h["quota_tb"]) * HZ_OVER_TB
+    if h.get("aws"):
+        if edge is None:
+            bw += aws_egress(need["out_tb"] * nodes)
+        if ha:  # every frame to two followers in other AZs, plus 2/3 of the forwards
+            peer_b = 2 * FRAME_B + 2 / 3 * (FRAME_B + FWD_EXTRA_B)
+            bw += RATE_AVG * mult * peer_b * MONTH_S / GB * AWS_CROSS_AZ
+    # Backfill is served from local disk (Q_MIN_LOCAL_H and up), so S3 egress for bucket reads is
+    # only paid on recovery and isn't in the monthly total.
+    hosts = nodes * h["usd"]
+    edges_usd = edge["usd"] if edge else 0.0
+    return {"hosts": hosts, "edges": edges_usd, "edge": edge, "bucket": bk["usd"], "req": bk["req_usd"],
+            "storage": bk["storage_usd"], "bw": bw, "total": hosts + edges_usd + bk["usd"] + bw, "a": bk["a"], "b": bk["b"],
+            "seg_puts": bk["seg_puts"], "fit": fit, "need": need}
+
+
+def q_cheapest(mult, flush_s, store, hosts=Q_HA_HOSTS, **kw):
+    best = None
+    for k in hosts:
+        t = q_total(mult, flush_s, k, store, **kw)
+        if t["fit"] is None and (best is None or t["total"] < best[1]["total"]):
+            best = (k, t)
+    return best
+
+
+def q_storm(mult, flush_s):
+    """Events a lost unflushed tail makes the relay re-request, worst case (crash just before a flush)."""
+    w = flush_s + Q_UPLOAD_S + Q_DETECT_S
+    r = RATE_AVG * mult
+    ev = r * w
+    spare = RATE_PEAK_HOUR * mult * BURST / CPU_TARGET - r
+    return {"window_s": w, "events": ev, "per_bsky": ev * BSKY_SHARE / BSKY_HOSTS, "others": ev * (1 - BSKY_SHARE),
+            "gb": ev * FRAME_B / GB, "catchup_s": ev / spare}
+
+
+def q_cell(t):
+    if t["fit"] is not None:
+        return f"no: {t['fit']}"
+    if t["edge"]:
+        return f"{money(t['total'])}, {t['edge']['n']} edge{'s' if t['edge']['n'] > 1 else ''}"
+    return money(t["total"])
+
+
+def quorum_main():
+    if "--json" in sys.argv:
+        out = {}
+        for name, m in Q_LOADS:
+            for f in Q_FLUSHES:
+                out[f"{name} {f}s"] = {"ha": q_total(m, f, "ovh-vps2", "r2"), "single": q_total(m, f, "ovh-vps2", "r2", ha=False),
+                                       "storm": q_storm(m, f)}
+        print(json.dumps(out, indent=1, default=str))
+        return
+
+    print("## Quorum: headline (today's load, 10 full-firehose consumers, R2 after its free tier)\n")
+    rows = []
+    for label, nodes in (("Old design, 3 nodes, OVH ADVANCE-2 + R2", None), ("Old design, one node, OVH ADVANCE-2 + R2", 1)):
+        t = total(scenario(1, 10, nodes=nodes), "ovh", "r2")
+        rows.append([label, "25 ms linger", money(t["total"]),
+                     f"bucket requests {money(t['bucket_req'])}, hosts {money(t['cores'] + t['edges'])}"])
+    for f in (30, 60):
+        k, t = q_cheapest(1, f, "r2")
+        rows.append([f"Quorum HA, 3 x {QHOSTS[k]['name']}, commitlog", f"{f} s", money(t["total"]),
+                     f"hosts {money(t['hosts'])}, bucket requests {money(t['req'])}, storage {money(t['storage'])}"])
+    t = q_total(1, 60, "ovh-vps1", "r2", retention_s=24 * 3600)
+    rows.append(["Quorum HA, 3 x OVH VPS-1, commitlog, 24 h of log in the bucket", "60 s", money(t["total"]),
+                 f"hosts {money(t['hosts'])}, bucket requests {money(t['req'])}, storage {money(t['storage'])}"])
+    for k in ("hz-cax21", "hz-ax42", "ovh-adv2"):
+        t = q_total(1, 30, k, "r2")
+        rows.append([f"Quorum HA, 3 x {QHOSTS[k]['name']}, commitlog", "30 s", money(t["total"]),
+                     f"hosts {money(t['hosts'])}, bucket {money(t['bucket'])}"])
+    t = q_total(1, 30, "aws-c7gd-l", "s3")
+    rows.append(["Quorum HA, 3 x AWS c7gd.large + S3, consumers outside AWS", "30 s", money(t["total"]),
+                 f"egress and cross-AZ {money(t['bw'])}, hosts {money(t['hosts'])}, bucket {money(t['bucket'])}"])
+    for f in (30, 60):
+        t = q_total(1, f, "ovh-vps1", "r2", ha=False)
+        rows.append(["Single node, OVH VPS-1, NVMe WAL + R2 (72 h of log)", f"{f} s", money(t["total"]),
+                     f"host {money(t['hosts'])}, bucket requests {money(t['req'])}, storage {money(t['storage'])}"])
+    t = q_total(1, 60, "ovh-vps2", "r2", ha=False, bucket="dr")
+    rows.append(["Single node, OVH VPS-2, NVMe WAL + R2 for state and cursors only", "60 s", money(t["total"]),
+                 f"host {money(t['hosts'])}, bucket {money(t['bucket'])}"])
+    t = q_total(1, 60, "ovh-vps2", "r2", ha=False, bucket="none")
+    rows.append(["Single node, OVH VPS-2, NVMe only", "", money(t["total"]), "no bucket: losing the disk loses the cursors"])
+    rows.append(["Benchmark: a non-archival sync 1.1 relay on one node", "", "$10-15", "Jaz's figure"])
+    table(["setup", "flush", "$/mo", "where it goes"], rows)
+
+    print("## Quorum HA: bucket requests and storage per flush interval (3 nodes, peers for liveness)\n")
+    rows = []
+    for name, m in Q_LOADS:
+        for f in Q_FLUSHES:
+            r2, s3 = q_bucket(m, f, "r2"), q_bucket(m, f, "s3")
+            r2_paid = q_bucket(m, f, "r2", free_tier=False)
+            rows.append([name, f"{f} s", f"{r2['seg_puts']:.2f}", f"{r2['a']:.2f}", f"{r2['b']:.2f}",
+                         money(r2_paid["req_usd"]), money(r2["req_usd"]), money(s3["req_usd"]),
+                         f"{r2['gb']:,.0f}", money(r2["storage_usd"]), money(s3["storage_usd"])])
+    table(["load", "flush", "segment PUTs/s", "Class A/s", "Class B/s", "R2 req $/mo, no free tier", "R2 req $/mo",
+           "S3 req $/mo", "bucket GB", "R2 storage", "S3 storage"], rows)
+
+    print("## Single node: bucket per flush interval and bucket mode (R2 after its free tier / S3)\n")
+    rows = []
+    for name, m in Q_LOADS:
+        for f in Q_FLUSHES:
+            row = [name, f"{f} s"]
+            for mode in ("full", "dr"):
+                r2, s3 = q_bucket(m, f, "r2", bucket=mode, nodes=1), q_bucket(m, f, "s3", bucket=mode, nodes=1)
+                row += [f"{r2['a']:.2f} / {r2['b']:.2f}", f"{money(r2['usd'])} / {money(s3['usd'])}"]
+            rows.append(row)
+    table(["load", "flush", "72 h log: A/s / B/s", "R2 / S3 $/mo", "state and cursors only: A/s / B/s", "R2 / S3 $/mo"], rows)
+
+    print("## Old design against quorum, bucket requests only (R2, no free tier)\n")
+    rows = []
+    for name, m in Q_LOADS:
+        s3n, s1n = scenario(m, nodes=3), scenario(m, nodes=1)
+        rows.append([name, money(bucket_cost(s3n, "r2")["requests"]), money(q_bucket(m, 30, "r2", free_tier=False)["req_usd"]),
+                     money(bucket_cost(s1n, "r2")["requests"]), money(q_bucket(m, 30, "r2", nodes=1, free_tier=False)["req_usd"])])
+    table(["load", "old, 3 nodes", "quorum HA, 30 s", "old, one node", "quorum single, 30 s"], rows)
+
+    print("## What one node needs (the leader in HA; 10 consumers)\n")
+    rows = []
+    for name, m in Q_LOADS:
+        for f in (10, 60):
+            ha_mem, ha_cl, one = q_needs(m, f, True, "memory"), q_needs(m, f, True), q_needs(m, f, False)
+            rows.append([name, f"{f} s", f"{ha_cl['vcpu']:.2f}", f"{one['vcpu']:.2f}",
+                         f"{ha_mem['ram']:.1f} GB ({ha_mem['tail_gb']:.1f} tail)", f"{ha_cl['ram']:.1f} GB",
+                         f"{ha_cl['disk']:,.0f} GB", gbps(ha_cl["port_public"]), gbps(ha_cl["port_peer"]), gbps(one["port_public"])])
+    table(["load", "flush", "HA vCPUs", "single vCPUs", "HA RAM, memory only", "HA RAM, commitlog", "disk",
+           "HA public port", "leader replication out", "single public port"], rows)
+
+    print("## Host fit, 3-node HA, commitlog, 30 s flush, 10 consumers ($/mo for all three with R2, or S3 on AWS)\n")
+    rows = []
+    for k in Q_HA_HOSTS:
+        h = QHOSTS[k]
+        row = [h["name"], money(h["usd"])]
+        for name, m in Q_LOADS:
+            t = q_total(m, 30, k, "s3" if h.get("aws") else "r2")
+            row.append(q_cell(t))
+        rows.append(row)
+    table(["host", "$/mo each", "today", "10x", "100x"], rows)
+
+    print("## Host fit, single node, NVMe WAL, 30 s flush, 10 consumers (with R2 holding 72 h)\n")
+    rows = []
+    for k in Q_SINGLE_HOSTS:
+        h = QHOSTS[k]
+        row = [h["name"], money(h["usd"])]
+        for name, m in Q_LOADS:
+            t = q_total(m, 30, k, "r2", ha=False)
+            local_h = (0.85 * h["disk"] - Q_OS_DISK_GB - t["need"]["state_gb"]) / t["need"]["log_gb_h"]
+            row.append(f"{q_cell(t)} ({min(72, local_h):,.0f} h on disk)" if t["fit"] is None else q_cell(t))
+        rows.append(row)
+    table(["host", "$/mo", "today", "10x", "100x"], rows)
+
+    print("## Cheapest that fits, per load and flush (commitlog or WAL, 10 consumers, AWS left out)\n")
+    rows = []
+    for name, m in Q_LOADS:
+        for f in Q_FLUSHES:
+            row = [name, f"{f} s"]
+            for store in ("r2", "s3"):
+                b = q_cheapest(m, f, store, hosts=[k for k in Q_HA_HOSTS if not QHOSTS[k].get("aws")])
+                row.append(f"{q_cell(b[1])} ({QHOSTS[b[0]]['name']})" if b else "none fits")
+            b = q_cheapest(m, f, "r2", hosts=Q_SINGLE_HOSTS, ha=False)
+            row.append(f"{q_cell(b[1])} ({QHOSTS[b[0]]['name']})" if b else "none fits")
+            rows.append(row)
+    table(["load", "flush", "HA + R2", "HA + S3", "single + R2"], rows)
+
+    print("## Replication traffic (3 nodes)\n")
+    rows = []
+    for name, m in Q_LOADS:
+        r = RATE_AVG * m
+        peer_b = 2 * FRAME_B + 2 / 3 * (FRAME_B + FWD_EXTRA_B)
+        rows.append([name, f"{peer_b / 1e3:.1f} KB", gbps(r * peer_b * 8 / 1e9), f"{r * peer_b * MONTH_S / TB:,.0f}",
+                     "$0", "$0", money(r * peer_b * MONTH_S / GB * AWS_CROSS_AZ)])
+    table(["load", "peer bytes/event", "cluster total", "TB/mo", "OVH vRack", "Hetzner private network", "AWS cross-AZ"], rows)
+
+    print("## Re-ingest after a lost tail (worst case: the crash lands just before a flush)\n")
+    rows = []
+    for name, m in Q_LOADS:
+        for f in Q_FLUSHES:
+            s = q_storm(m, f)
+            rows.append([name, f"{f} s", f"{s['window_s']:.0f} s", f"{s['events']:,.0f}", f"{s['per_bsky']:,.0f}",
+                         f"{s['others']:,.0f}", f"{s['gb']:.2f} GB", f"{s['catchup_s']:.1f} s"])
+    table(["load", "flush", "window", "events re-requested", "per bsky.network PDS", "all other PDSes together", "bytes",
+           "catch-up"], rows)
+
+    print("## Ack and emit latency added by durability (assumed device and network numbers)\n")
+    table(["device", "fsync", "a WAL emit adds (group commit)"],
+          [[Q_DEV_NAME[d], f"{lo:g}-{hi:g} ms", f"up to {GROUP_COMMIT_S * 1e3:.0f} ms + {lo:g}-{hi:g} ms"]
+           for d, (lo, hi) in Q_FSYNC_MS.items()])
+    rows = []
+    for where, rtt in Q_RTT_MS.items():
+        base = rtt + GROUP_COMMIT_S * 1e3
+        rows.append([where, f"{rtt:g} ms", f"{base:g} ms", f"{base + Q_FSYNC_MS['dc'][1]:g} ms (dc) / {base + Q_FSYNC_MS['vps'][1]:g} ms (vps)"])
+    rows.append(["old design: 25 ms linger + an R2 PUT", "", f"~{25 + R2_PUT_P50_MS} ms p50", ""])
+    table(["follower placement", "RTT", "quorum ack, memory only", "quorum ack, commitlog fsynced"], rows)
+
+    print("## Local WAL and commitlog writes, and drive endurance\n")
+    rows = []
+    for name, m in Q_LOADS:
+        tb_day = RATE_AVG * m * FRAME_B * 86400 / TB
+        rows.append([name, f"{tb_day:.2f} TB", f"{600 / tb_day / 365:,.1f} years", f"{1.92 * 365 * 5 / tb_day / 365:,.1f} years"])
+    table(["load", "written a day (raw frames)", "consumer 1 TB drive, 600 TBW", "datacenter 1.92 TB, 1 DWPD for 5 years"], rows)
+
+    print("## Tuning, 3-node HA on R2 (requests $/mo, no free tier, to show the slope)\n")
+    rows = []
+    for label, kw in (("default: 64 MiB segments, 4 DID shards, peers", {}),
+                      ("8 MiB segments", {"seg_b": 8 * MIB}),
+                      ("24 DID shards (the old cluster's count)", {"shards": 24}),
+                      ("vlpds leases kept, TTL 30 s", {"ctl": "vlpds leases, TTL 30 s"}),
+                      ("vlpds leases kept, TTL 10 s", {"ctl": "vlpds leases, TTL 10 s"})):
+        row = [label]
+        for name, m in (("today", 1), ("100x", 100)):
+            for f in (10, 60):
+                row.append(money(q_bucket(m, f, "r2", free_tier=False, **kw)["req_usd"]))
+        rows.append(row)
+    table(["knob", "today, 10 s", "today, 60 s", "100x, 10 s", "100x, 60 s"], rows)
+
+    print("## Hosts priced\n")
+    table(["host", "$/mo", "vCPU", "RAM", "NVMe", "port", "source"],
+          [[h["name"], money(h["usd"]), h["vcpu"], f"{h['ram']} GB", f"{h['disk']:,} GB", f"{h['gbps']:g} Gb/s", h["src"]]
+           for h in QHOSTS.values()])
+
+
 def main():
+    if "--quorum" in sys.argv:
+        quorum_main()
+        return
     if "--json" in sys.argv:
         out = {name: scenario(m, 100) for name, m in LOADS}
         print(json.dumps(out, indent=1, default=float))
