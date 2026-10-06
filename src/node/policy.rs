@@ -1,4 +1,4 @@
-//! The policy engine wired into one node (docs/policy.md, "Integration
+//! The policy engine wired into one node (docs/policy-internals.md, "Wiring
 //! points"). The engine decides and counts; this module carries its
 //! decisions to the parts that enforce them and feeds it what they see:
 //!

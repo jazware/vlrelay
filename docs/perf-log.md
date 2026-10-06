@@ -1,4 +1,6 @@
-# vlRelay: node performance
+# vlRelay: node performance, the bench log
+
+Internal: the public summary is [Performance](perf.md) (`/docs/perf`). This is the full log, iteration by iteration.
 
 How many events a second one relay node takes, and how fast they reach the firehose. The target in `docs/design.html` is 100k events/s on 3 nodes of 8 cores and 32 GB, so about 33k/s per node. Iteration 6 measures a 3-node cluster against the whole target.
 

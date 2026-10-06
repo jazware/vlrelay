@@ -1,8 +1,39 @@
-# vlRelay: ecosystem compatibility
+---
+title: Compatibility
+section: Reference
+order: 301
+summary: "indigo's Go consumers, goat, @atproto/sync, Jetstream and indigo's relay itself, run against vlRelay beside indigo's relay on the same upstreams, with every difference classified."
+---
 
-Does software written for Bluesky's relay work against vlRelay unchanged? We ran indigo's Go consumers, `goat`, `@atproto/sync`, Jetstream and indigo's relay itself against vlRelay on the local dev network, with indigo's relay beside it on the same upstreams and load, and compared the two.
+```hero
+diagram:
+  caption: The compat run. Both relays subscribe to the same three upstreams under the same load, every consumer reads both, and a checker compares the two streams event by event.
+  nodes:
+    - { id: up, label: Upstreams, sub: 2 vlpds + the reference PDS, at: [0, 4], size: [10, 3], tone: muted, stack: true }
+    - { id: vl, label: vlRelay, sub: ":3480", at: [14, 1], size: [8, 3], tone: accent }
+    - { id: ind, label: indigo relay, sub: ":3470 · sqlite", at: [14, 7], size: [8, 3], tone: muted }
+    - { id: go, label: indigo consumer, sub: "+ sync 1.1 verifier", at: [27, 0], size: [10, 2.6], tone: blue }
+    - { id: ts, label: "`@atproto/sync`", sub: Firehose 0.4.13, at: [27, 3.4], size: [10, 2.6], tone: blue }
+    - { id: goat, label: goat firehose, sub: "--verify-sig --verify-mst", at: [27, 6.8], size: [10, 2.6], tone: blue }
+    - { id: js, label: Jetstream, sub: restarted halfway, at: [27, 10.2], size: [10, 2.6], tone: blue }
+  edges:
+    - "up.r -> vl.l: same load"
+    - "up.r -> ind.l"
+    - vl.r -> go.l
+    - vl.r -> ts.l
+    - vl.r -> goat.l
+    - vl.r -> js.l
+    - { from: ind.r, to: ts.l, dash: true }
+facts:
+  - { value: "1,861", unit: events, label: per relay, note: "60 s at 30 writes/s; every frame type", tone: blue }
+  - { value: "0", label: verifier failures, note: "on 1,815 commits and syncs, and goat had no warnings", tone: accent }
+  - { value: "=", label: seqs on both relays, note: "the same run's takedown frames are 1859–1861 on both", tone: violet }
+  - { value: "~29", unit: ms, label: p50 time to firehose, note: "indigo's relay: 46–60 ms on the same run", tone: amber }
+```
 
-Short answer: everything works, `@atproto/sync` included. vlRelay's stream matches indigo's event for event, and on the same run it matches seq for seq. The first run found one thing that broke: TypeScript. vlRelay's seqs were bigger than 2^53, and `@atproto/sync` rejected every frame. vlRelay now serves dense seqs (docs/seq.md).
+Does software written for Bluesky's relay work against vlRelay unchanged? To find out, we ran indigo's Go consumers, `goat`, `@atproto/sync`, Jetstream and indigo's relay itself against vlRelay on the local dev network, with indigo's relay beside it on the same upstreams and load, and compared the two.
+
+Everything works, `@atproto/sync` included. vlRelay's stream matches indigo's event for event, and on the same run it matches seq for seq. The first run found one thing that broke: TypeScript. vlRelay's seqs were bigger than 2^53, and `@atproto/sync` rejected every frame. vlRelay now serves dense seqs ([Stream seqs](seq.md)).
 
 ## How to run it
 
@@ -27,7 +58,7 @@ Two dev-network details matter here:
 
 ## Results
 
-Run on 2026-10-04 on the Mac (dev build): 60 s at 30 writes/s, 30 accounts on two vlpds upstreams and the reference PDS, 1,861 events per relay (1,794 `#commit`, 21 `#sync`, 24 `#identity`, 22 `#account`).
+Run on 2026-10-04 on a laptop (dev build): 60 s at 30 writes/s, 30 accounts on two vlpds upstreams and the reference PDS, 1,861 events per relay (1,794 `#commit`, 21 `#sync`, 24 `#identity`, 22 `#account`).
 
 | Software | Feature | vlRelay | indigo relay |
 |---|---|---|---|
@@ -52,48 +83,48 @@ Run on 2026-10-04 on the Mac (dev build): 60 s at 30 writes/s, 30 accounts on tw
 
 ### Every difference, classified
 
-Stream:
+### Stream
 
 | Difference | Class | Notes |
 |---|---|---|
-| seqs above 2^53 (`unix_micros << 8 \| writer`, ~4.6e17) | **was ours wrong, fixed** | It broke every JavaScript consumer that validates (all of `@atproto/sync`). vlRelay now serves dense seqs, the same on every node (docs/seq.md). vlpds as a PDS still emits the time-based seqs: it's in production with stored cursors, so that's a separate call. |
-| `#identity` keeps the handle, indigo strips it | deliberate | `SkipHandleVerification` makes indigo drop nearly every handle (reference-notes). 24 of 24 handles kept on vlRelay, 0 of 24 on indigo. `e2e_check` keys identity on the handle, so these show as 7-9 "missing" and "extra" on the indigo side. |
+| seqs above 2^53 (`unix_micros << 8 \| writer`, ~4.6e17) | was ours wrong, fixed | It broke every JavaScript consumer that validates (all of `@atproto/sync`). vlRelay now serves dense seqs, the same on every node. vlpds as a PDS still emits the time-based seqs, since it's in production with stored cursors. |
+| `#identity` keeps the handle, indigo strips it | deliberate | `SkipHandleVerification` makes indigo drop nearly every handle. 24 of 24 handles kept on vlRelay, 0 of 24 on indigo. `e2e_check` keys identity on the handle, so these show as 7-9 "missing" and "extra" on the indigo side. |
 | `FutureCursor` error frame on a future cursor | deliberate | Per the event-stream spec. indigo ignores the cursor and serves live (indigo#1328). indigo's consumer surfaces the frame through its `Error` callback, and the socket closes normally. |
 | vlRelay emits sooner | deliberate | p50 29 vs 46-60 ms. indigo writes to disk every 100 ms before it broadcasts. |
 
-Sync API (vlRelay vs indigo):
+### Sync API
 
 | Difference | Class | Notes |
 |---|---|---|
 | `RepoNotFound` and `HostNotFound` are HTTP 400, indigo 404 | deliberate | 400 is what the PDSes return for `RepoNotFound`. Jetstream's client goes by the error name (`isRepoNotFoundError`), not the status. |
 | `getLatestCommit` errors are 400, indigo 403 | deliberate | same reason |
 | Bad params give `InvalidRequest`, indigo `BadRequest` | deliberate | `InvalidRequest` is the XRPC spec's generic name |
-| `listRepos` lists deactivated and taken-down accounts with `active: false` and `status`. indigo leaves them out | deliberate | The lexicon has `active` and `status` for this. indigo can't list them (reference-notes). |
+| `listRepos` lists deactivated and taken-down accounts with `active: false` and `status`. indigo leaves them out | deliberate | The lexicon has `active` and `status` for this. indigo can't list them. |
 | `getRepoStatus` leaves out `rev` while inactive. indigo sends it | deliberate | The lexicon: rev "if active=true" |
-| `listRepos?limit=1` sets a cursor. indigo never pages a 1-item page | theirs wrong | reference-notes |
+| `listRepos?limit=1` sets a cursor. indigo never pages a 1-item page | theirs wrong | |
 | `getLatestCommit` on a deleted or other inactive account gives `RepoNotFound`. indigo sends the non-lexicon `RepoDeleted` / `RepoInactive` | deliberate | not hit in this run |
 | `getHostStatus.seq` off by one for a moment | timing | Both relays flush cursors on a timer, so a snapshot mid-traffic differs. Identical once quiet. |
 
-Relay chaining:
+### Relay chaining
 
-- **indigo's relay ← vlRelay.** Refused by design, twice over. The first dial sees `Server: vlrelay/0.1.0 (atproto-relay)` and the host goes to `banned`. Even without the ban, `CreateAccountHost` would refuse every account, since each DID document names a PDS and not us. indigo has no relay-upstream mode.
-- **vlRelay ← indigo's relay.** Before this work, vlRelay subscribed (it never looked at the upstream's `Server` header, although the must-match list says to), took 97 events in and rejected all 97 as `wrong_host`. `#identity` was rejected too: vlRelay checks host authority on `#identity`, and indigo doesn't. Fixed in `upstream/client.rs`: an upstream whose handshake `Server` contains `atproto-relay` is refused at connect, which covers `--host` and `requestCrawl` (crawl runs the same connect). Regression test: `upstream::client::tests::refuses_an_upstream_that_says_its_a_relay`.
+- indigo's relay ← vlRelay. Refused by design, twice over. The first dial sees `Server: vlrelay/0.1.0 (atproto-relay)` and the host goes to `banned`. Even without the ban, `CreateAccountHost` would refuse every account, since each DID document names a PDS and not us. indigo has no relay-upstream mode.
+- vlRelay ← indigo's relay. Before this work, vlRelay subscribed (it never looked at the upstream's `Server` header, although the must-match list says to), took 97 events in and rejected all 97 as `wrong_host`. `#identity` was rejected too: vlRelay checks host authority on `#identity`, and indigo doesn't. Fixed in `upstream/client.rs`: an upstream whose handshake `Server` contains `atproto-relay` is refused at connect, which covers `--host` and `requestCrawl` (crawl runs the same connect). Regression test: `upstream::client::tests::refuses_an_upstream_that_says_its_a_relay`.
 
-Should vlRelay support relay-as-upstream? Not as an upstream mode. Our host authority (PLAN decision 3) is what keeps a host from speaking for accounts it doesn't hold, and a relay upstream is exactly that, for every account. To support it, we'd need to trust the relay for authority (signatures prove who wrote a commit, not that it's the newest), to re-check every `#account` and `#identity` at the PDS (they aren't signed), and to dedupe against the same accounts arriving directly. The design's "other relays (opt.)" is better served by the two cheaper things it's really for:
+Should vlRelay support relay-as-upstream? Not as an upstream mode. Host authority ([Design](design.md#two-kinds-of-shard)) is what keeps a host from speaking for accounts it doesn't hold, and a relay upstream is exactly that, for every account. To support it, we'd need to trust the relay for authority (signatures prove who wrote a commit, not that it's the newest), to re-check every `#account` and `#identity` at the PDS (they aren't signed), and to dedupe against the same accounts arriving directly. The design's "other relays (opt.)" is better served by the two cheaper things it's really for:
 
-- **Bootstrap a host list** by reading another relay's `listHosts` and crawling those PDSes directly. This needs no trust in the relay.
-- **Mirror a vlRelay**, which edges and replicas already do inside a cluster.
+- Bootstrap a host list by reading another relay's `listHosts` and crawling those PDSes directly. This needs no trust in the relay.
+- Mirror a vlRelay, which edges and replicas already do inside a cluster.
 
 ## Follow-ups from the first run
 
-1. **Seqs above 2^53: fixed.** vlRelay serves a dense counter in merge order (docs/seq.md). It's the same on every node, edge and replica, and kept across restarts and takeovers through `seqck/` checkpoints in the bucket. `@atproto/sync` passes with 0 errors, and the seqs equal indigo's on the same run. vlpds's own PDS firehose is unchanged.
-2. **`#identity` from any host: fixed.** vlRelay refreshes the DID document and emits the event, as indigo does. Host authority still applies to `#commit`, `#sync` and `#account` (`state::tests::identity_event_refreshes_the_key`). Like indigo, another host's `#identity` doesn't create an account the relay hasn't seen: it's emitted with no state change, and the account is created (and meets its PDS's account cap) at that PDS's first event (`state::tests::foreign_identity_creates_no_account`).
-3. **A refused relay upstream: banned, fixed.** A permanent refusal at connect (`upstream::client::Refused`, today the `atproto-relay` Server header) bans the host through the policy engine's audited ban action, and its task stops. An operator unban is how to retry it (`node::policy::tests::a_relay_upstream_is_banned_not_retried`).
-4. **80 more events on `cursor=1`: not vlRelay replaying a backlog.**
+1. Seqs above 2^53: fixed. vlRelay serves a dense counter in merge order ([Stream seqs](seq.md)). It's the same on every node, edge and replica, and kept across restarts and takeovers through `seqck/` checkpoints in the bucket. `@atproto/sync` passes with 0 errors, and the seqs equal indigo's on the same run. vlpds's own PDS firehose is unchanged.
+2. `#identity` from any host: fixed. vlRelay refreshes the DID document and emits the event, as indigo does. Host authority still applies to `#commit`, `#sync` and `#account` (`state::tests::identity_event_refreshes_the_key`). Like indigo, another host's `#identity` doesn't create an account the relay hasn't seen: it's emitted with no state change, and the account is created (and meets its PDS's account cap) at that PDS's first event (`state::tests::foreign_identity_creates_no_account`).
+3. A refused relay upstream: banned, fixed. A permanent refusal at connect (`upstream::client::Refused`, today the `atproto-relay` Server header) bans the host through the policy engine's audited ban action, and its task stops. An operator unban is how to retry it (`node::policy::tests::a_relay_upstream_is_banned_not_retried`).
+4. 80 more events on `cursor=1`: not vlRelay replaying a backlog.
    - vlRelay's first subscription to a host has no cursor: `RegistryCursor` has no acked seq for a new host, and `ws_url` leaves the parameter out. A test now pins that (`upstream::client::tests::a_new_host_is_subscribed_without_a_cursor`).
    - In the first run, all 80 events arrived 0.45 s after vlRelay started, before it was even listening. They came from the reference PDS's 10 accounts, all 8 events each. indigo subscribed about 3 s later.
    - A quiet seeded network gives vlRelay nothing on a no-cursor subscription, whether it starts idle or right after a fresh seed. The full rerun had identical `cursor=1` replays on both relays (1,857 events).
    - So the reference PDS sent those events live just after it came up (`dev/up.sh` recreates its container when `DEV_PDS_HOST` changes), and only vlRelay was connected yet. Any relay subscribed then would have relayed them.
-5. **`OutdatedCursor` and `ConsumerTooSlow` from outside: done.** Dev-only `--retention-secs` and `--max-lag-mb` exist now. A window under an hour also shrinks the ring to 1 MiB, because the ring serves whatever it holds and old cursors have to reach the bucket. The compat run checks both frames on the :3478 relay.
-6. **The current Jetstream needs public-looking PDS hostnames:** still open.
+5. `OutdatedCursor` and `ConsumerTooSlow` from outside: done. Dev-only `--retention-secs` and `--max-lag-mb` exist now. A window under an hour also shrinks the ring to 1 MiB, because the ring serves whatever it holds and old cursors have to reach the bucket. The compat run checks both frames on the :3478 relay.
+6. The current Jetstream needs public-looking PDS hostnames: still open.
 

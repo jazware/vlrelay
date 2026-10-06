@@ -1,0 +1,15 @@
+# Internal notes: in the repo, left off the public docs site (/docs).
+# They name private hosts and paths, or only make sense next to the code.
+# One path per line, relative to docs/. See _style.md, "Public and internal".
+
+index.md                # the repo's reading list of every page, public and internal
+PLAN.md                 # the first build-out's decisions and module owners
+devloop.md              # the dev loop, local network, e2e harnesses and the bench box
+chaos.md                # chaos scenarios and what they found
+loadfleet.md            # fakepds, the synthetic upstream fleet
+reference-notes.md      # how indigo's relay and the production firehose behave
+shadow.md               # the shadow run against real PDSes
+quorum.md               # quorum replication design and cost study (in progress)
+perf-log.md             # the perf bench, iteration by iteration
+cluster-internals.md    # how node.rs plugs into the cluster library
+policy-internals.md     # how the policy engine is wired into the node

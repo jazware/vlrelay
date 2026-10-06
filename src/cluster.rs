@@ -28,7 +28,7 @@
 //! and serve. Replicas do the same from the bucket alone, with read-only
 //! credentials and no peer certificate.
 //!
-//! How `node.rs` plugs in: docs/cluster.md.
+//! How `node.rs` plugs in: docs/cluster-internals.md.
 
 pub mod follow;
 pub mod forward;

@@ -46,7 +46,37 @@ SECTIONS = [
     ),
 ]
 
-HEADER = """# Configuration
+HEADER = """---
+title: Configuration
+section: Operations
+order: 102
+summary: "Every flag of vlrelay and its env var, generated from vlrelay --help by just config-doc."
+---
+
+```hero
+diagram:
+  caption: One binary, configured by flags or env vars. The bucket and the prefix are the relay's identity. Everything else is how this node serves, which upstreams it starts with, how its log seals segments, and its place in a cluster.
+  nodes:
+    - { id: bin, label: vlrelay, sub: flags · VLRELAY_* env, at: [14, 4.5], size: [9, 3], tone: accent }
+    - { id: serve, label: Serving, sub: "--listen · --admin-token", at: [0, 0], size: [10, 3], tone: blue }
+    - { id: up, label: Upstreams, sub: "--host · --crawl · --plc-export", at: [0, 4.5], size: [10, 3], tone: muted }
+    - { id: clu, label: Cluster, sub: "--role · --peer-tls-dir", at: [0, 9], size: [10, 3], tone: accent }
+    - { id: bucket, label: Bucket, sub: "--s3-* · --prefix", at: [27, 0], size: [10, 3], shape: store, tone: amber }
+    - { id: log, label: Log, sub: "--linger-ms · --retention", at: [27, 4.5], size: [10, 3], tone: amber }
+    - { id: pipe, label: Pipeline, sub: "--did-shards · --lanes", at: [27, 9], size: [10, 3], tone: accent }
+  edges:
+    - serve.r -> bin.l30
+    - up.r -> bin.l
+    - clu.r -> bin.l70
+    - bin.r30 -> bucket.l
+    - bin.r -> log.l
+    - bin.r70 -> pipe.l
+facts:
+  - { value: "2980", label: the public port, note: "`--listen`; the image binds 0.0.0.0", tone: accent }
+  - { value: "25", unit: ms, label: segment linger, note: "`--linger-ms`; time to firehose is about linger plus one PUT", tone: amber }
+  - { value: "72", unit: h, label: of log for cursor replay, note: "`--retention`", tone: blue }
+  - { value: "flag", label: wins over its env var, note: "pass secrets as env vars; --help never prints them", tone: violet }
+```
 
 Every flag of `vlrelay`, generated from `vlrelay --help` by `just config-doc` (`build/config_doc.py`).
 Flags with an env var can be set either way, and the flag wins. Secrets (`--s3-secret-key`,
