@@ -1168,19 +1168,19 @@ Measured so far: one real host, vps1 (an ex-vlpds OVH VPS), single node only; nu
 
 #### vps1: one OVH VPS, single node
 
-The host: an OVH VPS in Us-west (the decommissioned vlpds-node1). It has 2 vCPU (KVM, "Intel Core Processor (Haswell, no TSX)"), 3.8 GB RAM and no swap. The disk is a 40 GB virtio `QEMU HARDDISK` (ext4, write cache "write back", `discard`), running Ubuntu 26.04 and kernel 7.0. Measured 2026-10-06 from 17:15 to 18:20 UTC. RTT from benchbox is 4.5 ms (same metro).
+The host: an OVH VPS in Us-west (the decommissioned vlpds-node1). It has 2 vCPU (KVM, "Intel Core Processor (Haswell, no TSX)"), 3.8 GB RAM and no swap. The disk is a 40 GB virtio `QEMU HARDDISK` (ext4, write cache "write back", `discard`), running Ubuntu 26.04 and kernel 7.0. Measured 2026-10-06 from 17:15 to 19:20 UTC. RTT from benchbox is 4.5 ms (same metro).
 
-`fsync_probe.sh`, three runs over 50 minutes (p50 / p99 in ms):
+`fsync_probe.sh`, four runs over two hours (p50 / p99 in ms):
 
-| | 17:15 | 17:48 | 18:04 |
+| | 17:15 | 17:48 | 18:04 | 19:18 |
 |---|---|---|---|
-| fdatasync 4 KiB, 1 writer | 0.61 / 0.94 | 0.57 / 0.95 | 0.59 / 0.86 |
-| fdatasync 64 KiB, 1 writer | 0.68 / 0.95 | 0.63 / 1.07 | 0.65 / 1.07 |
-| fdatasync 1 MiB, 1 writer (MiB/s) | 1.12 / 2.15 (548) | 1.09 / 2.25 (548) | 1.12 / 1.53 (519) |
-| fdatasync 64 KiB, 3 writers (MiB/s) | 0.86 / 1.42 (175) | 0.86 / 1.35 (179) | 0.87 / 1.38 (173) |
-| unsynced write ceiling | 1,565 MiB/s | 1,499 | 1,428 |
+| fdatasync 4 KiB, 1 writer | 0.61 / 0.94 | 0.57 / 0.95 | 0.59 / 0.86 | 0.62 / 0.90 |
+| fdatasync 64 KiB, 1 writer | 0.68 / 0.95 | 0.63 / 1.07 | 0.65 / 1.07 | 0.66 / 0.91 |
+| fdatasync 1 MiB, 1 writer (MiB/s) | 1.12 / 2.15 (548) | 1.09 / 2.25 (548) | 1.12 / 1.53 (519) | 1.16 / 1.50 (568) |
+| fdatasync 64 KiB, 3 writers (MiB/s) | 0.86 / 1.42 (175) | 0.86 / 1.35 (179) | 0.87 / 1.38 (173) | 0.86 / 1.38 (178) |
+| unsynced write ceiling | 1,565 MiB/s | 1,499 | 1,428 | 1,491 |
 
-That's steady across the hour and well above 0.1 ms, so the flush really reaches the hypervisor's storage, not just a cache. It's 0.6-0.7 ms at commitlog-sized appends, the "0.5-2 ms VPS" the study assumed and 4x better than benchbox's consumer NVMe (2.7 ms). Three writers cost ~0.2 ms more, against 2x on benchbox. The 1 MiB rate (~550 MiB/s fsynced) is past what one member needs at 100x (~185 MB/s).
+That's steady across two hours and well above 0.1 ms, so the flush really reaches the hypervisor's storage, not just a cache. It's 0.6-0.7 ms at commitlog-sized appends, the "0.5-2 ms VPS" the study assumed and 4x better than benchbox's consumer NVMe (2.7 ms). Three writers cost ~0.2 ms more, against 2x on benchbox. The 1 MiB rate (~550 MiB/s fsynced) is past what one member needs at 100x (~185 MB/s).
 
 Single node (`run_single.sh`): the commitlog on the disk, MinIO on the same disk, 30 s flushes, a 256 MiB ring. The load generator and the checker ran on the box too, so all four share its 2 vCPU. Frames ~5.3 KB, ack = submit to the node's fsynced ack, loopback:
 
