@@ -30,6 +30,7 @@
 //! Memory-only (`node::MemoryOnly`) remains for comparison.
 
 pub mod bucket;
+pub mod budget;
 pub mod check;
 pub mod client;
 pub mod commitlog;

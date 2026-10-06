@@ -24,6 +24,16 @@
 # STATUS_EVERY (0: off; else every node's status into status.jsonl),
 # STATE_POLL_MS (the state's compactor poll, 30000).
 #
+# A billed bucket (tests/qlog/R2_HOUR.md): S3_ENDPOINT and S3_BUCKET in
+# place of the local MinIO (keys from QLOG_S3_ACCESS_KEY and
+# QLOG_S3_SECRET_KEY in the environment, never on a command line),
+# VERIFY_EVERY=0 (no mid-run verify: each reads every segment), BUDGET
+# (node flags such as "--budget-a 3500 --budget-rate-a 2.4"; each node also
+# gets --budget-state, so its count survives restarts). A node that trips
+# its budget exits 86: the harness then kills every process of the run at
+# once, skips the final verify and retain, and exits 86. OUT/pgid holds the
+# run's process group (for r2_watchdog.py; start the harness under setsid).
+#
 # With the flush on, `qlog verify` checks the manifest (segments, state
 # and cursors at one F) every VERIFY_EVERY seconds and at the end, and the
 # checker ends with a consumer from cursor 0 through the bucket backfill.
@@ -109,7 +119,12 @@ out=${OUT:-$crate/dev/state-qlog-$B/$scenario}
 rm -rf "$out"
 mkdir -p "$out"
 prefix="qlog-$scenario-$(date +%s)"
-ms() { date +%s%3N; }
+echo "$prefix" >"$out/prefix"
+ps -o pgid= $$ | tr -d ' ' >"$out/pgid"
+s3_endpoint=${S3_ENDPOINT:-http://127.0.0.1:$minio}
+s3_flags=(--s3-endpoint "$s3_endpoint" --s3-bucket "${S3_BUCKET:-vlrelay}")
+# uutils date (Ubuntu 26.04) ignores %3N
+ms() { local n; n=$(date +%s%N); echo $((n / 1000000)); }
 log() { echo "$(ms) $*" | tee -a "$out/events.log"; }
 
 pids=()
@@ -120,12 +135,21 @@ cleanup() {
   for i in $slots; do pkill -9 -f "^$bin node --id n$i " 2>/dev/null || true; done
   wait 2>/dev/null || true
   [ "$cl_dir" = "$out" ] || rm -rf "$cl_dir"
-  [ "${KEEP:-}" = 1 ] || docker compose -f "$here/compose.yml" down -v >/dev/null 2>&1 || true
+  [ -n "${S3_ENDPOINT:-}" ] || [ "${KEEP:-}" = 1 ] || docker compose -f "$here/compose.yml" down -v >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-docker compose -f "$here/compose.yml" up -d --wait minio >/dev/null
-docker compose -f "$here/compose.yml" run --rm minio-init >/dev/null
+if [ -z "${S3_ENDPOINT:-}" ]; then
+  docker compose -f "$here/compose.yml" up -d --wait minio >/dev/null
+  docker compose -f "$here/compose.yml" run --rm minio-init >/dev/null
+fi
+
+# a node over its request budget: nothing of this run may send another request
+budget_stop() {
+  touch "$out/stop" "$out/budget-tripped"
+  pkill -9 -f "^$bin .*(--prefix $prefix|$out)" 2>/dev/null || true
+  echo "$(ms) BUDGET n$1 tripped: $(cat "$out/budget-n$1.tripped" 2>/dev/null)" >>"$out/events.log"
+}
 
 if [ "$proxy" = 1 ]; then
   routes=()
@@ -160,6 +184,8 @@ supervise() {
   [ -n "${FSYNC_DELAY_US:-}" ] && disk+=(--fsync-delay-us "$FSYNC_DELAY_US")
   [ -n "${seg_mb:-}" ] && disk+=(--segment-mb "$seg_mb")
   [ -n "${STATE_POLL_MS:-}" ] && disk+=(--state-compactor-poll-ms "$STATE_POLL_MS")
+  # shellcheck disable=SC2206 # flags, word split on purpose
+  [ -n "${BUDGET:-}" ] && disk+=($BUDGET --budget-state "$out/budget-n$i.json")
   disk+=(--flush-ms "$flush_ms" --headroom "${HEADROOM:-100000000}" --flush-segment-mb "${FLUSH_SEGMENT_MB:-64}")
   [ -n "$crash_at" ] && disk+=(--crash-at "$crash_at" --crash-prob "$crash_prob" --crash-stop-file "$out/no-more-crashes")
   for j in $slots; do
@@ -169,10 +195,11 @@ supervise() {
   while [ ! -e "$out/stop" ] && [ ! -e "$out/retired-n$i" ]; do
     set +e
     "$bin" node --id "n$i" --listen "127.0.0.1:$(peer "$i")" --http "127.0.0.1:$(http "$i")" "${peers[@]}" \
-      --members "$members_flag" --s3-endpoint "http://127.0.0.1:$minio" --prefix "$prefix" "${disk[@]}" >>"$out/n$i.log" 2>&1
+      --members "$members_flag" "${s3_flags[@]}" --prefix "$prefix" "${disk[@]}" >>"$out/n$i.log" 2>&1
     local rc=$?
     set -e
     echo "$(ms) exit n$i $rc" >>"$out/events.log"
+    [ "$rc" = 86 ] && { budget_stop "$i"; break; }
     [ -e "$out/stop" ] || [ -e "$out/retired-n$i" ] && break
     sleep "${RESTART_SEC:-1}"
     # a wipe holds the restart until the disk is gone
@@ -180,6 +207,14 @@ supervise() {
   done
 }
 for i in $ids; do supervise "$i" & pids+=($!); done
+if [ -n "${BUDGET:-}" ]; then
+  # after a trip, keep killing: the checker or the load may start later
+  (
+    while [ ! -e "$out/budget-tripped" ]; do sleep 0.2; done
+    while :; do pkill -9 -f "^$bin .*(--prefix $prefix|$out)" 2>/dev/null || true; sleep 0.5; done
+  ) &
+  pids+=($!)
+fi
 started="$ids"
 start_slot() {
   supervise "$1" &
@@ -213,6 +248,7 @@ nodepid() { pgrep -f "^$bin node --id n$1 " | head -1; }
 
 t=0
 until [ -n "$(leader)" ]; do
+  [ -e "$out/budget-tripped" ] && { echo "qlog chaos: a node tripped its request budget" >&2; exit 86; }
   sleep 0.2; t=$((t + 1))
   [ $t -lt 100 ] || { echo "qlog chaos: no leader in 20 s" >&2; exit 1; }
 done
@@ -221,7 +257,7 @@ log "leader n$(leader)"
 nodes=() https=()
 for i in $slots; do nodes+=(--node "n$i=127.0.0.1:$(peer "$i")"); https+=(--node "n$i=127.0.0.1:$(http "$i")"); done
 # with no flush there's no bucket: a cursor older than the ring is outdated
-s3=(--s3-endpoint "http://127.0.0.1:$minio" --prefix "$prefix")
+s3=("${s3_flags[@]}" --prefix "$prefix")
 "$bin" check "${https[@]}" --backfill "$([ "$flush_ms" != 0 ] && echo true || echo false)" --gap-ms "${GAP_MS:-15}" --stop-file "$out/stop" --acked "$out/acked.txt" --out "$out" \
   "${s3[@]}" --load-summary "$out/load.json" >"$out/check.log" 2>&1 &
 checker=$!
@@ -230,7 +266,7 @@ sleep 1
 loader=$!
 pids+=($loader)
 
-if [ "$flush_ms" != 0 ]; then
+if [ "$flush_ms" != 0 ] && [ "${VERIFY_EVERY:-20}" != 0 ]; then
   (
     while kill -0 "$loader" 2>/dev/null; do
       sleep "${VERIFY_EVERY:-20}"
@@ -506,6 +542,7 @@ while [ $(($(date +%s) - start + 12)) -lt "$duration" ] && [ "$scenario" != base
 done
 
 wait "$loader" || true
+[ -e "$out/budget-tripped" ] && { echo "qlog chaos: a node tripped its request budget; no final verify" >&2; exit 86; }
 touch "$out/no-more-crashes"
 if [ "$flush_ms" != 0 ]; then
   # the last flush covers everything committed (no more injected crashes:
@@ -517,6 +554,10 @@ touch "$out/stop"
 set +e
 wait "$checker"
 rc=$?
+if [ -e "$out/budget-tripped" ]; then
+  echo "qlog chaos: a node tripped its request budget; no final verify" >&2
+  exit 86
+fi
 if [ "$flush_ms" != 0 ]; then
   "$bin" verify "${s3[@]}" >"$out/verify.json" 2>>"$out/verify.log"
   vrc=$?
