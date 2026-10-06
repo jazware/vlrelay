@@ -3,7 +3,7 @@
 use axum::http::{HeaderValue, header};
 use axum::middleware;
 use axum::response::Response;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,7 +49,7 @@ struct Args {
     prefix: String,
     #[arg(long, default_value = "https://plc.directory", env = "VLRELAY_PLC_URL")]
     plc_url: String,
-    /// Segment linger (PLAN.md decision 1).
+    /// Segment linger: a segment seals this long after its first event (docs/design.md, "Decisions").
     #[arg(long, default_value_t = 25)]
     linger_ms: u64,
     /// Segment PUTs in flight at once.
@@ -61,7 +61,7 @@ struct Args {
     /// zstd level for log segments: 0 stores them uncompressed, negative
     /// levels are zstd's fast ones. Firehose frames are mostly hashes:
     /// on production frames -1 compresses 1.8x faster than 1 for 0.6% more
-    /// bytes (docs/perf.md, iteration 5).
+    /// bytes (docs/perf.md, "Compression").
     #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
     log_compression: i32,
     /// An upstream to subscribe to (repeatable). `http://` means plain
@@ -185,9 +185,12 @@ fn main() {
     // reqwest, tungstenite and object_store each pull rustls; with more than
     // one provider compiled in, nothing picks one unless we do
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let args = Args::parse();
+    let cmd = Args::command();
+    let matches = cmd.clone().get_matches();
+    let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let settings = vlrelay::admin::settings::from_clap(&cmd, &matches);
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("main").build().expect("runtime");
-    let code = match rt.block_on(run(args)) {
+    let code = match rt.block_on(run(args, settings)) {
         Ok(()) => 0,
         Err(e) => {
             tracing::error!("{e:#}");
@@ -197,7 +200,7 @@ fn main() {
     std::process::exit(code);
 }
 
-async fn run(a: Args) -> anyhow::Result<()> {
+async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<()> {
     let loopback_plc = a.plc_url.contains("://127.") || a.plc_url.contains("://localhost");
     let dev_mode = a.dev_mode || a.hosts.iter().any(|h| h.starts_with("http://")) || loopback_plc;
     let mut lease_store = None;
@@ -304,22 +307,26 @@ async fn run(a: Args) -> anyhow::Result<()> {
         app = app.merge(node.crawler.router());
     }
     let token = a.admin_token.clone().filter(|t| !t.is_empty());
-    // a core answers its peers' dashboards even without a dashboard of its own
-    let admin_src = (token.is_some() || node.cluster.is_some()).then(|| {
+    // always built: the public page's stats come from it, and a core answers
+    // its peers' dashboards even without a dashboard of its own
+    let admin_src = {
         let policy = node.policy.clone().expect("the relay always runs the policy engine");
         let demo = vlrelay::admin::demo::Demo::start(42);
         let src = NodeAdmin::new(node.clone(), policy, demo)
-            .with_followers(a.admin_followers.clone(), token.clone().unwrap_or_default());
+            .with_followers(a.admin_followers.clone(), token.clone().unwrap_or_default())
+            .with_settings(settings);
         Arc::new(src)
-    });
-    if let (Some(g), Some(src)) = (&node.cluster, &admin_src) {
-        let _ = g.admin.set(Arc::downgrade(src));
+    };
+    if let Some(g) = &node.cluster {
+        let _ = g.admin.set(Arc::downgrade(&admin_src));
     }
     // admin_src stays bound for the life of `run`: the peer slot holds it weakly
-    if let (Some(token), Some(src)) = (token, admin_src.clone()) {
-        let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
-        app = app.merge(vlrelay::admin::app(src, token.clone(), ui));
+    let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
+    if let Some(token) = token {
+        app = app.merge(vlrelay::admin::app(admin_src.clone(), token.clone(), ui));
         app = app.merge(vlrelay::archive::admin::router(node.state.clone(), token));
+    } else {
+        app = app.merge(vlrelay::admin::docs_routes(ui)).merge(vlrelay::admin::public_routes(admin_src.clone()));
     }
     let app = with_real_ip(app.layer(middleware::map_response(server_header)), &a.trusted_proxies);
 

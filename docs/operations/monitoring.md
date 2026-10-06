@@ -1,4 +1,32 @@
-# Monitoring vlRelay
+---
+title: Monitoring
+section: Operations
+order: 103
+summary: "The Prometheus series every node serves at /metrics, what to watch first, and how to read them."
+---
+
+```hero
+diagram:
+  caption: Where the main series are measured along an event's path. The ack backlog is everything read but not yet durable, and time to firehose runs from the frame arriving to it going out on subscribeRepos.
+  nodes:
+    - { id: pds, label: PDS socket, sub: "`vlrelay_events_in_total`", at: [0, 0], size: [10, 3], tone: muted }
+    - { id: pipe, label: Pipeline, sub: "`vlrelay_stage_seconds`", at: [13, 0], size: [10, 3], tone: accent }
+    - { id: log, label: Log, sub: "`vlrelay_durable_lag_ms`", at: [26, 0], size: [10, 3], shape: store, tone: amber }
+    - { id: out, label: subscribeRepos, sub: "`vlrelay_events_out_total`", at: [39, 0], size: [10, 3], tone: blue }
+    - { id: rej, label: Rejects, sub: "`…_rejected_total{reason}`", at: [13, 6], size: [10, 3], tone: danger }
+    - { id: ack, label: Ack backlog, sub: "`vlrelay_ack_pending`", at: [26, 6], size: [10, 3], tone: solid }
+  edges:
+    - pds -> pipe
+    - "pipe -> log: append"
+    - "log -> out: merged"
+    - { from: pipe.b, to: rej.t, label: dropped, dash: true }
+    - { from: ack.t, to: log.b, label: until durable, dash: true }
+facts:
+  - { value: "/metrics", label: on every node, note: "on the --listen port, with no auth: keep it private", tone: blue }
+  - { value: "~70", unit: µs, label: of CPU per event, note: "on one node; `stage_busy_us_total` ÷ `events_in_total`", tone: amber }
+  - { value: "flat", label: "`vlrelay_ack_pending`", note: "climbing and still climbing means the node is behind", tone: danger }
+  - { value: "0", unit: alert rules, label: shipped so far, note: "the dashboard at /admin is the live view", tone: muted }
+```
 
 Every node serves Prometheus metrics at `GET /metrics` on its `--listen` port, with no auth (keep
 it off the public side of your proxy, see [Deploy](deploy.md#in-front-of-it)). The relay's own
@@ -64,8 +92,9 @@ Label values:
 ## Reading them
 
 `vlrelay_ack_pending` is the backlog between reading an event and making it durable. When it
-climbs and keeps climbing, the node is behind. [Performance](../perf.md) found the committer to be
-the first stage to give out on one node (~90-95k events/s), and this gauge is how that showed up.
+climbs and keeps climbing, the node is behind. On the perf bench, before each DID shard got its
+own committer, the committer was the first stage to give out on one node (~90–95k events/s), and
+this gauge is how that showed up ([Performance](../perf.md)).
 
 Time to firehose is linger plus a segment PUT (`--linger-ms`, 25 by default). Above ~50k events/s
 a segment seals on size (`--max-segment-mb`) before its linger is up, so the PUT latency of your

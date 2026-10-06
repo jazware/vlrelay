@@ -1,45 +1,39 @@
 # vlRelay docs
 
-Read them roughly in this order. The design doc says what vlRelay is for and why it's shaped the
-way it is, the operations pages say how to run it, and the internals pages say how each part works
-and how it was measured.
+Every page in this directory, roughly in reading order. The public ones are the docs site, served
+by every node at `/docs` (front matter, heroes and the voice in `_style.md`). The internal ones are
+listed in `_internal.txt` and stay in the repository: they name private hosts and paths, or only
+make sense next to the code.
 
-## Overview
-
-| Page | What's in it |
-|---|---|
-| [Design](design.html) | The design-session doc: the job, what carries over from vlpds, host and DID shards, sequencing, validation, policy, archival mode, replicas, cost and failure modes. Open it in a browser. |
-| [Cost](cost.md) | What it costs today and at 10x, 100x and 1000x: CPU, peer traffic, bucket requests and storage, consumer egress, priced on OVH, Hetzner and AWS with six object stores (`scripts/cost_model.py`) |
-| [Quorum study](quorum.md) | A design and cost study, its replication core built and chaos-tested (Implementation notes): one sequenced log replicated to 3 nodes with quorum acks and a local commitlog, the bucket flushed every 10-60 s, and a single node on a local NVMe WAL, against a $10-15 a month benchmark (`scripts/cost_model.py --quorum`, [page](quorum-study.html)) |
-| [Build plan](PLAN.md) | The design session's decisions (linger, where signatures are checked, archival defaults) and who owns which module |
-
-## Operations
+## The site (public)
 
 | Page | What's in it |
 |---|---|
-| [Deploy](operations/deploy.md) | The image, one node on Compose, a three-node cluster with peer mTLS, edges and replicas, the proxy in front |
-| [Configuration](operations/configuration.md) | Every flag and env var, from `vlrelay --help` |
-| [Monitoring](operations/monitoring.md) | The `/metrics` series and what to watch |
-| [Dashboard and admin API](admin-api.md) | The `/admin` dashboard's JSON API, the policy document and the demo backend |
+| [Overview](overview.md) | The shape, the path of an event, host and DID shards, one stream on every node, the numbers |
+| [Subscribe to the firehose](subscribing.md) | For consumers: frames, seqs, cursors on any node, falling behind, takedowns, the sync endpoints |
+| [Design](design.md) | The job, where it's hard, what carries over from vlpds, where each check runs, decisions, failure modes |
+| [Stream seqs](seq.md) | Dense seqs as a function of the bucket, checkpoints, anchoring, cursor semantics |
+| [Cluster](cluster.md) | Roles, flags, peer authorization, restart dedupe, failure handling, resharding, the bucket, HA results |
+| [Policy](policy.md) | Defaults, tiers, domain rules, admission, account caps, spam counting, takedowns, PLC export seeding |
+| [Archival mode](archival.md) | The mirror, keeping it current, bootstrap, takedowns, endpoints, numbers, gaps |
+| [Operations](operations/index.md) | [Deploy](operations/deploy.md), [Configuration](operations/configuration.md) (generated), [Monitoring](operations/monitoring.md) |
+| [Admin API](admin-api.md) | The `/admin` dashboard's JSON API, the cluster view and the demo backend |
+| [Compatibility](compat.md) | indigo's consumers, goat, `@atproto/sync`, Jetstream and indigo's relay against vlRelay |
+| [Performance](perf.md) | One node, compression, a three-node cluster, fan-out |
+| [Cost](cost.md) | Today and at 10x, 100x and 1000x on OVH, Hetzner and AWS with six object stores (`scripts/cost_model.py`) |
 
-## Internals
-
-| Page | What's in it |
-|---|---|
-| [Cluster](cluster.md) | Roles, leases, host and DID shards, handoff, restart dedupe, what's in the bucket, HA results |
-| [Policy](policy.md) | Tiers, limits, domain rules, requestCrawl admission, spam counting and cases |
-| [Performance](perf.md) | The node bench, each optimization pass, the per-node ceiling and fan-out |
-| [Compatibility](compat.md) | indigo's consumers, goat, `@atproto/sync`, Jetstream and indigo's relay against vlRelay, every difference classified |
-| [Shadow run](shadow.md) | Two hours against ten real PDSes beside `bsky.network`: matches, latency, policy on real traffic, leaks, bugs found |
-| [Reference notes](reference-notes.md) | How indigo's relay and the production relay behave, the baseline vlRelay is checked against |
-
-Archival mode (a full mirror of every repo, `docs/design.html` "Archival mode") is in progress and
-has no page yet. The sequencer (`src/seq.rs`) is described in the design doc's "Sequencing and
-cursors" and in [Cluster](cluster.md).
-
-## Development
+## Internal
 
 | Page | What's in it |
 |---|---|
-| [Dev loop](devloop.md) | Building and testing, the local network, the e2e contract, `e2e_check`, the cluster e2e, benchbox and build speed |
+| [Design session](design.html) | The original design-session doc. Open it in a browser. |
+| [Build plan](PLAN.md) | The design session's decisions and who owned which module |
+| [Quorum study](quorum.md) | Quorum replication: design, cost study and implementation notes ([page](quorum-study.html)) |
+| [Perf log](perf-log.md) | The node and cluster benches, iteration by iteration, with profiles |
+| [Cluster internals](cluster-internals.md) | How `node.rs` plugs into `src/cluster.rs` |
+| [Policy internals](policy-internals.md) | How the policy engine is wired into the node, and the full PLC export notes |
+| [Shadow run](shadow.md) | Two hours against ten real PDSes beside `bsky.network` |
+| [Chaos](chaos.md) | Fault schedules against the cluster and what they found |
+| [Reference notes](reference-notes.md) | How indigo's relay and the production relay behave |
+| [Dev loop](devloop.md) | Building and testing, the local network, the e2e contract, the bench box |
 | [Load fleet](loadfleet.md) | `fakepds`, the synthetic upstream fleet behind the perf numbers |

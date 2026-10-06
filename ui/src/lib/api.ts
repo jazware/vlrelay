@@ -309,6 +309,154 @@ export type CaseEvidence = {
 }
 export type CaseDetail = Case & { trips: number; evidence: CaseEvidence[] }
 
+// ---------------------------------------------------------------- quorum log
+
+export type Quantiles = { count: number; p50: number; p90: number; p99: number; p999: number; max: number }
+
+export type QDisk = { fsyncs: number; fsync_us: Quantiles; batch_ops: Quantiles; bytes_written: number; disk_bytes: number; rollovers: number; deleted: number }
+
+export type QFlush = {
+  flushes: number
+  aborted: number
+  failed: number
+  fences: number
+  adopted: number
+  segments: number
+  segment_bytes: number
+  raw_bytes: number
+  entries: number
+  duration_us: Quantiles
+  seal_us: Quantiles
+  requests: Record<string, number>
+  requests_total: Record<string, number>
+  applied: number
+  last_flushed: number
+  last_reserve: number
+}
+
+export type QSwitch = {
+  from_epoch: number
+  epoch: number
+  from: string[]
+  to: string[]
+  leader: string
+  record_ms: number
+  catch_up_ms: number
+  pre_flush_ms: number
+  drain_ms: number
+  flush_ms: number
+  cas_ms: number
+  paused_ms: number
+  flushed: number
+  at_ms: number
+}
+
+export type QRecovery = {
+  generation: number
+  epoch: number
+  manifest_flushed: number
+  orphans_to: number
+  after: number
+  base: number
+  orphan_segments: number
+  salvaged: number
+  read_ms: number
+  clone_ms: number
+  apply_seal_ms: number
+  segments_ms: number
+  manifest_ms: number
+  total_ms: number
+}
+
+/** `qlog::node::Status` as `/qlog/status` serializes it (snake_case). Fields may be added; read defensively. */
+export type QStatus = {
+  id: string
+  role: 'follower' | 'candidate' | 'leader'
+  epoch: number
+  promised: number
+  leader: string | null
+  base: number
+  last: number
+  commit: number
+  emitted: number
+  intact: boolean
+  log_bytes: number
+  appended: number
+  takeovers: number
+  step_downs: number
+  resets: number
+  emit_gaps: number
+  promise_rounds: number
+  disk_reads: number
+  bucket_reads: number
+  commit_us: Quantiles
+  disk: QDisk | null
+  /** F: the log may leave local disk up to here. */
+  flushed: number
+  /** R: the commit index may rise to here. */
+  reserve: number
+  flush: QFlush | null
+  generation: number
+  recoveries: number
+  lost_quorums: number
+  recovered: QRecovery[]
+  members: string[]
+  learners: string[]
+  members_since: number
+  retired: boolean
+  paused: boolean
+  last_epoch: number
+  switches: QSwitch[]
+  /** Bucket requests by class/purpose (newer builds). */
+  requests?: Record<string, unknown>
+}
+
+export type QuorumNode = { node: string; addr: string; stale: boolean; error: string | null; reportedMs: number; status: QStatus | null }
+export type QuorumView = { nodes: QuorumNode[] }
+
+// ---------------------------------------------------------------- settings
+
+export type ConfigEntry = {
+  flag: string
+  env: string | null
+  value: string | null
+  source: 'flag' | 'env' | 'default' | 'unset'
+  default: string | null
+  secret: boolean
+  set: boolean
+  help: string
+}
+export type SettingsView = { binary: string; version: string; entries: ConfigEntry[] }
+
+// ---------------------------------------------------------------- public
+
+export type Health = 'ok' | 'degraded' | 'down'
+export type PublicStats = {
+  timeMs: number
+  version: string
+  uptimeSecs: number
+  eventsInPerSec: number
+  eventsOutPerSec: number
+  streamEventsPerSec: number
+  timeToFirehoseP50Ms: number
+  timeToFirehoseP99Ms: number
+  hostsConnected: number
+  consumers: number
+  lastSeq: number
+  nodes: number
+  nodesHealthy: number
+  health: Health
+  quorum: Health | null
+  history: { sampleSecs: number; t: number[]; eventsIn: number[]; eventsOut: number[]; ttfP50Ms: number[]; ttfP99Ms: number[] }
+}
+
+/** The public page's numbers: no token. */
+export async function publicStats(): Promise<PublicStats> {
+  const r = await fetch('/api/public/stats')
+  if (!r.ok) throw new ApiError(r.status, `HTTP ${r.status}`, 'Stats are unavailable right now')
+  return r.json()
+}
+
 // ---------------------------------------------------------------- token
 
 const AKEY = 'vlrelay.admin'

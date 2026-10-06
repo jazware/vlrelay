@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Empty, ErrorNotice, Loading, PageHead, Panel, Spinner } from '../components/ui'
-import { InlineConfirm, Live, SeverityPill } from '../components/relay'
-import { api, ApiError, enc, errText, type Case, type CaseDetail as CaseDetailT, type CaseEvidence, type CaseStatus, type Severity } from '../lib/api'
+import { InlineConfirm, Live, SeverityPill, Tile } from '../components/relay'
+import { api, ApiError, enc, errText, type Overview, type Case, type CaseDetail as CaseDetailT, type CaseEvidence, type CaseStatus, type Severity } from '../lib/api'
 import { fmtNum, fmtTime, relTime, short } from '../lib/format'
 import { useAction } from '../lib/hooks'
 import { Link, navigate, useSearch } from '../lib/router'
@@ -93,6 +93,40 @@ function Evidence({ id, kind }: { id: number; kind: string }) {
   )
 }
 
+/** Every moderation lever in one place: what's under action now, and where each is set. */
+function ModerationStrip({ open }: { open: number }) {
+  const o = useApi<Overview>('overview', undefined, 10000).data
+  const n = (s: 'throttled' | 'suspended' | 'banned') => o?.hostsByStatus[s] ?? 0
+  const host = (s: 'throttled' | 'suspended' | 'banned', label: string, sub: string) => (
+    <Tile
+      k={label}
+      v={
+        <Link to={`/admin/hosts?status=${s}`} className="plain">
+          {o ? fmtNum(n(s)) : '…'}
+        </Link>
+      }
+      tone={n(s) > 0 && s !== 'throttled' ? 'bad' : n(s) > 0 ? 'warn' : undefined}
+      sub={sub}
+    />
+  )
+  return (
+    <>
+      <div className="tiles mod-strip">
+        <Tile k="Open cases" v={fmtNum(open)} tone={open > 0 ? 'warn' : 'ok'} sub="listed below" />
+        {host('throttled', 'Throttled hosts', 'by a tier, a budget or an operator')}
+        {host('suspended', 'Suspended hosts', 'paused, cursor kept')}
+        {host('banned', 'Banned hosts', 'events dropped, crawl refused')}
+      </div>
+      <nav className="mod-links small" aria-label="Moderation tools">
+        <Link to="/admin/accounts">Takedowns (by account)</Link>
+        <Link to="/admin/rules">Domain bans and allows</Link>
+        <Link to="/admin/policy">Tier limits and case thresholds</Link>
+        <Link to="/admin/tuning">Budgets, spam signals, consumer limits</Link>
+      </nav>
+    </>
+  )
+}
+
 export function Cases() {
   const search = useSearch()
   const filter = (search.get('status') as CaseStatus | 'all' | null) ?? 'open'
@@ -143,6 +177,7 @@ export function Cases() {
         <Live at={l.at} error={l.error} every={5000} />
       </div>
       <p className="muted small">Opened when a host crosses a spam threshold in the policy. A host gets at most one open case per kind.</p>
+      <ModerationStrip open={counts.open ?? 0} />
       <div className="toolbar">
         <div className="chips" role="group" aria-label="Status">
           {FILTERS.map((f) => (

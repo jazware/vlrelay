@@ -1,12 +1,13 @@
-//! Serves the built dashboard (`ui/dist`): `/admin` and everything under it
-//! that isn't `/admin/api` gets index.html, `/assets/*` and `/fonts/*` are files.
+//! Serves the built dashboard (`ui/dist`): `/` (the public page), `/admin`
+//! and everything under it that isn't `/admin/api`, and `/docs/*`, get
+//! index.html; `/assets/*` and `/fonts/*` are files.
 
 use axum::{
     Router,
     body::Bytes,
     extract::{Path as AxPath, State},
     http::{HeaderValue, StatusCode, header},
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use std::{collections::HashMap, path::Path, sync::Arc};
@@ -71,10 +72,22 @@ fn walk(root: &Path, dir: &Path, out: &mut HashMap<String, (Bytes, HeaderValue)>
 
 pub fn ui_routes(ui: Arc<UiFiles>) -> Router {
     Router::new()
-        .route("/", get(|| async { Redirect::temporary("/admin") }))
         .route("/admin", get(shell))
         .route("/admin/", get(shell))
         .route("/admin/{*rest}", get(shell))
+        .with_state(ui.clone())
+        .merge(docs_routes(ui))
+}
+
+/// The public page, the docs site and the files they load. Public, so a
+/// node serves them even without `--admin-token`: the shell is static, and
+/// only `/admin/api` holds data (`/api/public/stats` is an allow-list).
+pub fn docs_routes(ui: Arc<UiFiles>) -> Router {
+    Router::new()
+        .route("/", get(shell))
+        .route("/docs", get(shell))
+        .route("/docs/", get(shell))
+        .route("/docs/{*rest}", get(shell))
         .route("/assets/{*path}", get(asset))
         .route("/fonts/{*path}", get(asset))
         .route("/favicon.svg", get(asset))

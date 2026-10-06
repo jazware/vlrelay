@@ -11,6 +11,8 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
+mod extra;
+
 const HOST_SHARDS: usize = 64;
 const DID_SHARDS: usize = 256;
 const NODES: [&str; 3] = ["relay-a", "relay-b", "relay-c"];
@@ -21,6 +23,8 @@ const EVENT_BYTES: f64 = 4_600.0;
 
 pub struct Demo {
     sim: Mutex<Sim>,
+    /// Always locked after `sim` when both are held.
+    extra: Mutex<extra::Extra>,
 }
 
 impl Demo {
@@ -33,7 +37,8 @@ impl Demo {
             sim.tick(start - i * 1000);
         }
         sim.tick(start);
-        let demo = Arc::new(Demo { sim: Mutex::new(sim) });
+        let extra = extra::Extra::new(start, sim.last_seq);
+        let demo = Arc::new(Demo { sim: Mutex::new(sim), extra: Mutex::new(extra) });
         let weak = Arc::downgrade(&demo);
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_secs(1));
@@ -1318,6 +1323,69 @@ impl AdminSource for Demo {
         Ok(())
     }
 
+    async fn quorum(&self) -> AdminResult<QuorumView> {
+        let s = self.sim.lock();
+        let ev = s.history.back().map_or(0.0, |x| x.ev_in);
+        Ok(self.extra.lock().view(s.last_seq, s.now_ms, ev))
+    }
+
+    async fn change_quorum_members(&self, req: QuorumMembersChange, _by: &str) -> AdminResult<serde_json::Value> {
+        let s = self.sim.lock();
+        self.extra.lock().change(req, s.last_seq, s.now_ms)
+    }
+
+    async fn settings(&self) -> AdminResult<SettingsView> {
+        Ok(self.extra.lock().settings())
+    }
+
+    async fn full_policy(&self) -> AdminResult<FullPolicyDoc> {
+        let s = self.sim.lock();
+        let x = self.extra.lock();
+        Ok(FullPolicyDoc {
+            version: s.policy.version,
+            updated_at_ms: x.full_at_ms.max(s.policy.updated_at_ms),
+            updated_by: x.full_by.clone(),
+            note: x.full_note.clone(),
+            policy: x.full.clone(),
+        })
+    }
+
+    async fn update_full_policy(&self, u: FullPolicyUpdate, by: &str) -> AdminResult<FullPolicyDoc> {
+        let body: crate::policy::doc::PolicyBody =
+            serde_json::from_value(u.policy).map_err(|e| AdminError::BadRequest(format!("policy: {e}")))?;
+        crate::policy::doc::validate(&body).map_err(|e| AdminError::BadRequest(e.join("; ")))?;
+        let new = serde_json::to_value(&body).map_err(anyhow::Error::from)?;
+        let mut s = self.sim.lock();
+        let mut x = self.extra.lock();
+        if u.base_version != s.policy.version {
+            return Err(AdminError::Conflict(format!(
+                "the policy is at version {} (you edited {}): reload and reapply your change",
+                s.policy.version, u.base_version
+            )));
+        }
+        let changes = diff_json(&x.full, &new);
+        if changes.is_empty() {
+            return Err(AdminError::BadRequest("nothing changed".into()));
+        }
+        let now = s.now_ms;
+        s.policy.version += 1;
+        s.policy.updated_at_ms = now;
+        s.policy.updated_by = by.into();
+        let version = s.policy.version;
+        s.audit.push(PolicyAudit { version, at_ms: now, by: by.into(), note: u.note.clone(), changes });
+        x.full = new;
+        x.full_at_ms = now;
+        x.full_by = by.into();
+        x.full_note = u.note;
+        Ok(FullPolicyDoc {
+            version,
+            updated_at_ms: now,
+            updated_by: by.into(),
+            note: x.full_note.clone(),
+            policy: x.full.clone(),
+        })
+    }
+
     async fn cluster(&self) -> AdminResult<ClusterView> {
         let s = self.sim.lock();
         let now = s.now_ms;
@@ -1490,5 +1558,36 @@ mod tests {
             d.update_policy(PolicyUpdate { base_version: p.version, policy: np, note: String::new() }, "admin").await;
         assert!(matches!(stale, Err(AdminError::Conflict(_))));
         assert_eq!(d.policy_audit().await.unwrap()[0].changes, vec!["spam.rejectRatio: 0.2 → 0.3".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn quorum_members_and_tuning() {
+        let d = Demo::start(7);
+        let q = d.quorum().await.unwrap();
+        assert_eq!(q.nodes.len(), 3);
+        let leader = q.nodes.iter().filter_map(|n| n.status.as_ref()).find(|s| s["role"] == "leader").unwrap();
+        assert_eq!(leader["members"].as_array().unwrap().len(), 3);
+        let add = |m: &[&str], addrs: &[(&str, &str)]| QuorumMembersChange {
+            members: m.iter().map(|s| s.to_string()).collect(),
+            addrs: addrs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        };
+        let want = ["relay-a", "relay-b", "relay-c", "relay-d"];
+        assert!(matches!(d.change_quorum_members(add(&want, &[]), "admin").await, Err(AdminError::BadRequest(_))));
+        d.change_quorum_members(add(&want, &[("relay-d", "10.0.7.14:2981")]), "admin").await.unwrap();
+        let q = d.quorum().await.unwrap();
+        assert!(q.nodes.iter().any(|n| n.node == "relay-d"));
+
+        let f = d.full_policy().await.unwrap();
+        let mut p = f.policy.clone();
+        p["consumers"]["connectionsPerIp"] = serde_json::json!(32);
+        let u = FullPolicyUpdate { base_version: f.version, policy: p.clone(), note: "t".into() };
+        let n = d.update_full_policy(u, "admin").await.unwrap();
+        assert_eq!(n.version, f.version + 1);
+        assert_eq!(d.policy().await.unwrap().version, n.version);
+        let stale = FullPolicyUpdate { base_version: f.version, policy: p, note: String::new() };
+        assert!(matches!(d.update_full_policy(stale, "admin").await, Err(AdminError::Conflict(_))));
+
+        let s = d.settings().await.unwrap();
+        assert!(s.entries.iter().filter(|e| e.secret).all(|e| e.value.is_none()));
     }
 }

@@ -51,6 +51,7 @@ pub struct NodeAdmin {
     /// (when read, windows, checkpoint time): the stored PLC checkpoint,
     /// which only changes every 10 s.
     plc_ck: Mutex<Option<(Instant, Vec<admin::PlcWindow>, i64)>>,
+    settings: Option<admin::SettingsView>,
 }
 
 const OPEN_CASES_TTL: Duration = Duration::from_secs(10);
@@ -67,7 +68,14 @@ impl NodeAdmin {
             process: Process::default(),
             plc_rate: Rate::default(),
             plc_ck: Mutex::new(None),
+            settings: None,
         }
+    }
+
+    /// The process's effective config, for the Settings page.
+    pub fn with_settings(mut self, s: admin::SettingsView) -> NodeAdmin {
+        self.settings = Some(s);
+        self
     }
 
     /// Edges and replicas to poll (their public URLs), with the admin token
@@ -964,6 +972,16 @@ impl AdminSource for NodeAdmin {
         tracing::info!(target: "vlrelay::audit", consumer = id, node = n, by, "consumer kicked");
         Ok(())
     }
+
+    async fn settings(&self) -> AdminResult<admin::SettingsView> {
+        self.settings.clone().ok_or_else(|| AdminError::NotFound("this node doesn't report its config".into()))
+    }
+
+    // TODO(qlog wiring): once a relay node runs the quorum log, answer
+    // `quorum` from each member's `/qlog/status` (addrs from `qlog/leader`,
+    // never `?reset=true`) and forward `change_quorum_members` to the
+    // leader's `POST /qlog/members`. Until then the trait's defaults say
+    // the relay doesn't run one, and the public page leaves quorum out.
 
     async fn cluster(&self) -> AdminResult<admin::ClusterView> {
         match &self.node.cluster {

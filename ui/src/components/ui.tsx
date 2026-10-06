@@ -246,15 +246,20 @@ export function ThemeToggle() {
   )
 }
 
-export function Topbar({ where, children }: { where?: string; children?: ReactNode }) {
+/** `console`: the operator console's bar, which has its own tabs instead of the public links. */
+export function Topbar({ where, console, children }: { where?: string; console?: boolean; children?: ReactNode }) {
   return (
     <>
       <header className="topbar">
-        <Link to="/admin" className="wordmark" aria-label="vlRelay console">
+        <Link to="/" className="wordmark" aria-label="vlRelay home">
           <I.Mark />
           vlRelay
           {where && <span className="where">{where}</span>}
         </Link>
+        <nav className="topnav" aria-label="Site">
+          <Link to="/docs">Docs</Link>
+          {!console && <Link to="/admin">Console</Link>}
+        </nav>
         <div className="spacer" />
         {children}
         <ThemeToggle />

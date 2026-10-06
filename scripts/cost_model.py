@@ -20,8 +20,8 @@ MIB = 1 << 20
 
 # ---------------------------------------------------------------- inputs
 FRAME_B = 5_300            # mean frame, reference-notes.md "Frame sizes and rates" (5,283-5,323 B)
-ZSTD_RATIO = 1.56          # zstd -1 on production frames, perf.md iteration 5
-FWD_EXTRA_B = 90           # forward hop adds DID, host, seq, meta: perf.md iteration 6
+ZSTD_RATIO = 1.56          # zstd -1 on production frames, perf-log.md iteration 5
+FWD_EXTRA_B = 90           # forward hop adds DID, host, seq, meta: perf-log.md iteration 6
 RATE_AVG = 350             # events/s, 7-day average, reference-notes.md (ClickHouse repo_records)
 RATE_PEAK_HOUR = 480
 RATE_LOW_HOUR = 180

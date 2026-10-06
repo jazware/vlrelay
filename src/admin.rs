@@ -8,6 +8,8 @@
 pub mod demo;
 mod diff;
 pub mod fleet;
+pub mod public;
+pub mod settings;
 mod ui;
 
 use axum::{
@@ -22,7 +24,9 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 pub use diff::diff_json;
-pub use ui::{UiFiles, ui_routes};
+pub use public::{PublicStats, public_routes};
+pub use settings::{ConfigEntry, SettingsView};
+pub use ui::{UiFiles, docs_routes, ui_routes};
 
 // ---------------------------------------------------------------- shared enums
 
@@ -494,6 +498,39 @@ pub struct NodeView {
     pub stream_seq: i64,
 }
 
+/// The quorum log as every node reports it (`/qlog/status`, docs/quorum.md).
+/// `status` is passed through as the node serialized it, so a field the log
+/// adds shows up without a change here; `ui/src/lib/api.ts` mirrors it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuorumView {
+    pub nodes: Vec<QuorumNode>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuorumNode {
+    pub node: String,
+    pub addr: String,
+    /// It didn't answer this round; `status` is None.
+    pub stale: bool,
+    pub error: Option<String>,
+    /// When `status` was read (unix ms): the last contact.
+    pub reported_ms: i64,
+    pub status: Option<serde_json::Value>,
+}
+
+/// A membership change, forwarded to the leader's `POST /qlog/members`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuorumMembersChange {
+    /// The whole member set wanted.
+    pub members: Vec<String>,
+    /// Addresses for nodes the leader can't dial yet.
+    #[serde(default)]
+    pub addrs: BTreeMap<String, String>,
+}
+
 // ---------------------------------------------------------------- accounts
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -963,6 +1000,29 @@ pub trait AdminSource: Send + Sync + 'static {
     }
 
     fn cluster(&self) -> impl Future<Output = AdminResult<ClusterView>> + Send;
+    fn quorum(&self) -> impl Future<Output = AdminResult<QuorumView>> + Send {
+        async { Err(AdminError::NotFound("this relay doesn't run the quorum log".into())) }
+    }
+    /// The leader's status after the change.
+    fn change_quorum_members(
+        &self,
+        _req: QuorumMembersChange,
+        _by: &str,
+    ) -> impl Future<Output = AdminResult<serde_json::Value>> + Send {
+        async { Err(AdminError::NotFound("this relay doesn't run the quorum log".into())) }
+    }
+    fn settings(&self) -> impl Future<Output = AdminResult<SettingsView>> + Send {
+        async { Err(AdminError::NotFound("this relay doesn't report its config".into())) }
+    }
+    /// The public page's numbers; see [`public::project`] for why it's a
+    /// projection and not its own query.
+    fn public_stats(&self) -> impl Future<Output = AdminResult<PublicStats>> + Send {
+        async {
+            let o = self.overview().await?;
+            let q = self.quorum().await.ok();
+            Ok(public::project(&o, q.as_ref()))
+        }
+    }
     /// The DID shard layout: version, shards (id, slots, owner), the op in flight.
     fn shard_layout(&self) -> impl Future<Output = AdminResult<serde_json::Value>> + Send {
         async { Err(no_cluster()) }
@@ -1012,6 +1072,10 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
         .route("/admin/api/consumers", get(consumers::<S>))
         .route("/admin/api/consumers/{id}/kick", post(kick::<S>))
         .route("/admin/api/cluster", get(cluster::<S>))
+        .route("/admin/api/cluster/quorum", get(quorum::<S>))
+        .route("/admin/api/cluster/quorum/members", post(quorum_members::<S>))
+        .route("/admin/api/settings", get(settings::<S>))
+        .route("/admin/api/policy/defaults", get(policy_defaults))
         .route("/admin/api/ops/archive", get(archive_view::<S>))
         .route("/admin/api/ops/plc", get(plc_view::<S>))
         .route("/admin/api/ops/seq", get(seq_view::<S>))
@@ -1139,6 +1203,26 @@ async fn pipeline_view<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Pipe
 async fn cluster<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<ClusterView>> {
     Ok(Json(c.src.cluster().await?))
 }
+async fn quorum<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<QuorumView>> {
+    Ok(Json(c.src.quorum().await?))
+}
+async fn quorum_members<S: AdminSource>(
+    State(c): Ax<S>,
+    Json(req): Json<QuorumMembersChange>,
+) -> AdminResult<Json<serde_json::Value>> {
+    if req.members.is_empty() || req.members.iter().any(|m| m.trim().is_empty()) {
+        return Err(AdminError::BadRequest("members must be a non-empty list of node ids".into()));
+    }
+    tracing::info!(target: "vlrelay::audit", members = ?req.members, by = BY, "quorum members");
+    Ok(Json(c.src.change_quorum_members(req, BY).await?))
+}
+async fn settings<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<SettingsView>> {
+    Ok(Json(c.src.settings().await?))
+}
+/// What every policy field is on a fresh relay, for the Tuning page.
+async fn policy_defaults() -> AdminResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::to_value(crate::policy::doc::PolicyBody::default()).map_err(anyhow::Error::from)?))
+}
 async fn shard_layout<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<serde_json::Value>> {
     Ok(Json(c.src.shard_layout().await?))
 }
@@ -1212,7 +1296,7 @@ pub fn validate_policy(p: &Policy) -> Result<(), String> {
     Ok(())
 }
 
-/// The demo binary's whole app: API plus UI.
+/// The dashboard's whole app: the operator API, the public stats and the UI.
 pub fn app<S: AdminSource>(src: Arc<S>, admin_token: String, ui: Arc<UiFiles>) -> Router {
-    api_routes(src, admin_token).merge(ui_routes(ui))
+    api_routes(src.clone(), admin_token).merge(public_routes(src)).merge(ui_routes(ui))
 }
