@@ -64,7 +64,7 @@ if [ -n "$bucket" ]; then
 fi
 start_relay() {
   dev/capped.sh "${RELAY_MEM_MB:-4096}" "$target/vlrelay" \
-    --listen "127.0.0.1:$RELAY_PORT" $store_flags --plc-url "http://127.0.0.1:$PLC_PORT" --linger-ms 25 \
+    --listen "127.0.0.1:$RELAY_PORT" $store_flags --plc-url "http://127.0.0.1:$PLC_PORT" --qlog-listen 127.0.0.1:0 \
     $(sed 's/^/--host /' ${DEV_STATE:-dev/state}/hosts | tr '\n' ' ') >>"$out/relay.log" 2>&1 &
   relay_pid=$!
   pids+=($relay_pid)

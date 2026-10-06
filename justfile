@@ -58,7 +58,7 @@ dev-load rate="20" duration="0" *args:
 relay *args:
     cargo build --quiet --bin vlrelay
     source dev/ports.sh && dev/capped.sh ${RELAY_MEM_MB:-4096} {{bin}}/vlrelay \
-        --listen 127.0.0.1:$RELAY_PORT --memory --plc-url http://127.0.0.1:$PLC_PORT --linger-ms 25 \
+        --listen 127.0.0.1:$RELAY_PORT --memory --plc-url http://127.0.0.1:$PLC_PORT --qlog-listen 127.0.0.1:0 \
         $(sed 's/^/--host /' dev/state/hosts | tr '\n' ' ') {{args}}
 
 # Compare a relay's firehose with every local upstream's (e2e_check; extra flags e.g. --duration 60)
@@ -79,29 +79,17 @@ e2e *args:
 e2e-policy *args:
     tests/e2e/policy.sh {{args}}
 
-# Archival e2e: archive off -> all mid-load, a forced desync, then every account's getRepo vs its PDS (tests/e2e/archival.sh)
-e2e-archival *args:
-    tests/e2e/archival.sh {{args}}
-
-# Cluster e2e: 3 core relays + an edge + a replica on one prefix, kill -9 / SIGTERM / rejoin under load (tests/e2e/cluster.sh)
-e2e-cluster *args:
-    tests/e2e/cluster.sh {{args}}
-
-# Reshard e2e: 3 cores with archival and PLC seeding, a DID shard split and merged under load (tests/e2e/reshard.sh)
-e2e-reshard *args:
-    tests/e2e/reshard.sh {{args}}
-
 # Ecosystem compat: vlRelay beside indigo's relay with goat, indigo's consumer, @atproto/sync and Jetstream on both (docs/compat.md)
 compat *args:
     tests/compat/run.sh {{args}}
 
-# Chaos: the cluster under faults (kill -9, zombies, bucket latency/errors, partitions, upstream and consumer faults), invariants checked after (tests/chaos/chaos.sh, docs/chaos.md; `just chaos list`)
-chaos scenario *args:
-    tests/chaos/chaos.sh {{scenario}} {{args}}
-
 # The quorum log under kill -9, partitions and SIGSTOP on a local 3-node cluster, every node's stream checked (tests/qlog/chaos.sh, docs/quorum.md "Implementation notes"; `just qlog-chaos list`)
 qlog-chaos scenario *args:
     tests/qlog/chaos.sh {{scenario}} {{args}}
+
+# The relay on the quorum log under chaos: fakepds -> three relays -> every node's stream checked, the manifest verified and every upstream event matched (tests/qlog/relay-chaos.sh; `just relay-chaos list`)
+relay-chaos scenario *args:
+    tests/qlog/relay-chaos.sh {{scenario}} {{args}}
 
 # ---- benchbox (scripts/benchbox.sh) --------------------------------------------
 

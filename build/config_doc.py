@@ -17,44 +17,25 @@ SECTIONS = [
     ),
     (
         "Upstreams and identity",
-        "`--host` and `--crawl` work on any core node of a cluster, since the host registry is in the bucket.",
+        "`--host` and `--crawl` work on any member: a host admitted anywhere goes into the leader's host table, "
+        "and the leader gives it to a member.",
         ["host", "crawl", "host-tier", "plc-url", "dev-mode", "did-lookups-per-sec"],
     ),
+    ("Pipeline and serving", "", ["lanes", "ingest-threads", "ring-mb", "max-lag-mb", "log-compression"]),
     (
-        "PLC export seeding",
-        "A cold relay would resolve each of ~56M accounts once at the PLC lookup budget (about 31 h at 500/s). "
-        "With `--plc-export` it reads the directory's `/export` instead and keeps each did:plc's key and PDS "
-        "in its DID shard, so a cache miss costs no lookup. The cursors checkpoint to "
-        "`plc/export-checkpoint.json` in the bucket, so a restart resumes; once caught up it follows the "
-        "export's tail. A signature that fails against a seeded key, and every `#identity`, still resolve "
-        "from PLC ([Policy](../policy.md#plc-export-seeding)).",
-        ["plc-export", "plc-export-url", "plc-export-rate", "plc-export-streams"],
-    ),
-    (
-        "Log",
-        "Time to firehose is about linger plus one segment PUT. Above ~50k events/s segments seal on size "
-        "before the linger is up ([Performance](../perf.md)).",
-        ["linger-ms", "log-inflight", "max-segment-mb", "log-compression", "retention"],
-    ),
-    ("Pipeline and state", "", ["did-shards", "lanes", "ingest-threads"]),
-    (
-        "Quorum cluster",
-        "With `--quorum` the node is a member of a quorum cluster (one member is a single node with its "
-        "commitlog as the WAL). Every member uses the same bucket and `--prefix` "
-        "([Quorum cluster](../quorum-cluster.md)).",
-        ["quorum", "qlog-listen", "qlog-peer", "qlog-members", "qlog-dir", "qlog-flush-ms", "qlog-headroom",
+        "Quorum log",
+        "Every member uses the same bucket and `--prefix`. A node with no `--qlog-peer` is a single node with "
+        "its commitlog as the WAL ([Cluster](../cluster.md)).",
+        ["node-id", "qlog-listen", "qlog-peer", "qlog-members", "qlog-dir", "qlog-flush-ms", "qlog-headroom",
          "qlog-admin-token", "qlog-retain-hours", "qlog-retain-secs", "qlog-retain-every-secs",
          "qlog-host-failover-ms", "qlog-host-poll-ms", "qlog-election-ms", "qlog-heartbeat-ms",
          "qlog-state-compactor-poll-ms", "qlog-no-auto-recover", "qlog-segment-mb", "qlog-disk-retain-mb",
-         "qlog-memory-mb", "qlog-crash-at", "qlog-crash-prob", "qlog-crash-stop-file", "qlog-power-cut-on-usr1",
-         "qlog-fsync-delay-us"],
+         "qlog-memory-mb"],
     ),
     (
-        "Lease cluster",
-        "The first cluster, kept for comparison: it runs only with `--legacy-cluster`. Without `--cluster` or `--role` the node runs alone. Core and edge nodes need `--peer-tls-dir` and "
-        "`--internal-token`, and a replica needs neither ([Deploy](deploy.md#a-cluster), [Cluster](../cluster.md)).",
-        ["node-id", "legacy-cluster", "cluster", "role", "peer-listen", "advertise-url", "peer-tls-dir", "internal-token",
-         "lease-ttl-ms", "host-shards"],
+        "Chaos",
+        "For the chaos harness (`tests/qlog/relay-chaos.sh`); never on a production node.",
+        ["qlog-crash-at", "qlog-crash-prob", "qlog-crash-stop-file", "qlog-power-cut-on-usr1", "qlog-fsync-delay-us"],
     ),
 ]
 
@@ -67,15 +48,15 @@ summary: "Every flag of vlrelay and its env var, generated from vlrelay --help b
 
 ```hero
 diagram:
-  caption: One binary, configured by flags or env vars. The bucket and the prefix are the relay's identity. Everything else is how this node serves, which upstreams it starts with, how its log seals segments, and its place in a cluster.
+  caption: One binary, configured by flags or env vars. The bucket and the prefix are the relay's identity. Everything else is how this node serves, which upstreams it starts with, and its place in the quorum log.
   nodes:
     - { id: bin, label: vlrelay, sub: flags · VLRELAY_* env, at: [14, 4.5], size: [9, 3], tone: accent }
     - { id: serve, label: Serving, sub: "--listen · --admin-token", at: [0, 0], size: [10, 3], tone: blue }
-    - { id: up, label: Upstreams, sub: "--host · --crawl · --plc-export", at: [0, 4.5], size: [10, 3], tone: muted }
-    - { id: clu, label: Cluster, sub: "--role · --peer-tls-dir", at: [0, 9], size: [10, 3], tone: accent }
+    - { id: up, label: Upstreams, sub: "--host · --crawl", at: [0, 4.5], size: [10, 3], tone: muted }
+    - { id: clu, label: Quorum log, sub: "--qlog-peer · --qlog-dir", at: [0, 9], size: [10, 3], tone: accent }
     - { id: bucket, label: Bucket, sub: "--s3-* · --prefix", at: [27, 0], size: [10, 3], shape: store, tone: amber }
-    - { id: log, label: Log, sub: "--linger-ms · --retention", at: [27, 4.5], size: [10, 3], tone: amber }
-    - { id: pipe, label: Pipeline, sub: "--did-shards · --lanes", at: [27, 9], size: [10, 3], tone: accent }
+    - { id: log, label: Flush, sub: "--qlog-flush-ms · --qlog-retain-hours", at: [27, 4.5], size: [10, 3], tone: amber }
+    - { id: pipe, label: Pipeline, sub: "--lanes · --ingest-threads", at: [27, 9], size: [10, 3], tone: accent }
   edges:
     - serve.r -> bin.l30
     - up.r -> bin.l
@@ -85,14 +66,14 @@ diagram:
     - bin.r70 -> pipe.l
 facts:
   - { value: "2980", label: the public port, note: "`--listen`; the image binds 0.0.0.0", tone: accent }
-  - { value: "25", unit: ms, label: segment linger, note: "`--linger-ms`; time to firehose is about linger plus one PUT", tone: amber }
-  - { value: "72", unit: h, label: of log for cursor replay, note: "`--retention`", tone: blue }
+  - { value: "30", unit: s, label: bucket flush, note: "`--qlog-flush-ms`; the log, the records and the hosts at one seq", tone: amber }
+  - { value: "72", unit: h, label: of log for cursor replay, note: "`--qlog-retain-hours`", tone: blue }
   - { value: "flag", label: wins over its env var, note: "pass secrets as env vars; --help never prints them", tone: violet }
 ```
 
 Every flag of `vlrelay`, generated from `vlrelay --help` by `just config-doc` (`build/config_doc.py`).
 Flags with an env var can be set either way, and the flag wins. Secrets (`--s3-secret-key`,
-`--admin-token`, `--internal-token`) are best passed as env vars, and `--help` never prints their
+`--admin-token`, `--qlog-admin-token`) are best passed as env vars, and `--help` never prints their
 values.
 
 The image sets `VLRELAY_LISTEN=0.0.0.0:2980` and passes `--ui-dir /usr/share/vlrelay/ui` in its

@@ -1,20 +1,14 @@
 //! The per-DID record and its key, kept compact: at 56M DIDs every byte is
 //! ~56 MB of keys in the bucket and in the caches.
 //!
-//! Keys are slot-major like vlpds's (`0x01 ‖ slot ‖ family ‖ rest`), so a
-//! shard's slot range is one contiguous key range and vlpds's split/merge
-//! clone works on these DBs as is.
+//! Keys are slot-major like vlpds's (`0x01 ‖ slot ‖ family ‖ rest`), so
+//! `listRepos` pages are one range scan. The quorum state holds them beside
+//! its own keys (`_applied`, `c/` cursors, `h/` the host table).
 //!
 //! ```text
 //! 0x01 slot 'd' 'p' <15 bytes>     did:plc (the 24 base32 chars, decoded)
 //! 0x01 slot 'd' 'w' <utf-8>        any other DID, minus its "did:" prefix
-//! 0x02 slot <hostname>             host record (slot of the hostname)
-//! meta/applied/<log id>            u64 BE: last log ordinal applied
 //! ```
-//!
-//! Host rows get their own tag so a shard's hosts are one short scan, not a
-//! walk over its DIDs. A split/merge clone carries every tag
-//! ([`super::RESHARD_FAMILIES`]).
 
 use bytes::{BufMut, Bytes};
 use sha2::{Digest, Sha256};
@@ -23,7 +17,6 @@ use vlpds::state::{SLOT_PREFIX_LEN, slot_prefix};
 use vlpds::tid::Tid;
 
 pub const DID_FAMILY: u8 = b'd';
-pub const HOST_TAG: u8 = 0x02;
 const DID_PLC: u8 = b'p';
 const DID_OTHER: u8 = b'w';
 const PLC_PREFIX: &str = "did:plc:";
@@ -104,37 +97,9 @@ pub fn did_family_start(slot: u16) -> Vec<u8> {
     k
 }
 
-pub fn host_key(hostname: &str) -> Vec<u8> {
-    let mut k = host_slot_key(vlpds::slots::slot_of(hostname) as u32);
-    k.extend_from_slice(hostname.as_bytes());
-    k
-}
-
-/// The first host key of `slot`; `slot` 65,536 is the end of every host.
-pub fn host_slot_key(slot: u32) -> Vec<u8> {
-    if slot >= vlpds::slots::SLOTS {
-        return vec![HOST_TAG + 1];
-    }
-    let [a, b] = (slot as u16).to_be_bytes();
-    vec![HOST_TAG, a, b]
-}
-
-/// Host rows of slots [lo, hi).
-pub fn host_range_keys(lo: u32, hi: u32) -> (Bytes, Bytes) {
-    (host_slot_key(lo).into(), host_slot_key(hi).into())
-}
-
-pub fn host_from_key(key: &[u8]) -> Option<&str> {
-    (key.len() > 3 && key[0] == HOST_TAG).then(|| std::str::from_utf8(&key[3..]).ok()).flatten()
-}
-
-pub fn applied_key(log_id: &str) -> Vec<u8> {
-    format!("meta/applied/{log_id}").into_bytes()
-}
-
 /// A host by the first 8 bytes of sha256(hostname): fixed width in every
-/// record, and nothing to allocate or coordinate across shards. Names come
-/// back from host records.
+/// record, and nothing to allocate or coordinate. Names come back from the
+/// events that carried them.
 ///
 /// Host authority compares these, so a hostname whose key equals a real
 /// PDS's would pass as it. 64 bits holds: matching one given host is a
@@ -499,13 +464,4 @@ impl<'a> Reader<'a> {
         }
         Err(DecodeError)
     }
-    pub fn str(&mut self) -> Result<&'a str, DecodeError> {
-        let n = self.varint()? as usize;
-        std::str::from_utf8(self.take(n)?).map_err(|_| DecodeError)
-    }
-}
-
-pub(crate) fn put_str(b: &mut Vec<u8>, s: &str) {
-    put_varint(b, s.len() as u64);
-    b.extend_from_slice(s.as_bytes());
 }

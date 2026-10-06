@@ -1,14 +1,13 @@
-//! Cluster-wide numbers for the dashboard. Each node reports its own
-//! ([`NodeReport`], over the peer admin RPC in `node::peer_admin`) and the
-//! node answering the dashboard adds them up here. A node that didn't
+//! The dashboard's numbers from node reports. Each node reports its own
+//! ([`NodeReport`]) and the dashboard's views add the reports up here; a
+//! node's dashboard has its own report. A node that didn't
 //! answer is a [`Member`] with no report: it's listed as stale with zeros,
 //! and left out of every sum, so the totals always equal the sum of the
 //! rows shown beside them.
 
 use super::{
-    ArchiveCounts, ArchiveError, ArchiveNode, ArchiveView, ClusterView, History, HostRow, HostStatus, NodeTotals,
-    NodeView, Overview, PipelineHost, PipelineNode, PipelineView, PlcNode, PlcView, PlcWindow, RejectReason,
-    SeqBoundary, SeqNode, SeqPair, SeqView,
+    ClusterView, History, HostRow, HostStatus, NodeTotals, NodeView, Overview, PipelineHost, PipelineNode,
+    PipelineView, PlcNode, PlcView, PlcWindow, RejectReason,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -18,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[serde(rename_all = "camelCase")]
 pub struct NodeReport {
     pub node: String,
-    /// `core`, `edge`, `replica` or `single`.
+    /// `leader`, `follower` or `candidate` (the quorum log's role).
     pub role: String,
     pub version: String,
     pub time_ms: i64,
@@ -41,20 +40,7 @@ pub struct NodeReport {
     pub history: History,
     pub pipeline: PipelineNode,
     pub pipeline_hosts: Vec<PipelineHost>,
-    pub archive: Option<ArchiveReport>,
     pub plc: Option<PlcReport>,
-    /// Its newest (key, seq) stream checkpoints, oldest first.
-    pub seq_checkpoints: Vec<(i64, i64)>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ArchiveReport {
-    pub mode: String,
-    pub policy_version: u64,
-    pub counts: ArchiveCounts,
-    /// (did, error), newest last.
-    pub errors: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -339,43 +325,6 @@ pub fn merge_hosts(
     out.into_values().collect()
 }
 
-pub fn archive_view(members: &[Member]) -> Option<ArchiveView> {
-    let with: Vec<&Member> =
-        members.iter().filter(|m| m.role == "core" || m.role == "single" || m.report.is_none()).collect();
-    let first = fresh(members).filter_map(|r| r.archive.as_ref()).max_by_key(|a| a.policy_version)?;
-    let mut v = ArchiveView { mode: first.mode.clone(), policy_version: first.policy_version, ..Default::default() };
-    for m in with {
-        let a = m.report.as_ref().and_then(|r| r.archive.as_ref());
-        if m.report.is_some() && a.is_none() {
-            continue;
-        }
-        let counts = a.map(|a| a.counts.clone()).unwrap_or_default();
-        let t = &mut v.totals;
-        t.mirrored += counts.mirrored;
-        t.queued += counts.queued;
-        t.running += counts.running;
-        t.failed += counts.failed;
-        t.fetched += counts.fetched;
-        t.retried += counts.retried;
-        t.bytes += counts.bytes;
-        t.records += counts.records;
-        t.sst_bytes += counts.sst_bytes;
-        t.applied += counts.applied;
-        t.mismatches += counts.mismatches;
-        t.healed += counts.healed;
-        t.swept_at_ms = t.swept_at_ms.max(counts.swept_at_ms);
-        if let Some(a) = a {
-            for (did, error) in &a.errors {
-                v.errors.push(ArchiveError { node: m.id.clone(), did: did.clone(), error: error.clone() });
-            }
-        }
-        v.nodes.push(ArchiveNode { node: m.id.clone(), stale: m.is_stale(), counts });
-    }
-    let keep = v.errors.len().saturating_sub(64);
-    v.errors.drain(..keep);
-    Some(v)
-}
-
 pub fn plc_view(members: &[Member]) -> PlcView {
     let mut v = PlcView::default();
     for m in members {
@@ -419,40 +368,6 @@ pub fn plc_view(members: &[Member]) -> PlcView {
         }
     }
     v
-}
-
-pub fn seq_pair(key: i64, seq: i64) -> SeqPair {
-    SeqPair { key, time_ms: (key >> 8) / 1000, seq }
-}
-
-/// Lines up every node's checkpoints by boundary. A boundary two nodes
-/// counted differently means they numbered the stream differently.
-pub fn seq_view(members: &[Member], boundaries: usize) -> SeqView {
-    let mut by_key: BTreeMap<i64, BTreeMap<String, i64>> = BTreeMap::new();
-    let mut nodes = Vec::new();
-    for m in members {
-        let r = m.report.as_ref();
-        for (k, s) in r.map(|r| r.seq_checkpoints.as_slice()).unwrap_or_default() {
-            by_key.entry(*k).or_default().insert(m.id.clone(), *s);
-        }
-        nodes.push(SeqNode {
-            node: m.id.clone(),
-            role: m.role.clone(),
-            stale: m.is_stale(),
-            head: r.map_or(0, |r| r.stream_seq),
-            latest: r.and_then(|r| r.seq_checkpoints.last()).map(|(k, s)| seq_pair(*k, *s)),
-        });
-    }
-    let all: Vec<SeqBoundary> = by_key
-        .into_iter()
-        .map(|(key, seqs)| {
-            let agree = seqs.values().collect::<BTreeSet<_>>().len() <= 1;
-            SeqBoundary { key, time_ms: (key >> 8) / 1000, seqs, agree }
-        })
-        .collect();
-    let agree = all.iter().all(|b| b.agree);
-    let boundaries = all.into_iter().rev().take(boundaries).collect();
-    SeqView { nodes, boundaries, agree }
 }
 
 pub fn pipeline_view(members: &[Member], hosts: usize) -> PipelineView {
@@ -673,49 +588,12 @@ mod tests {
     }
 
     #[test]
-    fn seq_checkpoints_agree_or_not() {
+    fn plc_takes_the_leaders_counters() {
         let mut a = report("n1", "core", 1.0, 0, 0);
-        a.seq_checkpoints = vec![(10 << 8, 5), (20 << 8, 9)];
-        let mut b = report("n2", "core", 1.0, 0, 0);
-        b.seq_checkpoints = vec![(20 << 8, 9), (30 << 8, 12)];
-        let v = seq_view(&[Member::ok(a.clone()), Member::ok(b.clone())], 10);
-        assert!(v.agree);
-        assert_eq!(v.boundaries.len(), 3);
-        assert_eq!(v.boundaries[0].key, 30 << 8);
-        assert_eq!(v.boundaries[1].seqs.len(), 2);
-        assert_eq!(v.nodes[1].latest, Some(seq_pair(30 << 8, 12)));
-
-        b.seq_checkpoints = vec![(20 << 8, 8)];
-        let v = seq_view(&[Member::ok(a), Member::ok(b), Member::stale("n3", "core", "down".into(), 0)], 10);
-        assert!(!v.agree);
-        assert!(!v.boundaries.iter().find(|x| x.key == 20 << 8).unwrap().agree);
-        assert!(v.nodes[2].stale);
-    }
-
-    #[test]
-    fn archive_and_plc_sum_cores_and_take_the_leader() {
-        let mut a = report("n1", "core", 1.0, 0, 0);
-        a.archive = Some(ArchiveReport {
-            mode: "all".into(),
-            policy_version: 3,
-            counts: ArchiveCounts { mirrored: 10, queued: 2, failed: 1, ..Default::default() },
-            errors: vec![("did:a".into(), "boom".into())],
-        });
         a.plc = Some(PlcReport { leader: true, ops: 500, ops_per_sec: 50.0, throttled: 2, ..Default::default() });
         let mut b = report("n2", "core", 1.0, 0, 0);
-        b.archive = Some(ArchiveReport {
-            mode: "all".into(),
-            policy_version: 3,
-            counts: ArchiveCounts { mirrored: 5, running: 1, ..Default::default() },
-            errors: vec![],
-        });
         b.plc = Some(PlcReport { leader: false, ops: 40, throttled: 1, ..Default::default() });
         let ms = [Member::ok(a), Member::ok(b), Member::stale("n3", "core", "down".into(), 0)];
-        let v = archive_view(&ms).unwrap();
-        assert_eq!((v.totals.mirrored, v.totals.queued, v.totals.running, v.totals.failed), (15, 2, 1, 1));
-        assert_eq!(v.nodes.len(), 3);
-        assert!(v.nodes[2].stale);
-        assert_eq!(v.errors[0].node, "n1");
         let p = plc_view(&ms);
         assert!(p.enabled);
         assert_eq!(p.leader.as_deref(), Some("n1"));

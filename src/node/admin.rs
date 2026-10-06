@@ -1,25 +1,22 @@
 //! The operator API over the node's real state: hosts and their actions,
 //! consumers, the overview's numbers and account lookups and takedowns.
 //! Policy, domain rules, cases and host tier actions go to the policy
-//! engine's admin half (`node::policy`). The cluster view is the real
-//! cluster on a cluster node (`node::cluster::Glue::view`) and the
-//! simulation on a single node.
+//! engine's admin half (`node::policy`). The cluster and Quorum views are
+//! the quorum log's members (`node::quorum::Glue`).
 //!
-//! On a cluster every number is the cluster's: this node reports its own
-//! (`local_*`) and asks every other member for theirs over the peer admin
-//! RPC (`node::peer_admin`), and `admin::fleet` adds them up. A host's
-//! detail and actions go to the node reading it, an account's to its DID
-//! shard's owner, a consumer's kick to the node serving it.
+//! Numbers are this node's own: the hosts it reads, its consumers, its
+//! rates. Other members' rates and hosts show in the cluster view (from
+//! their statuses); their consumers, host details and host actions are on
+//! their own dashboards. Accounts are the leader's records, so an account
+//! lookup or a takedown answers on any node only through the leader's log
+//! (takedowns) or on the leader itself (lookups).
 
 use super::Node;
 use super::metrics::HostSeries as Series;
-use super::peer_admin::{self, Fleet, Process, Rate, Target};
 use super::policy::PolicyHooks;
-use crate::admin::fleet::{self, ArchiveReport, Member, NodeReport, PlcReport};
+use crate::admin::fleet::{self, Member, NodeReport};
 use crate::admin::{self, AdminError, AdminResult, AdminSource, RejectReason, demo::Demo};
-use crate::cluster::ClusterNode;
 use crate::policy::admin::PolicyAdmin;
-use crate::seq::EventMeta;
 use crate::state::{AccountStatus, Upstream};
 use crate::types::Host;
 use crate::upstream::{HostStatus, HostView, Tier};
@@ -28,16 +25,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-fn layout_json(c: &vlpds::cluster::Cluster) -> serde_json::Value {
-    let l = c.layout();
-    let shards: Vec<serde_json::Value> = l
-        .shards
-        .iter()
-        .map(|r| serde_json::json!({"id": r.id, "lo": r.lo, "hi": r.hi, "owner": c.owner_of(r.id).map(|o| o.0)}))
-        .collect();
-    serde_json::json!({"version": l.version, "shards": shards, "nextId": l.next_id, "op": l.op})
-}
-
 pub struct NodeAdmin {
     pub node: Arc<Node>,
     pub policy: Arc<PolicyHooks>,
@@ -45,31 +32,59 @@ pub struct NodeAdmin {
     /// (when, open cases): the overview polls every second or two, and a
     /// count is a bucket listing.
     open_cases: Mutex<Option<(Instant, u32)>>,
-    pub fleet: Fleet,
-    process: Process,
-    plc_rate: Rate,
-    /// (when read, windows, checkpoint time): the stored PLC checkpoint,
-    /// which only changes every 10 s.
-    plc_ck: Mutex<Option<(Instant, Vec<admin::PlcWindow>, i64)>>,
+    cpu: Mutex<Option<(Instant, f64, f64)>>,
     settings: Option<admin::SettingsView>,
 }
 
 const OPEN_CASES_TTL: Duration = Duration::from_secs(10);
-const PLC_CK_TTL: Duration = Duration::from_secs(5);
+
+fn now_ms() -> i64 {
+    crate::upstream::host::now_ms() as i64
+}
+
+/// CPU seconds this process has used (user + system).
+fn cpu_seconds() -> f64 {
+    // SAFETY: getrusage fills the struct it's handed.
+    unsafe {
+        let mut r: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut r) != 0 {
+            return 0.0;
+        }
+        let s = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+        s(r.ru_utime) + s(r.ru_stime)
+    }
+}
+
+/// Every relay gauge about in-flight work, queues, backlogs, caps and
+/// pauses, by name and labels. Read by name so the ones the pipeline adds
+/// later show up without a change here.
+fn pipeline_gauges() -> BTreeMap<String, f64> {
+    const WORDS: [&str; 9] =
+        ["inflight", "in_flight", "pending", "queued", "backlog", "paused", "cap", "dedupe", "lag"];
+    let mut out = BTreeMap::new();
+    for fam in prometheus::gather() {
+        let name = fam.name();
+        if !name.starts_with("vlrelay_") || !WORDS.iter().any(|w| name.contains(w)) {
+            continue;
+        }
+        if fam.get_field_type() != prometheus::proto::MetricType::GAUGE {
+            continue;
+        }
+        for m in fam.get_metric() {
+            let labels: Vec<String> = m.get_label().iter().map(|l| format!("{}=\"{}\"", l.name(), l.value())).collect();
+            let key = if labels.is_empty() { name.to_string() } else { format!("{name}{{{}}}", labels.join(",")) };
+            out.insert(key, m.get_gauge().get_value());
+            if out.len() >= 200 {
+                return out;
+            }
+        }
+    }
+    out
+}
 
 impl NodeAdmin {
     pub fn new(node: Arc<Node>, policy: Arc<PolicyHooks>, demo: Arc<Demo>) -> NodeAdmin {
-        NodeAdmin {
-            node,
-            policy,
-            demo,
-            open_cases: Mutex::new(None),
-            fleet: Fleet::new(Vec::new(), String::new()),
-            process: Process::default(),
-            plc_rate: Rate::default(),
-            plc_ck: Mutex::new(None),
-            settings: None,
-        }
+        NodeAdmin { node, policy, demo, open_cases: Mutex::new(None), cpu: Mutex::new(None), settings: None }
     }
 
     /// The process's effective config, for the Settings page.
@@ -78,76 +93,36 @@ impl NodeAdmin {
         self
     }
 
-    /// Edges and replicas to poll (their public URLs), with the admin token
-    /// they share with this node.
-    pub fn with_followers(mut self, urls: Vec<String>, admin_token: String) -> NodeAdmin {
-        self.fleet = Fleet::new(urls, admin_token);
-        self
-    }
-
-    fn cluster_node(&self) -> Option<&ClusterNode> {
-        self.node.cluster.as_ref().map(|g| &*g.cluster)
-    }
-
     fn id(&self) -> &str {
         &self.node.cfg.node_id
     }
 
-    /// This node reads `host` (always, on a single node).
-    fn owns(&self, host: &str) -> bool {
-        match &self.node.cluster {
-            Some(g) => g.cluster.owns_host(&Host(host.to_string())),
-            None => true,
-        }
-    }
-
-    /// The core reading `host`, when it's another live one.
-    fn host_owner(&self, host: &str) -> Option<Target> {
-        let g = self.node.cluster.as_ref()?;
-        let (id, addr) = g.cluster.hosts.as_ref()?.owner_of(&Host(host.to_string()))?;
-        (id != *self.id()).then_some(Target::Core { id, addr })
-    }
-
-    /// The core owning `did`'s shard, when it's another one.
-    fn did_owner(&self, did: &str) -> Option<Target> {
-        let g = self.node.cluster.as_ref()?;
-        let o = g.cluster.owner_of_did(did)?;
-        (o.node_id != *self.id()).then_some(Target::Core { id: o.node_id, addr: o.addr })
-    }
-
     async fn members(&self) -> Arc<Vec<Member>> {
-        if self.node.cluster.is_none() && !self.fleet.has_followers() {
-            return Arc::new(vec![Member::ok(self.local_report().await)]);
-        }
-        self.fleet.members(self.cluster_node(), self.local_report()).await
+        Arc::new(vec![Member::ok(self.local_report().await)])
     }
 
-    async fn remote<T: serde::de::DeserializeOwned>(
-        &self,
-        t: &Target,
-        method: reqwest::Method,
-        path: &str,
-        body: Option<serde_json::Value>,
-    ) -> AdminResult<T> {
-        let who = self.fleet.id_of(t).0;
-        self.fleet.call(self.cluster_node(), t, method, path, body).await.map_err(|e| {
-            if e.starts_with("HTTP 404") {
-                AdminError::NotFound(format!("{who}: {e}"))
-            } else if e.starts_with("HTTP 400") {
-                AdminError::BadRequest(format!("{who}: {e}"))
-            } else {
-                AdminError::Internal(anyhow::anyhow!("{who} didn't answer: {e}"))
+    /// (cores busy since the last read at least a second ago, resident bytes).
+    fn process(&self) -> (f64, u64) {
+        let mut g = self.cpu.lock();
+        let (now, total) = (Instant::now(), cpu_seconds());
+        let rate = match *g {
+            Some((at, _, rate)) if now.duration_since(at) < Duration::from_secs(1) => rate,
+            Some((at, prev, _)) => {
+                let r = ((total - prev) / now.duration_since(at).as_secs_f64()).max(0.0);
+                *g = Some((now, total, r));
+                r
             }
-        })
+            None => {
+                *g = Some((now, total, 0.0));
+                0.0
+            }
+        };
+        (rate, vlpds::metrics::resident_bytes().unwrap_or(0))
     }
 
     fn admin(&self) -> &PolicyAdmin {
         &self.policy.admin
     }
-}
-
-fn internal(e: impl std::fmt::Display) -> AdminError {
-    AdminError::Internal(anyhow::anyhow!("{e}"))
 }
 
 pub fn host_status_label(h: &HostView) -> &'static str {
@@ -216,8 +191,8 @@ impl NodeAdmin {
         }
     }
 
-    /// Every host in this node's registry (on a cluster, every host; only
-    /// the owned ones have live numbers).
+    /// Every host in this node's registry (every host the leader's table
+    /// has; only the ones this node reads have live numbers).
     fn rows(&self) -> Vec<admin::HostRow> {
         let hosts = self.node.manager.hosts();
         let dash = self.node.dash.lock();
@@ -234,7 +209,7 @@ impl NodeAdmin {
     /// The hosts this node reads.
     pub fn owned_rows(&self) -> Vec<admin::HostRow> {
         let mut rows = self.rows();
-        rows.retain(|r| self.owns(&r.host));
+        rows.retain(|r| self.node.manager.is_running(&Host(r.host.clone())));
         rows
     }
 
@@ -271,7 +246,13 @@ impl NodeAdmin {
             .state
             .get(did)
             .await
-            .map_err(|e| AdminError::Internal(anyhow::anyhow!("{e}")))?
+            .map_err(|e| match e {
+                crate::state::StoreError::NotOwner(_) => AdminError::BadRequest(format!(
+                    "accounts are the leader's records: ask {}",
+                    self.node.quorum.qnode.status().leader.unwrap_or_else(|| "the leader".into())
+                )),
+                e => AdminError::Internal(anyhow::anyhow!("{e}")),
+            })?
             .ok_or_else(|| AdminError::NotFound(format!("no account {did}")))?;
         let handle = match self.node.identity.cached(did) {
             Some(Ok(id)) => id.handle.clone(),
@@ -288,7 +269,6 @@ impl NodeAdmin {
             Upstream::Throttled => "throttled",
             Upstream::Inactive => "inactive",
         };
-        let shard = self.node.state.shard_id_of_slot(vlpds::slots::slot_of(did));
         Ok(admin::Account {
             did: did.to_string(),
             handle,
@@ -307,51 +287,17 @@ impl NodeAdmin {
             last_event_ms: 0,
             events_last_hour: 0,
             rejects_last_hour: 0,
-            did_shard: shard.0,
+            did_shard: 0,
             node: self.node.cfg.node_id.clone(),
-            archive: self
-                .account_archive(did, &self.node.state.host_name(rec.host).map(|h| h.to_string()).unwrap_or_default())
-                .await,
-        })
-    }
-
-    async fn account_archive(&self, did: &str, host: &str) -> Option<admin::AccountArchive> {
-        let a = self.node.state.archive()?;
-        let snap = self.policy.engine.snapshot();
-        if snap.policy.body.archive.mode == crate::policy::doc::ArchiveMode::Off {
-            return None;
-        }
-        let shard = self.node.state.shard_for(did).ok()?;
-        let meta = crate::archive::mirror::read_meta(&shard.db, did).await.ok().flatten().unwrap_or_default();
-        let head = match meta.live {
-            Some(_) => crate::archive::mirror::read_head(&shard.db, did).await.ok().flatten(),
-            None => None,
-        };
-        let last_error = a.queue.errors.lock().iter().rev().find(|(d, _)| d == did).map(|(_, e)| e.clone());
-        Some(admin::AccountArchive {
-            wanted: a.gate().wants(host),
-            mirrored: meta.live.is_some(),
-            rev: head.map(|h| h.rev.to_string()),
-            fetching: a.queue.contains(did),
-            staging: meta.staging.is_some(),
-            last_error,
-            takedown_at_ms: (meta.takedown_at != 0).then_some(meta.takedown_at as i64 * 1000),
         })
     }
 
     /// On the quorum log the leader makes the takedown: the record's flag
     /// and the `#account` announcing it are one entry.
-    async fn quorum_takedown(
-        &self,
-        q: &Arc<super::quorum::Glue>,
-        did: &str,
-        takedown: bool,
-        by: &str,
-        reason: &str,
-    ) -> AdminResult<admin::Account> {
+    async fn set_takedown(&self, did: &str, takedown: bool, by: &str, reason: &str) -> AdminResult<admin::Account> {
         self.policy.engine.takedowns.record(did, takedown, by, reason).await?;
         self.node.serve.takedowns.apply_local(did, takedown);
-        match q.takedown(did, takedown).await {
+        match self.node.quorum.takedown(did, takedown).await {
             Ok(_) => {}
             Err(e) if format!("{e}").starts_with("no_account") => {
                 return Err(AdminError::NotFound(format!("no account {did}")));
@@ -360,75 +306,13 @@ impl NodeAdmin {
         }
         self.account_view(did).await
     }
-
-    /// Writes the takedown flag, then announces the new status on the
-    /// firehose with an `#account` the relay makes itself.
-    async fn set_takedown(&self, did: &str, takedown: bool, by: &str, reason: &str) -> AdminResult<admin::Account> {
-        if let Some(q) = self.node.quorum.get() {
-            return self.quorum_takedown(q, did, takedown, by, reason).await;
-        }
-        let Some(local) = self.node.local.clone() else {
-            return Err(AdminError::BadRequest("this node has no log of its own to announce a takedown on".into()));
-        };
-        if self.node.state.get(did).await.map_err(internal)?.is_none() {
-            return Err(AdminError::NotFound(format!("no account {did}")));
-        }
-        let _own = match &self.node.cluster {
-            Some(g) => Some(g.own_write(did).await.ok_or_else(|| {
-                AdminError::Internal(anyhow::anyhow!("{did}'s shard isn't held here with a valid lease: try again"))
-            })?),
-            None => None,
-        };
-        self.policy.engine.takedowns.record(did, takedown, by, reason).await?;
-        // before the #account below: this node's consumers must not see it
-        // and then the account's old commits replayed
-        self.node.serve.takedowns.apply_local(did, takedown);
-        let st = self
-            .node
-            .state
-            .set_relay_takedown(did, takedown)
-            .await
-            .map_err(|e| AdminError::Internal(anyhow::anyhow!("{e}")))?
-            .ok_or_else(|| AdminError::NotFound(format!("no account {did}")))?;
-        let host = match self.node.state.get(did).await {
-            Ok(Some(r)) => self.node.state.host_name(r.host).map(|h| h.to_string()).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let frame = vlpds::events::account_frame(did, st.is_active(), st.as_str(), &vlpds::events::now_rfc3339());
-        let shard = self.node.state.shard_id_of_slot(vlpds::slots::slot_of(did));
-        let meta = EventMeta { did: did.to_string(), host: Host(host), upstream_seq: 0, shard: shard.0 };
-        local.append_own(meta, frame).await.map_err(|e| AdminError::Internal(anyhow::anyhow!("{e}")))?;
-        self.account_view(did).await
-    }
 }
 
 fn status_str(s: AccountStatus) -> &'static str {
     s.as_str().unwrap_or(if s.is_active() { "active" } else { "inactive" })
 }
 
-impl NodeAdmin {
-    fn vlpds_cluster(&self) -> AdminResult<(Arc<vlpds::cluster::Cluster>, Arc<dyn vlpds::cluster::ShardHost>)> {
-        let g = self.node.cluster.as_ref().ok_or_else(|| AdminError::BadRequest("not a cluster core node".into()))?;
-        let c = g.cluster.cluster.clone().ok_or_else(|| AdminError::BadRequest("not a cluster core node".into()))?;
-        let host: Arc<dyn vlpds::cluster::ShardHost> = g.cluster.clone();
-        Ok((c, host))
-    }
-}
-
-/// For the peer RPC's query strings.
-fn enc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-/// What this node itself measures and holds; the peer RPC serves these.
+/// What this node itself measures and holds.
 impl NodeAdmin {
     pub async fn local_report(&self) -> NodeReport {
         let rows = self.owned_rows();
@@ -441,12 +325,17 @@ impl NodeAdmin {
         let mut top = rows;
         top.sort_by(|a, b| b.events_per_sec.total_cmp(&a.events_per_sec));
         top.truncate(10);
-        let (cpu, mem_bytes) = self.process.sample();
+        let (cpu, mem_bytes) = self.process();
         NodeReport {
             node: self.id().to_string(),
-            role: if self.node.cluster.is_some() { "core" } else { "single" }.into(),
+            role: match self.node.quorum.qnode.status().role {
+                crate::qlog::node::Role::Leader => "leader",
+                crate::qlog::node::Role::Candidate => "candidate",
+                crate::qlog::node::Role::Follower => "follower",
+            }
+            .into(),
             version: env!("CARGO_PKG_VERSION").into(),
-            time_ms: peer_admin::now_ms(),
+            time_ms: now_ms(),
             events_in_per_sec: last.events_in,
             events_out_per_sec: last.events_out,
             bytes_in_per_sec: last.bytes_in,
@@ -457,16 +346,14 @@ impl NodeAdmin {
             ttf_p50_ms: last.ttf_p50_ms,
             ttf_p99_ms: last.ttf_p99_ms,
             log_durability_lag_ms: last.durable_lag_ms,
-            stream_seq: self.node.serve.firehose.last_emitted.load(std::sync::atomic::Ordering::Acquire),
+            stream_seq: self.node.serve.head(),
             cpu,
             mem_bytes,
             top_hosts: top,
             history: h,
             pipeline,
             pipeline_hosts,
-            archive: self.archive_report(),
-            plc: self.plc_report().await,
-            seq_checkpoints: self.node.serve.seq_checkpoints(peer_admin::SEQ_CHECKPOINTS),
+            plc: None,
         }
     }
 
@@ -531,116 +418,11 @@ impl NodeAdmin {
             ack_pending: snap.pending as u64,
             oldest_pending_ms: snap.oldest_pending.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
             lane_queued: super::metrics::LANE_QUEUED.get().max(0) as u64,
-            dedupe_entries: self.node.cluster.as_ref().map_or(0, |g| g.recent.len() as u64),
+            dedupe_entries: 0,
             paused_hosts,
-            gauges: peer_admin::pipeline_gauges(),
+            gauges: pipeline_gauges(),
         };
         (node, hosts)
-    }
-
-    fn archive_report(&self) -> Option<ArchiveReport> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let a = self.node.state.archive()?;
-        let snap = self.policy.engine.snapshot();
-        let mode = serde_json::to_value(snap.policy.body.archive.mode)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_default();
-        let (queued, running) = a.queue.depth();
-        let f = &a.queue.stats;
-        let counts = admin::ArchiveCounts {
-            mirrored: a.stats.mirrors.load(Relaxed),
-            queued: queued as u64,
-            running: running as u64,
-            failed: f.failed.load(Relaxed),
-            fetched: f.done.load(Relaxed),
-            retried: f.retried.load(Relaxed),
-            bytes: f.bytes.load(Relaxed),
-            records: f.records.load(Relaxed),
-            sst_bytes: self.node.state.shards().iter().map(|s| s.sst_bytes()).sum(),
-            applied: a.stats.applied.load(Relaxed),
-            mismatches: a.stats.mismatches.load(Relaxed),
-            healed: f.healed.load(Relaxed),
-            swept_at_ms: a.stats.swept_at_ms.load(Relaxed) as i64,
-        };
-        Some(ArchiveReport {
-            mode,
-            policy_version: a.gate().version(),
-            counts,
-            errors: a.queue.errors.lock().iter().cloned().collect(),
-        })
-    }
-
-    async fn plc_report(&self) -> Option<PlcReport> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let ing = self.node.plc_ingest.get()?;
-        let s = &ing.stats;
-        let leader = self.node.cluster.as_ref().is_none_or(|g| g.cluster.plc_ingest_leader());
-        let ops = s.ops.load(Relaxed);
-        let (windows, checkpoint_ms) = if leader { self.plc_windows(ing).await } else { (Vec::new(), 0) };
-        Some(PlcReport {
-            leader,
-            caught_up: s.caught_up.load(Relaxed),
-            ops,
-            ops_per_sec: self.plc_rate.update(ops as f64),
-            written: s.written.load(Relaxed),
-            requests: s.requests.load(Relaxed),
-            throttled: s.throttled.load(Relaxed),
-            errors: s.errors.load(Relaxed),
-            restarts: s.restarts.load(Relaxed),
-            newest_ms: s.newest_ms.load(Relaxed) as i64,
-            windows,
-            checkpoint_ms,
-        })
-    }
-
-    async fn plc_windows(&self, ing: &crate::plc_seed::ingest::Ingester) -> (Vec<admin::PlcWindow>, i64) {
-        if let Some((at, w, ms)) = &*self.plc_ck.lock()
-            && at.elapsed() < PLC_CK_TTL
-        {
-            return (w.clone(), *ms);
-        }
-        let ck = match crate::plc_seed::ingest::Checkpoint::load(&ing.store).await {
-            Ok(Some(c)) => c,
-            Ok(None) => return (Vec::new(), 0),
-            Err(e) => {
-                tracing::debug!("reading the PLC export checkpoint: {e:#}");
-                return (Vec::new(), 0);
-            }
-        };
-        let now = peer_admin::now_ms();
-        let ms = |s: &str| crate::plc_seed::parse_ms(s).map_or(0, |v| v as i64);
-        let mut from = ing.cfg.start_ms as i64;
-        let windows = ck
-            .windows
-            .iter()
-            .map(|w| {
-                let after = ms(&w.after).max(from);
-                let until = w.until.as_deref().map(ms);
-                let end = until.unwrap_or(now);
-                let progress = if w.done {
-                    1.0
-                } else if end > from {
-                    ((after - from) as f64 / (end - from) as f64).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let out = admin::PlcWindow {
-                    from_ms: from,
-                    after_ms: after,
-                    until_ms: until,
-                    ops: w.count,
-                    done: w.done,
-                    progress,
-                };
-                if let Some(u) = until {
-                    from = u + 1;
-                }
-                out
-            })
-            .collect::<Vec<_>>();
-        *self.plc_ck.lock() = Some((Instant::now(), windows.clone(), ck.updated_ms));
-        (windows, ck.updated_ms)
     }
 
     pub async fn local_host(&self, host: &str) -> AdminResult<admin::HostDetail> {
@@ -729,7 +511,23 @@ impl NodeAdmin {
     }
 
     pub fn local_consumers(&self) -> Vec<admin::Consumer> {
-        peer_admin::consumers_of(&self.node.serve, self.id())
+        self.node
+            .serve
+            .consumers()
+            .into_iter()
+            .map(|c| admin::Consumer {
+                id: c.id,
+                ip: c.ip.to_string(),
+                user_agent: c.user_agent,
+                node: self.id().to_string(),
+                connected_since_ms: c.connected_since_ms,
+                cursor: c.last_seq,
+                lag_ms: c.lag_ms,
+                events_per_sec: c.events_per_sec,
+                bytes_per_sec: c.bytes_per_sec,
+                backfilling: c.backfilling,
+            })
+            .collect()
     }
 
     pub fn local_kick(&self, id: u64, by: &str) -> AdminResult<()> {
@@ -764,16 +562,6 @@ impl NodeAdmin {
         }
         let mut out = Vec::new();
         for id in ids {
-            if let Some(t) = self.did_owner(&id.did) {
-                match self
-                    .remote::<admin::Account>(&t, reqwest::Method::GET, &format!("/account?did={}", enc(&id.did)), None)
-                    .await
-                {
-                    Ok(a) => out.push(a),
-                    Err(e) => tracing::debug!(did = %id.did, "account from its owner: {e}"),
-                }
-                continue;
-            }
             match self.account_view(&id.did).await {
                 Ok(a) => out.push(a),
                 Err(AdminError::NotFound(_)) => {}
@@ -791,28 +579,6 @@ impl NodeAdmin {
         reason: &str,
     ) -> AdminResult<admin::Account> {
         self.set_takedown(did, takedown, by, reason).await
-    }
-
-    async fn takedown_anywhere(
-        &self,
-        did: &str,
-        takedown: bool,
-        by: &str,
-        reason: &str,
-    ) -> AdminResult<admin::Account> {
-        match self.did_owner(did) {
-            Some(t) => {
-                let body = serde_json::to_value(peer_admin::TakedownIn {
-                    did: did.to_string(),
-                    takedown,
-                    by: by.to_string(),
-                    reason: reason.to_string(),
-                })
-                .map_err(internal)?;
-                self.remote(&t, reqwest::Method::POST, "/takedown", Some(body)).await
-            }
-            None => self.set_takedown(did, takedown, by, reason).await,
-        }
     }
 
     fn sort_page(mut rows: Vec<admin::HostRow>, q: &admin::HostQuery) -> admin::HostList {
@@ -843,31 +609,22 @@ impl AdminSource for NodeAdmin {
     async fn overview(&self) -> AdminResult<admin::Overview> {
         let open_cases = self.open_case_count().await;
         let members = self.members().await;
-        Ok(fleet::overview(&members, open_cases, peer_admin::now_ms()))
+        Ok(fleet::overview(&members, open_cases, now_ms()))
     }
 
     async fn hosts(&self, q: admin::HostQuery) -> AdminResult<admin::HostList> {
-        let Some(g) = &self.node.cluster else {
-            return Ok(Self::sort_page(self.rows(), &q));
-        };
-        let mut owned = vec![(self.id().to_string(), self.owned_rows())];
-        owned.extend(self.fleet.each::<Vec<admin::HostRow>>(self.cluster_node(), "/hosts").await);
-        let hs = g.cluster.hosts.clone();
-        let rows = fleet::merge_hosts(self.rows(), &owned, |h| {
-            hs.as_ref().and_then(|s| s.owner_of(&Host(h.to_string()))).map(|(id, _)| id)
-        });
+        let mut rows = self.rows();
+        // a host another member reads: named, without this node's numbers
+        let owners = self.node.quorum.hosts.owners();
+        for r in &mut rows {
+            if let Some(o) = owners.get(&r.host) {
+                r.node = o.clone();
+            }
+        }
         Ok(Self::sort_page(rows, &q))
     }
 
     async fn host(&self, host: &str) -> AdminResult<admin::HostDetail> {
-        if let Some(t) = self.host_owner(host) {
-            match self.remote(&t, reqwest::Method::GET, &format!("/host?host={}", enc(host)), None).await {
-                Ok(d) => return Ok(d),
-                Err(AdminError::NotFound(m)) => return Err(AdminError::NotFound(m)),
-                // the owner is down: this node's registry row, without its live numbers
-                Err(e) => tracing::debug!(host, "host detail from its owner: {e}"),
-            }
-        }
         self.local_host(host).await
     }
 
@@ -876,30 +633,17 @@ impl AdminSource for NodeAdmin {
         if self.node.manager.host(&k).is_none() {
             return Err(AdminError::NotFound(format!("unknown host {host}")));
         }
-        let owner = self.host_owner(host);
-        match (action, &owner) {
-            (admin::HostAction::Reconnect, Some(t)) => {
-                self.remote::<serde_json::Value>(
-                    t,
-                    reqwest::Method::POST,
-                    &format!("/reconnect?host={}", enc(host)),
-                    None,
-                )
-                .await?;
+        match action {
+            admin::HostAction::Reconnect if !self.node.manager.is_running(&k) => {
+                let owner = self.node.quorum.hosts.owners().get(host).cloned().unwrap_or_else(|| "nobody yet".into());
+                return Err(AdminError::BadRequest(format!("{host} is read by {owner}: reconnect it there")));
             }
-            (admin::HostAction::Reconnect, None) => self.node.manager.kick(&k),
-            (a, _) => {
+            admin::HostAction::Reconnect => self.node.manager.kick(&k),
+            a => {
                 self.admin().host_action(host, a, by).await?;
                 // the socket follows now, not at the sync loop's next pass
                 self.policy.refresh_host(host).await?;
             }
-        }
-        if let Some(t) = owner
-            && let Ok(d) = self
-                .remote::<admin::HostDetail>(&t, reqwest::Method::GET, &format!("/host?host={}", enc(host)), None)
-                .await
-        {
-            return Ok(d.row);
         }
         self.host_row(host)
     }
@@ -976,12 +720,9 @@ impl AdminSource for NodeAdmin {
         })
     }
 
+    /// This node's consumers (each member's dashboard lists its own).
     async fn consumers(&self) -> AdminResult<Vec<admin::Consumer>> {
-        let mut out = self.local_consumers();
-        for (_, cs) in self.fleet.each::<Vec<admin::Consumer>>(self.cluster_node(), "/consumers").await {
-            out.extend(cs);
-        }
-        Ok(out)
+        Ok(self.local_consumers())
     }
 
     async fn kick_consumer(&self, id: u64, by: &str) -> AdminResult<()> {
@@ -989,16 +730,10 @@ impl AdminSource for NodeAdmin {
     }
 
     async fn kick_consumer_on(&self, node: Option<&str>, id: u64, by: &str) -> AdminResult<()> {
-        let Some(n) = node.filter(|n| *n != self.id()) else {
-            return self.local_kick(id, by);
-        };
-        let t = self
-            .fleet
-            .target(self.cluster_node(), n)
-            .ok_or_else(|| AdminError::NotFound(format!("no node {n} in this cluster")))?;
-        self.remote::<serde_json::Value>(&t, reqwest::Method::POST, &format!("/kick?id={id}"), None).await?;
-        tracing::info!(target: "vlrelay::audit", consumer = id, node = n, by, "consumer kicked");
-        Ok(())
+        match node.filter(|n| *n != self.id()) {
+            None => self.local_kick(id, by),
+            Some(n) => Err(AdminError::BadRequest(format!("consumer {id} is on {n}: kick it from {n}'s dashboard"))),
+        }
     }
 
     async fn settings(&self) -> AdminResult<admin::SettingsView> {
@@ -1008,10 +743,7 @@ impl AdminSource for NodeAdmin {
     /// Each member's status, asked over the peer protocol (addresses from
     /// `qlog/leader` and `--qlog-peer`); never resets its histograms.
     async fn quorum(&self) -> AdminResult<admin::QuorumView> {
-        match self.node.quorum.get() {
-            Some(q) => Ok(q.view().await),
-            None => Err(AdminError::NotFound("this relay doesn't run the quorum log".into())),
-        }
+        Ok(self.node.quorum.view().await)
     }
 
     /// Sent to the leader with the qlog admin token (`--qlog-admin-token`):
@@ -1021,9 +753,7 @@ impl AdminSource for NodeAdmin {
         req: admin::QuorumMembersChange,
         _by: &str,
     ) -> AdminResult<serde_json::Value> {
-        let Some(q) = self.node.quorum.get() else {
-            return Err(AdminError::NotFound("this relay doesn't run the quorum log".into()));
-        };
+        let q = &self.node.quorum;
         if req.members.is_empty() {
             return Err(AdminError::BadRequest("an empty member set".into()));
         }
@@ -1038,82 +768,15 @@ impl AdminSource for NodeAdmin {
     }
 
     async fn cluster(&self) -> AdminResult<admin::ClusterView> {
-        if let Some(q) = self.node.quorum.get() {
-            return Ok(q.cluster_view().await);
-        }
-        match &self.node.cluster {
-            Some(g) => {
-                let mut v = g.view(&self.node);
-                let members = self.members().await;
-                fleet::fill_cluster(&mut v, &members);
-                Ok(v)
-            }
-            None => self.demo.cluster().await,
-        }
-    }
-
-    async fn archive_view(&self) -> AdminResult<admin::ArchiveView> {
-        fleet::archive_view(&self.members().await)
-            .ok_or_else(|| AdminError::NotFound("no node reported archival numbers".into()))
+        Ok(self.node.quorum.cluster_view().await)
     }
 
     async fn plc_view(&self) -> AdminResult<admin::PlcView> {
         Ok(fleet::plc_view(&self.members().await))
     }
 
-    async fn seq_view(&self) -> AdminResult<admin::SeqView> {
-        Ok(fleet::seq_view(&self.members().await, 8))
-    }
-
     async fn pipeline_view(&self) -> AdminResult<admin::PipelineView> {
         Ok(fleet::pipeline_view(&self.members().await, 50))
-    }
-
-    async fn shard_layout(&self) -> AdminResult<serde_json::Value> {
-        let (c, _) = self.vlpds_cluster()?;
-        Ok(layout_json(&c))
-    }
-
-    async fn reshard(&self, req: admin::ReshardReq) -> AdminResult<serde_json::Value> {
-        use vlpds::reshard::Plan;
-        use vlpds::slots::ShardId;
-        let (c, host) = self.vlpds_cluster()?;
-        let (plan, wait) = match req {
-            admin::ReshardReq::Split { shard, at, wait } => (Plan::Split { shard: ShardId(shard), at }, wait),
-            admin::ReshardReq::Merge { left, right, wait } => {
-                (Plan::Merge { left: ShardId(left), right: ShardId(right) }, wait)
-            }
-            admin::ReshardReq::Abort => {
-                let op = c.abort_reshard(&host).await?;
-                return Ok(serde_json::json!({ "aborted": op, "layout": layout_json(&c) }));
-            }
-        };
-        let before = c.layout().version;
-        let op = c.plan_reshard(&host, plan).await.map_err(|e| AdminError::BadRequest(format!("{e:#}")))?;
-        let mut out = serde_json::json!({ "op": op });
-        if wait {
-            let deadline = Instant::now() + Duration::from_secs(120);
-            loop {
-                let l = c.layout();
-                if l.version > before && l.op.as_ref().is_none_or(|o| o.id != op.id) {
-                    out["done"] = l.shards.iter().any(|r| op.children.iter().any(|ch| ch.id == r.id)).into();
-                    break;
-                }
-                if l.op.is_none() && l.version == before {
-                    out["done"] = false.into();
-                    break;
-                }
-                if Instant::now() > deadline {
-                    return Err(AdminError::Internal(anyhow::anyhow!(
-                        "reshard {} still in progress after 120 s",
-                        op.id
-                    )));
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-        out["layout"] = layout_json(&c);
-        Ok(out)
     }
 
     async fn accounts(&self, q: admin::AccountQuery) -> AdminResult<Vec<admin::Account>> {
@@ -1127,36 +790,19 @@ impl AdminSource for NodeAdmin {
                 Err(e) => Err(e),
             };
         }
-        let mut out = self.local_accounts(&q).await?;
-        if self.node.cluster.is_some() {
-            // handles are in the identity caches of the nodes reading their hosts
-            let peers =
-                self.fleet.each::<Vec<admin::Account>>(self.cluster_node(), &format!("/accounts?q={}", enc(&q))).await;
-            for (_, accts) in peers {
-                for a in accts {
-                    if !out.iter().any(|x| x.did == a.did) {
-                        out.push(a);
-                    }
-                }
-            }
-            out.truncate(100);
-        }
-        Ok(out)
+        self.local_accounts(&q).await
     }
 
     async fn account(&self, did: &str) -> AdminResult<admin::Account> {
-        match self.did_owner(did) {
-            Some(t) => self.remote(&t, reqwest::Method::GET, &format!("/account?did={}", enc(did)), None).await,
-            None => self.account_view(did).await,
-        }
+        self.account_view(did).await
     }
 
     async fn takedown(&self, did: &str, reason: String, by: &str) -> AdminResult<admin::Account> {
-        self.takedown_anywhere(did, true, by, &reason).await
+        self.set_takedown(did, true, by, &reason).await
     }
 
     async fn untakedown(&self, did: &str, by: &str) -> AdminResult<admin::Account> {
-        self.takedown_anywhere(did, false, by, "").await
+        self.set_takedown(did, false, by, "").await
     }
 
     async fn cases(&self, q: admin::CaseQuery) -> AdminResult<Vec<admin::Case>> {

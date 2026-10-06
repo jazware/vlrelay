@@ -587,7 +587,6 @@ impl Sim {
             did_shard: shard,
             node: self.did_shards[shard as usize].clone().unwrap_or_default(),
             did,
-            archive: None,
         }
     }
 

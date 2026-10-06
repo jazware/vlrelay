@@ -69,7 +69,7 @@ done
 host_flags=""
 for ((g = 0; g < hosts; g++)); do host_flags="$host_flags --host http://127.0.0.1:$((base + g))"; done
 dev/capped.sh "${RELAY_MEM_MB:-4096}" "$target/vlrelay" --listen "127.0.0.1:$relay_port" --memory \
-  --plc-url "http://127.0.0.1:$((base - 1))" --linger-ms 25 --host-tier default --admin-token "$token" \
+  --plc-url "http://127.0.0.1:$((base - 1))" --qlog-listen 127.0.0.1:0 --host-tier default --admin-token "$token" \
   $host_flags >>"$out/relay.log" 2>&1 &
 pids+=($!)
 for _ in $(seq 1 100); do

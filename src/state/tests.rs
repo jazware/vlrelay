@@ -3,7 +3,7 @@ use crate::types::Host;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use vlpds::cid::Cid;
-use vlpds::slots::Layout;
+use vlpds::store::Store;
 use vlpds::tid::Tid;
 
 pub(crate) struct MapIdentity {
@@ -35,13 +35,87 @@ impl IdentitySource for MapIdentity {
     }
 }
 
-pub(crate) async fn open(shards: u32, id: Arc<MapIdentity>, config: ApplyConfig) -> Arc<StateStore> {
-    let store = Store::memory(None);
-    let st = Arc::new(StateStore::new(store, Layout::uniform(shards).shards, StubChain, id, config));
-    for s in Layout::uniform(shards).shards {
-        st.open_shard(s.id, None).await.unwrap();
-    }
+/// A store serving one view over an in-memory database, as a leader's term
+/// does over the quorum state's.
+pub(crate) async fn open(_shards: u32, id: Arc<MapIdentity>, config: ApplyConfig) -> Arc<StateStore> {
+    let st = Arc::new(StateStore::new(StubChain, id, config));
+    attach_memory_shard(&st).await;
     st
+}
+
+pub(crate) async fn attach_memory_shard<C: Chain>(st: &StateStore<C>) {
+    let store = Store::memory(None);
+    let db = slatedb::Db::builder("state", store.raw.clone()).build().await.unwrap();
+    st.attach_shard(Arc::new(ShardState::new(
+        ShardId(0),
+        0,
+        vlpds::slots::SLOTS,
+        Arc::new(db),
+        st.config.cache_entries_per_shard,
+    )));
+}
+
+/// What the quorum log's applier does once an entry commits: the record its
+/// meta carried goes to the database, and the staged one is released.
+pub(crate) async fn persist(st: &StateStore, accepted: &[&Accepted]) {
+    let s = st.shard_for("").unwrap();
+    for a in accepted {
+        s.db.put(record::did_key(&a.delta.did), a.record.encode()).await.unwrap();
+    }
+    s.release(accepted.iter().map(|a| a.ticket.n));
+}
+
+/// An operator's takedown or its lifting, as the quorum leader stages it
+/// (lifting it also lifts a relay throttle).
+async fn set_relay_takedown(st: &StateStore, did: &str, takedown: bool) -> Option<AccountStatus> {
+    let s = st.shard_for(did).unwrap();
+    let _g = s.lock_did(did).await;
+    let mut rec = (*s.load(did).await.unwrap()?).clone();
+    rec.relay_takedown = takedown;
+    if !takedown {
+        rec.relay_throttled = false;
+    }
+    let st = rec.status();
+    s.stage_unlogged(did, rec);
+    Some(st)
+}
+
+fn accepted(a: &Applied) -> &Accepted {
+    match a {
+        Applied::Append(a) => a,
+        a => panic!("{a:?}"),
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct MemHosts(Mutex<HashMap<String, HostRecord>>);
+
+#[async_trait::async_trait]
+impl HostStore for MemHosts {
+    async fn get_host(&self, hostname: &str) -> anyhow::Result<Option<HostRecord>> {
+        Ok(self.0.lock().get(hostname).cloned())
+    }
+    async fn put_host(&self, rec: &HostRecord) -> anyhow::Result<()> {
+        self.0.lock().insert(rec.hostname.clone(), rec.clone());
+        Ok(())
+    }
+    async fn checkpoint_cursors(&self, _: &[(String, i64)]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn add_counts(&self, counts: &[(String, HostCounts)]) -> anyhow::Result<()> {
+        let mut m = self.0.lock();
+        for (h, c) in counts {
+            let r = m.entry(h.clone()).or_insert_with(|| HostRecord::new(h, Tier::New, 0));
+            r.account_count += c.accounts;
+            r.events += c.events;
+            r.failed_checks += c.failed_checks;
+            r.dropped += c.dropped;
+        }
+        Ok(())
+    }
+    async fn list_hosts(&self, _: Option<&str>, _: usize) -> anyhow::Result<HostPage> {
+        Ok(HostPage { hosts: self.0.lock().values().cloned().collect(), cursor: None })
+    }
 }
 
 pub(crate) fn plc(n: u64) -> String {
@@ -82,13 +156,6 @@ fn host(h: &str) -> Host {
 
 async fn commit(st: &StateStore, did: &str, h: &Host, c: CommitClaim, now: u32) -> Result<Applied, Reject> {
     st.apply(Incoming { did, host: h, now, kind: EventKind::Commit(c) }).await
-}
-
-fn ticket(a: &Applied) -> Ticket {
-    match a {
-        Applied::Append(a) => a.ticket,
-        a => panic!("{a:?}"),
-    }
 }
 
 async fn db_record(st: &StateStore, did: &str) -> Option<Record> {
@@ -136,18 +203,6 @@ fn record_round_trips_compactly() {
     assert!(Record::decode(&enc[..enc.len() - 1]).is_err());
 }
 
-#[test]
-fn delta_round_trips() {
-    let d = StateDelta {
-        did: plc(9),
-        host: HostKey::of("h"),
-        kind: ChangeKind::Sync,
-        chain: Some(ChainState { rev: rev(1), commit: cid("a"), data: cid("b") }),
-        upstream: Upstream::Throttled,
-    };
-    assert_eq!(StateDelta::decode(&d.encode()).unwrap(), d);
-}
-
 #[tokio::test]
 async fn first_commit_creates_and_commit_persists() {
     let id = MapIdentity::new();
@@ -162,14 +217,12 @@ async fn first_commit_creates_and_commit_persists() {
     // staged, not yet in SlateDB
     assert!(db_record(&st, &did).await.is_none());
     assert_eq!(st.get(&did).await.unwrap().unwrap().chain.unwrap().rev, rev(1));
-    assert_eq!(st.commit(&[ticket(&a)]).await.unwrap(), 1);
+    persist(&st, &[accepted(&a)]).await;
     let r = db_record(&st, &did).await.unwrap();
     assert_eq!(r.chain.unwrap().commit, claim(&did, 1).commit);
     assert_eq!(r.created_at, NOW);
     assert_eq!(r.pds, Some(HostKey::of("pds.a")));
     assert_eq!(st.shard_for(&did).unwrap().pending_len(), (0, 0));
-    // committing again is a no-op
-    assert_eq!(st.commit(&[ticket(&a)]).await.unwrap(), 0);
     assert_eq!(id.lookups(), 1);
 }
 
@@ -202,7 +255,7 @@ async fn wrong_host_reresolves_once_then_follows_migration() {
     id.set(&did, "pds.a", 1);
     let st = open(2, id.clone(), ApplyConfig { reresolve_after_secs: 30, ..Default::default() }).await;
     let a = commit(&st, &did, &host("pds.a"), claim(&did, 1), NOW).await.unwrap();
-    st.commit(&[ticket(&a)]).await.unwrap();
+    persist(&st, &[accepted(&a)]).await;
 
     // a stranger, within the re-resolve window: rejected with no lookup
     let r = commit(&st, &did, &host("pds.b"), claim(&did, 2), NOW + 5).await;
@@ -223,11 +276,12 @@ async fn wrong_host_reresolves_once_then_follows_migration() {
     assert!(matches!(r, Err(Reject::WrongHost { .. })));
 
     // host account counts followed the move
-    st.flush_host_counts(&*st).await.unwrap();
-    assert_eq!(st.get_host("pds.a").await.unwrap().unwrap().account_count, 0);
-    assert_eq!(st.get_host("pds.b").await.unwrap().unwrap().account_count, 1);
-    assert_eq!(st.get_host("pds.b").await.unwrap().unwrap().events, 1);
-    assert_eq!(st.get_host("pds.a").await.unwrap().unwrap().failed_checks, 1);
+    let hosts = MemHosts::default();
+    st.flush_host_counts(&hosts).await.unwrap();
+    assert_eq!(hosts.get_host("pds.a").await.unwrap().unwrap().account_count, 0);
+    assert_eq!(hosts.get_host("pds.b").await.unwrap().unwrap().account_count, 1);
+    assert_eq!(hosts.get_host("pds.b").await.unwrap().unwrap().events, 1);
+    assert_eq!(hosts.get_host("pds.a").await.unwrap().unwrap().failed_checks, 1);
 }
 
 #[tokio::test]
@@ -281,13 +335,13 @@ async fn inactive_accounts_drop_commits() {
     commit(&st, &did, &h, claim(&did, 3), NOW).await.unwrap();
 
     // a relay takedown outlives upstream "active"
-    assert_eq!(st.set_relay_takedown(&did, true).await.unwrap(), Some(AccountStatus::Takendown));
+    assert_eq!(set_relay_takedown(&st, &did, true).await, Some(AccountStatus::Takendown));
     account(&st, &did, &h, true, None).await.unwrap();
     assert!(matches!(
         commit(&st, &did, &h, claim(&did, 4), NOW).await,
         Err(Reject::Inactive(AccountStatus::Takendown))
     ));
-    st.set_relay_takedown(&did, false).await.unwrap();
+    set_relay_takedown(&st, &did, false).await;
     commit(&st, &did, &h, claim(&did, 4), NOW).await.unwrap();
 }
 
@@ -298,8 +352,8 @@ async fn broken_chain_desyncs_until_sync() {
     id.set(&did, "pds.a", 1);
     let st = open(2, id, ApplyConfig::default()).await;
     let h = host("pds.a");
-    let t1 = ticket(&commit(&st, &did, &h, claim(&did, 1), NOW).await.unwrap());
-    st.commit(&[t1]).await.unwrap();
+    let a1 = commit(&st, &did, &h, claim(&did, 1), NOW).await.unwrap();
+    persist(&st, &[accepted(&a1)]).await;
     // commit 3 arrives without 2: prevData mismatch
     let r = commit(&st, &did, &h, claim(&did, 3), NOW).await;
     assert!(matches!(r, Err(Reject::Chain(ChainError::PrevDataMismatch))), "{r:?}");
@@ -308,9 +362,11 @@ async fn broken_chain_desyncs_until_sync() {
     assert_eq!(rec.chain.unwrap().rev, rev(1));
     let r = commit(&st, &did, &h, claim(&did, 4), NOW).await;
     assert!(matches!(r, Err(Reject::Desynchronized)), "{r:?}");
-    // the desync mark is written without any log entry
-    assert_eq!(st.shard_for(&did).unwrap().flush_unlogged().await.unwrap(), 1);
-    assert_eq!(db_record(&st, &did).await.unwrap().status(), AccountStatus::Desynchronized);
+    // the desync mark has no log entry: it's the leader's memory only, never
+    // the database (the log's applier is its only writer)
+    st.shard_for(&did).unwrap().settle_unlogged_in_memory();
+    assert_eq!(st.get(&did).await.unwrap().unwrap().status(), AccountStatus::Desynchronized);
+    assert_eq!(db_record(&st, &did).await.unwrap().status(), AccountStatus::Active);
 
     // #sync resets the chain
     let c = claim(&did, 4);
@@ -403,114 +459,61 @@ async fn per_minute_commit_limit() {
 }
 
 #[tokio::test]
-async fn only_committed_tickets_reach_slatedb() {
+async fn only_committed_entries_reach_slatedb() {
     let id = MapIdentity::new();
     let did = plc(11);
     id.set(&did, "pds.a", 1);
     let st = open(1, id, ApplyConfig::default()).await;
     let h = host("pds.a");
-    let t1 = ticket(&commit(&st, &did, &h, claim(&did, 1), NOW).await.unwrap());
-    let t2 = ticket(&commit(&st, &did, &h, claim(&did, 2), NOW).await.unwrap());
-    // an unlogged change after both: must not be written ahead of t2
+    let a1 = commit(&st, &did, &h, claim(&did, 1), NOW).await.unwrap();
+    let a2 = commit(&st, &did, &h, claim(&did, 2), NOW).await.unwrap();
+    // an unlogged change after both
     assert!(commit(&st, &did, &h, claim(&did, 9), NOW).await.is_err());
-    st.shard_for(&did).unwrap().flush_unlogged().await.unwrap();
+    st.shard_for(&did).unwrap().settle_unlogged_in_memory();
     assert!(db_record(&st, &did).await.is_none());
-    st.commit(&[t1]).await.unwrap();
+    persist(&st, &[accepted(&a1)]).await;
     assert_eq!(db_record(&st, &did).await.unwrap().chain.unwrap().rev, rev(1));
     assert_eq!(st.get(&did).await.unwrap().unwrap().chain.unwrap().rev, rev(2));
-    st.commit(&[t2]).await.unwrap();
+    persist(&st, &[accepted(&a2)]).await;
     let r = db_record(&st, &did).await.unwrap();
     assert_eq!(r.chain.unwrap().rev, rev(2));
-    // the last record written carries the unlogged desync mark too
-    assert_eq!(r.status(), AccountStatus::Desynchronized);
+    // the database has the entry's record; the desync mark stays in memory
+    assert_eq!(r.status(), AccountStatus::Active);
+    assert_eq!(st.get(&did).await.unwrap().unwrap().status(), AccountStatus::Desynchronized);
     assert_eq!(st.shard_for(&did).unwrap().pending_len(), (0, 0));
 }
 
-struct VecSource(Vec<(u64, Vec<StateDelta>)>);
-
-#[async_trait::async_trait]
-impl ReplaySource for VecSource {
-    async fn tail(
-        &self,
-        _log: &str,
-        _shard: ShardId,
-        after: Option<u64>,
-    ) -> anyhow::Result<Vec<(u64, Vec<StateDelta>)>> {
-        Ok(self.0.iter().filter(|(o, _)| after.is_none_or(|a| *o > a)).cloned().collect())
-    }
-}
-
 #[tokio::test]
-async fn replay_rebuilds_state_idempotently() {
-    let id = MapIdentity::new();
-    let dids: Vec<String> = (20..30).map(plc).collect();
-    for d in &dids {
-        id.set(d, "pds.a", 1);
-    }
-    let st = open(1, id.clone(), ApplyConfig::default()).await;
-    let h = host("pds.a");
-    let mut log = Vec::new();
-    for (i, d) in dids.iter().enumerate() {
-        for n in 1..=3 {
-            let Applied::Append(a) = commit(&st, d, &h, claim(d, n), NOW).await.unwrap() else { panic!() };
-            log.push(((i * 3 + n as usize) as u64, vec![a.delta]));
-        }
-    }
-    let Applied::Append(a) = account(&st, &dids[0], &h, false, Some("deactivated")).await.unwrap() else { panic!() };
-    log.push((100, vec![a.delta]));
-    // the node dies: nothing committed. A fresh store over the same bucket
-    // replays the log.
-    let store = st.store.clone();
-    let id0 = st.shards()[0].id;
-    st.close_shard(id0).await.unwrap();
-    let st2 =
-        Arc::new(StateStore::new(store, Layout::uniform(1).shards, StubChain, id.clone(), ApplyConfig::default()));
-    st2.open_shard(id0, None).await.unwrap();
-    let src = VecSource(log.clone());
-    assert_eq!(st2.recover(id0, "node-a", &src, NOW).await.unwrap(), 10 * 3 + 1);
-    let check = |st: Arc<StateStore>| {
-        let dids = dids.clone();
-        async move {
-            for (i, d) in dids.iter().enumerate() {
-                let r = db_record(&st, d).await.unwrap();
-                assert_eq!(r.chain.unwrap().commit, claim(d, 3).commit);
-                assert_eq!(r.status(), if i == 0 { AccountStatus::Deactivated } else { AccountStatus::Active });
-            }
-        }
-    };
-    check(st2.clone()).await;
-    assert_eq!(st2.shard(id0).unwrap().applied_marker("node-a").await.unwrap(), Some(100));
-    // again: the marker skips everything
-    assert_eq!(st2.recover(id0, "node-a", &src, NOW).await.unwrap(), 0);
-    // replaying the whole log over the state changes nothing
-    assert_eq!(st2.replay(&log.iter().flat_map(|(_, d)| d.clone()).collect::<Vec<_>>(), NOW).await.unwrap(), 0);
-    check(st2.clone()).await;
-    // and the replayed head acks the PDS's replays as duplicates
-    assert!(matches!(commit(&st2, &dids[1], &h, claim(&dids[1], 3), NOW).await, Ok(Applied::Duplicate)));
-}
-
-#[tokio::test]
-async fn list_repos_pages_across_shards() {
+async fn list_repos_pages_in_key_order() {
     let id = MapIdentity::new();
     let st = open(4, id.clone(), ApplyConfig::default()).await;
     let h = host("pds.a");
     let mut want = Vec::new();
-    let mut tickets = Vec::new();
+    let mut applied = Vec::new();
     for n in 0..200u64 {
         let d = plc(1000 + n);
         id.set(&d, "pds.a", 1);
         if n % 10 == 0 {
             // identity only: no head, so not listed
-            let a = st.apply(Incoming { did: &d, host: &h, now: NOW, kind: EventKind::Identity }).await.unwrap();
-            tickets.push(ticket(&a));
+            applied.push(st.apply(Incoming { did: &d, host: &h, now: NOW, kind: EventKind::Identity }).await.unwrap());
             continue;
         }
-        tickets.push(ticket(&commit(&st, &d, &h, claim(&d, 1), NOW).await.unwrap()));
+        applied.push(commit(&st, &d, &h, claim(&d, 1), NOW).await.unwrap());
         want.push(d);
     }
+    let mut taken_rec = None;
     let taken = want[0].clone();
-    st.set_relay_takedown(&taken, true).await.unwrap();
-    st.commit(&tickets).await.unwrap();
+    let mut acc: Vec<&Accepted> = applied.iter().map(accepted).collect();
+    for a in &mut acc {
+        if a.delta.did == taken {
+            let mut r = (*a.record).clone();
+            r.relay_takedown = true;
+            taken_rec = Some(r);
+        }
+    }
+    persist(&st, &acc).await;
+    let s = st.shard_for("").unwrap();
+    s.db.put(record::did_key(&taken), taken_rec.unwrap().encode()).await.unwrap();
     let mut got = Vec::new();
     let mut cursor: Option<String> = None;
     let mut pages = 0;
@@ -538,41 +541,6 @@ async fn list_repos_pages_across_shards() {
     let last = keys.last().map(|k| record::did_from_key(k).unwrap()).unwrap();
     let p = st.list_repos(Some(&last), 10).await.unwrap();
     assert!(p.repos.is_empty() && p.cursor.is_none());
-}
-
-#[tokio::test]
-async fn host_records() {
-    let st = open(4, MapIdentity::new(), ApplyConfig::default()).await;
-    assert!(st.get_host("nope").await.unwrap().is_none());
-    for i in 0..25 {
-        st.put_host(&HostRecord::new(&format!("pds{i}.example"), Tier::Default, NOW)).await.unwrap();
-    }
-    st.checkpoint_cursors(&[("pds3.example".into(), 500), ("unknown.example".into(), 9)]).await.unwrap();
-    st.checkpoint_cursors(&[("pds3.example".into(), 400)]).await.unwrap();
-    assert_eq!(st.get_host("pds3.example").await.unwrap().unwrap().cursor, 500);
-    assert!(st.get_host("unknown.example").await.unwrap().is_none());
-    let mut seen = Vec::new();
-    let mut cursor = None;
-    loop {
-        let p = HostStore::list_hosts(&*st, cursor.as_deref(), 4).await.unwrap();
-        seen.extend(p.hosts.into_iter().map(|h| h.hostname));
-        match p.cursor {
-            Some(c) => cursor = Some(c),
-            None => break,
-        }
-    }
-    seen.sort();
-    seen.dedup();
-    assert_eq!(seen.len(), 25);
-    let mut r = st.get_host("pds4.example").await.unwrap().unwrap();
-    r.tier = Tier::Banned;
-    st.put_host(&r).await.unwrap();
-    assert_eq!(st.get_host("pds4.example").await.unwrap().unwrap().lexicon_status(), "banned");
-    // host names survive a reopen (they come back from the host rows)
-    let sid = st.shard_for("pds4.example").unwrap().id;
-    st.close_shard(sid).await.unwrap();
-    st.open_shard(sid, None).await.unwrap();
-    assert!(st.host_name(HostKey::of("pds4.example")).is_some());
 }
 
 #[tokio::test]
@@ -604,51 +572,6 @@ async fn concurrent_applies_for_one_did_stay_ordered() {
     }
     assert_eq!(appended, 3);
     assert_eq!(st.get(&did).await.unwrap().unwrap().chain.unwrap().rev, rev(3));
-}
-
-#[tokio::test]
-async fn update_host_is_atomic_against_counter_flushes() {
-    let st = open(2, MapIdentity::new(), ApplyConfig::default()).await;
-    st.put_host(&HostRecord::new("pds.example", Tier::Default, NOW)).await.unwrap();
-    // a tier change and counter flushes interleaving on one record: none lost
-    let mut tasks = Vec::new();
-    for i in 0..50u64 {
-        let st = st.clone();
-        tasks.push(tokio::spawn(async move {
-            if i % 10 == 0 {
-                st.update_host(
-                    "pds.example",
-                    Box::new(|cur| {
-                        let mut r = cur?;
-                        r.tier = Tier::Throttled;
-                        Some(r)
-                    }),
-                )
-                .await
-                .unwrap();
-            } else {
-                st.add_counts(&[("pds.example".into(), HostCounts { events: 1, ..Default::default() })]).await.unwrap();
-            }
-        }));
-    }
-    for t in tasks {
-        t.await.unwrap();
-    }
-    let r = st.get_host("pds.example").await.unwrap().unwrap();
-    assert_eq!((r.tier, r.events), (Tier::Throttled, 45));
-    // None writes nothing; an unknown host is offered None
-    assert!(st.update_host("pds.example", Box::new(|_| None)).await.unwrap().is_none());
-    let seen = st
-        .update_host(
-            "nope.example",
-            Box::new(|cur| {
-                assert!(cur.is_none());
-                None
-            }),
-        )
-        .await
-        .unwrap();
-    assert!(seen.is_none() && st.get_host("nope.example").await.unwrap().is_none());
 }
 
 struct CapGate(AtomicU32);
@@ -688,7 +611,7 @@ async fn accounts_past_the_gate_are_created_throttled() {
     // an upstream #account doesn't lift it; an operator's untakedown does
     account(&st, &b, &h, true, None).await.unwrap();
     assert_eq!(st.get(&b).await.unwrap().unwrap().status(), AccountStatus::Throttled);
-    st.set_relay_takedown(&b, false).await.unwrap();
+    set_relay_takedown(&st, &b, false).await;
     commit(&st, &b, &h, claim(&b, 3), NOW).await.unwrap();
     // a deferred account isn't created: its next event asks again
     let d = plc(9);
@@ -796,7 +719,8 @@ async fn foreign_identity_creates_no_account() {
     let gate = Arc::new(LogGate::default());
     st.set_account_gate(gate.clone());
     let (victim, other) = (host("victim.example"), host("relayer.example"));
-    st.put_host(&HostRecord::new("victim.example", Tier::Default, NOW)).await.unwrap();
+    let hosts = MemHosts::default();
+    hosts.put_host(&HostRecord::new("victim.example", Tier::Default, NOW)).await.unwrap();
     let dids: Vec<String> = (40..43).map(plc).collect();
     for d in &dids {
         id.set(d, "victim.example", 1);
@@ -805,90 +729,9 @@ async fn foreign_identity_creates_no_account() {
         assert!(st.get(d).await.unwrap().is_none());
     }
     assert!(gate.0.lock().is_empty());
-    st.flush_host_counts(&*st).await.unwrap();
-    assert_eq!(HostStore::get_host(&*st, "victim.example").await.unwrap().unwrap().account_count, 0);
+    st.flush_host_counts(&hosts).await.unwrap();
+    assert_eq!(hosts.get_host("victim.example").await.unwrap().unwrap().account_count, 0);
     // the account's own PDS meets the gate as for any unknown account
     commit(&st, &dids[0], &victim, claim(&dids[0], 3), NOW).await.unwrap();
     assert_eq!(*gate.0.lock(), vec![(dids[0].clone(), Arrival::FirstSeen)]);
-}
-
-/// A split and a merge carry every slot-keyed family (sync records, mirror
-/// rows, host rows, seeds) to the shard that owns its slot, and leave the
-/// per-shard applied markers behind.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn split_and_merge_carry_every_family() {
-    use vlpds::slots::ShardRange;
-    let id = MapIdentity::new();
-    let st = open(1, id.clone(), ApplyConfig::default()).await;
-    let store = st.store.clone();
-    let dids: Vec<String> = (0..60).map(plc).collect();
-    for d in &dids {
-        id.set(d, "pds0.example", 1);
-    }
-    let hosts: Vec<String> = (0..20).map(|i| format!("pds{i}.example")).collect();
-    let h = host("pds0.example");
-    for d in &dids {
-        let a = commit(&st, d, &h, claim(d, 0), NOW).await.unwrap();
-        st.commit(&[ticket(&a)]).await.unwrap();
-        let s = st.shard_for(d).unwrap();
-        s.put_raw(crate::plc_seed::seed_key(d), Bytes::from(format!("seed {d}"))).await.unwrap();
-        s.put_raw(crate::archive::mirror::meta_key(d), Bytes::from(format!("mirror {d}"))).await.unwrap();
-    }
-    for (i, hn) in hosts.iter().enumerate() {
-        let mut r = HostRecord::new(hn, Tier::Default, NOW);
-        r.cursor = 100 + i as i64;
-        st.put_host(&r).await.unwrap();
-    }
-    st.shard(ShardId(0)).unwrap().checkpoint("log-a", 41).await.unwrap();
-    let mut before = Vec::new();
-    for d in &dids {
-        before.push(st.get(d).await.unwrap().unwrap());
-    }
-    st.close_shard(ShardId(0)).await.unwrap();
-
-    let check = |layout: Vec<ShardRange>| {
-        let (store, dids, hosts, before) = (store.clone(), &dids, &hosts, &before);
-        async move {
-            let st = StateStore::new(store, layout.clone(), StubChain, MapIdentity::new(), ApplyConfig::default());
-            for r in &layout {
-                st.open_shard(r.id, None).await.unwrap();
-            }
-            for (d, rec) in dids.iter().zip(before) {
-                assert_eq!(st.get(d).await.unwrap().as_deref(), Some(&**rec), "{d}");
-                let s = st.shard_for(d).unwrap();
-                let seed = s.db.get(crate::plc_seed::seed_key(d)).await.unwrap();
-                assert_eq!(seed.as_deref(), Some(format!("seed {d}").as_bytes()), "seed of {d}");
-                let m = s.db.get(crate::archive::mirror::meta_key(d)).await.unwrap();
-                assert_eq!(m.as_deref(), Some(format!("mirror {d}").as_bytes()), "mirror of {d}");
-            }
-            for (i, hn) in hosts.iter().enumerate() {
-                assert_eq!(st.get_host(hn).await.unwrap().map(|r| r.cursor), Some(100 + i as i64), "{hn}");
-            }
-            let mut listed = 0;
-            for r in &layout {
-                let s = st.shard(r.id).unwrap();
-                assert_eq!(s.applied_marker("log-a").await.unwrap(), None, "a marker of the parent's log");
-                let (a, b) = s.range_keys();
-                let mut it = vlpds::state::BatchedScan::new(s.db.scan(a.to_vec()..b.to_vec()).await.unwrap());
-                while let Some(kv) = it.next().await.unwrap() {
-                    let slot = vlpds::state::key_slot(&kv.key).unwrap() as u32;
-                    assert!((r.lo..r.hi).contains(&slot), "shard {} holds slot {slot}", r.id);
-                    listed += 1;
-                }
-            }
-            assert_eq!(listed, dids.len() * 2);
-            assert_eq!(st.list_repos(None, 1000).await.unwrap().repos.len(), dids.len());
-            assert_eq!(HostStore::list_hosts(&st, None, 1000).await.unwrap().hosts.len(), hosts.len());
-            for r in &layout {
-                st.close_shard(r.id).await.unwrap();
-            }
-        }
-    };
-    let halves = [(ShardId(1), 0u32, 32768u32), (ShardId(2), 32768, 65536)];
-    for (c, lo, hi) in halves {
-        vlpds::partition::clone_db_families(&store, c, &[(ShardId(0), lo, hi)], CLONE_FAMILIES).await.unwrap();
-    }
-    check(halves.iter().map(|&(id, lo, hi)| ShardRange { id, lo, hi }).collect()).await;
-    vlpds::partition::clone_db_families(&store, ShardId(3), &halves, CLONE_FAMILIES).await.unwrap();
-    check(vec![ShardRange { id: ShardId(3), lo: 0, hi: 65536 }]).await;
 }

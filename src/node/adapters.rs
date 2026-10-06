@@ -1,19 +1,12 @@
 //! The seams between modules that were built apart: the verify workstream's
-//! chain check and DID cache behind the state store's traits, the state
-//! store's host records behind the upstream registry, and the node log
-//! behind the state store's replay.
+//! chain check and DID cache behind the state store's traits, and the
+//! upstream registry's rows as host records.
 
 use crate::identity::{Fetch, HttpFetch, IdentityCache, LookupError};
-use crate::seq::{self, Logged};
-use crate::state::{self, Chain, HostStore as _, IdentityError, IdentitySource, ReplaySource, StateDelta, StateStore};
-use crate::types::Host;
+use crate::state::{self, Chain, IdentityError, IdentitySource};
 use crate::upstream::{self, ErrorCounters, HostStatus};
 use bytes::Bytes;
-use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::sync::Arc;
-use vlpds::slots::ShardId;
-use vlpds::store::Store;
 
 /// `verify::check_chain` as the state store's [`Chain`].
 pub struct VerifyChain;
@@ -70,10 +63,8 @@ fn multikey_bytes(mb: &str) -> Option<Bytes> {
     (raw.len() <= state::record::MAX_KEY_LEN).then(|| Bytes::from(raw))
 }
 
-/// The upstream registry's rows kept in the state store's host records. The
-/// upstream-only fields ride in the record's `extra` map under `upstream`.
-pub struct StateHosts<C: Chain>(pub Arc<StateStore<C>>);
-
+/// The upstream-only fields of a registry row, kept in a host record's
+/// `extra` map under `upstream`.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 struct UpstreamExtra {
@@ -136,206 +127,4 @@ pub(crate) fn apply_upstream(rec: &mut state::HostRecord, r: &upstream::HostReco
     if let Some(c) = r.acked_seq {
         rec.cursor = rec.cursor.max(c);
     }
-}
-
-impl<C: Chain> upstream::HostStore for StateHosts<C> {
-    fn load(&self) -> upstream::host::StoreFuture<'_, Vec<upstream::HostRecord>> {
-        Box::pin(async move {
-            let mut out = Vec::new();
-            let mut cursor: Option<String> = None;
-            loop {
-                let page = self.0.list_hosts(cursor.as_deref(), 1000).await?;
-                out.extend(page.hosts.iter().map(to_upstream));
-                match page.cursor {
-                    Some(c) => cursor = Some(c),
-                    None => return Ok(out),
-                }
-            }
-        })
-    }
-
-    /// The registry's tier only seeds a new record: after that the policy
-    /// engine owns it (operator actions, the driver's throttles), and the
-    /// registry follows the record, never the other way round.
-    fn put(&self, records: Vec<upstream::HostRecord>) -> upstream::host::StoreFuture<'_, ()> {
-        Box::pin(async move {
-            for r in &records {
-                let conn = match r.status {
-                    HostStatus::Active | HostStatus::Throttled => state::Conn::Active,
-                    HostStatus::Idle => state::Conn::Idle,
-                    HostStatus::Connecting | HostStatus::Backoff => state::Conn::Offline,
-                };
-                let x = serde_json::to_value(UpstreamExtra {
-                    admitted_ms: r.admitted_ms,
-                    last_connected_ms: r.last_connected_ms,
-                    errors: r.errors.clone(),
-                })?;
-                let tier = tier_to_state(r.tier);
-                let hostname = r.hostname.clone();
-                self.0
-                    .update_host(
-                        &r.hostname,
-                        Box::new(move |cur| {
-                            let mut rec =
-                                cur.unwrap_or_else(|| state::HostRecord::new(&hostname, tier, state::now_secs()));
-                            rec.conn = conn;
-                            rec.extra.insert("upstream".into(), x);
-                            Some(rec)
-                        }),
-                    )
-                    .await?;
-            }
-            // every row, cursor or not: checkpoint_cursors flushes the
-            // memtable of each shard it touches, and nothing else does
-            let cursors: Vec<(String, i64)> =
-                records.iter().map(|r| (r.hostname.clone(), r.acked_seq.unwrap_or(0))).collect();
-            self.0.checkpoint_cursors(&cursors).await
-        })
-    }
-}
-
-/// One log's segments read once from the lowest ordinal any shard needs,
-/// then served to every shard's `recover`.
-pub type Tail = Arc<Vec<(u64, Vec<Logged>)>>;
-
-/// (from, end: None = to the log's end, the segments read)
-type Cached = (u64, Option<u64>, Tail);
-
-pub struct LogReplay {
-    store: Store,
-    cache: Mutex<HashMap<String, Cached>>,
-    /// Per log: a takeover opens many shards of one dead log at once, and
-    /// each would otherwise read it in full.
-    reading: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-}
-
-impl LogReplay {
-    pub fn new(store: Store) -> LogReplay {
-        LogReplay { store, cache: Mutex::new(HashMap::new()), reading: Mutex::new(HashMap::new()) }
-    }
-
-    pub async fn read(&self, log_id: &str, from: u64) -> anyhow::Result<Tail> {
-        self.read_span(log_id, from, None).await
-    }
-
-    /// The segments of `log_id` in `[from, end)`. A bounded span (an
-    /// earlier owner's, closed by its release or the takeover's fence) is
-    /// read without a LIST and never past its end: a log that lived on
-    /// long after it held the shard made every open read the rest of it.
-    pub async fn read_span(&self, log_id: &str, from: u64, end: Option<u64>) -> anyhow::Result<Tail> {
-        let hit = |c: &Cached| c.0 <= from && (c.1.is_none() || end.is_some_and(|e| Some(e) <= c.1));
-        if let Some(c) = self.cache.lock().get(log_id).filter(|c| hit(c)) {
-            return Ok(c.2.clone());
-        }
-        if end.is_some_and(|e| e <= from) {
-            return Ok(Arc::default());
-        }
-        let lock = self.reading.lock().entry(log_id.to_string()).or_default().clone();
-        let _one = lock.lock().await;
-        if let Some(c) = self.cache.lock().get(log_id).filter(|c| hit(c)) {
-            return Ok(c.2.clone());
-        }
-        use futures::StreamExt;
-        let to = match end {
-            Some(e) => e,
-            None => vlpds::nodelog::first_free(&self.store, log_id).await?.0,
-        };
-        let segs: Vec<anyhow::Result<(u64, Option<Vec<Logged>>)>> = futures::stream::iter(from..to)
-            .map(|ord| async move { Ok((ord, seq::read_segment(&self.store, log_id, ord).await?)) })
-            .buffered(16)
-            .collect()
-            .await;
-        let mut out = Vec::new();
-        for s in segs {
-            let (ord, evs) = s?;
-            if let Some(evs) = evs {
-                out.push((ord, evs));
-            }
-        }
-        let t: Tail = Arc::new(out);
-        self.cache.lock().insert(log_id.to_string(), (from, end, t.clone()));
-        Ok(t)
-    }
-
-    /// Every (host, upstream seq) the cached tails hold, for hosts whose
-    /// durable cursor is below it.
-    /// (upstream seq, `did_key`) of each logged event past its host's cursor.
-    pub fn logged_above(&self, cursor: impl Fn(&Host) -> i64) -> HashMap<Host, std::collections::HashSet<(i64, u64)>> {
-        let mut out: HashMap<Host, std::collections::HashSet<(i64, u64)>> = HashMap::new();
-        for (_, _, t) in self.cache.lock().values() {
-            for (_, evs) in t.iter() {
-                for e in evs {
-                    if e.meta.upstream_seq > 0 && e.meta.upstream_seq > cursor(&e.meta.host) {
-                        let k = (e.meta.upstream_seq, super::cluster::did_key(&e.meta.did));
-                        out.entry(e.meta.host.clone()).or_default().insert(k);
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    pub fn clear(&self) {
-        self.cache.lock().clear();
-    }
-}
-
-#[async_trait::async_trait]
-impl ReplaySource for LogReplay {
-    async fn tail(
-        &self,
-        log_id: &str,
-        shard: ShardId,
-        after: Option<u64>,
-    ) -> anyhow::Result<Vec<(u64, Vec<StateDelta>)>> {
-        let from = after.map_or(0, |a| a + 1);
-        let t = self.read(log_id, from).await?;
-        deltas_of(&t, log_id, shard, from)
-    }
-    async fn frames(
-        &self,
-        log_id: &str,
-        shard: ShardId,
-        after: Option<u64>,
-    ) -> anyhow::Result<Vec<(u64, Vec<(String, bytes::Bytes)>)>> {
-        let from = after.map_or(0, |a| a + 1);
-        let t = self.read(log_id, from).await?;
-        Ok(frames_of(&t, shard, from))
-    }
-}
-
-/// `shard`'s state deltas in `t` from ordinal `from` on.
-pub fn deltas_of(t: &Tail, log_id: &str, shard: ShardId, from: u64) -> anyhow::Result<Vec<(u64, Vec<StateDelta>)>> {
-    let mut out = Vec::new();
-    for (ord, evs) in t.iter() {
-        if *ord < from {
-            continue;
-        }
-        let deltas: Vec<StateDelta> = evs
-            .iter()
-            .filter(|e| e.meta.shard == shard.0)
-            .filter_map(|e| e.delta.as_ref())
-            .map(|d| StateDelta::decode(d).map_err(|e| anyhow::anyhow!("{log_id}/{ord}: bad state delta: {e}")))
-            .collect::<anyhow::Result<_>>()?;
-        if !deltas.is_empty() {
-            out.push((*ord, deltas));
-        }
-    }
-    Ok(out)
-}
-
-/// `shard`'s frames in `t` from ordinal `from` on.
-pub fn frames_of(t: &Tail, shard: ShardId, from: u64) -> Vec<(u64, Vec<(String, bytes::Bytes)>)> {
-    let mut out = Vec::new();
-    for (ord, evs) in t.iter() {
-        if *ord < from {
-            continue;
-        }
-        let frames: Vec<(String, bytes::Bytes)> =
-            evs.iter().filter(|e| e.meta.shard == shard.0).map(|e| (e.meta.did.clone(), e.frame.clone())).collect();
-        if !frames.is_empty() {
-            out.push((*ord, frames));
-        }
-    }
-    out
 }

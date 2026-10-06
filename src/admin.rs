@@ -551,29 +551,6 @@ pub struct Account {
     pub rejects_last_hour: u64,
     pub did_shard: u32,
     pub node: String,
-    /// The mirror, on an archiving relay (None: archival is off).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub archive: Option<AccountArchive>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AccountArchive {
-    /// The policy wants this account mirrored.
-    pub wanted: bool,
-    /// A live mirror exists (getRepo serves it).
-    pub mirrored: bool,
-    /// The mirror's head rev.
-    pub rev: Option<String>,
-    /// A fetch is queued or running.
-    pub fetching: bool,
-    /// A fetch's rows are staged but not switched in yet.
-    pub staging: bool,
-    /// The newest fetch failure still in the error list.
-    pub last_error: Option<String>,
-    /// When the sweeper first saw it taken down (unix ms); the mirror goes
-    /// `takedownRetentionHours` later.
-    pub takedown_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -677,60 +654,6 @@ pub struct CaseUpdate {
 
 // ---------------------------------------------------------------- operations
 
-/// Archival mode across the core nodes (each mirrors its own DID shards).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ArchiveView {
-    /// `off`, `all`, `tiers` or `hosts`.
-    pub mode: String,
-    pub policy_version: u64,
-    pub totals: ArchiveCounts,
-    pub nodes: Vec<ArchiveNode>,
-    /// The newest fetch failures, newest last.
-    pub errors: Vec<ArchiveError>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ArchiveCounts {
-    /// Live mirrors, as the last sweep counted them.
-    pub mirrored: u64,
-    /// Waiting for a fetch slot.
-    pub queued: u64,
-    /// Fetching now.
-    pub running: u64,
-    /// Gave up after every retry (since start).
-    pub failed: u64,
-    pub fetched: u64,
-    pub retried: u64,
-    /// CAR bytes fetched since start.
-    pub bytes: u64,
-    pub records: u64,
-    /// SST bytes of the shards the mirrors live in.
-    pub sst_bytes: u64,
-    /// Live commits applied to mirrors since start.
-    pub applied: u64,
-    pub mismatches: u64,
-    pub healed: u64,
-    pub swept_at_ms: i64,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ArchiveNode {
-    pub node: String,
-    pub stale: bool,
-    pub counts: ArchiveCounts,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ArchiveError {
-    pub node: String,
-    pub did: String,
-    pub error: String,
-}
-
 /// PLC export seeding (docs/policy.md): one core reads the export, the
 /// lowest-named live one.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -781,49 +704,6 @@ pub struct PlcNode {
     pub ops_per_sec: f64,
     pub throttled: u64,
     pub errors: u64,
-}
-
-/// Stream seq checkpoints (docs/seq.md): every node numbers the merged
-/// stream on its own, so at each boundary they must all agree.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SeqView {
-    pub nodes: Vec<SeqNode>,
-    /// The newest boundaries any node knows, newest first.
-    pub boundaries: Vec<SeqBoundary>,
-    /// Every boundary two or more nodes know has one seq.
-    pub agree: bool,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SeqNode {
-    pub node: String,
-    pub role: String,
-    pub stale: bool,
-    /// The last seq its stream emitted.
-    pub head: i64,
-    /// Its newest checkpoint.
-    pub latest: Option<SeqPair>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SeqPair {
-    pub key: i64,
-    /// The boundary as unix ms (`key >> 8` is unix µs).
-    pub time_ms: i64,
-    pub seq: i64,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SeqBoundary {
-    pub key: i64,
-    pub time_ms: i64,
-    /// Node -> the seq it counted at this boundary (absent: it doesn't know it).
-    pub seqs: BTreeMap<String, i64>,
-    pub agree: bool,
 }
 
 /// The ack backlog and restart dedupe: what's been read off upstream
@@ -901,33 +781,6 @@ impl IntoResponse for AdminError {
 
 pub type AdminResult<T> = Result<T, AdminError>;
 
-/// An online DID shard split or merge (vlpds's `reshard`), or aborting the
-/// one in flight before it flips. With `wait`, the answer comes once the op
-/// flipped or was aborted (at most 120 s).
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "op")]
-pub enum ReshardReq {
-    /// `at`: the first slot of the right half (default: the midpoint).
-    Split {
-        shard: u32,
-        at: Option<u32>,
-        #[serde(default)]
-        wait: bool,
-    },
-    /// `left` holds the lower slots.
-    Merge {
-        left: u32,
-        right: u32,
-        #[serde(default)]
-        wait: bool,
-    },
-    Abort,
-}
-
-fn no_cluster() -> AdminError {
-    AdminError::BadRequest("not a cluster core node".into())
-}
-
 /// What the dashboard needs from a relay. `by` is the operator label the
 /// audit trail records (the admin token has no user, so it's "admin" plus
 /// the client IP).
@@ -986,14 +839,8 @@ pub trait AdminSource: Send + Sync + 'static {
         }
     }
 
-    fn archive_view(&self) -> impl Future<Output = AdminResult<ArchiveView>> + Send {
-        async { Err(AdminError::NotFound("archival isn't available on this relay".into())) }
-    }
     fn plc_view(&self) -> impl Future<Output = AdminResult<PlcView>> + Send {
         async { Err(AdminError::NotFound("PLC export seeding isn't available on this relay".into())) }
-    }
-    fn seq_view(&self) -> impl Future<Output = AdminResult<SeqView>> + Send {
-        async { Err(AdminError::NotFound("seq checkpoints aren't available on this relay".into())) }
     }
     fn pipeline_view(&self) -> impl Future<Output = AdminResult<PipelineView>> + Send {
         async { Err(AdminError::NotFound("pipeline numbers aren't available on this relay".into())) }
@@ -1022,13 +869,6 @@ pub trait AdminSource: Send + Sync + 'static {
             let q = self.quorum().await.ok();
             Ok(public::project(&o, q.as_ref()))
         }
-    }
-    /// The DID shard layout: version, shards (id, slots, owner), the op in flight.
-    fn shard_layout(&self) -> impl Future<Output = AdminResult<serde_json::Value>> + Send {
-        async { Err(no_cluster()) }
-    }
-    fn reshard(&self, _req: ReshardReq) -> impl Future<Output = AdminResult<serde_json::Value>> + Send {
-        async { Err(no_cluster()) }
     }
 
     fn accounts(&self, q: AccountQuery) -> impl Future<Output = AdminResult<Vec<Account>>> + Send;
@@ -1076,12 +916,8 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
         .route("/admin/api/cluster/quorum/members", post(quorum_members::<S>))
         .route("/admin/api/settings", get(settings::<S>))
         .route("/admin/api/policy/defaults", get(policy_defaults))
-        .route("/admin/api/ops/archive", get(archive_view::<S>))
         .route("/admin/api/ops/plc", get(plc_view::<S>))
-        .route("/admin/api/ops/seq", get(seq_view::<S>))
         .route("/admin/api/ops/pipeline", get(pipeline_view::<S>))
-        .route("/admin/api/cluster/layout", get(shard_layout::<S>))
-        .route("/admin/api/cluster/reshard", post(reshard::<S>))
         .route("/admin/api/accounts", get(accounts::<S>))
         .route("/admin/api/accounts/{did}", get(account::<S>))
         .route("/admin/api/accounts/{did}/takedown", post(takedown::<S>))
@@ -1188,14 +1024,8 @@ async fn kick<S: AdminSource>(
     c.src.kick_consumer_on(node, id, BY).await?;
     Ok(StatusCode::NO_CONTENT)
 }
-async fn archive_view<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<ArchiveView>> {
-    Ok(Json(c.src.archive_view().await?))
-}
 async fn plc_view<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<PlcView>> {
     Ok(Json(c.src.plc_view().await?))
-}
-async fn seq_view<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<SeqView>> {
-    Ok(Json(c.src.seq_view().await?))
 }
 async fn pipeline_view<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<PipelineView>> {
     Ok(Json(c.src.pipeline_view().await?))
@@ -1222,13 +1052,6 @@ async fn settings<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<SettingsV
 /// What every policy field is on a fresh relay, for the Tuning page.
 async fn policy_defaults() -> AdminResult<Json<serde_json::Value>> {
     Ok(Json(serde_json::to_value(crate::policy::doc::PolicyBody::default()).map_err(anyhow::Error::from)?))
-}
-async fn shard_layout<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<serde_json::Value>> {
-    Ok(Json(c.src.shard_layout().await?))
-}
-async fn reshard<S: AdminSource>(State(c): Ax<S>, Json(req): Json<ReshardReq>) -> AdminResult<Json<serde_json::Value>> {
-    tracing::info!(target: "vlrelay::audit", ?req, by = BY, "reshard");
-    Ok(Json(c.src.reshard(req).await?))
 }
 async fn accounts<S: AdminSource>(State(c): Ax<S>, Query(q): Query<AccountQuery>) -> AdminResult<Json<Vec<Account>>> {
     Ok(Json(c.src.accounts(q).await?))

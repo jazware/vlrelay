@@ -1,12 +1,11 @@
-//! One DID shard's SlateDB plus the in-memory view the DID owner checks
-//! against.
+//! The quorum leader's view of the records: the state's SlateDB as the
+//! log's applier wrote it, plus what this term decided and the applier
+//! hasn't reached.
 //!
-//! An applied event changes the in-memory record at once, so the DID's next
-//! event is checked against it, but reaches SlateDB only when its log entry
-//! is durable (`commit`). Writing earlier would let a memtable flush persist
-//! state for an event the log never got: after a crash the host replays it,
-//! the DID owner sees "same commit at the current rev", acks it as a
-//! duplicate, and the event never reaches the firehose.
+//! A decided event changes the in-memory record at once, so the DID's next
+//! event is checked against it. Nothing here writes the database: the
+//! applier writes each committed entry's record, and the staged one is
+//! then released to the cache (`release`).
 
 use super::record::{self, Record};
 use crate::types::FastMap;
@@ -17,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use vlpds::slots::ShardId;
 
-/// Names one applied event's pending write; the log carries it to `commit`.
+/// Names one decided event's staged record, until the applier has it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ticket {
     pub shard: ShardId,
@@ -58,8 +57,6 @@ pub struct ShardState {
     stripes: Box<[Arc<tokio::sync::Mutex<()>>]>,
     next_ticket: AtomicU64,
     pub stats: ShardStats,
-    /// Archival mode's in-memory side (`crate::archive`).
-    pub mirror: crate::archive::ShardMirror,
 }
 
 #[derive(Default)]
@@ -83,7 +80,6 @@ impl ShardState {
             stripes: (0..STRIPES).map(|_| Arc::new(tokio::sync::Mutex::new(()))).collect(),
             next_ticket: AtomicU64::new(1),
             stats: ShardStats::default(),
-            mirror: Default::default(),
         }
     }
 
@@ -179,107 +175,6 @@ impl ShardState {
         }
     }
 
-    /// Writes the records of `tickets` (all durable in the log, in log
-    /// order) to the memtable in one batch: what the log finalizer calls
-    /// before it acks them. Unknown tickets (already committed) are skipped.
-    pub async fn commit(&self, tickets: impl IntoIterator<Item = u64>) -> Result<usize, slatedb::Error> {
-        let mut rows: FastMap<Arc<str>, Arc<Record>> = FastMap::default();
-        let mut settled = Vec::new();
-        let mut mirror_rows = Vec::new();
-        let mut mirrored = Vec::new();
-        {
-            let mut p = self.pending.lock();
-            for t in tickets {
-                if let Some((did, m)) = self.mirror.take_ticket(t) {
-                    mirror_rows.extend(m);
-                    mirrored.push(did);
-                }
-                let Some((did, snap)) = p.by_ticket.remove(&t) else { continue };
-                let slot = p.by_did.get_mut(&did).expect("a ticket's DID is pending");
-                slot.outstanding -= 1;
-                if slot.outstanding == 0 {
-                    rows.insert(did.clone(), slot.rec.clone());
-                    settled.push((did, slot.rec.clone()));
-                } else {
-                    rows.insert(did, snap);
-                }
-            }
-        }
-        let n = rows.len();
-        if n == 0 && mirror_rows.is_empty() {
-            return Ok(0);
-        }
-        self.write_rows_with(rows, mirror_rows).await?;
-        for did in mirrored {
-            self.mirror.settle(&did);
-        }
-        self.settle(settled);
-        self.stats.committed.fetch_add(n as u64, Relaxed);
-        Ok(n)
-    }
-
-    /// Writes staged changes that no log entry carries, for DIDs with no
-    /// uncommitted logged change.
-    pub async fn flush_unlogged(&self) -> Result<usize, slatedb::Error> {
-        let rows: FastMap<Arc<str>, Arc<Record>> = {
-            let p = self.pending.lock();
-            p.by_did
-                .iter()
-                .filter(|(_, s)| s.outstanding == 0 && s.dirty)
-                .map(|(d, s)| (d.clone(), s.rec.clone()))
-                .collect()
-        };
-        let n = rows.len();
-        if n == 0 {
-            return Ok(0);
-        }
-        let settled: Vec<_> = rows.iter().map(|(d, r)| (d.clone(), r.clone())).collect();
-        self.write_rows(rows).await?;
-        self.settle(settled);
-        Ok(n)
-    }
-
-    async fn write_rows(&self, rows: FastMap<Arc<str>, Arc<Record>>) -> Result<(), slatedb::Error> {
-        self.write_rows_with(rows, Vec::new()).await
-    }
-
-    /// Sync records and mirror rows in one batch, the mirror's in log order.
-    async fn write_rows_with(
-        &self,
-        rows: FastMap<Arc<str>, Arc<Record>>,
-        mirror: Vec<vlpds::segment::Mutation>,
-    ) -> Result<(), slatedb::Error> {
-        let mut wb = slatedb::WriteBatch::new();
-        for (did, rec) in rows {
-            wb.put(record::did_key(&did), rec.encode());
-        }
-        for m in mirror {
-            match m.val {
-                Some(v) => wb.put(&m.key, &v),
-                None => wb.delete(&m.key),
-            }
-        }
-        self.db.write(wb).await.map(|_| ())
-    }
-
-    /// Moves written records from pending to the cache, unless a newer
-    /// change was staged while the batch was in flight.
-    fn settle(&self, written: Vec<(Arc<str>, Arc<Record>)>) {
-        let mut p = self.pending.lock();
-        for (did, rec) in written {
-            let done = p.by_did.get(&did).is_some_and(|s| s.outstanding == 0 && Arc::ptr_eq(&s.rec, &rec));
-            if done {
-                p.by_did.remove(&did);
-                self.cache[Self::way(&did) % CACHE_WAYS].lock().put(did, rec);
-            } else if let Some(s) = p.by_did.get_mut(&did)
-                && s.outstanding == 0
-                && !Arc::ptr_eq(&s.rec, &rec)
-            {
-                s.dirty = true;
-            }
-        }
-    }
-
     /// The quorum log's leader: these tickets' entries are applied, by the
     /// log's applier from the records their meta carried, so their records
     /// leave pending for the cache without being written here. A DID with
@@ -316,43 +211,6 @@ impl ShardState {
     pub fn pending_len(&self) -> (usize, usize) {
         let p = self.pending.lock();
         (p.by_did.len(), p.by_ticket.len())
-    }
-
-    /// Writes `rec` straight to the memtable (replay and operator edits:
-    /// nothing outstanding to order against). Drops any cached copy.
-    pub async fn put_direct(&self, did: &str, rec: Record) -> Result<(), slatedb::Error> {
-        let rec = Arc::new(rec);
-        self.db.put(record::did_key(did), rec.encode()).await?;
-        self.cache[Self::way(did) % CACHE_WAYS].lock().put(Arc::from(did), rec);
-        Ok(())
-    }
-
-    pub async fn put_raw(&self, key: Vec<u8>, value: Bytes) -> Result<(), slatedb::Error> {
-        self.db.put(key, value).await.map(|_| ())
-    }
-
-    pub async fn flush_memtable(&self) -> Result<(), slatedb::Error> {
-        self.db
-            .flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
-            .await
-    }
-
-    /// The last log ordinal of `log_id` applied before the last checkpoint.
-    pub async fn applied_marker(&self, log_id: &str) -> Result<Option<u64>, slatedb::Error> {
-        Ok(self
-            .db
-            .get(record::applied_key(log_id))
-            .await?
-            .and_then(|b| b.as_ref().try_into().ok().map(u64::from_be_bytes)))
-    }
-
-    /// Records that every entry of `log_id` up to `ord` is committed here,
-    /// then flushes, so the next owner replays from just after it. The
-    /// caller has committed every ticket of those entries.
-    pub async fn checkpoint(&self, log_id: &str, ord: u64) -> Result<(), slatedb::Error> {
-        self.flush_unlogged().await?;
-        self.db.put(record::applied_key(log_id), ord.to_be_bytes().to_vec()).await?;
-        self.flush_memtable().await
     }
 
     /// The live SSTs' bytes in the bucket (L0 plus compacted).

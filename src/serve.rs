@@ -1,41 +1,35 @@
 //! `com.atproto.sync.subscribeRepos` for consumers.
 //!
-//! This is vlpds's firehose (`vlpds::firehose::Firehose`) as is. The relay's
-//! node logs use vlpds's segment format and bucket layout, so everything
-//! that makes the vlpds firehose work carries over without changes:
+//! This is vlpds's firehose (`vlpds::firehose::Firehose`) as is, fed the
+//! quorum log's committed entries (`qlog::emit`) as one counted stream:
 //!
-//! - The merger cuts every 2 ms at the minimum watermark over the followed
-//!   logs, sorts by seq and frames each batch once. Every subscriber writes
-//!   slices of those same bytes, on a separate runtime.
+//! - The merger cuts every 2 ms at the commit index and frames each batch
+//!   once. Every subscriber writes slices of those same bytes, on a separate
+//!   runtime.
 //! - A cursor inside the in-memory ring is served from memory. An older one
-//!   is backfilled from the log segments in the bucket (every log, dead ones
-//!   included, merged by seq) and handed to the ring at its floor.
-//! - A subscriber that falls out of the ring catches up from the bucket
-//!   again while it's within `max_lag_bytes` of the head, and gets
-//!   `ConsumerTooSlow` past that.
-//! - A cursor below the retained floor (`retain/` reports, which `seq::prune`
-//!   raises before deleting) gets `#info OutdatedCursor` and continues from
-//!   the oldest event left. A cursor above both the head and the clock gets
-//!   `FutureCursor`.
+//!   is backfilled from the log segments in the bucket, then the node's own
+//!   log, and handed to the ring at its floor.
+//! - A subscriber that falls out of the ring catches up the same way while
+//!   it's within `max_lag_bytes` of the head, and gets `ConsumerTooSlow`
+//!   past that.
+//! - A cursor below the retained floor gets `#info OutdatedCursor` and
+//!   continues from the oldest event left.
 //!
-//! What this module adds is the relay's wiring: one-node startup (fence the
-//! earlier logs, start above their seqs, follow our own log), the axum
-//! route, the retention loop, and the client address behind a proxy
-//! ([`real_ip`]) that the per-IP limits key on.
+//! What this module adds is the relay's wiring: the takedown filter, the
+//! consumers' rates, the axum route, and the client address behind a
+//! proxy ([`real_ip`]) that the per-IP limits key on.
 
 use crate::policy::takedowns::TakedownSet;
-use crate::seq::{self, LogConfig, NodeLog};
 use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-use vlpds::firehose::{self, Firehose, Source, SubscriberView};
+use vlpds::firehose::{self, Firehose, SubscriberView};
 use vlpds::store::Store;
 
 #[derive(Clone, Debug)]
@@ -50,15 +44,6 @@ pub struct ServeConfig {
     pub max_per_ip: usize,
     /// Threads of the subscriber runtime.
     pub threads: usize,
-    pub retention: Duration,
-    pub retention_interval: Duration,
-    /// Spacing of the stream seq checkpoints (`seq::dense`).
-    pub seq_checkpoint_every: Duration,
-    /// Whether this node writes them (core nodes; edges and replicas only read).
-    pub write_seq_checkpoints: bool,
-    /// Frame bytes the merger may hold while it waits for the slowest
-    /// log's watermark; past it a log spills to reading back from the bucket.
-    pub merge_queue_bytes: usize,
     /// How often the takedown set re-reads `policy/takedowns/current/`
     /// (zero: never; [`Serve::load_takedowns`] still reads it once).
     pub takedown_poll: Duration,
@@ -91,22 +76,18 @@ impl Default for ServeConfig {
             max_backfills: firehose::DEFAULT_MAX_BACKFILLS,
             max_per_ip: firehose::DEFAULT_MAX_PER_IP,
             threads: 4,
-            retention: seq::DEFAULT_RETENTION,
-            retention_interval: Duration::from_secs(60),
-            seq_checkpoint_every: seq::dense::DEFAULT_CHECKPOINT_EVERY,
-            write_seq_checkpoints: true,
-            merge_queue_bytes: MERGE_QUEUE_BYTES,
             takedown_poll: crate::policy::REFRESH_EVERY,
         }
     }
 }
 
 pub struct Serve {
-    pub firehose: Arc<Firehose>,
+    /// Made at the node's first emission (`qlog::emit`): its floor is where
+    /// that emission starts, which a node reset to the leader's log only
+    /// learns then. Until it exists, subscribeRepos answers 503.
+    firehose: std::sync::OnceLock<Arc<Firehose>>,
     /// The firehose's filter: taken-down accounts' commits and syncs.
     pub takedowns: Arc<TakedownSet>,
-    /// None on the quorum log, whose seqs are its own (dense) counts.
-    seqs: Option<seq::dense::DenseSeqs>,
     pub store: Store,
     cfg: ServeConfig,
     /// Per-consumer rates by firehose connection id, sampled every second.
@@ -137,40 +118,17 @@ struct Rate {
     bytes_per_sec: f64,
 }
 
-/// vlpds's 256 MiB is half a second of a 100k/s stream of ~5.4 KB frames,
-/// less than a linger plus one slow PUT. A cluster merges three logs, each
-/// that far behind at times, and at 90k/s spilled every few seconds; the
-/// read-back couldn't keep up and the stream fell 25 s behind.
-pub const MERGE_QUEUE_BYTES: usize = 1 << 30;
-
 const CONSUMER_SAMPLE: Duration = Duration::from_secs(1);
 
 impl Serve {
-    /// A firehose over the logs in `store`, with no sources yet. Its start
-    /// floor is the clock now: older events are served from the bucket.
-    pub fn new(store: Store, cfg: ServeConfig, runtime: Option<tokio::runtime::Handle>) -> Arc<Serve> {
-        let fh = Firehose::new(cfg.firehose_options(runtime));
-        fh.set_max_queue_bytes(cfg.merge_queue_bytes);
-        *fh.store.write() = Some(store.clone());
-        // JavaScript consumers need seqs below 2^53, and indigo's are dense
-        let seqs = seq::dense::DenseSeqs::new(store.clone(), cfg.seq_checkpoint_every, cfg.write_seq_checkpoints);
-        fh.set_renumber(Arc::new(seqs.clone()));
-        Serve::wrap(fh, Some(seqs), store, cfg)
-    }
-
-    /// The quorum log's firehose (`qlog::emit`), already counting its own
-    /// seqs, with the relay's takedown filter and consumer views on it.
-    pub fn counted(store: Store, cfg: ServeConfig, fh: Arc<Firehose>) -> Arc<Serve> {
-        Serve::wrap(fh, None, store, cfg)
-    }
-
-    fn wrap(fh: Arc<Firehose>, seqs: Option<seq::dense::DenseSeqs>, store: Store, cfg: ServeConfig) -> Arc<Serve> {
+    /// For the quorum log's firehose (`qlog::emit`), which counts its own
+    /// seqs: the relay's takedown filter and consumer views go on it once
+    /// it's made ([`Serve::attach`]).
+    pub fn counted(store: Store, cfg: ServeConfig) -> Arc<Serve> {
         let takedowns = Arc::new(TakedownSet::default());
-        fh.set_filter(takedowns.clone());
         let s = Arc::new(Serve {
-            firehose: fh,
+            firehose: Default::default(),
             takedowns,
-            seqs,
             store,
             cfg,
             rates: parking_lot::Mutex::new(HashMap::new()),
@@ -182,6 +140,21 @@ impl Serve {
         s
     }
 
+    /// Serves `fh` from now on (the first call wins).
+    pub fn attach(&self, fh: &Arc<Firehose>) {
+        fh.set_filter(self.takedowns.clone());
+        let _ = self.firehose.set(fh.clone());
+    }
+
+    pub fn firehose(&self) -> Option<&Arc<Firehose>> {
+        self.firehose.get()
+    }
+
+    /// The newest seq emitted (0 before the first emission).
+    pub fn head(&self) -> i64 {
+        self.firehose().map_or(0, |f| f.last_emitted.load(Ordering::Acquire))
+    }
+
     /// Reads the takedown list once. Call it before serving: until the first
     /// read, taken-down accounts' old frames would replay.
     pub async fn load_takedowns(&self) {
@@ -190,17 +163,12 @@ impl Serve {
         }
     }
 
-    /// The newest `n` stream seq checkpoints this node knows (docs/seq.md).
-    pub fn seq_checkpoints(&self, n: usize) -> Vec<(i64, i64)> {
-        self.seqs.as_ref().map(|s| s.recent(n)).unwrap_or_default()
-    }
-
     /// The connected consumers, by id.
     pub fn consumers(&self) -> Vec<ConsumerSnapshot> {
-        let head = self.firehose.last_emitted.load(Ordering::Acquire);
+        let Some(fh) = self.firehose() else { return Vec::new() };
+        let head = fh.last_emitted.load(Ordering::Acquire);
         let rates = self.rates.lock();
-        self.firehose
-            .subscribers()
+        fh.subscribers()
             .0
             .into_iter()
             .filter_map(|v| {
@@ -215,8 +183,8 @@ impl Serve {
                     (s, _) => s,
                 };
                 // stream seqs are counts; their log keys are time (key >> 8 is unix µs)
-                let key = |s: i64| self.firehose.key_at(s).unwrap_or(0) >> 8;
-                let lag_ms = if pos < head { (key(head) - key(pos)).max(0) as f64 / 1000.0 } else { 0.0 };
+                // a counted stream's keys are its seqs, not time: lag is in events
+                let lag_ms = (head - pos).max(0) as f64;
                 let rate = rates.get(&id);
                 Some(ConsumerSnapshot {
                     id,
@@ -240,42 +208,13 @@ impl Serve {
 
     /// Disconnects consumer `id`; false if it's unknown or already gone.
     pub fn kick(&self, id: u64) -> bool {
-        self.firehose.kick(id)
-    }
-
-    /// Follows a log of this process (its watermark is read directly).
-    pub fn follow_local(&self, log: &NodeLog) {
-        self.firehose.set_source(&log.log_id, Some(Source::Local(log.wm.clone())));
-        if let Some(s) = &self.seqs {
-            s.set_own_log(&log.log_id);
-        }
+        self.firehose().is_some_and(|f| f.kick(id))
     }
 
     pub fn router(self: &Arc<Self>) -> axum::Router {
         axum::Router::new()
             .route("/xrpc/com.atproto.sync.subscribeRepos", axum::routing::get(subscribe_repos))
             .with_state(self.clone())
-    }
-
-    /// Prunes every log past the retention window, every interval.
-    pub fn spawn_retention(self: &Arc<Self>, reporter: String) {
-        if self.cfg.retention_interval.is_zero() {
-            return;
-        }
-        let s = self.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(s.cfg.retention_interval);
-            loop {
-                tick.tick().await;
-                match seq::prune(&s.store, &reporter, s.cfg.retention, 10_000).await {
-                    Ok(p) if p.deleted > 0 => {
-                        tracing::info!(deleted = p.deleted, pruned_seq = p.pruned_seq, "log retention")
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("log retention failed: {e:#}"),
-                }
-            }
-        });
     }
 }
 
@@ -366,7 +305,10 @@ pub async fn real_ip(State(trusted): State<Arc<Vec<Cidr>>>, mut req: Request, ne
 
 async fn subscribe_repos(State(s): State<Arc<Serve>>, Query(q): Query<SubscribeParams>, req: Request) -> Response {
     let client = client_ip(req.extensions());
-    s.firehose.upgrade(req, q.cursor, None, client, None)
+    match s.firehose() {
+        Some(fh) => fh.upgrade(req, q.cursor, None, client, None),
+        None => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "nothing committed yet").into_response(),
+    }
 }
 
 /// Per-consumer rates from the counters' deltas; forgets gone consumers.
@@ -376,7 +318,7 @@ async fn sample_consumers(serve: Weak<Serve>) {
     loop {
         tick.tick().await;
         let Some(s) = serve.upgrade() else { return };
-        let live: Vec<SubscriberView> = s.firehose.subscribers().0;
+        let live: Vec<SubscriberView> = s.firehose().map(|f| f.subscribers().0).unwrap_or_default();
         let now = Instant::now();
         let mut rates = s.rates.lock();
         let mut next = HashMap::with_capacity(live.len());
@@ -409,61 +351,6 @@ async fn poll_takedowns(serve: Weak<Serve>, every: Duration) {
             tracing::warn!("takedown list poll failed (retrying): {e:#}");
         }
     }
-}
-
-/// A running single-node relay log with its firehose.
-pub struct Started {
-    pub log: Arc<NodeLog>,
-    pub serve: Arc<Serve>,
-    pub recovered: seq::Recovered,
-}
-
-/// One-node startup. Every log already in the bucket is an earlier
-/// incarnation of this node, so it's fenced (a zombie writer fails its next
-/// PUT), and the new log's seqs start above everything it holds. The new
-/// log's id is `cfg.log_id`; its floor is raised as needed. A prefix with
-/// cluster leases is refused: those logs aren't ours to fence.
-pub async fn start_single_node(
-    store: Store,
-    mut cfg: LogConfig,
-    serve: ServeConfig,
-    runtime: Option<tokio::runtime::Handle>,
-    on_fatal: Option<seq::OnFatal>,
-) -> anyhow::Result<Started> {
-    // fencing every log would kill a cluster's live nodes
-    {
-        use futures::StreamExt;
-        let nodes = object_store::path::Path::from(format!("{}/nodes", store.prefix));
-        if let Some(m) = store.raw.list(Some(&nodes)).next().await {
-            let m = m?;
-            anyhow::bail!(
-                "this prefix holds cluster node leases ({}): start it as a cluster node (cluster::ClusterNode)",
-                m.location
-            );
-        }
-    }
-    let recovered = seq::fence_all(&store, &cfg.log_id).await?;
-    // The firehose's start floor is the clock, and backfill serves only
-    // events at or below it. An earlier log with seqs past the clock (a
-    // clock that stepped back) would leave a gap, so wait it out.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while vlpds::nodelog::seq_floor(vlpds::tid::now_micros()) <= recovered.seq_floor {
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "earlier logs hold seqs more than 10 s past the clock (seq {})",
-            recovered.seq_floor
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    let srv = Serve::new(store.clone(), serve, runtime);
-    srv.load_takedowns().await;
-    cfg.seq_floor = cfg.seq_floor.max(srv.firehose.position()).max(recovered.seq_floor);
-    let (tx, rx) = mpsc::unbounded_channel();
-    let log = NodeLog::start(store, cfg, tx, on_fatal);
-    srv.follow_local(&log);
-    srv.firehose.spawn_merger(rx);
-    srv.spawn_retention(log.log_id.to_string());
-    Ok(Started { log, serve: srv, recovered })
 }
 
 #[cfg(test)]
@@ -499,7 +386,10 @@ mod tests {
     /// disconnects it while it's idle (nothing is emitted) and forgets it.
     #[tokio::test]
     async fn consumers_are_listed_and_kicked() {
-        let s = Serve::new(Store::memory(None), ServeConfig::default(), None);
+        let cfg = ServeConfig::default();
+        let fh = Firehose::new(firehose::Options { start_floor: Some(0), ..cfg.firehose_options(None) });
+        let s = Serve::counted(Store::memory(None), cfg);
+        s.attach(&fh);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = s.router();

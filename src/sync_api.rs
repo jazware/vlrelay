@@ -2,7 +2,7 @@
 //! getRepoStatus, getLatestCommit, listHosts and getHostStatus. Field and
 //! error names follow the lexicons in vlpds/lexicons.
 
-use crate::state::{AccountStatus, Chain, HostPage, HostRecord, HostStore, Record, RepoPage, StateStore, StoreError};
+use crate::state::{AccountStatus, HostPage, HostRecord, Record, RepoPage, StoreError};
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -11,30 +11,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use vlpds::xrpc::XrpcError;
 
-/// What the handlers read. `StateStore` implements it for the shards this
-/// node owns; a cluster wrapper can route to the owner instead.
+/// What the handlers read: on the quorum log, the leader's records and the
+/// host table (`node::quorum::QuorumSync`).
 #[async_trait::async_trait]
 pub trait SyncSource: Send + Sync {
     async fn list_repos(&self, cursor: Option<&str>, limit: usize) -> Result<RepoPage, StoreError>;
     async fn repo(&self, did: &str) -> Result<Option<Arc<Record>>, StoreError>;
     async fn host(&self, hostname: &str) -> anyhow::Result<Option<HostRecord>>;
     async fn list_hosts(&self, cursor: Option<&str>, limit: usize) -> anyhow::Result<HostPage>;
-}
-
-#[async_trait::async_trait]
-impl<C: Chain> SyncSource for StateStore<C> {
-    async fn list_repos(&self, cursor: Option<&str>, limit: usize) -> Result<RepoPage, StoreError> {
-        StateStore::list_repos(self, cursor, limit).await
-    }
-    async fn repo(&self, did: &str) -> Result<Option<Arc<Record>>, StoreError> {
-        self.get(did).await
-    }
-    async fn host(&self, hostname: &str) -> anyhow::Result<Option<HostRecord>> {
-        self.get_host(hostname).await
-    }
-    async fn list_hosts(&self, cursor: Option<&str>, limit: usize) -> anyhow::Result<HostPage> {
-        HostStore::list_hosts(self, cursor, limit).await
-    }
 }
 
 type Src = Arc<dyn SyncSource>;
@@ -53,7 +37,9 @@ pub fn router(src: Src) -> Router {
 
 fn store_err(e: StoreError) -> XrpcError {
     match e {
-        StoreError::NotOwner(s) => XrpcError::unavailable("ShardUnavailable", format!("shard {s} is not served here")),
+        StoreError::NotOwner(_) => {
+            XrpcError::unavailable("NotLeader", "the account records are served by the quorum log's leader")
+        }
         StoreError::BadCursor => XrpcError::bad("InvalidRequest", "bad cursor"),
         e => XrpcError::internal(e.to_string()),
     }
@@ -190,12 +176,32 @@ async fn get_host_status(State(src): State<Src>, Query(p): Params) -> XResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::tests::{MapIdentity, claim, open, plc};
-    use crate::state::{Applied, ApplyConfig, EventKind, HostRecord, Incoming, Tier};
+    use crate::state::tests::{MapIdentity, MemHosts, claim, open, persist, plc};
+    use crate::state::{
+        Accepted, Applied, ApplyConfig, EventKind, HostRecord, HostStore, Incoming, StateStore, StubChain, Tier,
+    };
     use crate::types::Host;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    struct Src(Arc<StateStore<StubChain>>, MemHosts);
+
+    #[async_trait::async_trait]
+    impl SyncSource for Src {
+        async fn list_repos(&self, cursor: Option<&str>, limit: usize) -> Result<RepoPage, StoreError> {
+            self.0.list_repos(cursor, limit).await
+        }
+        async fn repo(&self, did: &str) -> Result<Option<Arc<Record>>, StoreError> {
+            self.0.get(did).await
+        }
+        async fn host(&self, hostname: &str) -> anyhow::Result<Option<HostRecord>> {
+            self.1.get_host(hostname).await
+        }
+        async fn list_hosts(&self, cursor: Option<&str>, limit: usize) -> anyhow::Result<HostPage> {
+            self.1.list_hosts(cursor, limit).await
+        }
+    }
 
     async fn call(app: &Router, uri: &str) -> (StatusCode, Value) {
         let r = app.clone().oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
@@ -209,7 +215,7 @@ mod tests {
         let id = MapIdentity::new();
         let st = open(4, id.clone(), ApplyConfig::default()).await;
         let h = Host("pds.a".into());
-        let mut tickets = Vec::new();
+        let mut accepted: Vec<Accepted> = Vec::new();
         let dids: Vec<String> = (0..5).map(|n| plc(500 + n)).collect();
         for d in &dids {
             id.set(d, "pds.a", 1);
@@ -218,7 +224,7 @@ mod tests {
             else {
                 panic!()
             };
-            tickets.push(a.ticket);
+            accepted.push(a);
         }
         for (d, status) in [(&dids[1], "takendown"), (&dids[2], "deactivated"), (&dids[3], "suspended")] {
             let Applied::Append(a) = st
@@ -233,13 +239,15 @@ mod tests {
             else {
                 panic!()
             };
-            tickets.push(a.ticket);
+            accepted.push(a);
         }
-        st.commit(&tickets).await.unwrap();
-        st.put_host(&HostRecord::new("pds.a", Tier::Default, 1)).await.unwrap();
-        st.flush_host_counts(&*st).await.unwrap();
-        st.checkpoint_cursors(&[("pds.a".into(), 77)]).await.unwrap();
-        let app = router(st.clone());
+        persist(&st, &accepted.iter().collect::<Vec<_>>()).await;
+        let hosts = MemHosts::default();
+        let mut rec = HostRecord::new("pds.a", Tier::Default, 1);
+        rec.cursor = 77;
+        hosts.put_host(&rec).await.unwrap();
+        st.flush_host_counts(&hosts).await.unwrap();
+        let app = router(Arc::new(Src(st.clone(), hosts)));
 
         let (s, v) = call(&app, "/xrpc/com.atproto.sync.listRepos?limit=2").await;
         assert_eq!(s, StatusCode::OK);

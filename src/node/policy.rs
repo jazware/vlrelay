@@ -214,19 +214,8 @@ fn oversized(reason: &str) -> bool {
 }
 
 impl PolicyHooks {
-    pub fn new(engine: Arc<Engine>, state: Arc<State>, dev_mode: bool) -> Arc<PolicyHooks> {
-        let raw: Arc<dyn HostStore> = state.clone();
-        Self::with_hosts(engine, state, raw, dev_mode)
-    }
-
-    /// With the host records somewhere other than the state shards (a
-    /// cluster keeps them in the bucket).
-    pub fn with_hosts(
-        engine: Arc<Engine>,
-        state: Arc<State>,
-        raw: Arc<dyn HostStore>,
-        dev_mode: bool,
-    ) -> Arc<PolicyHooks> {
+    /// Over `raw`, the host records (on the quorum log, its host table).
+    pub fn new(engine: Arc<Engine>, state: Arc<State>, raw: Arc<dyn HostStore>, dev_mode: bool) -> Arc<PolicyHooks> {
         let (tx, rx) = mpsc::unbounded_channel();
         let hosts: Arc<dyn HostStore> = Arc::new(Notifying { inner: raw, tx: tx.clone() });
         Arc::new(PolicyHooks {
@@ -455,7 +444,9 @@ impl PolicyHooks {
         s.detail = Some(&d);
         self.engine.record_signal(s);
         if !STATE_REASONS.contains(&reason) {
-            self.state.add_host_counts(HostKey::of(host), HostCounts { failed_checks: 1, ..Default::default() });
+            let k = HostKey::of(host);
+            self.state.note_host(k, host);
+            self.state.add_host_counts(k, HostCounts { failed_checks: 1, ..Default::default() });
         }
     }
 
@@ -600,21 +591,19 @@ mod tests {
 
     async fn setup() -> (Arc<PolicyHooks>, Arc<State>) {
         let store = Store::memory(None);
-        let layout = vlpds::slots::Layout::uniform(2).shards;
         let id = crate::state::tests::MapIdentity::new();
-        let state = Arc::new(StateStore::new(store.clone(), layout.clone(), VerifyChain, id, ApplyConfig::default()));
-        for s in layout {
-            state.open_shard(s.id, None).await.unwrap();
-        }
+        let state = Arc::new(StateStore::new(VerifyChain, id, ApplyConfig::default()));
+        crate::state::tests::attach_memory_shard(&state).await;
         let engine = Engine::new(store, "n1", Arc::new(FixedNodes::new(1)));
-        (PolicyHooks::new(engine, state.clone(), false), state)
+        let hosts: Arc<dyn HostStore> = Arc::new(crate::state::tests::MemHosts::default());
+        (PolicyHooks::new(engine, state.clone(), hosts, false), state)
     }
 
     #[tokio::test]
     async fn identity_events_and_forced_lookups_are_per_host() {
-        let (hooks, state) = setup().await;
-        add_host(&state, "noisy.example", Tier::Throttled).await;
-        add_host(&state, "quiet.example", Tier::Throttled).await;
+        let (hooks, _) = setup().await;
+        add_host(&*hooks.hosts, "noisy.example", Tier::Throttled).await;
+        add_host(&*hooks.hosts, "quiet.example", Tier::Throttled).await;
         hooks.load().await.unwrap();
         let per_hour = policy::TierLimits::throttled().identity_events_per_hour;
         let taken = (0..per_hour + 50).filter(|_| hooks.take_identity_event("noisy.example")).count() as u64;
@@ -627,8 +616,8 @@ mod tests {
         assert!(state::AccountGate::forced_lookup(&*hooks, "quiet.example"));
     }
 
-    async fn add_host(state: &State, h: &str, tier: Tier) {
-        state.put_host(&HostRecord::new(h, tier, state::now_secs())).await.unwrap();
+    async fn add_host(hosts: &dyn HostStore, h: &str, tier: Tier) {
+        hosts.put_host(&HostRecord::new(h, tier, state::now_secs())).await.unwrap();
     }
 
     async fn edit_policy(hooks: &PolicyHooks, f: impl FnOnce(&mut policy::PolicyBody)) {
@@ -645,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_become_signals_and_count_against_the_host() {
         let (hooks, state) = setup().await;
-        add_host(&state, "pds.example", Tier::Default).await;
+        add_host(&*hooks.hosts, "pds.example", Tier::Default).await;
         for _ in 0..3 {
             hooks.on_reject("pds.example", "did:plc:a", "bad_signature", "sig");
         }
@@ -658,9 +647,9 @@ mod tests {
         assert_eq!(snap.get("failed-validation"), Some(&4.0), "{snap:?}");
         assert_eq!(snap.get("account-failed-validation"), Some(&4.0), "{snap:?}");
         assert_eq!(snap.get("oversized-commits"), Some(&1.0), "{snap:?}");
-        state.flush_host_counts(&*state).await.unwrap();
+        state.flush_host_counts(&*hooks.hosts).await.unwrap();
         // bad_signature x3 and frame_too_big; prev_data_mismatch is the state step's
-        assert_eq!(state.get_host("pds.example").await.unwrap().unwrap().failed_checks, 4);
+        assert_eq!(hooks.hosts.get_host("pds.example").await.unwrap().unwrap().failed_checks, 4);
 
         hooks.on_accepted("pds.example", "did:plc:b", "commit");
         hooks.on_accepted("pds.example", "did:plc:b", "identity");
@@ -671,15 +660,15 @@ mod tests {
 
     #[tokio::test]
     async fn new_accounts_hit_the_host_cap_and_rate() {
-        let (hooks, state) = setup().await;
+        let (hooks, _) = setup().await;
         edit_policy(&hooks, |p| {
             p.tiers.default.max_accounts = 2;
             p.tiers.new.new_accounts_per_hour = 1;
             p.tiers.new.max_accounts = 100;
         })
         .await;
-        add_host(&state, "capped.example", Tier::Default).await;
-        add_host(&state, "young.example", Tier::New).await;
+        add_host(&*hooks.hosts, "capped.example", Tier::Default).await;
+        add_host(&*hooks.hosts, "young.example", Tier::New).await;
         hooks.load().await.unwrap();
         let did = |h: &str, i: u32| format!("did:plc:{h}{i}");
         let admit = |h: &str, i: u32| hooks.admit_account(h, &did(h, i), Arrival::Created);
@@ -717,7 +706,7 @@ mod tests {
         assert_eq!(hooks.accounts("young.example"), Some(100));
         // an hourly limit holds an hour's allowance, not one second's
         edit_policy(&hooks, |p| p.tiers.default.new_accounts_per_hour = 50).await;
-        add_host(&state, "busy.example", Tier::Default).await;
+        add_host(&*hooks.hosts, "busy.example", Tier::Default).await;
         hooks.refresh_host("busy.example").await.unwrap();
         edit_policy(&hooks, |p| p.tiers.default.max_accounts = 1000).await;
         hooks.refresh_host("busy.example").await.unwrap();
@@ -725,7 +714,7 @@ mod tests {
         assert_eq!(admitted, 50);
         // the cluster budget: one node's share of 60/min is one a second
         edit_policy(&hooks, |p| p.cluster.new_accounts_per_min = 60.0).await;
-        add_host(&state, "open.example", Tier::Trusted).await;
+        add_host(&*hooks.hosts, "open.example", Tier::Trusted).await;
         hooks.refresh_host("open.example").await.unwrap();
         assert_eq!(admit("open.example", 1), Admit);
         assert_eq!(admit("open.example", 2), Defer);
@@ -733,7 +722,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_farm_of_new_repos_trips_the_rate_and_a_case_where_old_accounts_dont() {
-        let (hooks, state) = setup().await;
+        let (hooks, _) = setup().await;
         edit_policy(&hooks, |p| {
             p.tiers.default.max_accounts = 10_000;
             p.tiers.default.new_accounts_per_hour = 100;
@@ -741,8 +730,8 @@ mod tests {
             p.spam.host_new_accounts.action = policy::SpamAction::ThrottleAndCase;
         })
         .await;
-        add_host(&state, "farm.example", Tier::Default).await;
-        add_host(&state, "old.example", Tier::Default).await;
+        add_host(&*hooks.hosts, "farm.example", Tier::Default).await;
+        add_host(&*hooks.hosts, "old.example", Tier::Default).await;
         hooks.load().await.unwrap();
         let run = |h: &str, how: Arrival| {
             (0..1_000).map(|i| hooks.admit_account(h, &format!("did:plc:{h}{i}"), how)).collect::<Vec<_>>()
@@ -811,24 +800,20 @@ mod tests {
             },
         ));
         let store = Store::memory(None);
-        let layout = vlpds::slots::Layout::uniform(4).shards;
         let state = Arc::new(StateStore::new(
-            store.clone(),
-            layout.clone(),
             VerifyChain,
             Arc::new(crate::node::adapters::CacheIdentity(identity.clone())),
             ApplyConfig::default(),
         ));
-        for s in layout {
-            state.open_shard(s.id, None).await.unwrap();
-        }
+        crate::state::tests::attach_memory_shard(&state).await;
         let engine = Engine::new(store, "n1", Arc::new(FixedNodes::new(1)));
-        let hooks = PolicyHooks::new(engine, state.clone(), false);
+        let hosts: Arc<dyn HostStore> = Arc::new(crate::state::tests::MemHosts::default());
+        let hooks = PolicyHooks::new(engine, state.clone(), hosts, false);
         state.set_account_gate(hooks.clone());
         let e = hooks.engine.clone();
         identity.set_budget_gate(Arc::new(move || e.try_take(BudgetKind::PlcLookupsPerSec, 1.0)));
         edit_policy(&hooks, |p| p.cluster.plc_lookups_per_sec = PLC_PER_SEC).await;
-        add_host(&state, host, Tier::Trusted).await;
+        add_host(&*hooks.hosts, host, Tier::Trusted).await;
         hooks.load().await.unwrap();
 
         // one commit per account, each with prevData: none is its repo's first
@@ -909,9 +894,9 @@ mod tests {
 
     #[tokio::test]
     async fn host_policy_follows_records_actions_and_rules() {
-        let (hooks, state) = setup().await;
-        add_host(&state, "a.example", Tier::Default).await;
-        add_host(&state, "b.spam.example", Tier::Trusted).await;
+        let (hooks, _) = setup().await;
+        add_host(&*hooks.hosts, "a.example", Tier::Default).await;
+        add_host(&*hooks.hosts, "b.spam.example", Tier::Trusted).await;
         hooks.load().await.unwrap();
         let a = hp(&hooks, "a.example");
         assert_eq!((a.tier, a.connect), (upstream::Tier::Default, true));
@@ -948,12 +933,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_spam_trip_throttles_the_host_through_the_driver() {
-        let (hooks, state) = setup().await;
+        let (hooks, _) = setup().await;
         edit_policy(&hooks, |p| {
             p.spam.host_failed_validation.limit = 10.0;
         })
         .await;
-        add_host(&state, "bad.example", Tier::Default).await;
+        add_host(&*hooks.hosts, "bad.example", Tier::Default).await;
         hooks.load().await.unwrap();
         for _ in 0..11 {
             hooks.on_reject("bad.example", "", "bad_signature", "sig");
@@ -971,7 +956,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_is_the_engines() {
-        let (hooks, state) = setup().await;
+        let (hooks, _) = setup().await;
         edit_policy(&hooks, |p| p.cluster.new_hosts_per_day = 1).await;
         let set = RuleSet {
             next_id: 2,
@@ -1007,17 +992,17 @@ mod tests {
         // trusted domains skip the budget and start trusted
         assert_eq!(admit("morel.us-east.host.bsky.network").await, Ok(upstream::Tier::Trusted));
         // a known host keeps its tier, unless it's banned
-        add_host(&state, "known.example", Tier::Default).await;
+        add_host(&*hooks.hosts, "known.example", Tier::Default).await;
         assert_eq!(admit("known.example").await, Ok(upstream::Tier::Default));
-        add_host(&state, "gone.example", Tier::Banned).await;
+        add_host(&*hooks.hosts, "gone.example", Tier::Banned).await;
         assert_eq!(admit("gone.example").await, Err(CrawlError::HostBanned));
         assert!(matches!(admit("localhost").await, Err(CrawlError::Refused(_))));
     }
 
     #[tokio::test]
     async fn the_manager_disconnects_and_reconnects_with_the_policy() {
-        let (hooks, state) = setup().await;
-        add_host(&state, "127.0.0.1:9", Tier::Default).await;
+        let (hooks, _) = setup().await;
+        add_host(&*hooks.hosts, "127.0.0.1:9", Tier::Default).await;
         hooks.load().await.unwrap();
         let mut cfg = upstream::UpstreamConfig::new(true);
         cfg.endpoint = Arc::new(|h: &Host| format!("http://{}", h.0));
@@ -1045,9 +1030,9 @@ mod tests {
     /// is on the record), and never dialed again.
     #[tokio::test]
     async fn a_relay_upstream_is_banned_not_retried() {
-        let (hooks, state) = setup().await;
+        let (hooks, _) = setup().await;
         let h = crate::upstream::client::tests::ws_server(Some("indigo-relay/v0.0.0 (atproto-relay)")).await;
-        add_host(&state, &h.0, Tier::Default).await;
+        add_host(&*hooks.hosts, &h.0, Tier::Default).await;
         hooks.load().await.unwrap();
         let mut cfg = upstream::UpstreamConfig::new(true);
         cfg.endpoint = Arc::new(|h: &Host| format!("http://{}", h.0));
@@ -1061,7 +1046,7 @@ mod tests {
         m.admit(&h, upstream::Tier::Default).await.unwrap();
         let t = Instant::now();
         loop {
-            let rec = state.get_host(&h.0).await.unwrap().unwrap();
+            let rec = hooks.hosts.get_host(&h.0).await.unwrap().unwrap();
             if rec.tier == Tier::Banned {
                 assert_eq!(rec.lexicon_status(), "banned");
                 let actions = PolicyAdmin::host_actions(&rec);

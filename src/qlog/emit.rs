@@ -41,7 +41,13 @@ pub struct Emitter {
     /// log (`set_local_tail`).
     store: Option<vlpds::store::Store>,
     owner: Arc<OnceLock<Weak<super::node::Node>>>,
+    serving: Serving,
 }
+
+/// Who serves a node's firehose once it's made.
+pub type OnStart = Box<dyn Fn(&Arc<Firehose>) + Send + Sync>;
+
+type Serving = parking_lot::Mutex<Option<(firehose::Options, OnStart)>>;
 
 impl Emitter {
     pub fn new(
@@ -59,6 +65,7 @@ impl Emitter {
             tap,
             store: None,
             owner: Arc::new(OnceLock::new()),
+            serving: Default::default(),
         })
     }
 
@@ -85,13 +92,10 @@ impl Emitter {
         self.live.get().map(|l| &l.fh)
     }
 
-    /// Starts the firehose now, counting from `floor` (where this node's
-    /// emission will start, as its recovered log says), with `opts` (the
-    /// relay's serving options): the relay serves it before anything
-    /// commits. A later first emission above the floor is a jump, as for
-    /// any node reset past what it emitted.
-    pub fn start_firehose(&self, floor: u64, opts: firehose::Options) -> Arc<Firehose> {
-        self.live.get_or_init(|| self.make(floor, opts)).fh.clone()
+    /// The relay's serving options for the firehose this node makes at its
+    /// first emission, and who serves it once it's made.
+    pub fn set_serving(&self, opts: firehose::Options, on_start: OnStart) {
+        *self.serving.lock() = Some((opts, on_start));
     }
 
     fn make(&self, floor: u64, opts: firehose::Options) -> Live {
@@ -114,8 +118,13 @@ impl Emitter {
     /// the watermark moves: the merger reads the watermark, then drains, so
     /// it never holds a watermark past events it hasn't been given.
     pub fn emit(&self, after: u64, upto: u64, events: Vec<(i64, Bytes)>) {
-        let live = self.live.get_or_init(|| {
-            self.make(after, firehose::Options { ring_bytes: self.ring_bytes, ..firehose::Options::default() })
+        let live = self.live.get_or_init(|| match self.serving.lock().take() {
+            Some((opts, on_start)) => {
+                let live = self.make(after, opts);
+                on_start(&live.fh);
+                live
+            }
+            None => self.make(after, firehose::Options { ring_bytes: self.ring_bytes, ..firehose::Options::default() }),
         });
         if let Some(tap) = &self.tap {
             let _ =

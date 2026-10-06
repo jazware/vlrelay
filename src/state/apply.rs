@@ -162,8 +162,7 @@ pub enum ChangeKind {
     Account = 3,
 }
 
-/// What an accepted event did, compact enough to ride in its log entry:
-/// replaying these rebuilds the shard's state (see `replay`).
+/// What an accepted event did to its account.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateDelta {
     pub did: String,
@@ -171,56 +170,6 @@ pub struct StateDelta {
     pub kind: ChangeKind,
     pub chain: Option<ChainState>,
     pub upstream: Upstream,
-}
-
-impl StateDelta {
-    pub fn encode(&self) -> Vec<u8> {
-        use bytes::BufMut;
-        let mut b = Vec::with_capacity(self.did.len() + 96);
-        super::record::put_str(&mut b, &self.did);
-        b.put_u64(self.host.0);
-        b.put_u8(self.kind as u8);
-        b.put_u8(self.upstream as u8);
-        match &self.chain {
-            Some(c) => {
-                b.put_u8(1);
-                b.put_u64(c.rev.0);
-                b.put_slice(&c.commit.digest);
-                b.put_slice(&c.data.digest);
-            }
-            None => b.put_u8(0),
-        }
-        b
-    }
-
-    pub fn decode(b: &[u8]) -> Result<StateDelta, super::record::DecodeError> {
-        use super::record::{DecodeError, Reader};
-        let mut r = Reader(b);
-        let did = r.str()?.to_string();
-        let host = HostKey(r.u64()?);
-        let kind = match r.u8()? {
-            0 => ChangeKind::Commit,
-            1 => ChangeKind::Sync,
-            2 => ChangeKind::Identity,
-            3 => ChangeKind::Account,
-            _ => return Err(DecodeError),
-        };
-        let upstream = upstream_from(r.u8()?).ok_or(DecodeError)?;
-        let chain = match r.u8()? {
-            0 => None,
-            _ => Some(ChainState {
-                rev: Tid(r.u64()?),
-                commit: Cid { codec: CODEC_DAG_CBOR, digest: r.array()? },
-                data: Cid { codec: CODEC_DAG_CBOR, digest: r.array()? },
-            }),
-        };
-        Ok(StateDelta { did, host, kind, chain, upstream })
-    }
-}
-
-fn upstream_from(b: u8) -> Option<Upstream> {
-    use Upstream::*;
-    [Active, Takendown, Suspended, Deleted, Deactivated, Desynchronized, Throttled, Inactive].get(b as usize).copied()
 }
 
 #[derive(Debug)]
@@ -324,43 +273,23 @@ enum Authority {
 
 impl<C: Chain> StateStore<C> {
     pub async fn apply(&self, ev: Incoming<'_, C::Verified>) -> Result<Applied, Reject> {
-        self.apply_with_frame(ev, None).await
-    }
-
-    /// [`apply`](Self::apply) with the frame as received, which archival
-    /// mode applies to the account's mirror.
-    pub async fn apply_with_frame(
-        &self,
-        ev: Incoming<'_, C::Verified>,
-        frame: Option<&bytes::Bytes>,
-    ) -> Result<Applied, Reject> {
         let shard = self.shard_for(ev.did)?;
-        self.apply_in(&shard, ev, frame).await
+        self.apply_in(&shard, ev).await
     }
 
-    /// [`apply_with_frame`](Self::apply_with_frame) against `shard`, which
-    /// needn't be the one this store routes the DID to: the quorum log's
-    /// leader applies against its own term's view.
-    pub async fn apply_in(
-        &self,
-        shard: &Arc<ShardState>,
-        ev: Incoming<'_, C::Verified>,
-        frame: Option<&bytes::Bytes>,
-    ) -> Result<Applied, Reject> {
+    /// [`apply`](Self::apply) against `shard`, which needn't be the one
+    /// this store serves: the quorum log's leader applies against its own
+    /// term's view.
+    pub async fn apply_in(&self, shard: &Arc<ShardState>, ev: Incoming<'_, C::Verified>) -> Result<Applied, Reject> {
         let _did_lock = shard.lock_did(ev.did).await;
-        self.apply_held(shard, ev, frame).await
+        self.apply_held(shard, ev).await
     }
 
     /// [`apply_in`](Self::apply_in) with the DID's lock already held by the
     /// caller (`ShardState::lock_dids_owned`).
-    pub async fn apply_held(
-        &self,
-        shard: &Arc<ShardState>,
-        ev: Incoming<'_, C::Verified>,
-        frame: Option<&bytes::Bytes>,
-    ) -> Result<Applied, Reject> {
+    pub async fn apply_held(&self, shard: &Arc<ShardState>, ev: Incoming<'_, C::Verified>) -> Result<Applied, Reject> {
         let prev = shard.load(ev.did).await?;
-        let r = self.apply_locked(shard, &ev, prev.as_deref(), frame).await;
+        let r = self.apply_locked(shard, &ev, prev.as_deref()).await;
         let hk = HostKey::of(&ev.host.0);
         match &r {
             Ok(Applied::Append(a)) => {
@@ -402,10 +331,8 @@ impl<C: Chain> StateStore<C> {
         shard: &ShardState,
         ev: &Incoming<'_, C::Verified>,
         prev: Option<&Record>,
-        frame: Option<&bytes::Bytes>,
     ) -> Result<Applied, Reject> {
         let hk = HostKey::of(&ev.host.0);
-        let mut mirror_rows = None;
         let new_account = prev.is_none();
         let mut rec = prev.cloned().unwrap_or_else(|| Record::new(hk, ev.now));
         let status_before = prev.map(|p| p.status());
@@ -510,21 +437,12 @@ impl<C: Chain> StateStore<C> {
                 }
                 match self.chain.check_chain(rec.chain.as_ref(), v) {
                     Ok(cs) => {
-                        if let Some(f) = frame
-                            && let crate::archive::Step::Rows(r) =
-                                self.archive_commit(shard, ev.did, &ev.host.0, f).await
-                        {
-                            mirror_rows = Some(r);
-                        }
                         rec.chain = Some(cs);
                         rec.desync = None;
                         rec.minute_commits += 1;
                     }
                     Err(e) => {
                         let was_desync = rec.desync.is_some();
-                        if was_desync || e == ChainError::PrevDataMismatch {
-                            self.archive_chain_broken(ev.did, &ev.host.0);
-                        }
                         rec.failed_checks = rec.failed_checks.saturating_add(1);
                         rec.desync.get_or_insert(e.reason());
                         shard.stage_unlogged(ev.did, rec);
@@ -539,11 +457,6 @@ impl<C: Chain> StateStore<C> {
                         shard.stage_unlogged(ev.did, rec.clone());
                     }
                     return Err(Reject::Inactive(rec.status()));
-                }
-                if let Some(f) = frame
-                    && let crate::archive::Step::Rows(r) = self.archive_sync(shard, ev.did, &ev.host.0, f).await
-                {
-                    mirror_rows = Some(r);
                 }
                 rec.chain = Some(ChainState { rev: *rev, commit: *commit, data: *data });
                 rec.desync = None;
@@ -564,9 +477,6 @@ impl<C: Chain> StateStore<C> {
         let key_changed = rec.key != key_before;
         let record = Box::new(rec.clone());
         let ticket = shard.stage_logged(ev.did, rec);
-        if let Some(r) = mirror_rows {
-            shard.mirror.attach(ticket.n, ev.did, r);
-        }
         Ok(Applied::Append(Accepted {
             ticket,
             record,
@@ -625,44 +535,5 @@ impl<C: Chain> StateStore<C> {
             }
             fresh = true;
         }
-    }
-
-    /// Rebuilds state from log entries the shard's SlateDB may not have
-    /// (those after its applied marker). Idempotent: a chain only moves to a
-    /// newer rev, and statuses are replayed in log order.
-    pub async fn replay(&self, deltas: &[StateDelta], now: u32) -> Result<usize, Reject> {
-        let mut n = 0;
-        for d in deltas {
-            let shard = self.shard_for(&d.did)?;
-            let _g = shard.lock_did(&d.did).await;
-            let prev = shard.load(&d.did).await?;
-            let mut rec = prev.as_deref().cloned().unwrap_or_else(|| Record::new(d.host, now));
-            let before = rec.clone();
-            match d.kind {
-                ChangeKind::Commit | ChangeKind::Sync => {
-                    if let Some(c) = d.chain {
-                        let newer = rec.chain.is_none_or(|cur| c.rev > cur.rev);
-                        let resync = d.kind == ChangeKind::Sync && rec.chain.is_some_and(|cur| c.rev == cur.rev);
-                        if newer || resync {
-                            rec.chain = Some(c);
-                            rec.desync = None;
-                            rec.host = d.host;
-                        }
-                    }
-                }
-                ChangeKind::Account => {
-                    rec.upstream = d.upstream;
-                    rec.host = d.host;
-                }
-                // the key in the log entry's DID doc isn't carried: look it
-                // up again before trusting it
-                ChangeKind::Identity => rec.fetched_at = 0,
-            }
-            if prev.is_none() || rec != before {
-                shard.stage_unlogged(&d.did, rec);
-                n += 1;
-            }
-        }
-        Ok(n)
     }
 }

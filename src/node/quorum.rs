@@ -30,8 +30,8 @@
 //!   hosts to the recovery's cursors before a node's cursors count again.
 //! - Membership is `qlog/leader`'s.
 
+use super::forward::{ForwardError, Outcome as FwdOutcome};
 use super::{Checked, CheckedKind, DidOwner, Node, NodeConfig, Rejection, State, Submitted};
-use crate::cluster::forward::{ForwardError, Outcome as FwdOutcome};
 use crate::qlog::client::{Client, Decided};
 use crate::qlog::log::{Entry, Meta, decode_cursors, encode_cursors};
 use crate::qlog::node::{Admission, Hooks, Verdict};
@@ -175,7 +175,7 @@ fn encode_item(did: &str, host: &Host, from: &str, useq: i64, rest: &[u8]) -> By
     b.into()
 }
 
-fn decode_item(meta: &Bytes, frame_len: usize) -> anyhow::Result<ItemMeta> {
+fn decode_item(meta: &Bytes) -> anyhow::Result<ItemMeta> {
     let mut r = meta.clone();
     let did = get_str16(&mut r).ok_or_else(|| anyhow::anyhow!("short item"))?;
     let host = Host(get_str16(&mut r).ok_or_else(|| anyhow::anyhow!("short item"))?);
@@ -188,8 +188,7 @@ fn decode_item(meta: &Bytes, frame_len: usize) -> anyhow::Result<ItemMeta> {
     }
     // the frame here is the prefix and suffix, without the seq: the span
     // check is the host owner's
-    let _ = frame_len;
-    let m = super::cluster::decode_meta(&did, usize::MAX, r)?;
+    let m = super::forward::decode_meta(&did, r)?;
     Ok(ItemMeta { did, host, from, useq, kind: ItemKind::Event { kind: m.kind, first_sighting: m.first_sighting } })
 }
 
@@ -465,7 +464,7 @@ impl RelayHooks {
         let mut tries = 0;
         let r = loop {
             let ev = Incoming { did: &did, host: &host, now: state::now_secs(), kind: clone_kind(&ev_kind) };
-            match self.state.apply_held(&term.shard, ev, None).await {
+            match self.state.apply_held(&term.shard, ev).await {
                 Err(e) if e.retryable() && tries < 2 && t0.elapsed() < Duration::from_millis(300) => {
                     tries += 1;
                     tokio::time::sleep(Duration::from_millis(50 << tries)).await;
@@ -540,6 +539,10 @@ impl RelayHooks {
         };
         let mut rec: Record = (*prev).clone();
         rec.relay_takedown = takedown;
+        // lifting a takedown is how an operator also lifts a relay throttle
+        if !takedown {
+            rec.relay_throttled = false;
+        }
         let st = rec.status();
         let record = rec.clone();
         let t = shard.stage_logged(did, rec);
@@ -699,7 +702,7 @@ impl Hooks for RelayHooks {
             let mut out: Vec<Option<Verdict>> = (0..items.len()).map(|_| None).collect();
             let mut groups: HashMap<String, Vec<(usize, ItemMeta)>> = HashMap::new();
             for (i, it) in items.iter().enumerate() {
-                match decode_item(&it.meta, it.prefix.len() + it.suffix.len()) {
+                match decode_item(&it.meta) {
                     Ok(m) => groups.entry(m.did.clone()).or_default().push((i, m)),
                     Err(e) => {
                         out[i] = Some(Verdict::Answer {
@@ -1040,7 +1043,7 @@ const MAX_BATCH_BYTES: usize = 4 << 20;
 
 struct Pending {
     item: Item,
-    fence: Option<crate::cluster::forward::Fence>,
+    fence: Option<super::forward::Fence>,
     since: Instant,
     tx: oneshot::Sender<Result<FwdOutcome, ForwardError>>,
 }
@@ -1122,7 +1125,7 @@ impl DidOwner for QuorumOwner {
         let item = Item {
             prefix: c.frame.slice(..s - 4),
             suffix: c.frame.slice(e..),
-            meta: encode_item(&c.did, &c.host, &self.id, c.upstream_seq, &super::cluster::encode_meta(&c)),
+            meta: encode_item(&c.did, &c.host, &self.id, c.upstream_seq, &super::forward::encode_meta(&c)),
         };
         let (tx, rx) = oneshot::channel();
         let i = super::lane_of(&c.did, self.slots.len());
@@ -1291,6 +1294,11 @@ impl QuorumHosts {
         o.since.get_or_insert_with(Instant::now);
     }
 
+    /// host -> the member that reads it, as the leader's table last said.
+    pub fn owners(&self) -> HashMap<String, String> {
+        self.table.read().rows.values().filter_map(|r| Some((r.hostname.clone(), r.owner.clone()?))).collect()
+    }
+
     fn owned(&self, me: &str) -> HashSet<Host> {
         self.table
             .read()
@@ -1382,6 +1390,29 @@ impl state::HostStore for QuorumHosts {
         rows.truncate(limit);
         let cursor = more.then(|| rows.last().map(|r| r.hostname.clone())).flatten();
         Ok(state::HostPage { hosts: rows, cursor })
+    }
+}
+
+/// The sync API's reads: the leader's records (as applied), and the host
+/// table on any node.
+pub struct QuorumSync {
+    pub state: Arc<State>,
+    pub hosts: Arc<QuorumHosts>,
+}
+
+#[async_trait::async_trait]
+impl crate::sync_api::SyncSource for QuorumSync {
+    async fn list_repos(&self, cursor: Option<&str>, limit: usize) -> Result<state::RepoPage, state::StoreError> {
+        self.state.list_repos(cursor, limit).await
+    }
+    async fn repo(&self, did: &str) -> Result<Option<Arc<Record>>, state::StoreError> {
+        self.state.get(did).await
+    }
+    async fn host(&self, hostname: &str) -> anyhow::Result<Option<state::HostRecord>> {
+        state::HostStore::get_host(&*self.hosts, hostname).await
+    }
+    async fn list_hosts(&self, cursor: Option<&str>, limit: usize) -> anyhow::Result<state::HostPage> {
+        state::HostStore::list_hosts(&*self.hosts, cursor, limit).await
     }
 }
 
@@ -1607,6 +1638,9 @@ impl Glue {
         loop {
             tick.tick().await;
             let Some(n) = node.upgrade() else { return };
+            if let Err(e) = n.state.flush_host_counts(&*self.hosts).await {
+                tracing::debug!("host counts: {e:#}");
+            }
             let last = n.dash.lock().history.back().cloned();
             let now = (process_cpu_secs(), Instant::now());
             let cores = (now.0 - cpu.0) / now.1.duration_since(cpu.1).as_secs_f64().max(0.001);
@@ -1620,7 +1654,7 @@ impl Glue {
                 "durable_lag_ms": last.as_ref().map_or(0.0, |s| s.durable_lag_ms),
                 "cpu": cores,
                 "mem_bytes": process_rss_bytes(),
-                "stream_seq": n.serve.firehose.last_emitted.load(Ordering::Acquire),
+                "stream_seq": n.serve.head(),
             });
         }
     }
@@ -1696,7 +1730,7 @@ fn process_rss_bytes() -> u64 {
 
 /// (µs, events) submitted to answered, for the dashboard's durable lag.
 pub fn latency_totals(n: &Node) -> (u64, u64) {
-    n.quorum.get().map_or((0, 0), |g| (g.shared.lat_us.load(Ordering::Relaxed), g.shared.lat_n.load(Ordering::Relaxed)))
+    (n.quorum.shared.lat_us.load(Ordering::Relaxed), n.quorum.shared.lat_n.load(Ordering::Relaxed))
 }
 
 // ---------------------------------------------------------------- start
@@ -1705,17 +1739,14 @@ impl Node {
     /// A node on the quorum log: its peer port, commitlog and firehose, the
     /// pipeline for the hosts the leader gives it, and the leader's half
     /// when it leads. The firehose and every API are ready on return.
-    pub async fn start_quorum(store: Store, cfg: NodeConfig, q: QuorumSetup) -> anyhow::Result<Arc<Node>> {
+    pub async fn start(store: Store, cfg: NodeConfig, q: QuorumSetup) -> anyhow::Result<Arc<Node>> {
         use crate::qlog::{bucket::Bucket, commitlog, emit, node as qn};
         let id = cfg.node_id.clone();
-        anyhow::ensure!(cfg.plc_export.is_none(), "--plc-export isn't built for the quorum log yet");
         let identity = Arc::new(crate::identity::IdentityCache::new(
             crate::identity::HttpFetch::new(&cfg.plc_url, cfg.dev_mode),
             cfg.identity.clone(),
         ));
         let state = Arc::new(state::StateStore::new(
-            store.clone(),
-            vlpds::slots::Layout::uniform(1).shards,
             super::adapters::VerifyChain,
             Arc::new(super::adapters::CacheIdentity(identity.clone())),
             state::ApplyConfig::default(),
@@ -1757,19 +1788,15 @@ impl Node {
             }
             None => (Arc::new(qn::MemoryOnly), None),
         };
-        // Where this node's emission can start: its log's base, or the last
-        // flush if that's later (a wiped or new disk restarts at 0 and is
-        // reset to the leader's log, above F). Cursors below it backfill
-        // from the bucket, gaps and all; a floor below a recovery's jump
-        // would send them to this node's own log, past the gaps' far side.
-        let flushed = crate::qlog::flush::read_manifest(&bucket.flush).await?.map_or(0, |(m, _)| m.flushed);
-        let floor = recovered.as_ref().map_or(0, |r| r.log.base().1).max(flushed);
         let scfg = cfg.serve_config();
         let incarnation = chrono::Utc::now().timestamp_micros() as u64;
         let emitter = emit::Emitter::with_store(&id, incarnation, scfg.ring_bytes, None, bucket.backfill.clone());
-        let fh =
-            emitter.start_firehose(floor, scfg.firehose_options(Some(vlpds::firehose::runtime(cfg.serve_threads))));
-        let srv = crate::serve::Serve::counted(store.clone(), scfg, fh);
+        let srv = crate::serve::Serve::counted(store.clone(), scfg.clone());
+        let s2 = srv.clone();
+        emitter.set_serving(
+            scfg.firehose_options(Some(vlpds::firehose::runtime(cfg.serve_threads))),
+            Box::new(move |fh| s2.attach(fh)),
+        );
         srv.load_takedowns().await;
 
         let hooks = RelayHooks::new(state.clone(), Some(identity.clone()), q.clone());
@@ -1828,7 +1855,7 @@ impl Node {
         let crawler = upstream::Crawler::new(manager.clone(), upstream::CrawlPolicy::default());
         let policy = cfg.policy.as_ref().map(|p| {
             let raw: Arc<dyn state::HostStore> = hosts.clone();
-            super::policy::PolicyHooks::with_hosts(p.0.clone(), state.clone(), raw, cfg.dev_mode)
+            super::policy::PolicyHooks::new(p.0.clone(), state.clone(), raw, cfg.dev_mode)
         });
         if let Some(h) = &policy {
             h.install(&manager, &crawler, &identity);
@@ -1860,18 +1887,12 @@ impl Node {
             crawler,
             state,
             identity,
-            None,
             srv,
-            None,
             owner,
-            Arc::new(super::metrics::Ttf::default()),
-            HashMap::new(),
-            Default::default(),
             policy.clone(),
-            None,
+            glue.clone(),
             rx,
         )?;
-        let _ = node.quorum.set(glue.clone());
         // nothing is read until the leader gives this node its hosts
         manager.set_filter(Arc::new(|_: &Host| false)).await?;
         manager.follow_filter(filter_rx);
@@ -1930,7 +1951,7 @@ mod tests {
             fence: None,
         };
         let (prefix, suffix) = test_frame(&format!("{did}#{k}"), 32, 0);
-        Item { prefix, suffix, meta: encode_item(did, &c.host, from, 0, &super::super::cluster::encode_meta(&c)) }
+        Item { prefix, suffix, meta: encode_item(did, &c.host, from, 0, &super::super::forward::encode_meta(&c)) }
     }
 
     fn cluster_cfg(ident: Arc<MapIdentity>, slow_us: u64) -> ConfigFn {
@@ -1951,8 +1972,6 @@ mod tests {
                 crash: None,
             });
             let state = Arc::new(state::StateStore::new(
-                Store::memory(None),
-                vlpds::slots::Layout::uniform(1).shards,
                 super::super::adapters::VerifyChain,
                 ident.clone(),
                 state::ApplyConfig::default(),

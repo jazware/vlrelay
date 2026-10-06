@@ -1,4 +1,5 @@
-//! vlRelay: the single-node relay (docs/devloop.md "The e2e contract").
+//! vlRelay: one node of a relay on the quorum log (docs/quorum-cluster.md;
+//! with no peers, a single node).
 
 use axum::http::{HeaderValue, header};
 use axum::middleware;
@@ -49,15 +50,6 @@ struct Args {
     prefix: String,
     #[arg(long, default_value = "https://plc.directory", env = "VLRELAY_PLC_URL")]
     plc_url: String,
-    /// Segment linger: a segment seals this long after its first event (docs/design.md, "Decisions").
-    #[arg(long, default_value_t = 25)]
-    linger_ms: u64,
-    /// Segment PUTs in flight at once.
-    #[arg(long, default_value_t = vlrelay::seq::DEFAULT_INFLIGHT)]
-    log_inflight: usize,
-    /// A segment seals at this size even before its linger is up.
-    #[arg(long, default_value_t = vlrelay::seq::DEFAULT_MAX_SEGMENT_BYTES >> 20)]
-    max_segment_mb: usize,
     /// zstd level for log segments: 0 stores them uncompressed, negative
     /// levels are zstd's fast ones. Firehose frames are mostly hashes:
     /// on production frames -1 compresses 1.8x faster than 1 for 0.6% more
@@ -78,11 +70,6 @@ struct Args {
     /// Turns on /admin (dashboard and API) with this token.
     #[arg(long, env = "VLRELAY_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
-    /// An edge's or a replica's public URL (repeatable, or comma-separated),
-    /// for a core's dashboard to include its numbers and consumers. They
-    /// answer with the same --admin-token.
-    #[arg(long = "admin-follower", env = "VLRELAY_ADMIN_FOLLOWERS", value_delimiter = ',')]
-    admin_followers: Vec<String>,
     /// A built dashboard (`ui/dist`); default: this tree's, if built.
     #[arg(long)]
     ui_dir: Option<PathBuf>,
@@ -95,21 +82,14 @@ struct Args {
     /// documents. Implied by an http:// --host or a loopback --plc-url.
     #[arg(long)]
     dev_mode: bool,
-    /// DID state shards (SlateDB instances). Default: 4 on one node, 24 in
-    /// a cluster. Only read when the bucket has no DID layout yet.
-    #[arg(long)]
-    did_shards: Option<u32>,
-    /// How long the log keeps events for cursor replay, in hours.
-    #[arg(long, default_value_t = 72)]
-    retention: u64,
-    /// Dev mode only: retention in seconds instead (overrides --retention),
-    /// so a test can see `OutdatedCursor`.
-    #[arg(long)]
-    retention_secs: Option<u64>,
     /// Dev mode only: how far a live consumer may fall behind before
     /// `ConsumerTooSlow`, in MiB (default 128).
     #[arg(long)]
     max_lag_mb: Option<usize>,
+    /// The firehose's in-memory ring of recent events, in MiB (default
+    /// 512); older cursors read the node's log, then the bucket.
+    #[arg(long)]
+    ring_mb: Option<usize>,
     /// Pipeline lanes; a DID always maps to the same one.
     #[arg(long, default_value_t = 64)]
     lanes: usize,
@@ -130,65 +110,17 @@ struct Args {
     /// DID document fetches per second, all DIDs together.
     #[arg(long, default_value_t = 50.0)]
     did_lookups_per_sec: f64,
-    /// Seed DID documents from the PLC directory's /export (resumable, then
-    /// follows its tail), so a cold relay doesn't resolve each account. On
-    /// a cluster the lowest-named live core reads it.
-    #[arg(long, env = "VLRELAY_PLC_EXPORT", value_parser = clap::builder::BoolishValueParser::new())]
-    plc_export: bool,
-    /// The directory --plc-export reads (default: --plc-url).
-    #[arg(long, env = "VLRELAY_PLC_EXPORT_URL")]
-    plc_export_url: Option<String>,
-    /// /export requests per second, all streams together.
-    #[arg(long, default_value_t = 2.0)]
-    plc_export_rate: f64,
-    /// Time windows of the export read side by side on a fresh start.
-    #[arg(long, default_value_t = 4)]
-    plc_export_streams: usize,
-    /// Node id: the node log's id prefix, and the cluster member name.
+    /// The member's name in the quorum log.
     #[arg(long, default_value = "relay", env = "VLRELAY_NODE_ID")]
     node_id: String,
-    /// Run as a core cluster node (the same as --role core).
-    #[arg(long)]
-    cluster: bool,
-    /// Cluster role: core (lease, shards, a log), edge (follows every log
-    /// over peer mTLS) or replica (follows every log from the bucket).
-    #[arg(long, value_enum)]
-    role: Option<vlrelay::cluster::Role>,
-    /// The peer listener (node-to-node mTLS): forwarding, log streams.
-    #[arg(long, default_value = "127.0.0.1:2979", env = "VLRELAY_PEER_LISTEN")]
-    peer_listen: SocketAddr,
-    /// `https://host:port` peers reach --peer-listen at.
-    #[arg(long, env = "VLRELAY_ADVERTISE_URL")]
-    advertise_url: Option<String>,
-    /// Peer TLS: `ca.crt`, `{node-id}.crt`, `{node-id}.key` (vlpds admin
-    /// tls ca / issue). With --dev-mode they're created as needed.
-    #[arg(long, env = "VLRELAY_PEER_TLS_DIR")]
-    peer_tls_dir: Option<PathBuf>,
-    /// Shared secret on every peer request.
-    #[arg(long, env = "VLRELAY_INTERNAL_TOKEN", hide_env_values = true)]
-    internal_token: Option<String>,
-    /// Node lease TTL: a crashed core node's shards move after about this
-    /// plus a fifth of it.
-    #[arg(long, default_value_t = 10_000)]
-    lease_ttl_ms: u64,
-    /// Host shards (used only when the bucket has no host layout yet).
-    #[arg(long, default_value_t = 64)]
-    host_shards: u32,
-    /// The lease cluster (`--role`, `--cluster`), which the quorum log
-    /// (`--quorum`) supersedes: kept for comparison, off unless asked for.
-    #[arg(long, env = "VLRELAY_LEGACY_CLUSTER")]
-    legacy_cluster: bool,
     #[command(flatten)]
     quorum: QuorumArgs,
 }
 
-/// The relay on the quorum log (docs/quorum.md): one node of a cluster of
-/// any size (one is a single node with the commitlog as its WAL).
+/// The quorum log (docs/quorum.md): one node of a cluster of any size (one
+/// is a single node with the commitlog as its WAL).
 #[derive(clap::Args, Debug)]
 struct QuorumArgs {
-    /// Run on the quorum log.
-    #[arg(long, env = "VLRELAY_QUORUM")]
-    quorum: bool,
     /// The peer protocol: replication, submits, members' questions.
     #[arg(long, default_value = "127.0.0.1:2978", env = "VLRELAY_QLOG_LISTEN")]
     qlog_listen: String,
@@ -336,7 +268,6 @@ fn main() {
 async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<()> {
     let loopback_plc = a.plc_url.contains("://127.") || a.plc_url.contains("://localhost");
     let dev_mode = a.dev_mode || a.hosts.iter().any(|h| h.starts_with("http://")) || loopback_plc;
-    let mut lease_store = None;
     let store = if a.memory {
         vlpds::store::Store::memory(None)
     } else {
@@ -350,32 +281,18 @@ async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<
             region: a.s3_region.clone(),
         };
         let unsigned = a.s3_unsigned_payload.unwrap_or(cfg.endpoint.starts_with("https://"));
-        lease_store = Some(vlpds::store::Store::s3_with(&cfg, &a.prefix, None, 2, unsigned)?);
         vlpds::store::Store::s3_with(&cfg, &a.prefix, None, 256, unsigned)?
     };
 
     let mut cfg = NodeConfig::new(&a.plc_url);
     cfg.node_id = a.node_id.clone();
     cfg.dev_mode = dev_mode;
-    cfg.linger = Duration::from_millis(a.linger_ms);
-    cfg.log_inflight = a.log_inflight;
-    cfg.max_segment_bytes = a.max_segment_mb << 20;
     vlpds::segment::set_compression_level(a.log_compression);
-    let role = a.role.or(a.cluster.then_some(vlrelay::cluster::Role::Core));
-    anyhow::ensure!(
-        role.is_none() || a.legacy_cluster,
-        "the lease cluster (--role, --cluster) is superseded by the quorum log (--quorum): pass --legacy-cluster to run it anyway"
-    );
-    anyhow::ensure!(!(role.is_some() && a.quorum.quorum), "--quorum and --role are different clusters: pick one");
-    cfg.did_shards = a.did_shards.unwrap_or(default_did_shards(role)).max(1);
-    cfg.retention = Duration::from_secs(a.retention.max(1) * 3600);
-    if (a.retention_secs.is_some() || a.max_lag_mb.is_some()) && !dev_mode {
-        anyhow::bail!("--retention-secs and --max-lag-mb are for dev networks (--dev-mode)");
-    }
-    if let Some(s) = a.retention_secs {
-        cfg.retention = Duration::from_secs(s.max(1));
+    if a.max_lag_mb.is_some() && !dev_mode {
+        anyhow::bail!("--max-lag-mb is for dev networks (--dev-mode)");
     }
     cfg.max_lag_bytes = a.max_lag_mb.map(|mb| mb.max(1) << 20);
+    cfg.ring_bytes = a.ring_mb.map(|mb| mb.max(1) << 20);
     cfg.lanes = a.lanes.max(1);
     if let Some(n) = a.ingest_threads {
         cfg.ingest_threads = n.max(1);
@@ -390,12 +307,8 @@ async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<
     cfg.cli_host_tier = vlrelay::upstream::Tier::parse(&a.host_tier)
         .filter(|t| t.connects())
         .ok_or_else(|| anyhow::anyhow!("--host-tier {}: one of trusted, default, new, throttled", a.host_tier))?;
-    // a cluster splits the policy's budgets over its live core nodes
-    let cores = Arc::new(vlrelay::node::cluster::LiveCores::default());
-    let live: Arc<dyn vlrelay::policy::LiveNodes> = match role {
-        Some(_) => cores.clone(),
-        None => Arc::new(vlrelay::policy::FixedNodes::new(1)),
-    };
+    // the leader decides every new account, so its budgets are the cluster's
+    let live: Arc<dyn vlrelay::policy::LiveNodes> = Arc::new(vlrelay::policy::FixedNodes::new(1));
     cfg.policy =
         Some(vlrelay::node::policy::PolicyEngine(vlrelay::policy::Engine::new(store.clone(), &a.node_id, live)));
     cfg.identity.lookups_per_sec = a.did_lookups_per_sec;
@@ -405,91 +318,47 @@ async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<
         cfg.identity.lookups_per_sec = cfg.identity.lookups_per_sec.max(1000.0);
         cfg.identity.burst = cfg.identity.burst.max(1000.0);
     }
-    if a.plc_export {
-        let mut pc = vlrelay::plc_seed::ingest::Config::new(a.plc_export_url.as_deref().unwrap_or(&a.plc_url));
-        anyhow::ensure!(a.plc_export_rate > 0.0, "--plc-export-rate must be above 0");
-        pc.rate = a.plc_export_rate;
-        pc.streams = a.plc_export_streams.max(1);
-        cfg.plc_export = Some(pc);
-    }
-    let setup = match role {
-        Some(role) => Some(cluster_setup(&a, role, dev_mode, cores, lease_store)?),
-        None => None,
-    };
-    let node = match &setup {
-        None if a.quorum.quorum => {
-            let q = quorum_setup(&a.quorum, &a.node_id)?;
-            Node::start_quorum(store, cfg, q).await?
-        }
-        None => Node::start(store, cfg).await?,
-        Some(s) if s.role == vlrelay::cluster::Role::Core => {
-            let peer = tokio::net::TcpListener::bind(a.peer_listen).await?;
-            Node::start_cluster(store, cfg, s, peer).await?
-        }
-        Some(s) => return run_follower(&a, store, cfg, s).await,
-    };
+    let q = quorum_setup(&a.quorum, &a.node_id)?;
+    let node = Node::start(store, cfg, q).await?;
 
+    let admin = vlrelay::qlog::emit::Admin::for_listener(a.quorum.qlog_admin_token.clone(), a.listen);
     let mut app = axum::Router::new()
         .route("/xrpc/_health", axum::routing::get(health))
         .route("/metrics", axum::routing::get(|| async { vlpds::metrics::render() }))
-        .merge(node.serve.router());
-    if let Some(q) = node.quorum.get() {
-        let admin = vlrelay::qlog::emit::Admin::for_listener(a.quorum.qlog_admin_token.clone(), a.listen);
-        app = app.merge(vlrelay::qlog::emit::control_router(q.qnode.clone(), admin));
-    }
-    let mut app = app
-        .merge(vlrelay::sync_api::router(match &node.cluster {
-            Some(g) => {
-                Arc::new(vlrelay::node::cluster::ClusterSync { state: node.state.clone(), hosts: g.hosts.clone() })
-            }
-            None => node.state.clone(),
-        }))
-        .merge(vlrelay::archive::read::router(
-            node.state.clone(),
-            node.cluster.as_ref().map(|g| -> Arc<dyn vlrelay::archive::read::Forward> {
-                Arc::new(vlrelay::archive::wiring::PeerForward(Arc::downgrade(&g.cluster)))
-            }),
-        ));
+        .merge(node.serve.router())
+        .merge(vlrelay::qlog::emit::control_router(node.quorum.qnode.clone(), admin))
+        .merge(vlrelay::sync_api::router(Arc::new(vlrelay::node::quorum::QuorumSync {
+            state: node.state.clone(),
+            hosts: node.quorum.hosts.clone(),
+        })));
     if a.crawl {
         app = app.merge(node.crawler.router());
     }
     let token = a.admin_token.clone().filter(|t| !t.is_empty());
-    // always built: the public page's stats come from it, and a core answers
-    // its peers' dashboards even without a dashboard of its own
+    // always built: the public page's stats come from it
     let admin_src = {
         let policy = node.policy.clone().expect("the relay always runs the policy engine");
         let demo = vlrelay::admin::demo::Demo::start(42);
-        let src = NodeAdmin::new(node.clone(), policy, demo)
-            .with_followers(a.admin_followers.clone(), token.clone().unwrap_or_default())
-            .with_settings(settings);
-        Arc::new(src)
+        Arc::new(NodeAdmin::new(node.clone(), policy, demo).with_settings(settings))
     };
-    if let Some(g) = &node.cluster {
-        let _ = g.admin.set(Arc::downgrade(&admin_src));
-    }
-    // admin_src stays bound for the life of `run`: the peer slot holds it weakly
     let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
     if let Some(token) = token {
-        app = app.merge(vlrelay::admin::app(admin_src.clone(), token.clone(), ui));
-        app = app.merge(vlrelay::archive::admin::router(node.state.clone(), token));
+        app = app.merge(vlrelay::admin::app(admin_src.clone(), token, ui));
     } else {
         app = app.merge(vlrelay::admin::docs_routes(ui)).merge(vlrelay::admin::public_routes(admin_src.clone()));
     }
     let app = with_real_ip(app.layer(middleware::map_response(server_header)), &a.trusted_proxies);
 
     let listener = tokio::net::TcpListener::bind(a.listen).await?;
-    let log = node.log.as_ref().map(|l| l.log_id.to_string()).unwrap_or_else(|| "qlog".into());
-    tracing::info!(addr = %a.listen, log = %log, dev_mode, "vlrelay listening");
+    tracing::info!(addr = %a.listen, node = %a.node_id, dev_mode, "vlrelay listening");
     // Consumers (a reconnect storm's accepts and upgrades) are served on the
-    // subscriber runtime, so they can't starve the pipeline and peer RPC on
-    // this one. The tokio listener must be registered there too.
+    // subscriber runtime, so they can't starve the pipeline and the quorum
+    // log on this one. The tokio listener must be registered there too.
     let listener = listener.into_std()?;
     let server = vlpds::firehose::runtime(node.cfg.serve_threads).spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener)?;
         axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
     });
-    // the shards go first: consumers keep their sockets until the process
-    // exits, then resume on another node from their cursor
     signal().await;
     tracing::info!("shutting down");
     let r = node.shutdown().await;
@@ -505,82 +374,6 @@ async fn signal() {
     }
 }
 
-fn cluster_setup(
-    a: &Args,
-    role: vlrelay::cluster::Role,
-    dev_mode: bool,
-    cores: Arc<vlrelay::node::cluster::LiveCores>,
-    lease_store: Option<vlpds::store::Store>,
-) -> anyhow::Result<vlrelay::node::cluster::ClusterSetup> {
-    use vlrelay::cluster::Role;
-    let advertise = a.advertise_url.clone().unwrap_or_else(|| format!("https://{}", a.peer_listen));
-    let tls = match (role, &a.peer_tls_dir) {
-        (Role::Replica, _) => None,
-        (_, None) => anyhow::bail!("--role core and edge need --peer-tls-dir"),
-        (_, Some(dir)) => {
-            let files = if dev_mode {
-                let host = vlpds::peer_tls::url_host(&advertise)?;
-                vlpds::peer_tls::dev_files(dir, &a.node_id, &[host])?
-            } else {
-                vlpds::peer_tls::Files::in_dir(dir, &a.node_id)
-            };
-            let t = vlpds::peer_tls::PeerTls::load(files)?;
-            t.spawn_reloader();
-            Some(t)
-        }
-    };
-    let internal_token = a.internal_token.clone().filter(|t| !t.is_empty());
-    anyhow::ensure!(role == Role::Replica || internal_token.is_some(), "--role core and edge need --internal-token");
-    Ok(vlrelay::node::cluster::ClusterSetup {
-        role,
-        advertise,
-        tls,
-        internal_token: internal_token.unwrap_or_default(),
-        ttl: Duration::from_millis(a.lease_ttl_ms.max(500)),
-        host_shards: a.host_shards.max(1),
-        checkpoint_every: Duration::from_secs(2),
-        cores,
-        lease_store,
-    })
-}
-
-/// An edge or a replica: the merged firehose and health, nothing else.
-async fn run_follower(
-    a: &Args,
-    store: vlpds::store::Store,
-    cfg: NodeConfig,
-    setup: &vlrelay::node::cluster::ClusterSetup,
-) -> anyhow::Result<()> {
-    let peer = match setup.role {
-        vlrelay::cluster::Role::Edge => Some(tokio::net::TcpListener::bind(a.peer_listen).await?),
-        _ => None,
-    };
-    let node = vlrelay::node::cluster::start_follower(store, &cfg, setup).await?;
-    if let Some(p) = peer {
-        vlrelay::cluster::peer::spawn_listener(&node, p)?;
-    }
-    let mut app = axum::Router::new()
-        .route("/xrpc/_health", axum::routing::get(health))
-        .route("/metrics", axum::routing::get(|| async { vlpds::metrics::render() }))
-        .merge(node.serve.router());
-    // the cores' dashboards read this node's numbers and consumers here
-    if let Some(token) = a.admin_token.clone().filter(|t| !t.is_empty()) {
-        let fa = vlrelay::node::peer_admin::FollowerAdmin::start(node.clone());
-        app = app.merge(vlrelay::node::peer_admin::follower_router(fa, token));
-    }
-    let app = with_real_ip(app.layer(middleware::map_response(server_header)), &a.trusted_proxies);
-    let listener = tokio::net::TcpListener::bind(a.listen).await?;
-    tracing::info!(addr = %a.listen, role = ?setup.role, "vlrelay listening");
-    let server =
-        tokio::spawn(
-            async move { axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await },
-        );
-    signal().await;
-    let r = node.shutdown().await;
-    server.abort();
-    r
-}
-
 async fn health() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
 }
@@ -594,44 +387,9 @@ async fn server_header(mut r: Response) -> Response {
     r
 }
 
-/// Cores take at most `ceil(shards / live cores)` DID shards each, so 4
-/// shards over 3 cores can leave one core with none. 24 splits evenly over
-/// 2, 3, 4, 6 and 8 cores and leaves none empty at 5 (5/5/5/5/4); at 7 or
-/// 9+ the last core can still come up empty, so size --did-shards to the
-/// cluster there.
-fn default_did_shards(role: Option<vlrelay::cluster::Role>) -> u32 {
-    match role {
-        None => 4,
-        Some(_) => 24,
-    }
-}
-
 fn with_real_ip(app: axum::Router, trusted: &[vlrelay::serve::Cidr]) -> axum::Router {
     if trusted.is_empty() {
         return app;
     }
     app.layer(middleware::from_fn_with_state(Arc::new(trusted.to_vec()), vlrelay::serve::real_ip))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cluster_default_did_shards_leave_no_core_idle() {
-        let shards = default_did_shards(Some(vlrelay::cluster::Role::Core));
-        for cores in [2u32, 3, 4, 5, 6, 8] {
-            // the greedy fill: each core takes up to its fair share in turn
-            let fair = shards.div_ceil(cores);
-            let mut left = shards;
-            let mut min = u32::MAX;
-            for _ in 0..cores {
-                let take = fair.min(left);
-                left -= take;
-                min = min.min(take);
-            }
-            assert!(min > 0, "{shards} shards over {cores} cores leaves one with none");
-        }
-        assert_eq!(default_did_shards(None), 4);
-    }
 }
