@@ -47,8 +47,18 @@ struct Cluster {
     ring_bytes: usize,
 }
 
+/// Each port handed out once per process, below the ephemeral range: an
+/// OS-picked port can come back to a cluster running alongside, whose
+/// nodes would then append to this one's.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let base = 15_000 + (std::process::id() as u64 % 20) * 500;
+    loop {
+        let p = (base + NEXT.fetch_add(1, Ordering::Relaxed) % 500) as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+            return p;
+        }
+    }
 }
 
 fn config(id: &str, addrs: &HashMap<String, String>) -> Config {
@@ -268,9 +278,20 @@ impl Cluster {
             let st: Vec<_> = self.nodes.values().map(|r| r.node.status()).collect();
             let top = st.iter().map(|s| s.last).max().unwrap_or(0);
             if st.iter().all(|s| s.emitted == top && s.commit == top) && st.iter().any(|s| s.role == Role::Leader) {
-                // the tap is asynchronous
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                return;
+                // the tap is asynchronous: wait for the checker to have seen
+                // every running node's stream reach the top
+                let seen = {
+                    let ck = self.checker.lock();
+                    st.iter().all(|s| {
+                        let inc = self.incarnations.get(&s.id).copied().unwrap_or(0);
+                        // (a restarted node with nothing past its base emits nothing)
+                        ck.last(&format!("{}#{inc}", s.id)).map_or(s.base >= top, |l| l >= top)
+                    })
+                };
+                if seen {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    return;
+                }
             }
             assert!(t.elapsed() < within, "no convergence within {within:?}: {st:#?}");
             tokio::time::sleep(Duration::from_millis(20)).await;

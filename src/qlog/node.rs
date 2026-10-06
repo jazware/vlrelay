@@ -1307,7 +1307,9 @@ impl Node {
                     Role::Follower if c.electing => None,
                     Role::Follower => {
                         let quiet = c.last_heard.elapsed();
-                        if quiet > self.cfg.election_timeout && Instant::now() >= c.retry_at {
+                        // a single node has nobody to hear from: it leads at once
+                        let alone = self.cfg.members.len() == 1;
+                        if (alone || quiet > self.cfg.election_timeout) && Instant::now() >= c.retry_at {
                             c.electing = true;
                             Some(Act::Takeover)
                         } else if quiet > self.cfg.probe_after
@@ -1651,7 +1653,9 @@ impl Node {
         stats.total_ms = t0.elapsed().as_millis() as u64;
         tracing::warn!(
             id = %self.cfg.id, epoch, generation = rec.generation, f = stats.manifest_flushed, after, base,
-            salvaged = stats.salvaged, orphans = stats.orphan_segments, ms = stats.total_ms,
+            salvaged = stats.salvaged, orphans = stats.orphan_segments, read_ms = stats.read_ms,
+            clone_ms = stats.clone_ms, apply_seal_ms = stats.apply_seal_ms, segments_ms = stats.segments_ms,
+            manifest_ms = stats.manifest_ms, ms = stats.total_ms, end_ms = chrono::Utc::now().timestamp_millis(),
             "qlog recovery: the bucket's log adopted, resuming above R"
         );
         self.recovered.lock().push(stats);

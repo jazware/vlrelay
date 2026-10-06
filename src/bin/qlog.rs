@@ -399,6 +399,8 @@ struct Rewind {
 struct Acked {
     contig: u64,
     done: std::collections::BTreeMap<u64, u64>,
+    /// Recent acks with the generation each came under: (first, n, gen).
+    recent: std::collections::VecDeque<(u64, u64, u64)>,
 }
 
 impl Acked {
@@ -412,6 +414,19 @@ impl Acked {
         }
     }
 
+    fn note(&mut self, es: &[u64], generation: u64) {
+        let dense = es.windows(2).all(|w| w[1] == w[0] + 1);
+        if dense {
+            self.recent.push_back((es[0], es.len() as u64, generation));
+        } else {
+            self.recent.extend(es.iter().map(|&e| (e, 1, generation)));
+        }
+        // a few minutes of batches at the rates used: more than any rewind reaches back
+        while self.recent.len() > 200_000 {
+            self.recent.pop_front();
+        }
+    }
+
     fn is_acked(&self, e: u64) -> bool {
         e < self.contig || self.done.range(..=e).next_back().is_some_and(|(f, n)| e < f + n)
     }
@@ -420,14 +435,23 @@ impl Acked {
     /// cursor stays acked (it's in the log), every later one of the first
     /// `k` is returned to send again, `acked_before` counting those that
     /// were acked already.
-    fn rewind(&mut self, cursors: &std::collections::BTreeMap<String, u64>, run: &str, hosts: u64, k: u64) -> (Vec<u64>, u64) {
+    fn rewind(
+        &mut self,
+        cursors: &std::collections::BTreeMap<String, u64>,
+        g: u64,
+        run: &str,
+        hosts: u64,
+        k: u64,
+    ) -> (Vec<u64>, u64) {
         let cur = |h: u64| cursors.get(&format!("{run}-h{h}")).copied().unwrap_or(0);
         let start = (0..hosts).map(|h| cur(h) * hosts + h).min().unwrap_or(0).min(k);
         let mut resend = Vec::new();
         let mut acked_before = 0;
         let mut done = std::collections::BTreeMap::new();
+        let since: Vec<(u64, u64)> =
+            self.recent.iter().filter(|r| r.2 >= g && r.0 + r.1 > start).map(|r| (r.0, r.1)).collect();
         for e in start..k {
-            if e / hosts < cur(e % hosts) {
+            if e / hosts < cur(e % hosts) || since.iter().any(|&(f, n)| e >= f && e < f + n) {
                 done.insert(e, 1);
             } else {
                 if self.is_acked(e) {
@@ -494,6 +518,7 @@ impl LoadCtx {
         let _ = self.ack_tx.send((a.first, dids));
         {
             let mut tr = self.track.lock();
+            tr.note(&es, a.generation);
             if a.generation >= self.client.generation() {
                 let dense = es.windows(2).all(|w| w[1] == w[0] + 1);
                 if dense {
@@ -542,7 +567,7 @@ impl LoadCtx {
         let (resend, acked_before) = {
             let mut tr = self.track.lock();
             let k = self.next_event.load(Ordering::Acquire);
-            let r = tr.rewind(&cursors, &self.run, self.hosts, k);
+            let r = tr.rewind(&cursors, g2, &self.run, self.hosts, k);
             // under the track lock: cursors computed from here on count
             // from the recovery's, and say so
             self.client.rewound(g2);
@@ -858,7 +883,7 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
                         let lat = (at - sent).max(1) as u64;
                         let _ = by_node.entry(node).or_insert_with(mk).record(lat);
                         if seq > top {
-                            let _ = first.record_n(lat, seq - top);
+                            let _ = first.record(lat);
                             if at - top_at > a.gap_ms as i64 * 1000 {
                                 use std::io::Write;
                                 pauses.push((top_at / 1000, at / 1000));

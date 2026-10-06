@@ -33,6 +33,11 @@ print(
     f"acked {r.get('acked')}, acked but not emitted {r.get('acked_missing')}; violations {r.get('violations')}, "
     f"holes {r.get('holes')}, skipped with notice {r.get('skipped_with_notice')}"
 )
+if r.get("jumped") or r.get("duplicates") or r.get("reingested"):
+    print(
+        f"  recovery gaps: streams jumped {r.get('jumped')} seqs across them; acked seqs lost and re-ingested {r.get('reingested')}; "
+        f"events at two seqs {r.get('duplicates')} ({r.get('duplicates_across_gaps')} across a gap); events never emitted outside a gap {r.get('events_lost')}"
+    )
 for m in r.get("messages", [])[:10]:
     print(f"  ! {m}")
 
@@ -71,7 +76,8 @@ try:
         for l in f:
             p = l.split()
             if len(p) >= 3 and p[1] in ("kill9", "isolate", "stop", "powercut"):
-                kind = p[3] if len(p) > 3 and p[3] in ("kill-two", "kill-all", "power-cut-all") else p[1]
+                multi = ("kill-two", "kill-all", "power-cut-all", "wipe-all", "wipe-two", "single-wipe", "single-kill", "single-power-cut")
+                kind = p[3] if len(p) > 3 and p[3] in multi else p[1]
                 # one fault on several nodes at once is one fault
                 if faults and faults[-1][1] == kind and int(p[0]) - faults[-1][0] < 200:
                     faults[-1] = (faults[-1][0], kind, faults[-1][2] + "+" + p[2])
@@ -197,3 +203,40 @@ try:
         print(f"ack latency, seconds without: {agg(outn)}")
 except (OSError, AttributeError, ValueError):
     pass
+
+# bucket recoveries: what each node logged, and the load's re-ingest
+try:
+    import re
+
+    recs = []
+    for i in (1, 2, 3):
+        try:
+            with open(os.path.join(out, f"n{i}.log")) as f:
+                for l in f:
+                    if "qlog recovery: the bucket's log adopted" in l:
+                        recs.append(dict(re.findall(r"(\w+)=(\d+)", l)))
+        except OSError:
+            pass
+    for x in sorted(recs, key=lambda x: int(x.get("generation", 0))):
+        print(
+            f"recovery {x.get('generation')} (epoch {x.get('epoch')}): F {x.get('f')} -> kept to S {x.get('after')} "
+            f"({x.get('orphans')} orphan segments, {x.get('salvaged')} salvaged), resumed above R {x.get('base')}; "
+            f"read {x.get('read_ms')} ms, clone {x.get('clone_ms')} ms, apply+seal {x.get('apply_seal_ms')} ms, "
+            f"segments {x.get('segments_ms')} ms, manifest {x.get('manifest_ms')} ms, total {x.get('ms')} ms"
+        )
+    for rw in (ld or {}).get("rewinds", []):
+        print(
+            f"  load rewind for recovery {rw['generation']}: cursors after {rw['cursors_ms']} ms, {rw['resent']} events sent again "
+            f"({rw['acked_before']} of them acked before), all acked again in {rw['catch_up_ms']} ms"
+        )
+except (OSError, ValueError):
+    pass
+rt = load("retain.json")
+if rt:
+    pl = rt.get("plan", {})
+    print(
+        f"retain/qlog: {pl.get('segments')} segments ({pl.get('segment_bytes', 0) / 2**20:.1f} MiB); {len(pl.get('deletable', []))} deletable past "
+        f"{pl.get('horizon_secs')} s ({pl.get('deletable_bytes', 0) / 2**20:.1f} MiB, pruned_seq -> {pl.get('pruned_seq_after')}); "
+        f"{len(pl.get('stale_segments', []))} stale; state paths: "
+        + ", ".join(f"{x['path']}{' (current)' if x['current'] else ''}{' (referenced)' if x['referenced'] else ''}{' deletable' if x['deletable'] else ''} {x['bytes'] / 2**20:.1f} MiB, {len(x['stale_checkpoints'])} stale checkpoints" for x in pl.get("states", []))
+    )
