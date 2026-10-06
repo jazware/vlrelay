@@ -168,7 +168,7 @@ export function Overview() {
     { label: 'Sent', right: 'all consumers', value: fmtSi(o.eventsOutPerSec), unit: '/s', sec: `${fmtBytes(o.bytesOutPerSec)}/s`, spark: <Spark data={h.eventsOut} color="c5" />, to: '/admin/consumers' },
     { label: 'Time to firehose', right: 'p99 · p50 dashed', value: fmtMs(o.timeToFirehoseP99Ms), sec: fmtMs(o.timeToFirehoseP50Ms), spark: <Spark data={h.ttfP99Ms} l2={h.ttfP50Ms} color="warn" /> },
     { label: 'Rejects', right: `${((o.rejectsPerSec / Math.max(1, o.eventsInPerSec)) * 100).toFixed(2)}%`, value: fmtSi(o.rejectsPerSec), unit: '/s', spark: <Spark data={rejSeries} color="err" /> },
-    { label: 'Durability lag', right: 'oldest not yet durable', value: fmtMs(o.logDurabilityLagMs), spark: <Spark data={h.durabilityLagMs} color="violet" /> },
+    { label: 'Durability lag', right: 'oldest not yet durable', value: fmtMs(o.commitLagMs), spark: <Spark data={h.durabilityLagMs} color="violet" /> },
     q
       ? { label: 'Commit', right: 'p99 · p50 dashed', value: commitP99.length ? fmtMs(commitP99[commitP99.length - 1]) : '—', sec: fmtMs(seriesOf('commit-p50').slice(-1)[0]), spark: <Spark data={commitP99} l2={seriesOf('commit-p50')} color="signal" />, to: '/admin/quorum' }
       : { label: 'Consumers', value: fmtNum(o.consumers), sec: `${fmtBytes(o.bytesOutPerSec)}/s`, to: '/admin/consumers' },
@@ -318,7 +318,7 @@ export function Overview() {
           </Panel>
           <Panel title="Open cases" to="/admin/moderation" src={<Src>cases?status=open</Src>}>
             {(cases.data ?? []).slice(0, 5).map((c) => (
-              <RRow key={c.id} to={`/admin/cases/${c.id}`} x={ago(c.openedAtMs)}>
+              <RRow key={c.id} onClick={() => openPanel('case', String(c.id))} x={ago(c.openedAtMs)}>
                 <Glyph k={c.severity === 'critical' ? 'err' : c.severity === 'high' ? 'warn' : c.severity === 'warn' ? 'warn' : 'info'} />
                 <span className="mono sm">{c.id}</span>
                 <span className="nm">

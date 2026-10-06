@@ -242,43 +242,9 @@ export type Account = {
   rejectsLastHour: number
   didShard: number
   node: string
-  archive?: AccountArchive
-}
-
-export type AccountArchive = {
-  wanted: boolean
-  mirrored: boolean
-  rev: string | null
-  fetching: boolean
-  staging: boolean
-  lastError: string | null
-  takedownAtMs: number | null
 }
 
 // ---------------------------------------------------------------- operations
-
-export type ArchiveCounts = {
-  mirrored: number
-  queued: number
-  running: number
-  failed: number
-  fetched: number
-  retried: number
-  bytes: number
-  records: number
-  sstBytes: number
-  applied: number
-  mismatches: number
-  healed: number
-  sweptAtMs: number
-}
-export type ArchiveView = {
-  mode: string
-  policyVersion: number
-  totals: ArchiveCounts
-  nodes: { node: string; stale: boolean; counts: ArchiveCounts }[]
-  errors: { node: string; did: string; error: string }[]
-}
 
 export type PlcWindow = { fromMs: number; afterMs: number; untilMs: number | null; ops: number; done: boolean; progress: number }
 export type PlcView = {

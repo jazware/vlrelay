@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
-import { enc } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { fmtSi } from '../../lib/console/fmt'
 import { navigate } from '../../lib/router'
@@ -82,9 +81,9 @@ export const lookupProvider: PalProvider = {
   items: (q) => {
     const out: PalItem[] = []
     if (q.startsWith('did:'))
-      out.push({ group: 'Look up', glyph: '⌕', title: `Open account ${q.length > 40 ? `${q.slice(0, 40)}…` : q}`, desc: 'accounts/{did}', run: () => navigate(`/admin/accounts/${enc(q)}`) })
+      out.push({ group: 'Look up', glyph: '⌕', title: `Open account ${q.length > 40 ? `${q.slice(0, 40)}…` : q}`, desc: 'accounts/{did}', run: () => openPanel('acct', q) })
     else if (/^@?[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(q) && !q.includes(' '))
-      out.push({ group: 'Look up', glyph: '⌕', title: `Find accounts “${q.replace(/^@/, '')}”`, desc: 'accounts?q=', run: () => navigate(`/admin/accounts?q=${encodeURIComponent(q.replace(/^@/, ''))}`) })
+      out.push({ group: 'Look up', glyph: '⌕', title: `Find accounts “${q.replace(/^@/, '')}”`, desc: 'accounts?q=', run: () => navigate(`/admin/moderation?q=${encodeURIComponent(q.replace(/^@/, ''))}`) })
     return out
   },
   // hosts by name (the server filters), or a verb's targets

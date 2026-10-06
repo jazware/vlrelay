@@ -8,19 +8,17 @@ import { api, setAdminToken } from '../../lib/api'
 import { MISSING } from '../../lib/console/adminAdapter'
 import { useAdminToken } from '../../lib/hooks'
 import { Link, match } from '../../lib/router'
-import { AccountDetail, Accounts } from '../Accounts'
-import { CaseDetail, Cases } from '../Cases'
 import { Cluster } from '../Cluster'
 import { Consumers } from '../Consumers'
 import { Ops } from '../Ops'
-import { Policy } from '../Policy'
 import { Quorum } from '../Quorum'
-import { Rules } from '../Rules'
-import { Settings } from '../Settings'
-import { Tuning } from '../Tuning'
 import './hostDetail'
 import { Hosts } from './Hosts'
+import { Moderation } from './Moderation'
+import './moderationDetail'
 import { Overview } from './Overview'
+import { Policy } from './Policy'
+import { Settings } from './Settings'
 
 // The operator console: the token gate, then the shell around one page per route. Sections
 // still on their pre-console pages render them inside <Legacy> until they're rebuilt
@@ -43,15 +41,6 @@ const TABS: Partial<Record<Section['id'], Tab[]>> = {
     { to: '/admin/cluster', label: 'Cluster' },
     { to: '/admin/ops', label: 'Operations' },
   ],
-  policy: [
-    { to: '/admin/policy', label: 'Limits' },
-    { to: '/admin/tuning', label: 'Tuning' },
-    { to: '/admin/rules', label: 'Domain rules' },
-  ],
-  moderation: [
-    { to: '/admin/moderation', label: 'Cases' },
-    { to: '/admin/accounts', label: 'Accounts' },
-  ],
 }
 
 /** An older console page shown inside the new shell, in its own type, until its section is rebuilt. */
@@ -66,7 +55,7 @@ function Legacy({ section, path, children }: { section: Section; path: string; c
       {tabs && (
         <nav className="cx-subtabs" aria-label={section.label}>
           {tabs.map((t) => (
-            <Link key={t.to} to={t.to} aria-current={path === t.to || (t.to === '/admin/moderation' && path.startsWith('/admin/cases')) || path.startsWith(`${t.to}/`) ? 'page' : undefined}>
+            <Link key={t.to} to={t.to} aria-current={path === t.to || path.startsWith(`${t.to}/`) ? 'page' : undefined}>
               {t.label}
             </Link>
           ))}
@@ -119,21 +108,19 @@ function route(p: string): Route {
     case '/admin/store':
       return { section: S.store, page: <Store /> }
     case '/admin/policy':
-      return legacy(S.policy, <Policy />)
     case '/admin/tuning':
-      return legacy(S.policy, <Tuning />, 'Tuning')
-    case '/admin/rules':
-      return legacy(S.policy, <Rules />, 'Domain rules')
+      return { section: S.policy, page: <Policy /> }
     case '/admin/moderation':
     case '/admin/cases':
-      return legacy(S.moderation, <Cases />)
     case '/admin/accounts':
-      return legacy(S.moderation, <Accounts />, 'Accounts')
+    case '/admin/rules':
+      return { section: S.moderation, page: <Moderation /> }
     case '/admin/settings':
-      return legacy(S.settings, <Settings />)
+      return { section: S.settings, page: <Settings /> }
   }
-  if ((m = match('/admin/cases/:id', p))) return legacy(S.moderation, <CaseDetail id={Number(m.id)} />, `case ${m.id}`)
-  if ((m = match('/admin/accounts/:did', p))) return legacy(S.moderation, <AccountDetail did={m.did} />, m.did)
+  // the classic console's case and account pages
+  if ((m = match('/admin/cases/:id', p))) return { section: S.moderation, page: <DetailPage key="case" type="case" id={m.id} />, crumbs: crumb(S.moderation, `case ${m.id}`) }
+  if ((m = match('/admin/accounts/:did', p))) return { section: S.moderation, page: <DetailPage key="acct" type="acct" id={m.did} />, crumbs: crumb(S.moderation, m.did) }
   // the classic console's host page
   if ((m = match('/admin/hosts/:host', p))) return { section: S.hosts, page: <DetailPage key="host" type="host" id={m.host} />, crumbs: crumb(S.hosts, m.host) }
   // a detail kind's full page: /admin/<section>/<type>/<id>

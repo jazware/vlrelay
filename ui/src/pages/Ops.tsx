@@ -1,8 +1,8 @@
 import type { ReactNode } from 'react'
 import { Live, Tile } from '../components/relay'
 import { Empty, ErrorNotice, Loading, Notice, Panel, Status } from '../components/ui'
-import { ApiError, enc, type ArchiveView, type PipelineView, type PlcView, type SeqView } from '../lib/api'
-import { fmtBytes, fmtNum, fmtSi, fmtTime, relTime, short } from '../lib/format'
+import { ApiError, enc, type PipelineView, type PlcView, type SeqView } from '../lib/api'
+import { fmtNum, fmtSi, fmtTime, relTime } from '../lib/format'
 import { Link } from '../lib/router'
 import { useApi } from '../lib/useApi'
 
@@ -11,9 +11,8 @@ const dash = <span className="muted">—</span>
 const fmtMs = (v: number) => (v >= 60_000 ? `${(v / 60_000).toFixed(1)} min` : v >= 1000 ? `${(v / 1000).toFixed(1)} s` : `${v.toFixed(0)} ms`)
 const day = (ms: number) => (ms ? new Date(ms).toISOString().slice(0, 10) : '—')
 
-/** Background machinery: archival, PLC export seeding, stream seq checkpoints, and the ack backlog. */
+/** Background machinery: PLC export seeding, stream seq checkpoints, and the ack backlog. */
 export function Ops() {
-  const archive = useApi<ArchiveView>('ops/archive', undefined, POLL)
   const plc = useApi<PlcView>('ops/plc', undefined, POLL)
   const seq = useApi<SeqView>('ops/seq', undefined, POLL)
   const pipe = useApi<PipelineView>('ops/pipeline', undefined, POLL)
@@ -28,9 +27,6 @@ export function Ops() {
       </Section>
       <Section load={seq} what="Seq checkpoints">
         {(v) => <Seqs v={v} />}
-      </Section>
-      <Section load={archive} what="Archival">
-        {(v) => <Archive v={v} />}
       </Section>
       <Section load={plc} what="PLC export seeding">
         {(v) => <Plc v={v} />}
@@ -224,102 +220,6 @@ function Seqs({ v }: { v: SeqView }) {
           </table>
         </div>
       </Panel>
-    </>
-  )
-}
-
-function Archive({ v }: { v: ArchiveView }) {
-  const t = v.totals
-  const off = v.mode === 'off'
-  return (
-    <>
-      <h2 className="ops-sub">Archival</h2>
-      <div className="tiles">
-        <Tile k="Mode" v={v.mode} sub={`policy v${v.policyVersion}`} tone={off ? undefined : 'ok'} />
-        <Tile k="Mirrored repos" v={fmtNum(t.mirrored)} sub={t.sweptAtMs ? `as of the sweep ${relTime(t.sweptAtMs)}` : 'not swept yet'} />
-        <Tile k="Fetch queue" v={<>{fmtNum(t.queued + t.running)}<small>{fmtNum(t.running)} running</small></>} tone={t.queued > 1000 ? 'warn' : undefined} sub="repos waiting for a full copy" />
-        <Tile k="Failed" v={fmtNum(t.failed)} tone={t.failed ? 'warn' : undefined} sub={`gave up after retries; ${fmtNum(t.retried)} retried`} />
-        <Tile k="Fetched" v={fmtBytes(t.bytes)} sub={`${fmtNum(t.fetched)} repos, ${fmtNum(t.records)} records since start`} />
-        <Tile k="Mismatches" v={fmtNum(t.mismatches)} tone={t.mismatches ? 'warn' : undefined} sub={`${fmtNum(t.healed)} healed by a fetch`} />
-      </div>
-      <div className="grid2">
-        <Panel flush title="Per core" desc="Each core mirrors the accounts of its own DID shards.">
-          <table className="data compact">
-            <thead>
-              <tr>
-                <th>Node</th>
-                <th className="num">Mirrored</th>
-                <th className="num">Queued</th>
-                <th className="num">Running</th>
-                <th className="num">Failed</th>
-                <th className="num">Applied</th>
-                <th className="num">SST bytes</th>
-              </tr>
-            </thead>
-            <tbody>
-              {v.nodes.map((n) => (
-                <tr key={n.node} className={n.stale ? 'stale' : ''}>
-                  <td>
-                    <b>{n.node}</b> {n.stale && <Status kind="bad">stale</Status>}
-                  </td>
-                  <td className="num">
-                    <StaleCell stale={n.stale}>{fmtNum(n.counts.mirrored)}</StaleCell>
-                  </td>
-                  <td className="num">
-                    <StaleCell stale={n.stale}>{fmtNum(n.counts.queued)}</StaleCell>
-                  </td>
-                  <td className="num">
-                    <StaleCell stale={n.stale}>{fmtNum(n.counts.running)}</StaleCell>
-                  </td>
-                  <td className="num">
-                    <StaleCell stale={n.stale}>{fmtNum(n.counts.failed)}</StaleCell>
-                  </td>
-                  <td className="num">
-                    <StaleCell stale={n.stale}>{fmtNum(n.counts.applied)}</StaleCell>
-                  </td>
-                  <td className="num">
-                    <StaleCell stale={n.stale}>{fmtBytes(n.counts.sstBytes)}</StaleCell>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </Panel>
-        <Panel flush title="Recent fetch failures" desc="The newest failures on each core. An account's page shows its own.">
-          {v.errors.length === 0 ? (
-            <Empty title="No failures">{off ? 'Archival is off.' : 'Every fetch so far worked.'}</Empty>
-          ) : (
-            <table className="data compact">
-              <thead>
-                <tr>
-                  <th>Account</th>
-                  <th>Node</th>
-                  <th>Error</th>
-                </tr>
-              </thead>
-              <tbody>
-                {v.errors
-                  .slice()
-                  .reverse()
-                  .slice(0, 20)
-                  .map((e, i) => (
-                    <tr key={i}>
-                      <td className="mono">
-                        <Link to={`/admin/accounts/${enc(e.did)}`} className="plain">
-                          {short(e.did, 14)}
-                        </Link>
-                      </td>
-                      <td>{e.node}</td>
-                      <td className="small err-mid" title={e.error} style={{ overflowWrap: 'anywhere' }}>
-                        {e.error.length > 160 ? `${e.error.slice(0, 160)}…` : e.error}
-                      </td>
-                    </tr>
-                  ))}
-              </tbody>
-            </table>
-          )}
-        </Panel>
-      </div>
     </>
   )
 }

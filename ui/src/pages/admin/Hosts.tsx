@@ -1,7 +1,7 @@
 import { useEffect, useMemo } from 'react'
 import { DataTable, type Col } from '../../components/console/DataTable'
 import { useHostsVersion } from '../../components/console/hostActions'
-import { Banners, Chip, Empty, Glyph, HostName, Kbd, Loaded, LiveVal, Meter, NeedsVersion, PageHead, Panel, SearchInput, Seg, Src, Tiles, TierTag, hostTone, type TileSpec } from '../../components/console/kit'
+import { Banners, Chip, Empty, Glyph, HostName, Kbd, Loaded, LiveVal, Meter, PageHead, Panel, SearchInput, Seg, Src, Tiles, TierTag, hostTone, type TileSpec } from '../../components/console/kit'
 import { HOST_STATUSES } from '../../components/relay'
 import type { HostRow, HostStatus } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
@@ -10,6 +10,7 @@ import { useLivePoll } from '../../lib/console/live'
 import { capPoll, overviewPoll, policyFullPoll, policyPoll, slowLagMs, throttledPoll } from '../../lib/console/polls'
 import { useRelay } from '../../lib/console/relay'
 import { Link, useSearch } from '../../lib/router'
+import { Admissions } from './Admissions'
 import { crawlDialog } from './Overview'
 import { NodeTag, relayBanners } from './relayUi'
 
@@ -181,7 +182,7 @@ export function Hosts() {
             <button type="button" className="cx-btn" onClick={crawlDialog}>
               Request crawl…
             </button>
-            <Link className="cx-btn" to="/admin/rules">
+            <Link className="cx-btn" to="/admin/moderation#rules">
               Domain rules
             </Link>
           </>
@@ -257,11 +258,7 @@ export function Hosts() {
         </Loaded>
       </Panel>
       <div className="cx-grid2 cx-mt">
-        <Panel title="Crawl admission" src={<Src isNew>hosts/admissions</Src>}>
-          <NeedsVersion what="The admission log" endpoint="GET hosts/admissions">
-            Until then, a requestCrawl's outcome shows in the relay's logs, and admitted hosts appear above in the <span className="mono">{tiers[0] ?? 'default'}</span> tier.
-          </NeedsVersion>
-        </Panel>
+        <Admissions />
         <Panel title="Tiers" to="/admin/policy" src={<Src>policy · hosts?tier</Src>}>
           {pol.data ? (
             <div className="cx-tw">
