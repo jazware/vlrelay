@@ -17,7 +17,8 @@ import {
   type PolicyDoc,
   type QStatus,
   type QuorumView,
-  type Quantiles,
+  type StoreView,
+  type TailFrame,
   type SettingsView,
 } from '../api'
 import { isUnsupported } from './live'
@@ -55,14 +56,7 @@ export const hostAction = (h: string, a: HostAction) => api<HostRow>(`hosts/${en
 /** What hostAction sends, for the confirm dialog's footer. */
 export const hostActionCall = (h: string, a: HostAction) => `POST /admin/api/hosts/${h}/action ${JSON.stringify(a)}`
 
-/**
- * The cluster in the console's terms. Its wire names are moving to quorum terms (hostShards to
- * hostOwners); this is the one place that reads them, so the pages don't follow the rename.
- */
-export async function cluster(): Promise<ClusterView> {
-  const r = await api<ClusterView & { hostOwners?: (string | null)[] }>('cluster')
-  return { ...r, hostShards: r.hostShards ?? r.hostOwners ?? [] }
-}
+export const cluster = () => api<ClusterView>('cluster')
 export const consumers = () => api<Consumer[]>('consumers')
 /** Consumer ids are per node: `node` names the one serving it. */
 export const kickConsumer = (id: number, node: string) => api(`consumers/${id}/kick`, { method: 'POST', params: { node: node || undefined } })
@@ -119,22 +113,60 @@ export async function requestCrawl(hostname: string): Promise<void> {
   }
 }
 
-// ---------------------------------------------------------------- what the console wants next
+// ---------------------------------------------------------------- answered by this node
 
-export type Admission = { atMs: number; host: string; outcome: 'admitted' | 'refused' | 'banned' | 'rate-limited'; tier?: string; reason: string }
-export type AdmissionLog = { newHostsToday: number; newHostsPerDay: number; entries: Admission[] }
-/** Recent requestCrawl outcomes and today's new-host budget. */
-export const admissions = () => missing<AdmissionLog>('GET hosts/admissions', 'the crawl admission log')
+/**
+ * Frames this node read: with `rejects` the ones that never reached the stream (rejected or
+ * held), with `host` that host's frames (passed ones carry their seq). Newest first.
+ */
+export const tail = (o: { host?: string; rejects?: boolean; sinceMs?: number; limit?: number }) =>
+  api<TailFrame[]>('ops/tail', { params: { host: o.host || undefined, rejects: o.rejects ? 1 : undefined, sinceMs: o.sinceMs, limit: o.limit } })
 
-export type TailFrame = { atMs: number; host: string; did: string; kind: 'reject' | 'held'; reason?: string; upstreamSeq?: number }
-/** A sample of frames that never reached the firehose (rejected or read but held), and one host's frames at full rate. */
-export const tailFrames = (_host?: string) => missing<TailFrame[]>('GET ops/tail?host=&rejects=1', 'rejected and held frames in the tail, and following one host')
+/** The object store as this node uses it: requests by purpose and class, rates, bytes, latency, the last retention pass. */
+export const store = () => api<StoreView>('store')
 
-/** A history for each of the busiest hosts, so the exchange and the Busiest table can draw real trunks. */
-export const topHostHistory = () => missing<Record<string, number[]>>('overview.topHosts[].history', 'per-host rate history on the overview')
+/** `retain/qlog` as the leader's last pass wrote it (snake_case, as in the bucket). */
+export type RetainReport = {
+  pruned_seq: number
+  plan: {
+    at_ms: number
+    horizon_secs: number
+    flushed: number
+    segments: number
+    segment_bytes: number
+    deletable: { ordinal: number; first: number; last: number; bytes: number; age_secs: number }[]
+    deletable_bytes: number
+    pruned_seq_after: number
+    stale_segments: number[]
+    states: { path: string; current: boolean; referenced: boolean; objects: number; bytes: number; stale_checkpoints: string[]; deletable: boolean }[]
+  }
+  applied?: { segments: number; segment_bytes: number; pruned_seq: number; state_paths: string[]; state_objects: number; state_bytes: number; kept: string[] }
+}
+/** The one place that reads the report's wire shape. */
+export function retentionOf(v?: StoreView): RetainReport | undefined {
+  const r = v?.retention as (RetainReport & { plan: { state?: RetainReport['plan']['states'] } }) | null | undefined
+  if (!r || typeof r !== 'object' || !r.plan) return undefined
+  // admin_demo's report leaves some lists out and names `states` `state`
+  const p = r.plan
+  const a = r.applied
+  return {
+    pruned_seq: r.pruned_seq ?? 0,
+    plan: {
+      ...p,
+      deletable: p.deletable ?? [],
+      deletable_bytes: p.deletable_bytes ?? 0,
+      pruned_seq_after: p.pruned_seq_after ?? r.pruned_seq ?? 0,
+      stale_segments: p.stale_segments ?? [],
+      states: (p.states ?? p.state ?? []).map((x) => ({ ...x, stale_checkpoints: x.stale_checkpoints ?? [], referenced: !!x.referenced, deletable: !!x.deletable })),
+    },
+    applied: a && { ...a, pruned_seq: a.pruned_seq ?? r.pruned_seq ?? 0, state_paths: a.state_paths ?? [], kept: a.kept ?? [] },
+  }
+}
 
-/** When F last moved: the leader's own time where the status has it, else when this console saw F move. */
+/** When F last moved: the leader's flush.last_at_ms, else (older builds) when this console saw F move. */
 export const flushedAt = (lead: QStatus | undefined, seenAt: number | undefined) => lead?.flush?.last_at_ms || seenAt
+
+// ---------------------------------------------------------------- what the console wants next
 
 export type FlushRecord = { atMs: number; flushed: number; reserve: number; entries: number; segmentBytes: number; tookMs: number }
 /** The leader's recent flushes. Until then the console records the ones it sees F move for. */
@@ -148,31 +180,10 @@ export type ConsumerTier = 'ring' | 'disk' | 'bucket'
 /** Where each consumer's frames come from: the in-memory ring, the commitlog on disk, or the bucket. */
 export const consumerTiers = () => missing<Record<string, ConsumerTier>>('consumers[].readTier', 'where a replaying consumer reads from')
 
-export type RetentionReport = { atMs: number; by: string; horizonSecs: number; prunedSeq: number; deletedSegments: number; deletedStatePaths: number; pastHorizon: { segments: number; bytes: number } }
-/** The leader's last retention report (`retain/qlog` in the bucket). The status counts runs and deletes only. */
-export const retentionReport = () => missing<RetentionReport>('GET store/retention', 'the last retention report')
-
-export type PrefixStats = { prefix: string; objects: number; bytes: number }[]
-/** Objects and bytes under each of the relay's bucket prefixes. */
-export const prefixStats = () => missing<PrefixStats>('GET store/prefixes', 'objects and bytes per prefix')
-
-/** Object-store request latency (PUT and GET quantiles) per purpose. */
-export const requestLatency = () => missing<Record<string, Quantiles>>('qlog status.requests.latency_us', 'bucket request latency')
-
-/** Lift every account a host created throttled past its cap (indigo does this on a raise). */
-export const releaseThrottled = (h: string) => missing<{ released: number }>(`POST hosts/${h}/release-throttled`, 'releasing throttled accounts')
-
 /** Everything above, for CONSOLE.md and the "needs a newer vlRelay" placeholders. */
 export const MISSING = [
-  ['GET hosts/admissions', 'Hosts › Crawl admission: requestCrawl outcomes (admitted, refused, banned, 429) with the reason, and newHostsToday vs cluster.newHostsPerDay'],
-  ['GET ops/tail?host=&rejects=1', 'Overview tail: rejected and held frames (the firehose only carries what passed), and following one host at full rate'],
-  ['overview.topHosts[].history', 'Overview: per-host rate series for the exchange trunks and the Busiest hosts sparklines (the console keeps its own from polls until then)'],
-  ['qlog status.flush.last_at_ms', 'Overview health line: "flushed N s ago" (F alone has no time)'],
-  ['POST hosts/{host}/release-throttled', 'Host page: lift the accounts created throttled past the cap'],
   ['qlog status.flush.recent', 'Quorum › Flush: the recent flushes (F, entries, bytes, how long); the console records only the ones it sees while open'],
   ['GET cluster/quorum/history', 'Quorum › Leadership: takeovers and handoffs with their times (the status has membership changes and recoveries only)'],
   ['consumers[].readTier', 'Consumers: where a replaying consumer reads from (ring, disk, bucket)'],
-  ['GET store/retention', 'Object store › Retention: the last report (horizon, pruned seq, what it deleted, what is past the horizon now)'],
-  ['GET store/prefixes', 'Object store › Prefixes: objects and bytes under each prefix'],
-  ['qlog status.requests.latency_us', 'Object store: PUT and GET latency per purpose'],
+  ['GET consumers?all=1', "Consumers: every member's sockets (the list is the answering node's until it's asked over the qlog peer protocol)"],
 ] as const

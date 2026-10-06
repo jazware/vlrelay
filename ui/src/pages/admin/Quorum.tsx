@@ -1,15 +1,14 @@
-import { useMemo, useState, type ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { DataTable, type Col } from '../../components/console/DataTable'
-import { Banners, Empty, KV, LiveVal, Loaded, NeedsVersion, PageHead, Panel, Spark, Src, Swatch, Tiles, type BannerSpec, type TileSpec } from '../../components/console/kit'
+import { Banners, Chip, Empty, HostName, KV, LiveVal, Loaded, NeedsVersion, PageHead, Panel, Spark, Src, Swatch, Tiles, type BannerSpec, type TileSpec } from '../../components/console/kit'
 import { LogRail, type RailData } from '../../components/console/LogRail'
 import { openPanel } from '../../components/console/nav'
-import type { ClusterView, QStatus } from '../../lib/api'
+import type { ClusterView, HostRow, QStatus } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, clock, dt, dur, fmtBytes, fmtMs, fmtNum, fmtSi, fmtUs, plural, seqS } from '../../lib/console/fmt'
 import { useLivePoll } from '../../lib/console/live'
 import { clusterPoll, flushSeenAt, overviewPoll, quorumPoll, seenEpochs, seenFlushes, seriesOf, settingsPoll } from '../../lib/console/polls'
 import { useRelay, type RelayView } from '../../lib/console/relay'
-import { Link } from '../../lib/router'
 import './logPages.css'
 import './quorumDetail'
 import { EPOCH_GLYPH, EpochChip, epochEvents, memberRows, membersDialog, membershipOn, refStatus, RoleChip, type EpochEvent, type MemberRow } from './quorumUi'
@@ -111,9 +110,6 @@ export function Quorum() {
         }
         actions={
           <>
-            <Link className="cx-btn" to="/admin/ops">
-              Operations
-            </Link>
             <button type="button" className="cx-btn" onClick={change} title={on ? undefined : 'The nodes run without --qlog-admin-token'}>
               Change membership…
             </button>
@@ -384,65 +380,67 @@ function FlushPanel({ lead, flushMs }: { lead?: QStatus; flushMs?: number }) {
 
 function ShardPanel({ c, view }: { c?: ClusterView; view?: RelayView }) {
   const [focus, setFocus] = useState<string | null>(null)
-  const [hover, setHover] = useState<number | null>(null)
-  const shards = c?.hostShards ?? []
-  const counts = useMemo(() => {
-    const m = new Map<string, number>()
-    for (const o of shards) m.set(o ?? '', (m.get(o ?? '') ?? 0) + 1)
-    return m
-  }, [shards])
-  const owners = [...counts.keys()].filter(Boolean).sort()
-  const unowned = counts.get('') ?? 0
-  const perHost = !!view?.quorum
+  const [hover, setHover] = useState<HostRow | null>(null)
+  const list = useLivePoll(() => A.hosts({ sort: 'host', desc: false, limit: OWNER_CAP }), 'owners', 10_000, { keep: true })
+  const hosts = list.data?.hosts ?? []
+  const owners = (c?.nodes ?? []).filter((n) => n.ownedHosts > 0 || !n.stale).sort((a, b) => a.id.localeCompare(b.id))
+  const dead = (h: HostRow) => !h.node || !!view?.byId.get(h.node)?.stale
   return (
     <Panel
-      title="Host shards"
-      src={<Src>cluster · hostShards</Src>}
+      title="Host owners"
+      src={<Src>cluster · hosts?sort=host</Src>}
       right={
         <span className="cx-shardlegend">
-          {owners.map((o) => (
-            <button key={o} type="button" onMouseEnter={() => setFocus(o)} onMouseLeave={() => setFocus(null)} onFocus={() => setFocus(o)} onBlur={() => setFocus(null)} onClick={() => openPanel('node', o)}>
-              <Swatch color={view?.byId.get(o)?.color} />
-              {o} <span className="mono">{fmtNum(counts.get(o) ?? 0)}</span>
+          {owners.map((n) => (
+            <button key={n.id} type="button" onMouseEnter={() => setFocus(n.id)} onMouseLeave={() => setFocus(null)} onFocus={() => setFocus(n.id)} onBlur={() => setFocus(null)} onClick={() => openPanel('node', n.id)}>
+              <Swatch color={view?.byId.get(n.id)?.color} />
+              {n.id} <span className="mono">{fmtNum(n.ownedHosts)}</span>
             </button>
           ))}
-          {unowned > 0 && (
+          {!!c?.unownedHosts && (
             <span className="s-err">
-              <Swatch /> unowned <span className="mono">{fmtNum(unowned)}</span>
+              <Swatch /> unowned <span className="mono">{fmtNum(c.unownedHosts)}</span>
             </span>
           )}
         </span>
       }
     >
-      {!c ? (
-        <Loaded load={{ loading: true }}>{() => null}</Loaded>
-      ) : !shards.length ? (
-        <Empty>No hosts yet: the leader assigns each host it reads to a member as a log entry.</Empty>
+      {!list.data ? (
+        <Loaded load={list}>{() => null}</Loaded>
+      ) : !hosts.length ? (
+        <Empty>No hosts yet: the leader gives each host it learns of to a member as a log entry.</Empty>
       ) : (
         <div className="cx-pn-b">
-          <div className={`cx-shardmap${shards.length > 64 ? ' dense' : ''}${focus ? ' focus' : ''}`} onMouseLeave={() => setHover(null)}>
-            {shards.map((o, i) => (
-              <span
-                key={i}
-                className={`cx-shard${o ? '' : ' unowned'}${focus && o === focus ? ' hl' : ''}`}
-                style={o ? { background: view?.byId.get(o)?.color ?? 'var(--idle)' } : undefined}
-                onMouseEnter={() => setHover(i)}
-                title={`${perHost ? 'host' : 'shard'} ${i + 1}: ${o ?? 'unowned'}`}
+          <div className={`cx-shardmap${hosts.length > 64 ? ' dense' : ''}${focus ? ' focus' : ''}`} onMouseLeave={() => setHover(null)}>
+            {hosts.map((h, i) => (
+              <button
+                key={`${h.host}#${i}`}
+                type="button"
+                className={`cx-shard${dead(h) ? ' unowned' : ''}${focus && h.node === focus ? ' hl' : ''}`}
+                style={dead(h) ? undefined : { background: view?.byId.get(h.node)?.color ?? 'var(--idle)' }}
+                onMouseEnter={() => setHover(h)}
+                onFocus={() => setHover(h)}
+                onClick={() => openPanel('host', h.host)}
+                aria-label={`${h.host}: ${h.node || 'unowned'}`}
               />
             ))}
           </div>
           <div className="cx-shardinfo">
-            {hover !== null
-              ? `${perHost ? 'Host' : 'Shard'} ${hover + 1} of ${fmtNum(shards.length)}: ${shards[hover] ? `read by ${shards[hover]}` : 'nobody reads it'}`
-              : perHost
-                ? `One cell per host: the leader assigns each to a member as a log entry, and moves a dead member's hosts after the failover timeout.`
-                : 'Which node reads each shard’s upstream hosts.'}
+            {hover ? (
+              <>
+                <span className="mono">{hover.host}</span> · {hover.node ? `read by ${hover.node}` : 'nobody reads it'} · {hover.status}
+              </>
+            ) : (
+              `One cell per host in the leader's table${list.data.total > hosts.length ? ` (the first ${fmtNum(hosts.length)} of ${fmtNum(list.data.total)})` : ''}. The leader gives each to a member as a log entry and moves a dead member's hosts after the failover timeout.`
+            )}
           </div>
         </div>
       )}
     </Panel>
   )
 }
+
+const OWNER_CAP = 4000
 
 // ---------------------------------------------------------------- counters, pipeline
 
@@ -531,6 +529,33 @@ function Pipeline({ view }: { view?: RelayView }) {
             ))}
           </tbody>
         </table>
+        {d.data.hosts.length > 0 && (
+          <table className="cx-t compact">
+            <thead>
+              <tr>
+                <th>Host with work in flight</th>
+                <th className="r">In flight</th>
+                <th className="r">Events/s</th>
+                <th>Reader</th>
+              </tr>
+            </thead>
+            <tbody>
+              {d.data.hosts.slice(0, 8).map((h) => (
+                <tr key={`${h.node}/${h.host}`} data-open={`host:${h.host}`} onClick={() => openPanel('host', h.host)}>
+                  <td className="trunc" style={{ maxWidth: 220 }}>
+                    <HostName host={h.host} />
+                  </td>
+                  <td className="r mono sm">
+                    {fmtNum(h.inflight)}
+                    {h.inflightCap != null && <span className="muted"> / {fmtNum(h.inflightCap)}</span>}
+                  </td>
+                  <td className="r mono sm">{fmtSi(h.eventsPerSec)}</td>
+                  <td>{h.paused ? <Chip k="warn">paused</Chip> : <span className="muted sm">reading</span>}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
     )
   return (
@@ -546,7 +571,7 @@ function NoQuorum({ c, view }: { c?: ClusterView; view?: RelayView }) {
   const nodes = view?.nodes ?? []
   return (
     <>
-      <PageHead title="Quorum & cluster" sub={<span>{view?.single ? 'a single node' : `${nodes.length} nodes`}, without the quorum log</span>} actions={<Link className="cx-btn" to="/admin/ops">Operations</Link>} />
+      <PageHead title="Quorum & cluster" sub={<span>{view?.single ? 'a single node' : `${nodes.length} nodes`}, without the quorum log</span>} />
       <Panel title="Nodes" src={<Src>cluster</Src>}>
         <div className="cx-tw">
           <table className="cx-t compact">

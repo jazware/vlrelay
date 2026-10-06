@@ -55,7 +55,7 @@ registerDetail('node', {
     }
     const s = row?.s ?? null
     const dead = !!(row?.stale || n?.stale)
-    const owned = (cp.data?.hostShards ?? []).filter((o) => o === id).length
+    const owned = cn?.ownedHosts ?? n?.ownedHosts ?? 0
     const busy = (ov.data?.topHosts ?? []).filter((h) => h.node === id).slice(0, 8)
     const members = ref?.members ?? []
     const isMember = members.includes(id)
@@ -91,7 +91,7 @@ registerDetail('node', {
             )}
           </Sec>
         )}
-        <Sec title="Hosts it reads" digest={`${fmtNum(owned || n?.hostShards || 0)} ${qv ? 'hosts' : 'host shards'}`} open flush>
+        <Sec title="Hosts it reads" digest={`${fmtNum(owned)} hosts · ${fmtNum(cn?.hosts ?? 0)} sockets open`} open flush>
           {busy.length ? (
             busy.map((h) => (
               <RRow key={h.host} onClick={() => openPanel('host', h.host)} x={`${fmtSi(h.eventsPerSec)}/s`}>

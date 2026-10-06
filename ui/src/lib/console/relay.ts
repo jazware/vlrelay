@@ -18,7 +18,8 @@ export type NodeInfo = {
   consumers: number
   eventsInPerSec: number
   eventsOutPerSec: number
-  hostShards: number
+  /** Hosts the leader's table gives it. */
+  ownedHosts: number
   addr: string
   version: string
   rev: string
@@ -100,7 +101,7 @@ export function buildView(c?: ClusterView, q?: Optional<QuorumView>, s?: Setting
       consumers: n?.consumers ?? 0,
       eventsInPerSec: n?.eventsInPerSec ?? 0,
       eventsOutPerSec: n?.eventsOutPerSec ?? 0,
-      hostShards: n?.hostShards ?? 0,
+      ownedHosts: n?.ownedHosts ?? 0,
       addr: n?.addr ?? '',
       version: n?.version ?? s?.version ?? '',
       rev: n?.rev ?? '',
@@ -118,13 +119,13 @@ export function buildView(c?: ClusterView, q?: Optional<QuorumView>, s?: Setting
       id,
       color: COLORS[i % COLORS.length],
       role: qn?.stale ? 'no answer' : role,
-      core: !!qn || role === 'core' || role === 'leader' || role === 'follower' || role === 'learner' || role === '',
+      core: !!qn || role === 'leader' || role === 'follower' || role === 'candidate' || !!n?.learner,
       stale: !!(n?.stale || qn?.stale),
       error: n?.error ?? qn?.error ?? null,
       consumers: n?.consumers ?? 0,
       eventsInPerSec: n?.eventsInPerSec ?? 0,
       eventsOutPerSec: n?.eventsOutPerSec ?? 0,
-      hostShards: n?.hostShards ?? 0,
+      ownedHosts: n?.ownedHosts ?? 0,
       addr: qn?.addr || n?.addr || '',
       version: n?.version ?? '',
       rev: n?.rev ?? '',

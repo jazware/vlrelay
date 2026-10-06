@@ -9,7 +9,6 @@ import { useAdminToken } from '../../lib/hooks'
 import { Link, match } from '../../lib/router'
 import { AccountDetail, Accounts } from '../Accounts'
 import { CaseDetail, Cases } from '../Cases'
-import { Ops } from '../Ops'
 import { Policy } from '../Policy'
 import { Rules } from '../Rules'
 import { Settings } from '../Settings'
@@ -37,10 +36,6 @@ const crumb = (section: Section, last: ReactNode) => (
 
 type Tab = { to: string; label: string }
 const TABS: Partial<Record<Section['id'], Tab[]>> = {
-  quorum: [
-    { to: '/admin/quorum', label: 'Quorum & cluster' },
-    { to: '/admin/ops', label: 'Operations' },
-  ],
   policy: [
     { to: '/admin/policy', label: 'Limits' },
     { to: '/admin/tuning', label: 'Tuning' },
@@ -88,9 +83,8 @@ function route(p: string): Route {
       return { section: S.consumers, page: <Consumers /> }
     case '/admin/quorum':
     case '/admin/cluster':
-      return { section: S.quorum, page: <Quorum /> }
     case '/admin/ops':
-      return legacy(S.quorum, <Ops />, 'Operations')
+      return { section: S.quorum, page: <Quorum /> }
     case '/admin/store':
       return { section: S.store, page: <Store /> }
     case '/admin/policy':

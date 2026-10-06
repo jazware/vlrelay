@@ -25,8 +25,8 @@ The kit's parts are documented in the vlpds CONSOLE.md. What differs here:
 
 - `DataTable serverSort={{ id, asc, sortable, onSort }}` for tables the server sorts and pages (Hosts). Duplicate row keys get a suffix instead of breaking React.
 - `useLivePoll(fetch, key, ms, { keep })` is a poll owned by one component (a host's detail, one page of hosts). It pauses with space. `keep` keeps the last rows while a new filter loads.
-- `seriesOf(key)` (`polls.ts`) is a series the console builds from its own polls: the stream's rate, the commit latency, each busy host's rate, each consumer's rate, bucket requests per second. It fills in while the page is open.
-- The quorum poll also keeps what the statuses only have as counters: `requestRates()` (bucket requests per second over the last minute, by purpose, component and op, summed over the members that answer), `seenFlushes()` (F moving between two polls of the leader), `seenEpochs()` (the epoch moving) and `flushSeenAt()`. They start empty on each page load.
+- `seriesOf(key)` (`polls.ts`) is a series the console builds from its own polls: the stream's rate, the commit latency, each busy host's rate, each consumer's rate, bucket requests per second. The busiest hosts' rates come from `overview.topHosts[].history`. It fills in while the page is open.
+- `storePoll` keeps `GET store`'s rates as `store-a` and `store-b`. The quorum poll keeps what the statuses only have as counters: `requestRates()` (bucket requests per second over the last minute, by purpose, component and op, summed over the members that answer), `seenFlushes()` (F moving between two polls of the leader), `seenEpochs()` (the epoch moving) and `flushSeenAt()`. They start empty on each page load.
 - `NeedsVersion what endpoint` stands in for a panel whose endpoint isn't there yet (below).
 
 ## The adapter and what the backend lane owes
@@ -35,26 +35,17 @@ The kit's parts are documented in the vlpds CONSOLE.md. What differs here:
 
 | Endpoint | What it feeds |
 | --- | --- |
-| `GET hosts/admissions` | Hosts › Crawl admission: each requestCrawl's outcome (admitted, refused, banned, 429) with the reason and the tier it got, and `newHostsToday` against `cluster.newHostsPerDay` |
-| `GET ops/tail?host=&rejects=1` | The Overview tail's rejected and held frames (the firehose carries only what passed), and following one host at full rate. Today the tail can follow a DID, a handle or a collection at full rate, but not a host: frames don't name their PDS |
-| `overview.topHosts[].history` | A rate series per busy host, for the exchange's trunks and the Busiest hosts sparklines. Until then the console keeps its own from the 2 s polls |
-| `qlog status.flush.last_at_ms` | "Flushed N s ago" in the health line and Quorum's F tile. `A.flushedAt` reads it when the status has it, else when the console saw F move |
-| `POST hosts/{host}/release-throttled` | Lifting the accounts a host created throttled past its cap |
 | `qlog status.flush.recent` | Quorum › Flush: the leader's recent flushes (F, entries, bytes, how long). Until then the table lists the flushes the page saw |
 | `GET cluster/quorum/history` | Quorum › Leadership: takeovers and handoffs with their times and pauses. The statuses list membership changes (`switches`) and recoveries (`recovered`, no time) only, so a takeover shows as "new epoch" if the page was open for it |
 | `consumers[].readTier` | Consumers: where a replaying consumer reads from (ring, disk, bucket). Until then it says live or replaying |
-| `GET store/retention` | Object store › Retention: the last report (horizon, pruned seq, what it deleted, what's past the horizon). The status has the run and delete counts |
-| `GET store/prefixes` | Object store › What's stored: objects and bytes per prefix |
-| `qlog status.requests.latency_us` | Object store › Latency: PUT and GET latency by purpose. The flush's own timings are there already |
+| `GET consumers` on every member | Consumers › Connections: every member's sockets. The list is the answering node's until it's asked over the qlog peer protocol, so the page labels it "this node" |
 
 Found while building this, for the backend lane:
 
 - On the quorum log `GET consumers` lists the sockets of the node the console talks to. The Consumers page says so ("this node"); its Serving nodes table counts every member's from `cluster`.
 - On a local quorum cluster (macOS) every consumer reports `eventsPerSec` and `bytesPerSec` 0, and `cluster` reports `cpu` and `memBytes` 0 (they read `/proc`). The node drawer shows a dash for 0 memory.
 - `admin_demo`'s consumer kick answers "no node relay-b" for a consumer on another demo node (it has no fleet).
-
-- On a relay without the quorum log or a cluster, `GET cluster` answers `Demo::cluster()`'s simulated three-node layout (`node/admin.rs`). The console ignores it when `/api/public/stats` counts one node and draws the single node the hosts name as their reader.
-- `GET ops/pipeline` is a 404 on `admin_demo`, so the Overview's "ack backlog" tile became "durability lag" from the overview's own history. Phase 2's Quorum page can bring the backlog back with an adapter fallback.
+- `GET store`'s rates are since the node's previous sample, so the first answer after a start has a window of 0 and the page waits for the next.
 - `admin_demo` lists a few hostnames twice (`pds.kettle.social`, `bsky.pixel.net`, `pds.moss.social`).
 - `admin_demo` serves no `subscribeRepos`, so the tail says the firehose isn't reachable there. `npm run dev` proxies `/xrpc` (websockets too), so the tail works against a real relay.
 - The console's own tail is a consumer: it shows in the consumer list with the browser's user agent.
@@ -63,11 +54,11 @@ Found while building this, for the backend lane:
 
 | Section | Path | State |
 | --- | --- | --- |
-| Overview | `/admin` | Built: banners (quorum held or degraded, a node not answering, throttled hosts falling behind, hosts at their account cap, a slow consumer), the health line, eight tiles, the exchange, rejects by reason, busiest hosts, the sampled tail, and a rail with the stream, members, consumers, open cases and the bill |
+| Overview | `/admin` | Built: banners (quorum held or degraded, a node not answering, throttled hosts falling behind, hosts at their account cap, a slow consumer), the health line, eight tiles, the exchange, rejects by reason, busiest hosts, the sampled tail (with the frames that never reached the stream behind "rejects", and a hostname followed at full rate from `ops/tail`), and a rail with the stream, members, consumers and open cases |
 | Hosts | `/admin/hosts` | Built: status tiles, the paged table (server-side filter, sort and page; the at-cap, lagging and erroring flags filter here over every match), the `host` drawer and full page with every host action, crawl admission (placeholder) and tiers. `/admin/hosts/<host>` still lands on the host |
 | Consumers | `/admin/consumers` | Built: slow-consumer and "this node" banners, tiles, serving nodes (consumers, sent/s, entries behind the commit), the connection table (rate against the stream, mode, `?node=` and `?q=` filters), the `consumer` drawer with the kick behind a typed confirm (`#id`), consumer limits, read tiers (placeholder). ⌘K finds consumers by id, client or IP |
-| Quorum & cluster | `/admin/quorum` | Built: banners, eight tiles, the log rail, leadership (ribbon and table from `switches`, `recovered` and the epochs the page saw; `epoch` drawer), members (`node` drawer), flush, host owners (one cell per host), counters, the ack backlog, and the membership dialog (typed `change members`; off without `--qlog-admin-token`). `/admin/cluster` lands here. Operations (`/admin/ops`) is still the classic page |
-| Object store | `/admin/store` | Built: request rates and totals by purpose and component (R2 classes, no prices), per member, flush latency, retention counts; the report, prefixes and request latency are placeholders |
+| Quorum & cluster | `/admin/quorum` | Built: banners, eight tiles, the log rail, leadership (ribbon and table from `switches`, `recovered` and the epochs the page saw; `epoch` drawer), members (`node` drawer), flush (F's age from `flush.last_at_ms`), host owners (one cell per host from `hosts?sort=host`, each opening the host), counters, the ack backlog with the hosts that have work in flight, and the membership dialog (typed `change members`; off without `--qlog-admin-token`). `/admin/cluster` and `/admin/ops` land here (the classic Operations page went with seq checkpoints and archival) |
+| Object store | `/admin/store` | Built from `GET store` (the answering node): requests by purpose in R2's classes with rates and bytes, latency by op, the leader's last retention pass (segments, what's past the horizon, the pruned seq, state paths). The members' statuses add requests by key component and per member. Counts and rates only, no prices |
 | Policy | `/admin/policy` | Classic pages: Limits, Tuning (`/admin/tuning`), Domain rules (`/admin/rules`) |
 | Moderation | `/admin/moderation` | Classic pages: Cases (`/admin/cases`, `/admin/cases/<id>`), Accounts (`/admin/accounts`, `/admin/accounts/<did>`) |
 | Settings | `/admin/settings` | Classic page |

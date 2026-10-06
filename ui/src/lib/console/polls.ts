@@ -1,10 +1,10 @@
-import { publicStats, type Case, type ClusterView, type Consumer, type FullPolicyDoc, type HostList, type Overview, type PolicyDoc, type PublicStats, type QCounts, type QRequests, type QuorumView, type SettingsView } from '../api'
+import { publicStats, type Case, type ClusterView, type Consumer, type FullPolicyDoc, type HostList, type Overview, type PolicyDoc, type PublicStats, type QCounts, type QRequests, type QuorumView, type SettingsView, type StoreView } from '../api'
 import * as A from './adminAdapter'
 import { createPoller } from './live'
 
 // One shared poll per thing the console shows (createPoller in live.ts). The overview is the
 // heartbeat: when it fails the shell shows "Not updating". A few values the API has no series for
-// (the stream's own rate, the commit latency, each busy host's rate) are kept here from the polls,
+// (the stream's own rate, the commit latency, each consumer's rate) are kept here from the polls,
 // so their sparklines fill in while the page is open.
 
 const KEEP = 150
@@ -27,7 +27,6 @@ export const overviewPoll = createPoller<Overview>(A.overview, 2000, {
   heartbeat: true,
   onData: (o) => {
     push('stream', o.streamEventsPerSec ?? o.eventsOutPerSec)
-    for (const h of o.topHosts) push(`host:${h.host}`, h.eventsPerSec)
     for (const n of o.byNode ?? []) if (!n.stale) push(`node-in:${n.node}`, n.eventsInPerSec)
     seriesVersion++
   },
@@ -158,6 +157,17 @@ export const openCasesPoll = createPoller<Case[]>(A.openCases, 10_000)
 export const policyPoll = createPoller<PolicyDoc>(A.policy, 30_000)
 export const policyFullPoll = createPoller<FullPolicyDoc>(A.policyFull, 30_000)
 export const settingsPoll = createPoller<SettingsView>(A.settings, 60_000)
+/** This node's object store: requests by purpose and class with their rates, bytes, latency, the last retention pass. */
+export const storePoll = createPoller<StoreView>(A.store, 5000, {
+  onData: (v) => {
+    // the first answer has no window: its rates are 0, not a measurement
+    if (v.windowSecs > 0) {
+      push('store-a', v.total.perSec.a)
+      push('store-b', v.total.perSec.b)
+      seriesVersion++
+    }
+  },
+})
 /** Throttled hosts (they fall behind instead of dropping), for the banners. */
 export const throttledPoll = createPoller<HostList>(() => A.hosts({ status: 'throttled', sort: 'lag', desc: true, limit: 200 }), 5000)
 /** The busiest hosts with their caps, for the "at the account cap" banner. */
