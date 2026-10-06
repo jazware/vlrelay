@@ -33,7 +33,7 @@ pub fn encode_cursors(c: &BTreeMap<String, u64>) -> Bytes {
     if c.is_empty() {
         return Bytes::new();
     }
-    let mut b = Vec::with_capacity(4 + c.iter().map(|(h, _)| h.len() + 10).sum::<usize>());
+    let mut b = Vec::with_capacity(4 + c.keys().map(|h| h.len() + 10).sum::<usize>());
     b.extend_from_slice(&(c.len() as u32).to_le_bytes());
     for (h, v) in c {
         b.extend_from_slice(&(h.len() as u16).to_le_bytes());

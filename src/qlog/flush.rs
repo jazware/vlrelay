@@ -368,8 +368,10 @@ async fn fence(store: &Store, id: &str, epoch: u64, headroom: u64) -> anyhow::Re
 /// state, applies committed entries to it as they commit, and flushes every
 /// interval. Ends when the node stops leading `epoch`.
 pub async fn lead(node: Arc<Node>, epoch: u64, o: Options) {
-    let store = node.store().clone();
-    let mut l = Leader { node, epoch, o, store, man: Manifest::default(), etag: String::new(), crashed: false };
+    let store = node.bucket().flush.clone();
+    let state_store = node.bucket().state.clone();
+    let mut l =
+        Leader { node, epoch, o, store, state_store, man: Manifest::default(), etag: String::new(), crashed: false };
     if let Err(e) = l.run().await {
         tracing::warn!(epoch, "qlog flush: stopped: {e:#}");
         l.node.flush.s.lock().failed += 1;
@@ -380,7 +382,9 @@ struct Leader {
     node: Arc<Node>,
     epoch: u64,
     o: Options,
+    /// Everything but the state's own SlateDB, which is `state_store`.
     store: Store,
+    state_store: Store,
     man: Manifest,
     etag: String,
     /// Cut short by the crash hook: leave everything as a dead process would.
@@ -454,7 +458,7 @@ impl Leader {
             if self.leading().is_none() {
                 return Ok(());
             }
-            match State::open(&self.store, &rel).await {
+            match State::open(&self.state_store, &rel).await {
                 Ok(s) => break s,
                 Err(e) => {
                     tracing::warn!("qlog flush: opening the state failed: {e:#}");
@@ -835,6 +839,9 @@ pub struct Verified {
     pub stale: u64,
     /// Recovery gaps the segments were walked across.
     pub gaps: u64,
+    /// Retention's floor (`retain/qlog`): the walk starts at the oldest
+    /// segment left, which must continue the log from here.
+    pub pruned: u64,
     pub entries: u64,
     pub dids: u64,
     pub hosts: u64,
@@ -852,6 +859,11 @@ pub fn host_event(did: &str) -> Option<(&str, u64)> {
 /// checkpoint equals replaying those entries to F, its cursors are the
 /// manifest's, and no cursor counts an event that isn't in the log at or
 /// below F. Segments past the manifest must still continue the log.
+///
+/// After retention deleted segments (`pruned_seq` P > 0), the walk starts
+/// at the oldest segment left and must continue from P; a DID the state
+/// holds but the remaining log doesn't must be at or below P, and a host's
+/// cursor is checked against its events' run from the first one left.
 pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
     let mut v = Verified::default();
     let Some((m, _)) = read_manifest(store).await? else {
@@ -876,8 +888,9 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
     };
     let mut dids: BTreeMap<String, [u8; 16]> = BTreeMap::new();
     let mut hosts: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-    let mut last = 0u64;
-    let mut ord = 0u64;
+    v.pruned = super::retain::pruned_seq(store).await?;
+    let mut last = v.pruned;
+    let mut ord = if v.pruned > 0 { oldest_segment(store).await?.unwrap_or(m.next_ordinal) } else { 0 };
     v.gaps = m.gaps.len() as u64;
     loop {
         let Some(obj) = nodelog::read_object(store, LOG_ID, ord).await? else { break };
@@ -941,14 +954,17 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
                     bad(&mut v, format!("state's _applied is {applied:?}, F is {}", m.flushed));
                 }
                 let mut state_dids = 0u64;
+                let mut pruned_dids = 0u64;
                 let mut state_cursors = BTreeMap::new();
                 for (k, val) in &kv {
                     if let Some(did) = k.strip_prefix(b"d/") {
                         state_dids += 1;
                         let did = String::from_utf8_lossy(did);
+                        let seq = u64::from_be_bytes(val[..8].try_into().unwrap_or([0; 8]));
                         match dids.get(did.as_ref()) {
                             Some(x) if x[..] == val[..] => {}
                             Some(_) => bad(&mut v, format!("state holds {did} at another seq or content than the log")),
+                            None if seq <= v.pruned => pruned_dids += 1,
                             None => bad(&mut v, format!("state holds {did}, which isn't in the log up to F")),
                         }
                     } else if let Some(h) = k.strip_prefix(b"c/") {
@@ -958,7 +974,7 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
                         );
                     }
                 }
-                if state_dids != dids.len() as u64 {
+                if state_dids != dids.len() as u64 + pruned_dids {
                     bad(&mut v, format!("state holds {state_dids} DIDs, the log up to F {}", dids.len()));
                 }
                 if state_cursors != m.cursors {
@@ -971,7 +987,16 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
         let mut ns = hosts.remove(h).unwrap_or_default();
         ns.sort_unstable();
         ns.dedup();
-        let contiguous = ns.iter().enumerate().take_while(|(i, n)| **n == *i as u64 + 1).count() as u64;
+        let from = match ns.first() {
+            Some(&f) if v.pruned > 0 => f,
+            // every event of it pruned: nothing left to hold the cursor to
+            None if v.pruned > 0 => {
+                v.hosts += 1;
+                continue;
+            }
+            _ => 1,
+        };
+        let contiguous = from - 1 + ns.iter().enumerate().take_while(|(i, n)| **n == from + *i as u64).count() as u64;
         if *c > contiguous {
             bad(&mut v, format!("host {h}'s cursor {c} is ahead of the log at F (events 1..={contiguous} there)"));
         }
@@ -980,6 +1005,22 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
     v.dids = dids.len() as u64;
     v.ok = v.messages.is_empty();
     Ok(v)
+}
+
+async fn oldest_segment(store: &Store) -> anyhow::Result<Option<u64>> {
+    use futures::StreamExt;
+    let p = Path::from(format!("{}/log/{LOG_ID}", store.prefix));
+    let mut l = store.raw.list(Some(&p));
+    let mut min = None;
+    while let Some(o) = l.next().await {
+        let o = o?;
+        if let Some(ord) =
+            o.location.filename().and_then(|f| f.strip_suffix(".seg")).and_then(|f| f.parse::<u64>().ok())
+        {
+            min = Some(min.map_or(ord, |m: u64| m.min(ord)));
+        }
+    }
+    Ok(min)
 }
 
 /// Where the log stands in the bucket when a quorum is lost.

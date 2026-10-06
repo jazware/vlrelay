@@ -20,7 +20,9 @@
 # OUT (dev/state-qlog-$B/<scenario>), KEEP=1 (leave MinIO up),
 # FLUSH_MS (2000; 0: no flush), HEADROOM (H, 100M), FLUSH_SEGMENT_MB (64),
 # CRASH_AT/CRASH_PROB (die at a flush step: fenced, sealed, segment,
-# before-manifest, after-manifest, any; or mid-trim), VERIFY_EVERY (20 s).
+# before-manifest, after-manifest, any; or mid-trim), VERIFY_EVERY (20 s),
+# STATUS_EVERY (0: off; else every node's status into status.jsonl),
+# STATE_POLL_MS (the state's compactor poll, 30000).
 #
 # With the flush on, `qlog verify` checks the manifest (segments, state
 # and cursors at one F) every VERIFY_EVERY seconds and at the end, and the
@@ -157,6 +159,7 @@ supervise() {
   [ -n "${DISK_RETAIN_MB:-}" ] && disk+=(--disk-retain-mb "$DISK_RETAIN_MB")
   [ -n "${FSYNC_DELAY_US:-}" ] && disk+=(--fsync-delay-us "$FSYNC_DELAY_US")
   [ -n "${seg_mb:-}" ] && disk+=(--segment-mb "$seg_mb")
+  [ -n "${STATE_POLL_MS:-}" ] && disk+=(--state-compactor-poll-ms "$STATE_POLL_MS")
   disk+=(--flush-ms "$flush_ms" --headroom "${HEADROOM:-100000000}" --flush-segment-mb "${FLUSH_SEGMENT_MB:-64}")
   [ -n "$crash_at" ] && disk+=(--crash-at "$crash_at" --crash-prob "$crash_prob" --crash-stop-file "$out/no-more-crashes")
   for j in $slots; do
@@ -232,6 +235,20 @@ if [ "$flush_ms" != 0 ]; then
     while kill -0 "$loader" 2>/dev/null; do
       sleep "${VERIFY_EVERY:-20}"
       "$bin" verify "${s3[@]}" >>"$out/verify.jsonl" 2>>"$out/verify.log" || echo "$(ms) verify FAILED" >>"$out/events.log"
+    done
+  ) &
+  pids+=($!)
+fi
+
+# every node's /qlog/status every STATUS_EVERY s (0: off), for request
+# rates over time (report.py's bucket requests)
+if [ "${STATUS_EVERY:-0}" != 0 ]; then
+  (
+    while kill -0 "$loader" 2>/dev/null; do
+      for i in $slots; do
+        s=$(curl -sf --max-time 2 "http://127.0.0.1:$(http "$i")/qlog/status") && echo "{\"at_ms\": $(ms), \"node\": \"n$i\", \"status\": $s}" >>"$out/status.jsonl"
+      done
+      sleep "$STATUS_EVERY"
     done
   ) &
   pids+=($!)

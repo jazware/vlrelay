@@ -161,7 +161,8 @@ impl Cluster {
                 faults.block(&[b]);
             }
         }
-        let emit = Emitter::with_store(id, inc, self.ring_bytes, Some(self.tap.clone()), self.store.clone());
+        let bucket = super::bucket::Bucket::new(self.store.clone());
+        let emit = Emitter::with_store(id, inc, self.ring_bytes, Some(self.tap.clone()), bucket.backfill.clone());
         let (cl, recovered) = match &self.disk {
             Some((dir, o)) => {
                 let (cl, r) = CommitLog::open(&dir.path().join(id), o.clone()).unwrap();
@@ -175,7 +176,7 @@ impl Cluster {
         };
         let (cfg, store, addr, f) = (
             self.cfg.as_ref().map_or_else(|| config(id, &self.addrs), |f| f(id, &self.addrs)),
-            self.store.clone(),
+            bucket,
             self.addrs[id].clone(),
             faults.clone(),
         );
@@ -1957,13 +1958,11 @@ async fn crashes_at_every_switch_step_lose_nothing() {
     c.wait_leader(Duration::from_secs(5)).await;
     let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
     let steps = [Step::SwitchCatchUp, Step::SwitchBeforePause, Step::SwitchFlushed, Step::SwitchCas];
-    let mut spare = 4;
-    for (i, step) in steps.iter().cycle().take(8).enumerate() {
+    for (spare, (i, step)) in (4..).zip(steps.iter().cycle().take(8).enumerate()) {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let l = c.wait_leader(Duration::from_secs(10)).await;
         let mut members = c.record().await.members;
         let new = format!("n{spare}");
-        spare += 1;
         c.start(&new).await;
         let out = if i % 2 == 0 { members.iter().find(|m| **m != l).unwrap().clone() } else { l.clone() };
         members.retain(|m| *m != out);
@@ -2105,5 +2104,89 @@ async fn a_single_node_grows_to_three_and_back() {
     }
     let acked = load.stop().await;
     settle_and_verify(&c, &acked).await;
+    c.shutdown();
+}
+
+async fn wipe_all_and_recover(c: &mut Cluster, generation: u64) {
+    for id in c.ids.clone() {
+        c.wipe(&id);
+    }
+    for id in c.ids.clone() {
+        c.start(&id).await;
+    }
+    let l = c.wait_leader(Duration::from_secs(10)).await;
+    let st = c.nodes[&l].node.status();
+    assert_eq!(st.generation, generation, "{st:?}");
+}
+
+/// `qlog retain --apply` deletes what the report marks deletable and
+/// nothing else: segments past the horizon (with `pruned_seq` raised to
+/// their end), and a state path only when it's an older epoch's and no
+/// state that's still read lists it. The manifest still verifies, and a
+/// bucket recovery after the deletes works and loses nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retention_deletes_only_what_it_reports_and_recovery_still_works() {
+    use super::retain;
+    use object_store::ObjectStoreExt;
+    let mut c = flushing(|_| flush::Options { headroom: 5_000, ..flush_opts() }, 64 << 20).await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = HostLoad::start(&c, 4, 10, Duration::from_millis(2));
+    // two recoveries: the current state is a clone of a clone
+    for g in 1..=2 {
+        wait_flushed(&c, 1, Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        wipe_all_and_recover(&mut c, g).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let m = flush::read_manifest(&c.store).await.unwrap().unwrap().0;
+    let current = m.state_path().to_string();
+    let cur_epoch: u64 = current.strip_prefix("qlog/state-e").unwrap().parse().unwrap();
+    // a recovery whose CAS lost (an older epoch, nobody reads it), and one
+    // in progress (a newer epoch): only the first may go
+    let (lost, running) = ("qlog/state-e1".to_string(), format!("qlog/state-e{}", cur_epoch + 1000));
+    assert!(cur_epoch > 1);
+    for p in [&lost, &running] {
+        super::state::State::open(&c.store, p).await.unwrap().close().await;
+    }
+
+    let plan = retain::plan(&c.store, Duration::from_secs(1)).await.unwrap().unwrap();
+    assert!(!plan.deletable.is_empty(), "{plan:#?}");
+    let by_path = |p: &str| plan.states.iter().find(|s| s.path == p).unwrap_or_else(|| panic!("{p}: {plan:#?}"));
+    assert!(by_path(&lost).deletable && !by_path(&running).deletable && !by_path(&current).deletable);
+    let a = retain::apply(&c.store, &plan).await.unwrap();
+    eprintln!("{a:#?}");
+    assert_eq!(a.segments, plan.deletable.len() as u64);
+    assert_eq!(a.pruned_seq, plan.pruned_seq_after);
+    assert_eq!(retain::pruned_seq(&c.store).await.unwrap(), plan.pruned_seq_after);
+    assert!(a.state_paths.contains(&lost) && !a.state_paths.contains(&running), "{a:#?}");
+    let seg = |o: u64| vlpds::nodelog::segment_path(&c.store, flush::LOG_ID, o);
+    for s in &plan.deletable {
+        assert!(matches!(c.store.raw.head(&seg(s.ordinal)).await, Err(object_store::Error::NotFound { .. })));
+    }
+    assert!(c.store.raw.head(&seg(plan.deletable.last().unwrap().ordinal + 1)).await.is_ok());
+    for sp in &plan.states {
+        let admin =
+            slatedb::admin::Admin::builder(super::state::db_path(&c.store, &sp.path), c.store.raw.clone()).build();
+        let kept = admin.read_manifest(None).await.unwrap().is_some();
+        assert_eq!(kept, !a.state_paths.contains(&sp.path), "{}", sp.path);
+    }
+    let v = verify(&c).await;
+    assert!(v.ok && v.pruned == a.pruned_seq, "after the deletes: {v:#?}");
+
+    // a recovery from the pruned bucket, under load
+    wipe_all_and_recover(&mut c, 3).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let (acked, expected) = load.stop().await;
+    c.converge(Duration::from_secs(20)).await;
+    let top = c.nodes.values().map(|r| r.node.status().commit).max().unwrap();
+    let m = wait_flushed(&c, top, Duration::from_secs(10)).await;
+    let v = verify(&c).await;
+    assert!(v.ok && v.flushed == top && v.pruned == a.pruned_seq, "after a recovery: {v:#?}");
+    let r = c.finish_recovered(&acked, &m.gaps, &expected);
+    assert!(r.ok, "checker: {r:#?}");
+    assert_eq!((r.holes, r.events_lost, r.acked_missing), (0, 0, 0), "{r:#?}");
+    // and the planner still runs on what's left
+    let again = retain::plan(&c.store, Duration::from_secs(3600)).await.unwrap().unwrap();
+    assert!(again.deletable.is_empty() && again.segments > 0, "{again:#?}");
     c.shutdown();
 }

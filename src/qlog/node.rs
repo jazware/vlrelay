@@ -8,6 +8,7 @@
 //! `qlog/leader` to epoch + 1, collects promises from a quorum, adopts the
 //! longest tail among them, re-tags that tail with its epoch and carries on.
 
+use super::bucket::Bucket;
 use super::commitlog::{CommitLog, Recovered};
 use super::emit::Emitter;
 use super::flush;
@@ -457,6 +458,9 @@ pub struct Status {
     pub last_epoch: u64,
     /// The membership changes this node ran as leader, with their timings.
     pub switches: Vec<SwitchStats>,
+    /// Every bucket request this process has sent, by R2 class, purpose and
+    /// key component (`bucket::requests`).
+    pub requests: super::bucket::Requests,
 }
 
 /// One membership change, as the leader that ran it saw it.
@@ -513,7 +517,7 @@ impl Quantiles {
 pub struct Node {
     pub cfg: Config,
     core: Mutex<Core>,
-    store: Store,
+    bucket: Bucket,
     /// The leader's last seq: wakes its replicators.
     head: watch::Sender<u64>,
     commit: watch::Sender<u64>,
@@ -542,17 +546,17 @@ impl Node {
     /// a lost disk: it can't vouch for what it acked before).
     pub async fn start(
         cfg: Config,
-        store: Store,
+        bucket: Bucket,
         listener: TcpListener,
         emit: Arc<Emitter>,
         faults: Arc<Faults>,
         durability: Arc<dyn Durability>,
         recovered: Option<Recovered>,
     ) -> anyhow::Result<Arc<Node>> {
-        let record = read_leader(&store).await?.map(|(r, _)| r);
+        let record = read_leader(&bucket.leader).await?.map(|(r, _)| r);
         let genesis = record.is_none();
         let manifest = match &cfg.flush {
-            Some(_) => flush::read_manifest(&store).await?.map(|(m, _)| m),
+            Some(_) => flush::read_manifest(&bucket.flush).await?.map(|(m, _)| m),
             None => None,
         };
         let (mut log, promised, promised_to, whole) = match recovered {
@@ -620,7 +624,7 @@ impl Node {
                 retired: false,
             }),
             cfg,
-            store,
+            bucket,
             head: watch::channel(0).0,
             commit: watch::channel(commit).0,
             faults,
@@ -687,6 +691,7 @@ impl Node {
             paused: c.paused,
             last_epoch: c.log.last().0,
             switches: self.switches.lock().clone(),
+            requests: super::bucket::requests(),
         }
     }
 
@@ -699,8 +704,8 @@ impl Node {
 
     // ---- for the flush (flush.rs) and the firehose's local tail (emit.rs)
 
-    pub(crate) fn store(&self) -> &Store {
-        &self.store
+    pub(crate) fn bucket(&self) -> &Bucket {
+        &self.bucket
     }
 
     /// Still leading `epoch`, and the commit index.
@@ -1125,7 +1130,7 @@ impl Node {
                     // behind the disk too: from the bucket, if it's flushed
                     None if self.cfg.flush.is_some() && next <= flushed && fresh_start.is_none() => {
                         match flush::read_bucket(
-                            &self.store,
+                            &self.bucket.backfill,
                             &mut seg_cache,
                             next,
                             flushed.min(base),
@@ -1568,7 +1573,7 @@ impl Node {
     }
 
     async fn try_takeover(self: &Arc<Self>, started: Instant) -> anyhow::Result<()> {
-        let rec = read_leader(&self.store).await?;
+        let rec = read_leader(&self.bucket.leader).await?;
         let (cur, etag) = match &rec {
             Some((r, e)) => (Some(r.clone()), Some(e.clone())),
             None => (None, None),
@@ -1641,7 +1646,7 @@ impl Node {
         }
         let epoch = cur_epoch + 1;
         let rec = LeaderRecord { epoch, leader: self.cfg.id.clone(), members: members.clone(), learners, addrs, since };
-        if !cas_leader(&self.store, &rec, etag).await? {
+        if !cas_leader(&self.bucket.leader, &rec, etag).await? {
             let mut c = self.core.lock();
             c.last_heard = Instant::now();
             return Ok(());
@@ -1767,7 +1772,7 @@ impl Node {
     async fn bucket_recover(self: &Arc<Self>, epoch: u64, answered: Vec<(String, u64)>) -> anyhow::Result<()> {
         let o = self.cfg.flush.clone().expect("checked by the caller");
         let t0 = Instant::now();
-        let Some(p) = flush::recovery_point(&self.store).await? else {
+        let Some(p) = flush::recovery_point(&self.bucket.recovery).await? else {
             // Nothing was ever fenced, so the reservation was 0: nothing was
             // ever committed, let alone emitted. Start over at the bottom.
             let mut c = self.core.lock();
@@ -1798,7 +1803,7 @@ impl Node {
         let _stop = AbortOnDrop(keepalive);
         let from = p.flushed + 1;
         let mut by_commit = answered;
-        by_commit.sort_by(|a, b| b.1.cmp(&a.1));
+        by_commit.sort_by_key(|a| std::cmp::Reverse(a.1));
         // The salvage streams into segments as it's fetched, two chunks
         // ahead at most. A member that fails midway still leaves a dense,
         // committed prefix, and that's what's kept.
@@ -1831,7 +1836,7 @@ impl Node {
                 }
             }
         });
-        let m = flush::recover(&self.store, &self.cfg.id, epoch, &o, p, rx, &mut stats).await;
+        let m = flush::recover(&self.bucket.recovery, &self.cfg.id, epoch, &o, p, rx, &mut stats).await;
         fetcher.abort();
         let m = m?;
         let rec = m.recovery.clone().expect("a recovery manifest");
@@ -1845,7 +1850,7 @@ impl Node {
             let mut cache: flush::SegCache = None;
             let mut next = emitted + 1;
             while next <= after {
-                match flush::read_bucket(&self.store, &mut cache, next, after, 8 << 20).await? {
+                match flush::read_bucket(&self.bucket.backfill, &mut cache, next, after, 8 << 20).await? {
                     Some((_, es)) if !es.is_empty() => {
                         next = es.last().expect("non-empty").seq + 1;
                         catch_up.extend(es);
@@ -2044,7 +2049,7 @@ impl Node {
         let n = self.clone();
         tokio::spawn(async move {
             let r = async {
-                let Some((rec, _)) = read_leader(&n.store).await? else { anyhow::bail!("no qlog/leader") };
+                let Some((rec, _)) = read_leader(&n.bucket.leader).await? else { anyhow::bail!("no qlog/leader") };
                 anyhow::ensure!(
                     rec.epoch == epoch && rec.leader == n.cfg.id && rec.members.contains(&n.cfg.id),
                     "qlog/leader is epoch {} naming {}, not {epoch} naming this node",
@@ -2159,7 +2164,7 @@ impl Node {
         if rec.learners != learners || rec_addrs != rec.addrs {
             let next = LeaderRecord { learners: learners.clone(), addrs: rec_addrs.clone(), ..rec };
             anyhow::ensure!(
-                cas_leader(&self.store, &next, Some(etag)).await?,
+                cas_leader(&self.bucket.leader, &next, Some(etag)).await?,
                 "qlog/leader moved: no longer leading {epoch}"
             );
         }
@@ -2264,12 +2269,12 @@ impl Node {
             addrs: rec.addrs.clone(),
             since: epoch + 1,
         };
-        let landed = match cas_leader(&self.store, &next, Some(etag)).await {
+        let landed = match cas_leader(&self.bucket.leader, &next, Some(etag)).await {
             Ok(ok) => ok,
             // the PUT may have landed with its answer lost
             Err(e) => {
                 tracing::warn!(id = %self.cfg.id, epoch, "qlog member change: the CAS failed: {e:#}");
-                matches!(read_leader(&self.store).await, Ok(Some((r, _))) if r == next)
+                matches!(read_leader(&self.bucket.leader).await, Ok(Some((r, _))) if r == next)
             }
         };
         if !landed {
@@ -2337,7 +2342,7 @@ impl Node {
     /// `qlog/leader` as this leader of `epoch` holds it, with its ETag; a
     /// newer epoch there deposes it.
     async fn own_record(&self, epoch: u64) -> anyhow::Result<(LeaderRecord, Option<String>)> {
-        let Some((rec, etag)) = read_leader(&self.store).await? else { anyhow::bail!("no qlog/leader") };
+        let Some((rec, etag)) = read_leader(&self.bucket.leader).await? else { anyhow::bail!("no qlog/leader") };
         if rec.epoch != epoch || rec.leader != self.cfg.id {
             let mut c = self.core.lock();
             if c.epoch == epoch {

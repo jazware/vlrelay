@@ -60,7 +60,28 @@ pub fn recovery_path(epoch: u64) -> String {
     format!("qlog/state-e{epoch}")
 }
 
+/// The compactor's and its worker's poll, in ms. SlateDB's default (5 s
+/// each) made them most of the state's GETs in the hour run at today's
+/// rate (docs/quorum.md, Phase 6). Nothing waits on a poll here: the
+/// applier is the only writer, a flush adds one L0 per interval, and
+/// `l0_max_ssts` is far above the L0s one poll interval brings. vlpds polls
+/// every 30 s too.
+static COMPACTOR_POLL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(30_000);
+
+pub fn set_compactor_poll(d: Duration) {
+    COMPACTOR_POLL_MS.store((d.as_millis() as u64).max(100), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn compactor_poll() -> Duration {
+    if cfg!(test) {
+        // tests flush every 150 ms: a 30 s poll would fill L0
+        return Duration::from_secs(5);
+    }
+    Duration::from_millis(COMPACTOR_POLL_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 fn settings(l0_bytes: usize) -> slatedb::Settings {
+    let poll = compactor_poll();
     slatedb::Settings {
         wal_enabled: false,
         l0_sst_size_bytes: l0_bytes,
@@ -74,6 +95,14 @@ fn settings(l0_bytes: usize) -> slatedb::Settings {
         // the default 1 s poll is most of the state's GETs (~4/s measured);
         // vlpds polls every 10 s too
         manifest_poll_interval: std::time::Duration::from_secs(10),
+        compactor_options: Some(slatedb::config::CompactorOptions {
+            poll_interval: poll,
+            worker: Some(slatedb::config::CompactionWorkerOptions {
+                compactions_poll_interval: poll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -93,8 +122,11 @@ pub fn did_value(seq: u64, content: u64) -> [u8; 16] {
     v
 }
 
+/// A DID and its state value.
+pub type DidValue = (String, [u8; 16]);
+
 /// What one entry does to the state (the verifier replays the same).
-pub fn effects(e: &Entry) -> (Option<(String, [u8; 16])>, Vec<(String, u64)>) {
+pub fn effects(e: &Entry) -> (Option<DidValue>, Vec<(String, u64)>) {
     let did = parse_test_frame(&e.data).map(|(_, did, _)| (did, did_value(e.seq, content_id(&e.data))));
     (did, decode_cursors(&e.cursors))
 }
@@ -177,7 +209,7 @@ impl State {
         }
         let mut b = WriteBatch::new();
         b.put(APPLIED, seq.to_be_bytes());
-        self.db.write_with_options(b, &WriteOptions { seqnum: seq, ..Default::default() }).await?;
+        self.db.write_with_options(b, &WriteOptions { seqnum: seq }).await?;
         self.applied = seq;
         Ok(())
     }
@@ -214,7 +246,7 @@ impl State {
             }
         }
         b.put(APPLIED, last.seq.to_be_bytes());
-        self.db.write_with_options(b, &WriteOptions { seqnum: last.seq, ..Default::default() }).await?;
+        self.db.write_with_options(b, &WriteOptions { seqnum: last.seq }).await?;
         self.applied = last.seq;
         Ok(())
     }
@@ -322,7 +354,7 @@ mod tests {
     fn entry(seq: u64, pad: usize) -> Entry {
         let (p, s) = test_frame(&format!("did:q:h{}:{}", seq % 3, seq / 3 + 1), pad, 0);
         let mut e = Entry::new(1, seq, crate::qlog::wire::splice_seq(&p, &s, seq));
-        if seq % 10 == 0 {
+        if seq.is_multiple_of(10) {
             e.cursors = encode_cursors(&[(format!("h{}", seq % 3), seq / 3)].into());
         }
         e

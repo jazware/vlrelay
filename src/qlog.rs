@@ -17,7 +17,10 @@
 //! - `flush`: every interval the leader seals `state` at a committed seq F,
 //!   uploads the log to F as vlpds segments and CASes `qlog/manifest`.
 //!
-//! - `retain`: what bucket retention could delete, reported first.
+//! - `retain`: what bucket retention may delete, reported, and deleted
+//!   with `--apply`.
+//! - `bucket`: one counted client per purpose (flush, state, leader,
+//!   recovery, backfill, retain), so every request is billed to what sent it.
 //!
 //! A lost quorum (no quorum of intact logs can exist) is a bucket recovery:
 //! the log resumes at the last manifest's R + 1 (`flush::recover`, run by
@@ -26,6 +29,7 @@
 //!
 //! Memory-only (`node::MemoryOnly`) remains for comparison.
 
+pub mod bucket;
 pub mod check;
 pub mod client;
 pub mod commitlog;

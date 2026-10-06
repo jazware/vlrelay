@@ -85,6 +85,8 @@ struct S3Args {
 }
 
 impl S3Args {
+    /// Not counted: every user counts it once, under its purpose
+    /// (`qlog::bucket`).
     fn store(&self) -> anyhow::Result<vlpds::store::Store> {
         let s3 = vlpds::store::S3Config {
             endpoint: self.s3_endpoint.clone(),
@@ -93,7 +95,7 @@ impl S3Args {
             secret_key: self.s3_secret_key.clone(),
             region: "us-east-1".into(),
         };
-        Ok(vlpds::store::Store::s3(&s3, &self.prefix, None, 8)?.counted("qlog"))
+        vlpds::store::Store::s3(&s3, &self.prefix, None, 8)
     }
 }
 
@@ -116,6 +118,11 @@ struct RetainArgs {
     /// Don't write `retain/qlog`, only print.
     #[arg(long)]
     dry_run: bool,
+    /// Delete what the report marks deletable (segments past the horizon,
+    /// state paths nothing reads any more), re-checked against the manifest
+    /// first; `pruned_seq` is raised before any segment goes.
+    #[arg(long, conflicts_with = "dry_run")]
+    apply: bool,
 }
 
 #[derive(Parser)]
@@ -136,6 +143,10 @@ struct NodeArgs {
     /// Flush every this many ms (0: no flush, no reservation).
     #[arg(long, default_value_t = 30_000)]
     flush_ms: u64,
+    /// The state's SlateDB compactor and worker poll (SlateDB's default is
+    /// 5000).
+    #[arg(long, default_value_t = 30_000)]
+    state_compactor_poll_ms: u64,
     /// H: each manifest's R is F + H.
     #[arg(long, default_value_t = 8_640_000)]
     headroom: u64,
@@ -305,8 +316,9 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
         cfg.members.sort();
         cfg.members.dedup();
     }
+    vlrelay::qlog::state::set_compactor_poll(Duration::from_millis(a.state_compactor_poll_ms));
     cfg.retain_bytes = a.retain_mb.unwrap_or(if a.commitlog.is_some() { 64 } else { 512 }) << 20;
-    let store = a.s3.store()?;
+    let bucket = vlrelay::qlog::bucket::Bucket::new(a.s3.store()?);
     let die = |what: &str| {
         eprintln!("qlog: crash injected at {what}");
         // as sudden as a crash: no unwinding, no flush of anything
@@ -348,7 +360,7 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
     }
     let listener = tokio::net::TcpListener::bind(&a.listen).await?;
     let emit = if a.flush_ms > 0 {
-        Emitter::with_store(&a.id, now_us() as u64, a.ring_mb << 20, None, store.clone())
+        Emitter::with_store(&a.id, now_us() as u64, a.ring_mb << 20, None, bucket.backfill.clone())
     } else {
         Emitter::new(&a.id, now_us() as u64, a.ring_mb << 20, None)
     };
@@ -391,7 +403,7 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
         }
         None => (Arc::new(MemoryOnly) as Arc<dyn Durability>, None),
     };
-    let node = Node::start(cfg, store, listener, emit, Arc::new(Faults::default()), durability, recovered).await?;
+    let node = Node::start(cfg, bucket, listener, emit, Arc::new(Faults::default()), durability, recovered).await?;
     let http = tokio::net::TcpListener::bind(&a.http).await?;
     axum::serve(http, emit::router(node)).await?;
     Ok(())
@@ -516,6 +528,9 @@ impl Acked {
     }
 }
 
+/// (generation, events left, since).
+type Owed = (u64, std::collections::HashSet<u64>, Instant);
+
 fn load_did(run: &str, hosts: u64, e: u64) -> String {
     format!("did:q:{run}-h{}:{}", e % hosts, e / hosts + 1)
 }
@@ -532,7 +547,7 @@ struct LoadCtx {
     rewinding: Arc<tokio::sync::Mutex<()>>,
     rewinds_pending: Arc<AtomicU64>,
     /// Events still owed after a rewind: (generation, events left).
-    owed: Arc<Mutex<Option<(u64, std::collections::HashSet<u64>, Instant)>>>,
+    owed: Arc<Mutex<Option<Owed>>>,
     resend_tx: mpsc::UnboundedSender<Vec<u64>>,
     run: String,
     hosts: u64,
@@ -1034,7 +1049,10 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
                 s3_secret_key: "minioadmin".into(),
                 prefix: p.clone(),
             };
-            vlrelay::qlog::flush::read_manifest(&s3.store()?).await?.map(|(m, _)| m.gaps).unwrap_or_default()
+            vlrelay::qlog::flush::read_manifest(&vlrelay::qlog::bucket::counted(&s3.store()?, "tool"))
+                .await?
+                .map(|(m, _)| m.gaps)
+                .unwrap_or_default()
         }
         _ => Vec::new(),
     };
@@ -1088,7 +1106,7 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
 }
 
 async fn verify(a: VerifyArgs) -> anyhow::Result<()> {
-    let store = a.s3.store()?;
+    let store = vlrelay::qlog::bucket::counted(&a.s3.store()?, "tool");
     let mut tries = 0;
     let v = loop {
         tries += 1;
@@ -1110,7 +1128,7 @@ async fn verify(a: VerifyArgs) -> anyhow::Result<()> {
 
 async fn retain(a: RetainArgs) -> anyhow::Result<()> {
     use vlrelay::qlog::retain;
-    let store = a.s3.store()?;
+    let store = vlrelay::qlog::bucket::counted(&a.s3.store()?, "retain");
     let Some(plan) = retain::plan(&store, Duration::from_secs(a.horizon_secs)).await? else {
         println!("no manifest");
         return Ok(());
@@ -1118,7 +1136,8 @@ async fn retain(a: RetainArgs) -> anyhow::Result<()> {
     if a.dry_run {
         println!("{}", serde_json::to_string_pretty(&plan)?);
     } else {
-        let r = retain::write(&store, plan).await?;
+        let applied = if a.apply { Some(retain::apply(&store, &plan).await?) } else { None };
+        let r = retain::write(&store, plan, applied).await?;
         println!("{}", serde_json::to_string_pretty(&r)?);
     }
     Ok(())

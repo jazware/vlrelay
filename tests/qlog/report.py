@@ -308,3 +308,60 @@ try:
 except (OSError, ValueError, KeyError):
     pass
 
+
+# Bucket requests by R2 class, purpose and key component (qlog::bucket),
+# as rates over the sampled window (STATUS_EVERY), the whole cluster, and
+# per month at R2's prices (docs/quorum.md §2 "What a flush costs").
+R2_A, R2_B, R2_FREE_A, R2_FREE_B = 4.50, 0.36, 1e6, 10e6
+MONTH_S = 30.4375 * 86400
+samples = []
+try:
+    with open(os.path.join(out, "status.jsonl")) as f:
+        samples = [json.loads(line) for line in f if line.strip()]
+except OSError:
+    pass
+by_node = {}
+for s in samples:
+    if "requests" in s["status"]:
+        by_node.setdefault(s["node"], []).append(s)
+if by_node:
+    # from the first sample a minute in (past the start's reads and the
+    # first fence) to the last
+    t0 = min(x["at_ms"] for xs in by_node.values() for x in xs)
+    rates, components, ops, window = {}, {}, {}, None
+    for n, xs in sorted(by_node.items()):
+        xs = [x for x in xs if x["at_ms"] >= t0 + 60_000] or xs
+        a, b = xs[0], xs[-1]
+        secs = (b["at_ms"] - a["at_ms"]) / 1000
+        if secs <= 0:
+            continue
+        window = secs if window is None else min(window, secs)
+        ra, rb = a["status"]["requests"], b["status"]["requests"]
+        for key, dst in (("by_purpose", rates), ("by_component", components)):
+            for k, c in rb[key].items():
+                p = ra[key].get(k, {"a": 0, "b": 0, "free": 0})
+                d = dst.setdefault(k, [0.0, 0.0, 0.0])
+                d[0] += (c["a"] - p["a"]) / secs
+                d[1] += (c["b"] - p["b"]) / secs
+                d[2] += (c["free"] - p["free"]) / secs
+        for k, c in rb["by_op"].items():
+            ops[k] = ops.get(k, 0.0) + (c - ra["by_op"].get(k, 0)) / secs
+    if window:
+        print(f"bucket requests, all nodes, over {window / 60:.0f} min (per s; per month; R2 $/mo before / after the free tier):")
+
+        def row(name, a, b, free):
+            mo_a, mo_b = a * MONTH_S, b * MONTH_S
+            usd = mo_a / 1e6 * R2_A + mo_b / 1e6 * R2_B
+            print(f"  {name:<34} A {a:7.3f}/s  B {b:7.3f}/s  free {free:6.3f}/s   A {mo_a / 1e6:6.2f}M  B {mo_b / 1e6:6.2f}M   ${usd:6.2f}")
+
+        tot = [sum(v[i] for v in rates.values()) for i in range(3)]
+        for k, v in sorted(rates.items()):
+            row(k, *v)
+        row("total", *tot)
+        paid = max(0, tot[0] * MONTH_S - R2_FREE_A) / 1e6 * R2_A + max(0, tot[1] * MONTH_S - R2_FREE_B) / 1e6 * R2_B
+        print(f"  total after R2's free tier: ${paid:.2f}/mo")
+        print("  by purpose/component:")
+        for k, v in sorted(components.items(), key=lambda kv: -(kv[1][0] + kv[1][1])):
+            if v[0] + v[1] + v[2] > 0:
+                row("  " + k, *v)
+        print("  by purpose/op (per s): " + ", ".join(f"{k} {v:.3f}" for k, v in sorted(ops.items()) if v > 0))

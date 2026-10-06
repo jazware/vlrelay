@@ -1,8 +1,8 @@
-//! What bucket retention could delete (docs/quorum.md, "Bucket retention"),
-//! reported before anything is: `qlog retain` writes it to `retain/qlog`,
-//! the object vlpds's retention keeps per log (`retention::Report`; its
-//! `pruned_seq` is what `OutdatedCursor` answers from, and stays as it is
-//! until something deletes).
+//! What bucket retention may delete (docs/quorum.md, "Bucket retention"):
+//! `qlog retain` writes the plan to `retain/qlog`, the object vlpds's
+//! retention keeps per log (`retention::Report`; its `pruned_seq` is what
+//! `OutdatedCursor` answers from). `qlog retain --apply` then deletes what
+//! [`apply`] still finds deletable, raising `pruned_seq` first.
 //!
 //! - Log segments: vlpds deletes a log's segments oldest first, so what
 //!   could go is the longest prefix of ordinals whose objects are all older
@@ -14,8 +14,10 @@
 //!   one is a flush that died between its seal and its CAS.
 //! - State paths: a bucket recovery clones the state to `qlog/state-e{epoch}`.
 //!   An older path is still needed while the current one's SlateDB manifest
-//!   lists it as an external database (the clone reads its SSTs until
-//!   compaction rewrites them); after that it can go whole.
+//!   lists it as an external database, directly or through another clone
+//!   (the clone reads its SSTs until compaction rewrites them); after that
+//!   it can go whole. A newer epoch's path is never deletable: it may be a
+//!   recovery's clone in progress.
 
 use super::flush::{self, LOG_ID};
 use super::state;
@@ -73,13 +75,28 @@ pub struct Plan {
     pub states: Vec<StatePath>,
 }
 
-/// `retain/qlog`: vlpds's report for the log (nothing deleted yet, so its
-/// `pruned_seq` stays), with the plan alongside.
+/// `retain/qlog`: vlpds's report for the log, with the plan alongside and
+/// what the last `--apply` deleted.
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
     pub opened: BTreeMap<String, u64>,
     pub pruned_seq: i64,
     pub plan: Plan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<Applied>,
+}
+
+/// What [`apply`] deleted.
+#[derive(Debug, Default, Serialize)]
+pub struct Applied {
+    pub segments: u64,
+    pub segment_bytes: u64,
+    pub pruned_seq: u64,
+    pub state_paths: Vec<String>,
+    pub state_objects: u64,
+    pub state_bytes: u64,
+    /// Marked deletable by the plan and kept on a second look, with why.
+    pub kept: Vec<String>,
 }
 
 async fn list(store: &Store, prefix: &str) -> anyhow::Result<Vec<object_store::ObjectMeta>> {
@@ -144,13 +161,7 @@ pub async fn plan(store: &Store, horizon: Duration) -> anyhow::Result<Option<Pla
     }
     let current = m.state_path().to_string();
     let named = m.state.as_ref().map(|s| s.checkpoint.clone());
-    let mut external = BTreeSet::new();
-    let admin = slatedb::admin::Admin::builder(state::db_path(store, &current), store.raw.clone()).build();
-    if let Some(vm) = admin.read_manifest(None).await? {
-        for e in vm.external_dbs() {
-            external.insert(e.path.clone());
-        }
-    }
+    let external = referenced(store, &current).await?;
     let objs = list(store, "qlog").await?;
     let mut paths: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let base = Path::from(format!("{}/qlog", store.prefix));
@@ -178,7 +189,9 @@ pub async fn plan(store: &Store, horizon: Duration) -> anyhow::Result<Option<Pla
             .collect();
         let clone_checkpoints = cps.iter().filter(|c| c.name.is_none()).count() as u64;
         p.states.push(StatePath {
-            deletable: !is_current && !referenced,
+            deletable: !is_current
+                && !referenced
+                && matches!((path_epoch(&path), path_epoch(&current)), (Some(e), Some(c)) if e < c),
             path,
             current: is_current,
             referenced,
@@ -191,16 +204,134 @@ pub async fn plan(store: &Store, horizon: Duration) -> anyhow::Result<Option<Pla
     Ok(Some(p))
 }
 
-/// Writes the plan as `retain/qlog`, keeping any `pruned_seq` already
-/// there (nothing here deletes, so the retained floor doesn't move).
-pub async fn write(store: &Store, plan: Plan) -> anyhow::Result<Report> {
-    let path = Path::from(format!("{}/retain/{LOG_ID}", store.prefix));
-    let pruned_seq = match store.raw.get(&path).await {
-        Ok(r) => serde_json::from_slice::<serde_json::Value>(&r.bytes().await?)?["pruned_seq"].as_i64().unwrap_or(0),
-        Err(object_store::Error::NotFound { .. }) => 0,
-        Err(e) => return Err(e.into()),
-    };
-    let r = Report { opened: BTreeMap::new(), pruned_seq, plan };
-    store.raw.put(&path, serde_json::to_vec_pretty(&r)?.into()).await?;
+fn report_path(store: &Store) -> Path {
+    Path::from(format!("{}/retain/{LOG_ID}", store.prefix))
+}
+
+/// The retained floor `retain/qlog` publishes: every seq at or below it may
+/// be gone from the bucket.
+pub async fn pruned_seq(store: &Store) -> anyhow::Result<u64> {
+    match store.raw.get(&report_path(store)).await {
+        Ok(r) => {
+            Ok(serde_json::from_slice::<serde_json::Value>(&r.bytes().await?)?["pruned_seq"].as_u64().unwrap_or(0))
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Writes the plan (and what `apply` did with it) as `retain/qlog`,
+/// keeping the `pruned_seq` already there.
+pub async fn write(store: &Store, plan: Plan, applied: Option<Applied>) -> anyhow::Result<Report> {
+    let pruned_seq = pruned_seq(store).await? as i64;
+    let r = Report { opened: BTreeMap::new(), pruned_seq, plan, applied };
+    store.raw.put(&report_path(store), serde_json::to_vec_pretty(&r)?.into()).await?;
     Ok(r)
+}
+
+/// 0 for the original `qlog/state`, N for a recovery's `qlog/state-eN`.
+fn path_epoch(path: &str) -> Option<u64> {
+    match path.strip_prefix(state::DEFAULT_PATH)? {
+        "" => Some(0),
+        e => e.strip_prefix("-e")?.parse().ok(),
+    }
+}
+
+/// Every state path the current one reads SSTs from, following each
+/// external database's own `external_dbs` too (a clone of a clone).
+async fn referenced(store: &Store, current: &str) -> anyhow::Result<BTreeSet<String>> {
+    let mut seen = BTreeSet::new();
+    let mut todo = vec![state::db_path(store, current)];
+    while let Some(p) = todo.pop() {
+        let admin = slatedb::admin::Admin::builder(p.clone(), store.raw.clone()).build();
+        if let Some(vm) = admin.read_manifest(None).await? {
+            for e in vm.external_dbs() {
+                if seen.insert(e.path.clone()) {
+                    todo.push(e.path.clone());
+                }
+            }
+        }
+    }
+    Ok(seen)
+}
+
+/// Deletes what `plan` marked deletable, after checking each again against
+/// the manifest as it is now:
+///
+/// - Segments: `pruned_seq` is raised to the last one's end and published
+///   first (as vlpds's retention does, so a reader that checked the floor
+///   never misses data silently), then they go oldest first, so a pass cut
+///   short leaves a dense suffix. Each is at or below F and below the
+///   manifest's next ordinal, so neither a restart nor a recovery reads it:
+///   the state checkpoint covers it.
+/// - State paths: one goes whole only if it isn't the manifest's, nothing
+///   the current state reads lists it (`external_dbs`, transitively), and
+///   it's an older epoch's than the current one. A newer path may be a
+///   recovery's clone in progress, and no older one can become current
+///   again: a recovery's manifest CAS is against the manifest it read,
+///   which the current one replaced.
+///
+/// Not deleted here: stale segments past the manifest (the flush or a
+/// recovery deletes them when it reaches their ordinal, and a delete here
+/// could race it and take its fresh segment at the same key) and stale
+/// `qlog-*` checkpoints (a flush between its seal and its CAS holds one
+/// the manifest doesn't name yet; the leader clears them at its fence).
+pub async fn apply(store: &Store, plan: &Plan) -> anyhow::Result<Applied> {
+    let mut a = Applied::default();
+    let Some((m, _)) = flush::read_manifest(store).await? else { anyhow::bail!("qlog retain: no manifest") };
+    anyhow::ensure!(
+        m.flushed >= plan.flushed && m.next_ordinal >= plan.next_ordinal,
+        "qlog retain: the manifest went back (F {} next ordinal {}, the plan's {} {})",
+        m.flushed,
+        m.next_ordinal,
+        plan.flushed,
+        plan.next_ordinal
+    );
+    let segs: Vec<&SegmentPlan> =
+        plan.deletable.iter().filter(|s| s.ordinal < m.next_ordinal && s.last <= m.flushed).collect();
+    if let Some(top) = segs.last() {
+        let floor = pruned_seq(store).await?.max(top.last);
+        let body = serde_json::json!({ "opened": {}, "pruned_seq": floor, "plan": plan });
+        store.raw.put(&report_path(store), serde_json::to_vec_pretty(&body)?.into()).await?;
+        a.pruned_seq = floor;
+        for s in segs {
+            match store.raw.delete(&nodelog::segment_path(store, LOG_ID, s.ordinal)).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+            a.segments += 1;
+            a.segment_bytes += s.bytes;
+        }
+    }
+    let current = m.state_path().to_string();
+    let cur_epoch = path_epoch(&current);
+    let refs = referenced(store, &current).await?;
+    for sp in plan.states.iter().filter(|s| s.deletable) {
+        let why = if sp.path == current {
+            Some("current")
+        } else if refs.contains(&state::db_path(store, &sp.path)) {
+            Some("referenced")
+        } else if !matches!((path_epoch(&sp.path), cur_epoch), (Some(e), Some(c)) if e < c) {
+            Some("not an older epoch's")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            a.kept.push(format!("{}: {why}", sp.path));
+            continue;
+        }
+        let objs = list(store, &sp.path).await?;
+        let (n, bytes) = (objs.len() as u64, objs.iter().map(|o| o.size).sum::<u64>());
+        let locs = futures::stream::iter(objs.into_iter().map(|o| Ok(o.location))).boxed();
+        let mut del = store.raw.delete_stream(locs);
+        while let Some(r) = del.next().await {
+            match r {
+                Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        a.state_paths.push(sp.path.clone());
+        (a.state_objects, a.state_bytes) = (a.state_objects + n, a.state_bytes + bytes);
+    }
+    Ok(a)
 }

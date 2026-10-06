@@ -152,13 +152,14 @@ struct StatusParams {
     reset: bool,
 }
 
-/// subscribeRepos, `/qlog/status`, and `POST /qlog/members` (a membership
-/// change, on the leader) for one node.
+/// subscribeRepos, `/qlog/status`, `POST /qlog/members` (a membership
+/// change, on the leader) and `/metrics` for one node.
 pub fn router(node: Arc<super::node::Node>) -> axum::Router {
     axum::Router::new()
         .route("/xrpc/com.atproto.sync.subscribeRepos", axum::routing::get(subscribe))
         .route("/qlog/status", axum::routing::get(status))
         .route("/qlog/members", axum::routing::post(members))
+        .route("/metrics", axum::routing::get(metrics))
         .with_state(node)
 }
 
@@ -192,6 +193,15 @@ async fn subscribe(
     match n.emit.firehose() {
         Some(fh) => fh.upgrade(req, q.cursor, None, None, None),
         None => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "nothing committed yet").into_response(),
+    }
+}
+
+async fn metrics() -> Response {
+    use prometheus::Encoder;
+    let mut buf = Vec::new();
+    match prometheus::TextEncoder::new().encode(&prometheus::gather(), &mut buf) {
+        Ok(()) => ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], buf).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
