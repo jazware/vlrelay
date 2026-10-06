@@ -35,6 +35,11 @@
 # its budget exits 86: the harness then kills every process of the run at
 # once, skips the final verify and retain, and exits 86. OUT/pgid holds the
 # run's process group (for r2_watchdog.py; start the harness under setsid).
+# TOOL_BUDGET (the same flags for `qlog check`, `verify` and `retain`, each
+# with --budget-state OUT/budget-tool-<tool>.json, which r2_watchdog.py adds
+# to the cluster total; a tool that trips exits 86 and the harness sends
+# nothing more and exits 86), FINAL_VERIFY=0 (skip the final verify, which
+# reads the whole state: ~6,000 GETs after an hour at 350/s).
 #
 # With the flush on, `qlog verify` checks the manifest (segments, state
 # and cursors at one F) every VERIFY_EVERY seconds and at the end, and the
@@ -263,8 +268,9 @@ nodes=() https=()
 for i in $slots; do nodes+=(--node "n$i=127.0.0.1:$(peer "$i")"); https+=(--node "n$i=127.0.0.1:$(http "$i")"); done
 # with no flush there's no bucket: a cursor older than the ring is outdated
 s3=("${s3_flags[@]}" --prefix "$prefix")
+tool_budget() { [ -n "${TOOL_BUDGET:-}" ] && echo "$TOOL_BUDGET --budget-state $out/budget-tool-$1.json"; }
 "$bin" check "${https[@]}" --backfill "$([ "$flush_ms" != 0 ] && echo true || echo false)" --gap-ms "${GAP_MS:-15}" --stop-file "$out/stop" --acked "$out/acked.txt" --out "$out" \
-  "${s3[@]}" --load-summary "$out/load.json" >"$out/check.log" 2>&1 &
+  "${s3[@]}" --load-summary "$out/load.json" $(tool_budget check) >"$out/check.log" 2>&1 &
 checker=$!
 sleep 1
 "$bin" load "${nodes[@]}" --rate "$rate" --pad "$pad" --duration "$duration" --acked "$out/acked.txt" --out "$out/load.json" --run "$scenario" >"$out/load.log" 2>&1 &
@@ -275,7 +281,7 @@ if [ "$flush_ms" != 0 ] && [ "${VERIFY_EVERY:-20}" != 0 ]; then
   (
     while kill -0 "$loader" 2>/dev/null; do
       sleep "${VERIFY_EVERY:-20}"
-      "$bin" verify "${s3[@]}" >>"$out/verify.jsonl" 2>>"$out/verify.log" || echo "$(ms) verify FAILED" >>"$out/events.log"
+      "$bin" verify "${s3[@]}" $(tool_budget verify-mid) >>"$out/verify.jsonl" 2>>"$out/verify.log" || echo "$(ms) verify FAILED" >>"$out/events.log"
     done
   ) &
   pids+=($!)
@@ -563,12 +569,22 @@ if [ -e "$out/budget-tripped" ]; then
   echo "qlog chaos: a node tripped its request budget; no final verify" >&2
   exit 86
 fi
+tool_tripped() {
+  compgen -G "$out/budget-tool-*.tripped" >/dev/null || return 1
+  echo "$(ms) BUDGET tool tripped: $(cat "$out"/budget-tool-*.tripped)" >>"$out/events.log"
+  echo "qlog chaos: a tool tripped its request budget; nothing more is sent" >&2
+}
+tool_tripped && exit 86
 if [ "$flush_ms" != 0 ]; then
-  "$bin" verify "${s3[@]}" >"$out/verify.json" 2>>"$out/verify.log"
-  vrc=$?
-  [ $vrc = 0 ] || { echo "qlog chaos: the final manifest is inconsistent" >&2; rc=1; }
+  if [ "${FINAL_VERIFY:-1}" != 0 ]; then
+    "$bin" verify "${s3[@]}" $(tool_budget verify) >"$out/verify.json" 2>>"$out/verify.log"
+    vrc=$?
+    tool_tripped && exit 86
+    [ $vrc = 0 ] || { echo "qlog chaos: the final manifest is inconsistent" >&2; rc=1; }
+  fi
   grep -q "verify FAILED" "$out/events.log" && { echo "qlog chaos: a mid-run verify failed" >&2; rc=1; }
-  "$bin" retain "${s3[@]}" --horizon-secs "${RETAIN_HORIZON_SEC:-30}" >"$out/retain.json" 2>>"$out/verify.log" || true
+  "$bin" retain "${s3[@]}" --horizon-secs "${RETAIN_HORIZON_SEC:-30}" $(tool_budget retain) >"$out/retain.json" 2>>"$out/verify.log" || true
+  tool_tripped && exit 86
 fi
 [ -e "$out/removed-violation" ] && { echo "qlog chaos: a removed member counted after its removal" >&2; rc=1; }
 grep -q "switch-FAILED" "$out/events.log" && { echo "qlog chaos: a membership change never landed" >&2; rc=1; }

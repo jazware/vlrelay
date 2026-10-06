@@ -14,6 +14,11 @@ tests/qlog/R2_HOUR.md):
   - any one poll interval (--poll-s, 10) adding > --burst-a / --burst-b;
   - no status from some node for > --stale-s (30): it may be sending
     requests nobody can see, so that's a breach too.
+Tools that touch the bucket (`qlog check`, `verify`, `retain` with
+--budget-state) are summed too: each --count-glob file is one tool's
+cumulative count. --done-file ends the watch with one last count, which
+includes the tools; the harness touches it only once every process of the
+run has exited.
 
 On a breach: SIGKILL the run's process group (--pgid-file, the harness
 started under setsid), then every process matching --kill-pattern, write
@@ -23,6 +28,7 @@ total is every incarnation's last count. --done-file existing ends the watch
 cleanly (exit 0).
 """
 import argparse
+import glob
 import json
 import os
 import signal
@@ -40,7 +46,7 @@ def parse():
     p.add_argument("--rate-a", type=float, default=2.4)
     p.add_argument("--rate-b", type=float, default=8.3)
     p.add_argument("--window-s", type=float, default=120)
-    p.add_argument("--burst-a", type=int, default=150)
+    p.add_argument("--burst-a", type=int, default=250)
     p.add_argument("--burst-b", type=int, default=300)
     p.add_argument("--poll-s", type=float, default=10)
     p.add_argument("--stale-s", type=float, default=30)
@@ -49,6 +55,7 @@ def parse():
     p.add_argument("--log", required=True)
     p.add_argument("--tripped-file")
     p.add_argument("--done-file")
+    p.add_argument("--count-glob", action="append", default=[], help="budget-state files of tools, summed in")
     return p.parse_args()
 
 
@@ -90,6 +97,16 @@ def main():
     history = []  # (monotonic, cluster a, cluster b)
     log({"event": "start", "nodes": nodes, "rules": {k: v for k, v in vars(a).items() if k not in ("node",)}})
 
+    def tools():
+        for g in a.count_glob:
+            for f in glob.glob(g):
+                if f.endswith(".json"):
+                    try:
+                        c = json.load(open(f))
+                        procs[("tool", f)] = (c.get("a", 0), c.get("b", 0))
+                    except (OSError, ValueError):
+                        pass  # mid-rename; the next poll reads it
+
     def trip(why):
         log({"event": "TRIPPED", "why": why})
         kill_everything(a, log)
@@ -100,7 +117,9 @@ def main():
 
     while True:
         if a.done_file and os.path.exists(a.done_file):
-            log({"event": "done"})
+            tools()
+            log({"event": "done", "a": sum(v[0] for v in procs.values()), "b": sum(v[1] for v in procs.values()),
+                 "tools": {k[1]: v for k, v in procs.items() if k[0] == "tool"}})
             return 0
         t = time.monotonic()
         seen = {}
@@ -114,6 +133,7 @@ def main():
                 seen[n] = {"pid": r.get("pid"), "a": tot.get("a", 0), "b": tot.get("b", 0), "role": s.get("role")}
             except Exception as e:  # noqa: BLE001 - any failure is "no status"
                 seen[n] = {"error": str(e)[:120]}
+        tools()
         ca = sum(v[0] for v in procs.values())
         cb = sum(v[1] for v in procs.values())
         history.append((t, ca, cb))

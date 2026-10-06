@@ -109,6 +109,8 @@ struct VerifyArgs {
     /// Retries past a race with a flush deleting the checkpoint just read.
     #[arg(long, default_value_t = 5)]
     attempts: u32,
+    #[command(flatten)]
+    budget: vlrelay::qlog::budget::BudgetArgs,
 }
 
 #[derive(Parser)]
@@ -121,6 +123,8 @@ struct RetainArgs {
     /// Don't write `retain/qlog`, only print.
     #[arg(long)]
     dry_run: bool,
+    #[command(flatten)]
+    budget: vlrelay::qlog::budget::BudgetArgs,
     /// Delete what the report marks deletable (segments past the horizon,
     /// state paths nothing reads any more), re-checked against the manifest
     /// first; `pruned_seq` is raised before any segment goes.
@@ -295,7 +299,8 @@ struct CheckArgs {
     /// The load generator's summary (`load --out`): every event it sent
     /// must be emitted outside the recovery gaps.
     #[arg(long)]
-    load_summary: Option<String>,
+    load_summary: Option<String>,    #[command(flatten)]
+    budget: vlrelay::qlog::budget::BudgetArgs,
 }
 
 fn pairs(v: &[String]) -> anyhow::Result<Vec<(String, String)>> {
@@ -1121,7 +1126,9 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
                 s3_secret_key: std::env::var("QLOG_S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into()),
                 prefix: p.clone(),
             };
-            vlrelay::qlog::flush::read_manifest(&vlrelay::qlog::bucket::counted(&s3.store()?, "tool"))
+            let store = vlrelay::qlog::bucket::counted(&s3.store()?, "tool");
+            vlrelay::qlog::budget::start(&a.budget, store.clone())?;
+            vlrelay::qlog::flush::read_manifest(&store)
                 .await?
                 .map(|(m, _)| m.gaps)
                 .unwrap_or_default()
@@ -1179,6 +1186,7 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
 
 async fn verify(a: VerifyArgs) -> anyhow::Result<()> {
     let store = vlrelay::qlog::bucket::counted(&a.s3.store()?, "tool");
+    vlrelay::qlog::budget::start(&a.budget, store.clone())?;
     let mut tries = 0;
     let v = loop {
         tries += 1;
@@ -1201,6 +1209,7 @@ async fn verify(a: VerifyArgs) -> anyhow::Result<()> {
 async fn retain(a: RetainArgs) -> anyhow::Result<()> {
     use vlrelay::qlog::retain;
     let store = vlrelay::qlog::bucket::counted(&a.s3.store()?, "retain");
+    vlrelay::qlog::budget::start(&a.budget, store.clone())?;
     let Some(plan) = retain::plan(&store, Duration::from_secs(a.horizon_secs)).await? else {
         println!("no manifest");
         return Ok(());
