@@ -91,6 +91,9 @@ struct RunArgs {
     /// account re-announces its current key.
     #[arg(long, default_value_t = 0.0)]
     plc_tail_rate: f64,
+    /// Every Nth /export request answers 429 with Retry-After: 1 (0: never).
+    #[arg(long, default_value_t = 0)]
+    plc_throttle_every: u64,
     /// Events/s for this process, split over its hosts.
     #[arg(long, default_value_t = 10000.0)]
     rate: f64,
@@ -280,6 +283,7 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
         let hosts = a.plc_hosts.unwrap_or(a.host_base + a.hosts);
         // genesis ops a millisecond apart, the last one a minute ago
         let plc = export::FakePlc::new(layout.clone(), hosts, a.dids, export::now_ms() - 60_000, 1);
+        plc.throttle_every.store(a.plc_throttle_every, std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(axum::serve(lis, plc.router(a.plc_fallback.clone())).into_future());
         if a.plc_tail_rate > 0.0 && hosts > 0 && a.dids > 0 {
             let (rate, dids) = (a.plc_tail_rate, a.dids);

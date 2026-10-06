@@ -1150,7 +1150,6 @@ PHASE7_CHAOS
 
 ### What's left
 
-- **PLC export on the log:** the leader reads plc.directory's `/export` as a background job and seeds an identity cache in the bucket (Phase 7's last slice).
 - **Learners at F:** a new box could start at F and read below it from the bucket, rather than copying the leader's local log, or the catch-up could be rate-limited, for 0.5-1 Gb/s ports.
 - **Parallel segment PUTs** for 100x flushes on R2 (and, if the PUT count matters there, cutting segments by compressed size).
 - **The sync API's repo endpoints on followers** (the records are the leader's).

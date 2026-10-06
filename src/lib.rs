@@ -5,6 +5,7 @@ pub mod admin;
 pub mod event;
 pub mod identity;
 pub mod node;
+pub mod plc_seed;
 pub mod policy;
 pub mod qlog;
 pub mod serve;

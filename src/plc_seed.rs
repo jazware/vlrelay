@@ -1,0 +1,475 @@
+//! DID documents in bulk from the PLC directory's `/export`, so a cold relay
+//! doesn't resolve its ~56M accounts one lookup at a time.
+//!
+//! The quorum log's leader reads the export as a background job ([`job`]):
+//! the history in a few windows side by side, then the live tail
+//! ([`ingest`]). Per did:plc it keeps the latest op's `#atproto` signing key,
+//! its `atproto_pds` endpoint, whether it's a tombstone, and the op's
+//! `createdAt`, in a SlateDB of its own in the bucket (`plc/seeds`, ~3 GB
+//! for 56M DIDs), with the export's cursors checkpointed beside it
+//! (`plc/export-checkpoint.json`) once the rows before them are flushed. A
+//! new leader opens the database as its writer (which fences the old
+//! leader's) and resumes from the checkpoint; ops read after it are read
+//! again, and newest-wins makes that harmless.
+//!
+//! The seeds are a cache, not the log's state: they stay out of
+//! `qlog/state`, so flushes, checkpoints, `verify` and bucket recovery never
+//! carry 3 GB of documents, and losing the last seconds of them at a
+//! takeover only costs a few PLC lookups.
+//!
+//! Every member reads the database ([`SeedReader`]). On a DID document cache
+//! miss the seed fills the cache without spending the PLC lookup budget;
+//! the leader also weighs it against the account's record ([`choose`]). A
+//! forced refresh (an `#identity`, a signature that fails against the
+//! seeded key, a host that doesn't match) still goes to PLC.
+//!
+//! Validation is deliberately thin: each line must be a well-formed op of a
+//! known type (vlpds's `plc::op_type`) for a valid did:plc, and nullified
+//! ops are skipped. The op chain isn't checked: every commit's signature is
+//! still checked against the seeded key, and a failure re-resolves from PLC.
+
+pub mod ingest;
+pub mod job;
+
+use crate::identity::{self, Identity};
+use crate::state::record::{HostKey, Record};
+use crate::types::Host;
+use crate::verify::SigningKey;
+use bytes::Bytes;
+use serde_json::Value as J;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use vlpds::store::Store;
+
+/// The seed database, under the relay's prefix.
+pub const SEEDS_PATH: &str = "plc/seeds";
+
+pub fn seed_key(did: &str) -> Vec<u8> {
+    match crate::state::record::plc_bytes(did) {
+        Some(b) => {
+            let mut k = Vec::with_capacity(16);
+            k.push(b'p');
+            k.extend_from_slice(&b);
+            k
+        }
+        None => [b"w".as_slice(), did.strip_prefix("did:").unwrap_or(did).as_bytes()].concat(),
+    }
+}
+
+/// One DID's latest export op, as kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seed {
+    /// The op's `createdAt`, unix ms: an older op never replaces a newer one.
+    pub created_ms: u64,
+    pub tombstone: bool,
+    /// Multicodec bytes of the `#atproto` key, as the state record keeps it.
+    pub key: Option<Bytes>,
+    /// The `atproto_pds` endpoint's host ([`identity::normalize_host`]).
+    pub pds: Option<String>,
+    /// The endpoint is `http://`: the host alone would read back as https,
+    /// and a local PDS (the dev network's) serves plain http only.
+    pub pds_http: bool,
+}
+
+const VERSION: u8 = 1;
+const F_TOMBSTONE: u8 = 1;
+const F_KEY: u8 = 2;
+const F_PDS: u8 = 4;
+const F_PDS_HTTP: u8 = 8;
+
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("corrupt seed row")]
+pub struct DecodeError;
+
+impl Seed {
+    pub fn encode(&self) -> Bytes {
+        let mut b = Vec::with_capacity(64);
+        let mut flags = 0;
+        if self.tombstone {
+            flags |= F_TOMBSTONE;
+        }
+        if self.key.is_some() {
+            flags |= F_KEY;
+        }
+        if self.pds.is_some() {
+            flags |= F_PDS;
+        }
+        if self.pds_http {
+            flags |= F_PDS_HTTP;
+        }
+        b.push(VERSION);
+        b.push(flags);
+        crate::state::record::put_varint(&mut b, self.created_ms);
+        if let Some(k) = &self.key {
+            b.push(k.len() as u8);
+            b.extend_from_slice(k);
+        }
+        if let Some(p) = &self.pds {
+            let p = &p.as_bytes()[..p.len().min(255)];
+            b.push(p.len() as u8);
+            b.extend_from_slice(p);
+        }
+        Bytes::from(b)
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Seed, DecodeError> {
+        let mut r = crate::state::record::Reader(b);
+        let d = |_| DecodeError;
+        if r.u8().map_err(d)? != VERSION {
+            return Err(DecodeError);
+        }
+        let flags = r.u8().map_err(d)?;
+        let created_ms = r.varint().map_err(d)?;
+        let key = if flags & F_KEY != 0 {
+            let n = r.u8().map_err(d)? as usize;
+            Some(Bytes::copy_from_slice(r.take(n).map_err(d)?))
+        } else {
+            None
+        };
+        let pds = if flags & F_PDS != 0 {
+            let n = r.u8().map_err(d)? as usize;
+            Some(std::str::from_utf8(r.take(n).map_err(d)?).map_err(|_| DecodeError)?.to_string())
+        } else {
+            None
+        };
+        Ok(Seed { created_ms, tombstone: flags & F_TOMBSTONE != 0, key, pds, pds_http: flags & F_PDS_HTTP != 0 })
+    }
+
+    fn usable(&self) -> bool {
+        !self.tombstone && self.key.is_some() && self.pds.is_some()
+    }
+
+    pub fn identity(&self, did: &str) -> Option<Identity> {
+        if !self.usable() {
+            return None;
+        }
+        let pds = self.pds.as_ref()?;
+        let mb = format!("z{}", bs58::encode(self.key.as_ref()?).into_string());
+        let k = SigningKey::from_multibase(&mb).ok()?;
+        Some(Identity {
+            did: did.to_string(),
+            signing_key: Some(k),
+            signing_key_multibase: Some(mb),
+            pds: Some(format!("{}://{pds}", if self.pds_http { "http" } else { "https" })),
+            pds_host: Some(Host(pds.clone())),
+            handle: None,
+        })
+    }
+
+    /// Whether a cached document made from `self` would differ from one
+    /// made from `other`.
+    fn differs(&self, other: &Seed) -> bool {
+        self.tombstone != other.tombstone
+            || self.key != other.key
+            || self.pds != other.pds
+            || self.pds_http != other.pds_http
+    }
+}
+
+/// One line of the export, parsed.
+#[derive(Clone, Debug)]
+pub struct ExportOp {
+    pub did: String,
+    pub created_at: String,
+    pub seed: Seed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum LineError {
+    Json,
+    Did,
+    CreatedAt,
+    Op,
+    /// Valid, but nullified by a later recovery op: not the DID's state.
+    Nullified,
+}
+
+/// Parses one export line. Only the checks the module doc names.
+pub fn parse_line(line: &[u8]) -> Result<ExportOp, LineError> {
+    let v: J = serde_json::from_slice(line).map_err(|_| LineError::Json)?;
+    let did = v.get("did").and_then(J::as_str).ok_or(LineError::Did)?;
+    if !vlpds::plc::valid_plc_did(did) {
+        return Err(LineError::Did);
+    }
+    let created_at = v.get("createdAt").and_then(J::as_str).ok_or(LineError::CreatedAt)?;
+    let created_ms = parse_ms(created_at).ok_or(LineError::CreatedAt)?;
+    if v.get("nullified").and_then(J::as_bool) == Some(true) {
+        return Err(LineError::Nullified);
+    }
+    let op = v.get("operation").ok_or(LineError::Op)?;
+    let ty = vlpds::plc::op_type(op, true).map_err(|_| LineError::Op)?;
+    let seed = match ty {
+        vlpds::plc::OpType::Tombstone => Seed { created_ms, tombstone: true, key: None, pds: None, pds_http: false },
+        vlpds::plc::OpType::Operation | vlpds::plc::OpType::LegacyCreate => {
+            let (key, pds) = if ty == vlpds::plc::OpType::LegacyCreate {
+                (op.get("signingKey"), op.get("service"))
+            } else {
+                (
+                    op.pointer("/verificationMethods/atproto"),
+                    op.pointer("/services/atproto_pds")
+                        .filter(|s| s.get("type").and_then(J::as_str) == Some("AtprotoPersonalDataServer"))
+                        .and_then(|s| s.get("endpoint")),
+                )
+            };
+            let pds = pds.and_then(J::as_str);
+            Seed {
+                created_ms,
+                tombstone: false,
+                key: key.and_then(J::as_str).and_then(did_key_bytes),
+                pds: pds.and_then(identity::normalize_host).map(|h| h.0),
+                pds_http: pds.is_some_and(|p| p.trim().get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://"))),
+            }
+        }
+    };
+    Ok(ExportOp { did: did.to_string(), created_at: created_at.to_string(), seed })
+}
+
+/// A `did:key:z…` as multicodec bytes, if it's a key the relay can verify with.
+fn did_key_bytes(k: &str) -> Option<Bytes> {
+    let mb = k.strip_prefix("did:key:")?;
+    SigningKey::from_multibase(mb).ok()?;
+    let raw = bs58::decode(mb.strip_prefix('z')?).into_vec().ok()?;
+    (raw.len() <= crate::state::record::MAX_KEY_LEN).then(|| Bytes::from(raw))
+}
+
+pub fn parse_ms(s: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().and_then(|t| u64::try_from(t.timestamp_millis()).ok())
+}
+
+pub fn format_ms(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .unwrap_or_default()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// What fills the cache on a miss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// The record's own document is fresher: fetch it (the record keeps a
+    /// host's hash, not its name).
+    Record,
+    Seed,
+    /// Ask PLC.
+    Resolve,
+}
+
+/// The state record against the seed. A record resolved within `ttl` wins
+/// unless the seed's op is newer. A seed of any age is used, unless the
+/// account shows a change since its op and the op is older than `ttl`: an
+/// `#identity` not resolved since (`fetched_at` 0), or a later resolve that
+/// found another key or PDS.
+pub fn choose(rec: Option<&Record>, seed: Option<&Seed>, now_s: u32, ttl_s: u32) -> Pick {
+    let rec_ok = rec.filter(|r| r.key.is_some() && r.pds.is_some());
+    let rec_fresh = rec_ok.filter(|r| r.fetched_at != 0 && now_s.saturating_sub(r.fetched_at) < ttl_s);
+    let Some(seed) = seed.filter(|s| s.usable()) else {
+        return if rec_fresh.is_some() { Pick::Record } else { Pick::Resolve };
+    };
+    let seed_s = (seed.created_ms / 1000) as u32;
+    if let Some(r) = rec_fresh {
+        // an op in the resolve's own second may postdate it
+        return if r.fetched_at > seed_s { Pick::Record } else { Pick::Seed };
+    }
+    let seed_old = now_s.saturating_sub(seed_s) >= ttl_s;
+    if let Some(r) = rec
+        && seed_old
+    {
+        if r.fetched_at == 0 {
+            return Pick::Resolve;
+        }
+        let moved = r.key.as_ref().map(|k| &k.0) != seed.key.as_ref() || r.pds != seed.pds.as_deref().map(HostKey::of);
+        if r.fetched_at > seed_s && moved {
+            return Pick::Resolve;
+        }
+    }
+    Pick::Seed
+}
+
+fn db_path(store: &Store) -> object_store::path::Path {
+    object_store::path::Path::from(format!("{}/{SEEDS_PATH}", store.prefix))
+}
+
+#[derive(Default, Debug)]
+pub struct Applied {
+    pub written: usize,
+    /// DIDs whose cached documents may now be stale.
+    pub changed: Vec<String>,
+}
+
+/// The leader's handle on the seed database: the only writer, fenced by
+/// the next leader's open.
+pub struct SeedWriter {
+    db: slatedb::Db,
+    /// Ops created after this (unix ms) may postdate a cached document of a
+    /// DID that had no seed yet, so writing them drops the cached copy.
+    recent_after_ms: u64,
+}
+
+impl SeedWriter {
+    pub async fn open(store: &Store, ttl: Duration) -> anyhow::Result<SeedWriter> {
+        // a few seconds of the tail fit one memtable; the backfill seals
+        // 64 MiB L0s as it goes
+        let db = slatedb::Db::builder(db_path(store), store.raw.clone())
+            .with_settings(crate::qlog::state::settings(64 << 20))
+            .build()
+            .await?;
+        let recent_after_ms = crate::policy::store::now_ms().saturating_sub(ttl.as_millis() as i64) as u64;
+        Ok(SeedWriter { db, recent_after_ms })
+    }
+
+    pub async fn get(&self, did: &str) -> anyhow::Result<Option<Seed>> {
+        match self.db.get(seed_key(did)).await? {
+            Some(b) => Ok(Some(Seed::decode(&b)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Writes the entries newer than what each DID has, to the memtable:
+    /// [`Self::flush`] makes them durable.
+    pub async fn apply(&self, ops: Vec<(String, Seed)>) -> anyhow::Result<Applied> {
+        let mut out = Applied::default();
+        let mut wb = slatedb::WriteBatch::new();
+        for (did, seed) in &ops {
+            let k = seed_key(did);
+            let prev = match self.db.get(&k).await? {
+                Some(b) => Seed::decode(&b).ok(),
+                None => None,
+            };
+            if prev.as_ref().is_some_and(|p| p.created_ms >= seed.created_ms) {
+                continue;
+            }
+            let changed = match &prev {
+                Some(p) => p.differs(seed),
+                None => seed.created_ms > self.recent_after_ms,
+            };
+            if changed {
+                out.changed.push(did.clone());
+            }
+            wb.put(k, seed.encode());
+            out.written += 1;
+        }
+        // SlateDB refuses an empty batch
+        if out.written > 0 {
+            self.db.write(wb).await?;
+        }
+        Ok(out)
+    }
+
+    /// Makes every applied entry durable (the database runs without a WAL).
+    pub async fn flush(&self) -> anyhow::Result<()> {
+        self.db
+            .flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn close(&self) {
+        if let Err(e) = self.db.close().await {
+            tracing::debug!("closing the PLC seed database: {e:#}");
+        }
+    }
+}
+
+/// Every member's read side of the seed database, opened once the leader
+/// has made it, following its latest manifest (seeds a compaction removed
+/// under a read come back as a miss, and the cache fetches).
+pub struct SeedReader {
+    store: Store,
+    reader: tokio::sync::RwLock<Option<Arc<slatedb::DbReader>>>,
+    tried: parking_lot::Mutex<Option<Instant>>,
+    /// The leader's writer, for its own fresh rows.
+    pub writer: parking_lot::RwLock<Option<Arc<SeedWriter>>>,
+}
+
+/// How often a member retries opening the database before it exists, and
+/// how often an open reader looks for the writer's new manifests.
+const READER_POLL: Duration = Duration::from_secs(30);
+
+impl SeedReader {
+    pub fn new(store: Store) -> Arc<SeedReader> {
+        Arc::new(SeedReader {
+            store,
+            reader: Default::default(),
+            tried: Default::default(),
+            writer: Default::default(),
+        })
+    }
+
+    async fn reader(&self) -> Option<Arc<slatedb::DbReader>> {
+        if let Some(r) = self.reader.read().await.clone() {
+            return Some(r);
+        }
+        {
+            let mut t = self.tried.lock();
+            if t.is_some_and(|at| at.elapsed() < READER_POLL) {
+                return None;
+            }
+            *t = Some(Instant::now());
+        }
+        let mut w = self.reader.write().await;
+        if let Some(r) = w.clone() {
+            return Some(r);
+        }
+        let opts = slatedb::config::DbReaderOptions {
+            manifest_poll_interval: READER_POLL,
+            skip_wal_replay: true,
+            ..Default::default()
+        };
+        match slatedb::DbReader::builder(db_path(&self.store), self.store.raw.clone())
+            .with_options(opts)
+            .with_reader_mode(slatedb::DbReaderMode::FollowLatest)
+            .build()
+            .await
+        {
+            Ok(r) => {
+                let r = Arc::new(r);
+                *w = Some(r.clone());
+                Some(r)
+            }
+            Err(e) => {
+                tracing::debug!("the PLC seed database isn't readable yet: {e}");
+                None
+            }
+        }
+    }
+
+    pub async fn get(&self, did: &str) -> Option<Seed> {
+        let writer = self.writer.read().clone();
+        if let Some(w) = writer {
+            return w.get(did).await.ok().flatten();
+        }
+        let r = self.reader().await?;
+        match r.get(seed_key(did)).await {
+            Ok(Some(b)) => Seed::decode(&b).ok(),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::debug!(did, "reading a PLC seed: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// The identity cache's seeder on every member: the seed, weighed against
+/// the account's record where this node holds it (the leader).
+pub struct Seeder {
+    pub seeds: Arc<SeedReader>,
+    pub state: Arc<crate::node::State>,
+    pub ttl: Duration,
+}
+
+impl identity::Seeder for Seeder {
+    fn seed<'a>(&'a self, did: &'a str) -> futures::future::BoxFuture<'a, Option<Identity>> {
+        Box::pin(async move {
+            let seed = self.seeds.get(did).await?;
+            let rec = self.state.get(did).await.ok().flatten();
+            let now = crate::state::now_secs();
+            match choose(rec.as_deref(), Some(&seed), now, self.ttl.as_secs() as u32) {
+                Pick::Seed => seed.identity(did),
+                Pick::Record | Pick::Resolve => None,
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests;

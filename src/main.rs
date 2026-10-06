@@ -50,6 +50,22 @@ struct Args {
     prefix: String,
     #[arg(long, default_value = "https://plc.directory", env = "VLRELAY_PLC_URL")]
     plc_url: String,
+    /// Seed DID documents in bulk from the PLC directory's /export: the
+    /// quorum log's leader reads the history, then follows the tail, into a
+    /// database in the bucket every member reads, so a cold relay doesn't
+    /// resolve each account.
+    #[arg(long, env = "VLRELAY_PLC_EXPORT", value_parser = clap::builder::BoolishValueParser::new())]
+    plc_export: bool,
+    /// The directory --plc-export reads (default: --plc-url).
+    #[arg(long, env = "VLRELAY_PLC_EXPORT_URL")]
+    plc_export_url: Option<String>,
+    /// /export requests per second, all streams together (a 429 waits out
+    /// its Retry-After on top).
+    #[arg(long, default_value_t = 2.0)]
+    plc_export_rate: f64,
+    /// Time windows of the export read side by side on a fresh start.
+    #[arg(long, default_value_t = 4)]
+    plc_export_streams: usize,
     /// zstd level for log segments: 0 stores them uncompressed, negative
     /// levels are zstd's fast ones. Firehose frames are mostly hashes:
     /// on production frames -1 compresses 1.8x faster than 1 for 0.6% more
@@ -327,7 +343,14 @@ async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<
         cfg.identity.lookups_per_sec = cfg.identity.lookups_per_sec.max(1000.0);
         cfg.identity.burst = cfg.identity.burst.max(1000.0);
     }
-    let q = quorum_setup(&a.quorum, &a.node_id)?;
+    let mut q = quorum_setup(&a.quorum, &a.node_id)?;
+    if a.plc_export {
+        let mut pc = vlrelay::plc_seed::ingest::Config::new(a.plc_export_url.as_deref().unwrap_or(&a.plc_url));
+        anyhow::ensure!(a.plc_export_rate > 0.0, "--plc-export-rate must be above 0");
+        pc.rate = a.plc_export_rate;
+        pc.streams = a.plc_export_streams.max(1);
+        q.plc_export = Some(pc);
+    }
     let node = Node::start(store, cfg, q).await?;
 
     let admin = vlrelay::qlog::emit::Admin::for_listener(a.quorum.qlog_admin_token.clone(), a.listen);

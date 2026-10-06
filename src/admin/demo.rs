@@ -1609,6 +1609,51 @@ impl AdminSource for Demo {
         })
     }
 
+    async fn plc_view(&self) -> AdminResult<PlcView> {
+        let (leader, ..) = self.extra.lock().roles();
+        let now = self.sim.lock().now_ms;
+        let start = 1_668_643_200_000i64;
+        let windows: Vec<PlcWindow> = (0..4)
+            .map(|k| {
+                let from = start + (now - start) * k / 4;
+                let until = (k < 3).then(|| start + (now - start) * (k + 1) / 4 - 1);
+                PlcWindow {
+                    from_ms: from,
+                    after_ms: until.unwrap_or(now - 1_200),
+                    until_ms: until,
+                    ops: 19_000_000 + 1_300_000 * k as u64,
+                    done: k < 3,
+                    progress: 1.0,
+                }
+            })
+            .collect();
+        let ops = windows.iter().map(|w| w.ops).sum();
+        Ok(PlcView {
+            enabled: true,
+            leader: Some(leader.clone()),
+            caught_up: true,
+            ops,
+            ops_per_sec: round2(9.0 + (now / 1000 % 7) as f64),
+            written: ops - ops / 9,
+            requests: ops / 1000 + 4_200,
+            throttled: 37,
+            errors: 2,
+            restarts: 1,
+            newest_ms: now - 1_200,
+            windows,
+            checkpoint_ms: now - (now % 10_000),
+            nodes: vec![PlcNode {
+                node: leader,
+                stale: false,
+                leader: true,
+                ops,
+                ops_per_sec: 11.0,
+                throttled: 37,
+                errors: 2,
+            }],
+        })
+    }
+
     async fn cluster(&self) -> AdminResult<ClusterView> {
         let s = self.sim.lock();
         let (leader, epoch, members, learners) = self.extra.lock().roles();
@@ -1868,6 +1913,9 @@ mod tests {
         let q = d.quorum().await.unwrap();
         let st = q.nodes.iter().filter_map(|n| n.status.as_ref()).find(|s| s["role"] == "leader").unwrap();
         assert!(st["flush"]["last_at_ms"].as_i64().unwrap() > 0);
+        let p = json(call("GET", "/admin/api/ops/plc", true).await.unwrap()).await;
+        assert_eq!(p["enabled"], true);
+        assert_eq!(p["windows"].as_array().unwrap().len(), 4);
     }
 
     #[tokio::test]

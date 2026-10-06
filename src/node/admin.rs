@@ -822,7 +822,13 @@ impl AdminSource for NodeAdmin {
     }
 
     async fn plc_view(&self) -> AdminResult<admin::PlcView> {
-        Ok(fleet::plc_view(&self.members().await))
+        let Some(r) = self.node.quorum.plc_report().await else {
+            return Ok(admin::PlcView { enabled: self.node.quorum.plc.is_some(), ..Default::default() });
+        };
+        let leader = self.node.quorum.qnode.status().leader;
+        let member =
+            Member::ok(NodeReport { node: leader.clone().unwrap_or_default(), plc: Some(r), ..Default::default() });
+        Ok(fleet::plc_view(&[member]))
     }
 
     async fn admissions(&self) -> AdminResult<admin::AdmissionLog> {

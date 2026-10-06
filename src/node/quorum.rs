@@ -92,6 +92,9 @@ pub struct QuorumSetup {
     pub power_cut_on_usr1: bool,
     /// Chaos: sleep this long before each commitlog fsync.
     pub fsync_delay: Option<Duration>,
+    /// The leader reads the PLC directory's export into the seed database
+    /// (`plc_seed`), and every member seeds its DID documents from it.
+    pub plc_export: Option<crate::plc_seed::ingest::Config>,
 }
 
 impl QuorumSetup {
@@ -119,6 +122,7 @@ impl QuorumSetup {
             crash: None,
             power_cut_on_usr1: false,
             fsync_delay: None,
+            plc_export: None,
         }
     }
 }
@@ -415,6 +419,8 @@ pub struct RelayHooks {
     /// This node's own numbers (rates, hosts read, consumers, CPU), for the
     /// status other members' dashboards read.
     local: Mutex<serde_json::Value>,
+    /// The PLC export job, for `leader:plc`.
+    pub plc: std::sync::OnceLock<Arc<crate::plc_seed::job::PlcJob>>,
     /// Tests: each decision of every other batch (at random) takes this
     /// long (µs), as a batch with slow identity lookups does.
     #[cfg(test)]
@@ -460,6 +466,7 @@ impl RelayHooks {
             me: me.clone(),
             stats: HookStats::default(),
             local: Mutex::new(serde_json::Value::Null),
+            plc: std::sync::OnceLock::new(),
             #[cfg(test)]
             slow_us: AtomicU64::new(0),
         })
@@ -1125,6 +1132,13 @@ impl Hooks for RelayHooks {
                     let table = t.inner.lock().hosts.clone();
                     serde_json::to_vec(&table).ok().map(Bytes::from)
                 }
+                "leader:plc" => {
+                    let r = match self.plc.get() {
+                        Some(j) => j.report().await,
+                        None => None,
+                    };
+                    serde_json::to_vec(&r).ok().map(Bytes::from)
+                }
                 "leader:throttled" => {
                     let t = self.term.read().clone()?;
                     let host = std::str::from_utf8(&body).ok()?;
@@ -1581,6 +1595,7 @@ pub struct Glue {
     pub hosts: Arc<QuorumHosts>,
     pub shared: Arc<Shared>,
     pub setup: QuorumSetup,
+    pub plc: Option<Arc<crate::plc_seed::job::PlcJob>>,
     manager: std::sync::OnceLock<Arc<Manager>>,
     filter: watch::Sender<HostFilter>,
     owned: Mutex<HashSet<Host>>,
@@ -1822,6 +1837,17 @@ pub async fn release_throttled(client: &Client, from: &str, host: &str) -> anyho
 }
 
 impl Glue {
+    /// The PLC export as the leader reports it (None: no export, or the
+    /// leader didn't answer).
+    pub async fn plc_report(&self) -> Option<crate::admin::fleet::PlcReport> {
+        let j = self.plc.as_ref()?;
+        if let Some(r) = j.report().await {
+            return Some(r);
+        }
+        let b = self.client.ask_leader("leader:plc", Bytes::new(), Duration::from_secs(2)).await.ok()?;
+        serde_json::from_slice::<Option<crate::admin::fleet::PlcReport>>(&b).ok().flatten()
+    }
+
     /// Lifts the relay throttle of every account `host` created that has one
     /// (indigo lifts them when a host's cap is raised): the leader lists
     /// them, and each goes through its log with the `#account` announcing
@@ -1962,6 +1988,16 @@ impl Node {
             Arc::new(super::adapters::CacheIdentity(identity.clone())),
             state::ApplyConfig::default(),
         ));
+        let plc = q.plc_export.clone().map(|c| {
+            let st = crate::qlog::bucket::counted(&store, "plc");
+            let seeds = crate::plc_seed::SeedReader::new(st.clone());
+            identity.set_seeder(Arc::new(crate::plc_seed::Seeder {
+                seeds: seeds.clone(),
+                state: state.clone(),
+                ttl: cfg.identity.ttl,
+            }));
+            crate::plc_seed::job::PlcJob::new(c, st, seeds, identity.clone())
+        });
         let bucket = Bucket::new(store.clone());
         let memory = q.memory_bytes.unwrap_or(if q.commitlog.is_some() { 64 << 20 } else { 512 << 20 });
         let (durability, recovered): (Arc<dyn qn::Durability>, _) = match &q.commitlog {
@@ -2035,6 +2071,10 @@ impl Node {
             qn::Node::start(qc, bucket, listener, emitter, Arc::new(qn::Faults::default()), durability, recovered)
                 .await?;
         let _ = hooks.node.set(Arc::downgrade(&qnode));
+        if let Some(j) = &plc {
+            let _ = hooks.plc.set(j.clone());
+            tokio::spawn(j.clone().run(Arc::downgrade(&qnode)));
+        }
         let mut nodes: Vec<(String, String)> = q.peers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         nodes.push((id.clone(), format!("127.0.0.1:{}", local_addr.port())));
         nodes.sort();
@@ -2083,6 +2123,7 @@ impl Node {
                 hosts: hosts.clone(),
                 shared: shared.clone(),
                 setup: q.clone(),
+                plc: plc.clone(),
                 manager: std::sync::OnceLock::new(),
                 filter: filter_tx,
                 owned: Mutex::new(HashSet::new()),

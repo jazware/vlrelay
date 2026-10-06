@@ -24,7 +24,7 @@
 # host failover (2 s): its hosts move to the others, with their cursors.
 #
 # Env: RQ_BASE (3550: B+1..9 peer, B+11..19 http, B+29 proxy control, B+40
-# MinIO, B+45 the fake PLC, B+50.. proxy routes, B+100.. fakepds hosts),
+# MinIO, B+45 the fake PLC, B+50.. proxy routes (up to B+130 with 9 slots), B+200.. fakepds hosts),
 # FLUSH_MS (2000), HEADROOM (100M), CL_DIR (OUT: the commitlogs; /dev/shm
 # for no fsync cost), FSYNC_DELAY_US, RESTART_SEC (1), QLOG_PROFILE
 # (dev-release), RQ_NO_BUILD=1, KEEP=1, OUT (dev/state-relayq-$B/<scenario>),
@@ -32,6 +32,13 @@
 # RETAIN_SECS (bucket retention's horizon in the leader's loop; off unset),
 # RQ_CRATE (the crate, when this script runs from a copy), RETAIN_EVERY (60), STATE_POLL_MS (the state's compactor poll: 5000 under
 # 10 s flushes, else 30000), RELAY_LOG (RUST_LOG for the relays).
+#
+# PLC_EXPORT=1 runs the PLC export on the leader against the fake PLC's
+# /export: PLC_HOSTS (1000) hosts of --dids accounts in its history,
+# PLC_RATE (4) requests a second, and every PLC_THROTTLE_EVERY'th (6)
+# answered 429. The run fails unless the leader at the end has read the
+# whole export (caught up), whatever the faults did to the leaders that
+# read it before.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 # RQ_CRATE: a copy of this script elsewhere (so editing it can't cut a
@@ -74,7 +81,7 @@ ctl=$((B + 29))
 route() { echo $((B + 50 + S * ($1 - 1) + $2 - 1)); } # i dials j here
 minio=$((B + 40))
 fake_plc=$((B + 45))
-fake_base=$((B + 100))
+fake_base=$((B + 200))
 proxy=${PROXY:-1}
 export COMPOSE_PROJECT_NAME=vlrq-relay-$B MINIO_PORT=$minio
 
@@ -125,7 +132,9 @@ fi
 gen_threads=$(( rate > 2000 ? 8 : 2 ))
 "$target/fakepds" run --seed "relayq$B" --port-base "$fake_base" --hosts "$fake_hosts" --dids "$dids" --rate "$rate" \
   --gen-threads "$gen_threads" --plc-port "$fake_plc" --replay-mb 256 --lag-secs 30 \
-  --initial-records 20 --target-records 60 --stats-secs 30 >"$out/fakepds.log" 2>&1 &
+  --initial-records 20 --target-records 60 --stats-secs 30 \
+  $([ "${PLC_EXPORT:-}" = 1 ] && echo "--plc-hosts ${PLC_HOSTS:-1000} --plc-throttle-every ${PLC_THROTTLE_EVERY:-6}") \
+  >"$out/fakepds.log" 2>&1 &
 pids+=($!)
 for _ in $(seq 1 600); do grep -q READY "$out/fakepds.log" && break; sleep 0.2; done
 grep -q READY "$out/fakepds.log" || { echo "relay chaos: fakepds didn't come up" >&2; tail "$out/fakepds.log" >&2; exit 1; }
@@ -148,6 +157,7 @@ supervise() {
   # 2 s flushes add an L0 each; at the 30 s default poll they outrun the
   # compactor and seals wait for L0 room
   extra+=(--qlog-state-compactor-poll-ms "${STATE_POLL_MS:-$(( flush_ms < 10000 ? 5000 : 30000 ))}")
+  [ "${PLC_EXPORT:-}" = 1 ] && extra+=(--plc-export --plc-export-rate "${PLC_RATE:-4}" --admin-token relayq)
   [ -n "$crash_at" ] && extra+=(--qlog-crash-at "$crash_at" --qlog-crash-prob "$crash_prob" --qlog-crash-stop-file "$out/no-more-crashes")
   if [ -n "${RETAIN_SECS:-}" ]; then
     extra+=(--qlog-retain-secs "$RETAIN_SECS" --qlog-retain-every-secs "${RETAIN_EVERY:-60}")
@@ -409,6 +419,10 @@ grow_shrink() {
 durable_kinds="kill-leader kill-follower kill-two kill-all power-cut-leader power-cut-all partition-leader pause-leader down-follower partition-follower"
 wipe_kinds="kill-leader kill-two kill-all power-cut-all wipe-all wipe-two wipe-two partition-leader"
 sleep "$every"
+# injected crashes stop when the faults do: the hosts of a node that dies
+# at the very end need the failover and a reconnect before the fleet stops
+( sleep $(( duration > 12 ? duration - 12 - ($(date +%s) - load_start) : 0 )) 2>/dev/null; touch "$out/no-more-crashes" ) &
+pids+=($!)
 while [ $(($(date +%s) - load_start + 12)) -lt "$duration" ] && [ "$scenario" != baseline ]; do
   case $scenario in
     mixed-durable | mixed-flush) set -- $durable_kinds; shift $((RANDOM % 10)); k=$1 ;;
@@ -443,6 +457,24 @@ vrc=$?
 [ $vrc = 0 ] || { echo "relay chaos: the final manifest is inconsistent" >&2; rc=1; }
 grep -q "verify FAILED" "$out/events.log" && { echo "relay chaos: a mid-run verify failed" >&2; rc=1; }
 grep -q "switch-FAILED" "$out/events.log" && { echo "relay chaos: a membership change never landed" >&2; rc=1; }
+if [ "${PLC_EXPORT:-}" = 1 ]; then
+  for i in $started; do
+    curl -sf --max-time 5 -u admin:relayq "http://127.0.0.1:$(http "$i")/admin/api/ops/plc" >"$out/plc-n$i.json" || echo '{}' >"$out/plc-n$i.json"
+  done
+  python3 - "$out" $started <<'PY' || rc=1
+import json, sys
+out, ids = sys.argv[1], sys.argv[2:]
+views = {i: json.load(open(f"{out}/plc-n{i}.json")) for i in ids}
+lead = [v for v in views.values() if v.get("leader")]
+v = lead[0] if lead else {}
+print(f"plc export: leader {v.get('leader')} caught up {v.get('caughtUp')} ops {v.get('ops')} written {v.get('written')} "
+      f"requests {v.get('requests')} throttled {v.get('throttled')} restarts {v.get('restarts')} "
+      f"windows {[(w['ops'], w['done']) for w in v.get('windows', [])]}")
+if not v.get("caughtUp"):
+    print("relay chaos: the PLC export never caught up", file=sys.stderr)
+    sys.exit(1)
+PY
+fi
 missing=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("missing", -1))' "$out/e2e.json" 2>/dev/null || echo -1)
 [ "$missing" = 0 ] || { echo "relay chaos: e2e_check: $missing upstream events missing from the relay" >&2; rc=1; }
 set -e

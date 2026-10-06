@@ -160,8 +160,9 @@ page) with no migration. See [Cluster](cluster.md#changing-the-members) and
 
 ## What isn't built
 
-- Seeding the identity cache from the PLC directory's export isn't built yet, so a cold relay
-  resolves each account at the PLC budget.
+- With `--plc-export`, a cold relay seeds its DID documents from the PLC directory's export, which
+  at 2 requests a second takes about 11 hours for today's ~80M ops. Without it, each account is
+  resolved once at the PLC budget.
 - The sync API's repo endpoints answer on the leader, and a follower names it.
 - There are no alert rules, Grafana dashboards or Ansible kit for vlRelay yet, and no published
   image. [Operations](operations/index.md) says what there is.

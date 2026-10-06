@@ -40,6 +40,10 @@ pub struct FakePlc {
     pub afters: parking_lot::Mutex<Vec<String>>,
     /// Requests answered 503 before serving again.
     pub fail_next: AtomicU64,
+    /// Every Nth `/export` request is a 429 with `Retry-After: 1`, as
+    /// plc.directory's rate limit answers (0: never).
+    pub throttle_every: AtomicU64,
+    pub throttled: AtomicU64,
 }
 
 pub fn now_ms() -> u64 {
@@ -83,6 +87,8 @@ impl FakePlc {
             export_requests: AtomicU64::new(0),
             afters: Default::default(),
             fail_next: AtomicU64::new(0),
+            throttle_every: AtomicU64::new(0),
+            throttled: AtomicU64::new(0),
         })
     }
 
@@ -196,7 +202,12 @@ struct ExportQuery {
 type S = State<(Arc<FakePlc>, Option<String>, reqwest::Client)>;
 
 async fn export(State((p, _, _)): S, Query(q): Query<ExportQuery>) -> Response {
-    p.export_requests.fetch_add(1, Relaxed);
+    let n = p.export_requests.fetch_add(1, Relaxed) + 1;
+    let every = p.throttle_every.load(Relaxed);
+    if every > 0 && n % every == 0 {
+        p.throttled.fetch_add(1, Relaxed);
+        return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "1")]).into_response();
+    }
     if p.fail_next.load(Relaxed) > 0 {
         p.fail_next.fetch_sub(1, Relaxed);
         return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "0")]).into_response();

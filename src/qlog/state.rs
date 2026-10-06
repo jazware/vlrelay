@@ -82,7 +82,7 @@ fn compactor_poll() -> Duration {
     Duration::from_millis(COMPACTOR_POLL_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-fn settings(l0_bytes: usize) -> slatedb::Settings {
+pub(crate) fn settings(l0_bytes: usize) -> slatedb::Settings {
     let poll = compactor_poll();
     slatedb::Settings {
         wal_enabled: false,

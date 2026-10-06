@@ -19,7 +19,7 @@ SECTIONS = [
         "Upstreams and identity",
         "`--host` and `--crawl` work on any member: a host admitted anywhere goes into the leader's host table, "
         "and the leader gives it to a member.",
-        ["host", "crawl", "host-tier", "plc-url", "dev-mode", "did-lookups-per-sec"],
+        ["host", "crawl", "host-tier", "plc-url", "plc-export", "plc-export-url", "plc-export-rate", "plc-export-streams", "dev-mode", "did-lookups-per-sec"],
     ),
     ("Pipeline and serving", "", ["lanes", "ingest-threads", "host-inflight-events", "host-inflight-mb", "inflight-events", "inflight-mb", "ring-mb", "max-lag-mb", "log-compression"]),
     (
@@ -105,7 +105,14 @@ def parse(text):
         elif s == "Possible values:":
             pass
         else:
-            cur["help"].append(s)
+            # a one-line help ends with its tags
+            if m := re.search(r"\s*\[env: ([A-Z0-9_]+)=?[^\]]*\]", s):
+                cur["env"] = m.group(1)
+                s = s[: m.start()] + s[m.end():]
+            if m := re.search(r"\s*\[default: ([^\]]*)\]", s):
+                cur["default"] = m.group(1)
+                s = s[: m.start()] + s[m.end():]
+            cur["help"].append(s.strip())
     for f in ("help", "version"):
         flags.pop(f, None)
     return flags

@@ -251,8 +251,10 @@ carries the `#account`, so it commits like any event. Every node polls `policy/t
   defaults ([Subscribe to the firehose](subscribing.md#falling-behind)).
 - A relay-throttled account stays throttled until an operator lifts it, even after its host drops
   below its cap or its cap is raised.
-- A cold start resolves every account once at the PLC budget, about 31 hours for 56M accounts at
-  500/s. Seeding identities from the PLC directory's export isn't built on the quorum log yet.
+- Without `--plc-export`, a cold start resolves every account once at the PLC budget, about 31
+  hours for 56M accounts at 500/s. With it, the leader reads the directory's export at
+  `--plc-export-rate` (2 requests a second, ~11 hours for the history) and a seed fills a cache
+  miss without a lookup; a forced refresh (an `#identity`, a signature that fails) still asks PLC.
 - The account cap and the per-host new-account rate are counted on the leader and aren't in the
   bucket's host table, so they start over at a takeover.
 - Peers aren't nudged after a save. They pick changes up within 10 s, and a takedown reaches other

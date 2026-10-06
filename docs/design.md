@@ -114,8 +114,11 @@ expects relays to recover.
 
 DID documents come from PLC (and `did:web`) through a cache with a cluster-wide budget
 (`cluster.plcLookupsPerSec`, 500 a second by default). A cold relay resolves each of ~56M accounts
-once at that budget, about 31 hours. Seeding the cache from the PLC directory's export would cut
-that, and it isn't built yet.
+once at that budget, about 31 hours. With `--plc-export` the leader reads the PLC directory's
+`/export` instead (the history, then the tail) into a seed database in the bucket that every
+member reads, so a cache miss is a bucket read rather than a lookup. The seeds are a cache, kept
+out of the log's state: a new leader resumes the export from its checkpoint, and losing the last
+seconds of seeds at a takeover costs a few lookups.
 
 ## Staying available
 
