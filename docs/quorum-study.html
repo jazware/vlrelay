@@ -1,0 +1,435 @@
+<title>vlRelay Quorum Study</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Instrument+Serif&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: the vlRelay design doc's reading column (~68ch) with full-width figures and tables, a sticky section nav on wide screens. */
+:root {
+  --bg: #f5f6f4;
+  --surface: #ffffff;
+  --fg: #1b2024;
+  --muted: #5d676e;
+  --rule: #d9ddd9;
+  --accent: #1f6f78;
+  --accent-soft: #e2efef;
+  --warn: #9a5b12;
+  --warn-soft: #f6ecdd;
+  --ok: #2f6b3a;
+  --ok-soft: #e4f0e4;
+  --bad: #a33a2c;
+  --font-display: "Instrument Serif", Georgia, "Times New Roman", serif;
+  --font-body: "Instrument Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12171a; --surface: #192025; --fg: #e3e8ea; --muted: #97a3aa; --rule: #2b353b;
+    --accent: #6cc2c9; --accent-soft: #1b3236; --warn: #e2a35a; --warn-soft: #33281b;
+    --ok: #8ccf97; --ok-soft: #1c2f20; --bad: #ef8a7a; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #12171a; --surface: #192025; --fg: #e3e8ea; --muted: #97a3aa; --rule: #2b353b;
+  --accent: #6cc2c9; --accent-soft: #1b3236; --warn: #e2a35a; --warn-soft: #33281b;
+  --ok: #8ccf97; --ok-soft: #1c2f20; --bad: #ef8a7a; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 16px; line-height: 1.6; padding-inline: 16px; padding-block: 0 64px; }
+.wrap { max-width: 1100px; margin: 0 auto; display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 48px; }
+nav.toc { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 24px); align-self: start; padding-top: 40px; font-size: 13px; }
+nav.toc a { display: block; color: var(--muted); text-decoration: none; padding: 3px 0; }
+nav.toc a:hover, nav.toc a:focus-visible { color: var(--accent); }
+nav.toc .label { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+main { min-width: 0; }
+header.top { padding-top: 40px; padding-bottom: 8px; border-bottom: 1px solid var(--rule); margin-bottom: 8px; }
+.eyebrow { font-family: var(--font-mono); font-size: 12px; color: var(--accent); letter-spacing: .04em; }
+h1 { font-family: var(--font-display); font-weight: 400; font-size: clamp(40px, 6vw, 60px); line-height: 1.05; margin: 8px 0 12px; text-wrap: balance; }
+h2 { font-family: var(--font-display); font-weight: 400; font-size: 32px; line-height: 1.15; margin: 48px 0 8px; text-wrap: balance; scroll-margin-top: 24px; }
+h3 { font-size: 17px; font-weight: 600; margin: 28px 0 4px; text-wrap: balance; }
+p, li { max-width: 68ch; }
+p { margin: 10px 0; }
+.lede { font-size: 18px; }
+.meta { color: var(--muted); font-size: 14px; }
+code { font-family: var(--font-mono); font-size: .86em; background: var(--accent-soft); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+a { color: var(--accent); }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+ul, ol { padding-left: 20px; }
+li { margin: 4px 0; }
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 8px; overflow: hidden; margin: 20px 0; }
+.stat { background: var(--surface); padding: 14px 16px; min-width: 0; }
+.stat b { display: block; font-family: var(--font-display); font-weight: 400; font-size: 30px; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.stat .was { font-family: var(--font-mono); font-size: 12px; color: var(--muted); text-decoration: line-through; }
+.stat span { display: block; font-size: 13px; color: var(--muted); }
+.tablewrap { overflow-x: auto; margin: 16px 0; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; vertical-align: top; padding: 8px 12px; border-bottom: 1px solid var(--rule); }
+th { font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); font-weight: 600; background: var(--bg); }
+td { font-variant-numeric: tabular-nums; }
+tr:last-child td { border-bottom: 0; }
+tr.hl td { background: var(--accent-soft); }
+tr.bench td { background: var(--warn-soft); }
+td.no { color: var(--muted); font-size: 13px; }
+figure { margin: 20px 0; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 16px; }
+.svgscroll { overflow-x: auto; }
+figure svg { width: 100%; min-width: 600px; height: auto; display: block; }
+figcaption { font-size: 13.5px; color: var(--muted); margin-top: 10px; max-width: 74ch; }
+.decision { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 16px 0; }
+.caveat { border-left: 3px solid var(--warn); background: var(--warn-soft); padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 16px 0; }
+.steps { counter-reset: s; list-style: none; padding: 0; display: grid; gap: 8px; }
+.steps li { counter-increment: s; display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 8px; max-width: none; }
+.steps li::before { content: counter(s); font-family: var(--font-display); font-size: 24px; line-height: 1.1; color: var(--accent); }
+/* SVG parts, all from tokens */
+.d-box { fill: var(--surface); stroke: var(--rule); stroke-width: 1.5; }
+.d-lead { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+.d-bucket { fill: var(--warn-soft); stroke: var(--warn); stroke-width: 1.5; }
+.d-dim { fill: var(--bg); stroke: var(--rule); stroke-width: 1.5; stroke-dasharray: 4 3; }
+.d-t { fill: var(--fg); font-family: var(--font-body); font-size: 14px; font-weight: 600; }
+.d-s { fill: var(--muted); font-family: var(--font-body); font-size: 12px; }
+.d-m { fill: var(--muted); font-family: var(--font-mono); font-size: 11px; }
+.d-a { fill: var(--accent); font-family: var(--font-body); font-size: 12px; font-weight: 600; }
+.d-w { fill: var(--warn); font-family: var(--font-body); font-size: 12px; font-weight: 600; }
+.d-x { fill: var(--bad); font-family: var(--font-body); font-size: 12px; font-weight: 600; }
+.d-line { stroke: var(--muted); stroke-width: 1.5; fill: none; }
+.d-acc { stroke: var(--accent); stroke-width: 2; fill: none; }
+.d-ack { stroke: var(--accent); stroke-width: 1.5; fill: none; stroke-dasharray: 5 4; }
+.d-wline { stroke: var(--warn); stroke-width: 2; fill: none; }
+.d-bad { stroke: var(--bad); stroke-width: 1.5; fill: none; stroke-dasharray: 5 4; }
+.d-head-m { fill: var(--muted); }
+.d-head-a { fill: var(--accent); }
+.d-head-w { fill: var(--warn); }
+.d-head-x { fill: var(--bad); }
+.d-seg-ok { fill: var(--ok-soft); stroke: var(--ok); stroke-width: 1.2; }
+.d-seg-lost { fill: var(--warn-soft); stroke: var(--warn); stroke-width: 1.2; stroke-dasharray: 4 3; }
+.d-seg-res { fill: var(--bg); stroke: var(--rule); stroke-width: 1.2; }
+.d-seg-new { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.2; }
+@media (max-width: 860px) {
+  .wrap { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  nav.toc { display: none; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 600px) {
+  th, td { min-width: 7.5em; }
+  td:first-child { min-width: 9em; }
+}
+@media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+</style>
+
+<div class="wrap">
+<nav class="toc" aria-label="Sections">
+  <div class="label">Quorum study</div>
+  <a href="#headline">Headline</a>
+  <a href="#shape">The write path</a>
+  <a href="#seq">Seqs and emit</a>
+  <a href="#flush">The flush</a>
+  <a href="#lead">Leadership</a>
+  <a href="#failover">Failover</a>
+  <a href="#commitlog">Memory or commitlog</a>
+  <a href="#backfill">Catch-up</a>
+  <a href="#tuning">Cost tuning</a>
+  <a href="#hosts">Hosts</a>
+  <a href="#single">Single node</a>
+  <a href="#risks">Risks and prototypes</a>
+</nav>
+
+<main>
+<header class="top">
+  <div class="eyebrow">vlRelay · design and cost study · not built · 2026-10-06</div>
+  <h1>Quorum replication for vlRelay</h1>
+  <p class="lede">Keep the recent log in three replicas, emit an event once two of them hold it, and write the bucket every 30-60 s in big batches with the host cursors in the same commit. The bucket bill drops from ~$2.5k a month to a few dollars, and a 3-node relay lands at ~$15-35 a month on small VPSes.</p>
+  <p class="meta">Every number comes from <code>scripts/cost_model.py --quorum</code>, labeled measured, from code or assumed in <code>docs/quorum.md</code>. Today's load is ~350 events/s. Totals assume 10 full-firehose consumers and R2 after its free tier.</p>
+</header>
+
+<div class="stats">
+  <div class="stat"><span class="was">$3,131</span><b>~$22</b><span>3-node HA a month, 3 x OVH VPS-1, 30 s flush</span></div>
+  <div class="stat"><span class="was">$2,500</span><b>~$11</b><span>bucket requests a month on 3 nodes (R2 before its free tier)</span></div>
+  <div class="stat"><span class="was">$658</span><b>~$9</b><span>one node, NVMe WAL, 60 s flush, against the $10-15 benchmark</span></div>
+  <div class="stat"><span class="was">~225 ms</span><b>~2-7 ms</b><span>quorum ack in one DC or one metro, against 25 ms linger plus an R2 PUT</span></div>
+</div>
+
+<section>
+<h2 id="headline">Headline</h2>
+<p>Three nodes is the shape most likely to run in production, so it leads. The old design's bill was bucket requests: segments sealed every 25 ms on every node and host bookkeeping every 2-5 s. Here the bucket is a lagging copy, and the hosts are the bill.</p>
+<div class="tablewrap"><table><thead><tr><th>setup</th><th>flush</th><th>$/mo</th><th>where it goes</th></tr></thead><tbody><tr><td>Old design, 3 nodes, OVH ADVANCE-2 + R2</td><td>25 ms linger</td><td>$3,131</td><td>bucket requests $2,532, hosts $594</td></tr><tr><td>Old design, one node, OVH ADVANCE-2 + R2</td><td>25 ms linger</td><td>$658</td><td>bucket requests $455, hosts $198</td></tr><tr class="hl"><td>Quorum HA, 3 x OVH VPS-1, commitlog</td><td>30 s</td><td>$22</td><td>hosts $14, bucket requests $3, storage $5</td></tr><tr class="hl"><td>Quorum HA, 3 x OVH VPS-1, commitlog</td><td>60 s</td><td>$18</td><td>hosts $14, bucket requests $0, storage $5</td></tr><tr class="hl"><td>Quorum HA, 3 x OVH VPS-1, commitlog, 24 h of log in the bucket</td><td>60 s</td><td>$15</td><td>hosts $14, bucket requests $0, storage $2</td></tr><tr class="hl"><td>Quorum HA, 3 x Hetzner CAX21 (ARM), commitlog</td><td>30 s</td><td>$46</td><td>hosts $37, bucket $8</td></tr><tr class="hl"><td>Quorum HA, 3 x Hetzner AX42, commitlog</td><td>30 s</td><td>$335</td><td>hosts $327, bucket $8</td></tr><tr class="hl"><td>Quorum HA, 3 x OVH ADVANCE-2, commitlog</td><td>30 s</td><td>$602</td><td>hosts $594, bucket $8</td></tr><tr class="hl"><td>Quorum HA, 3 x AWS c7gd.large + S3, consumers outside AWS</td><td>30 s</td><td>$4,544</td><td>egress and cross-AZ $4,326, hosts $199, bucket $19</td></tr><tr><td>Single node, OVH VPS-1, NVMe WAL + R2 (72 h of log)</td><td>30 s</td><td>$13</td><td>host $5, bucket requests $3, storage $5</td></tr><tr><td>Single node, OVH VPS-1, NVMe WAL + R2 (72 h of log)</td><td>60 s</td><td>$9</td><td>host $5, bucket requests $0, storage $5</td></tr><tr><td>Single node, OVH VPS-2, NVMe WAL + R2 for state and cursors only</td><td>60 s</td><td>$9</td><td>host $8, bucket $0</td></tr><tr><td>Single node, OVH VPS-2, NVMe only</td><td></td><td>$8</td><td>no bucket: losing the disk loses the cursors</td></tr><tr class="bench"><td>Benchmark: a non-archival sync 1.1 relay on one node</td><td></td><td>$10-15</td><td>Jaz's figure</td></tr></tbody></table></div>
+<ul>
+  <li>3-node HA reaches the top of the $10-15 benchmark only on 4 GB VPSes with a 60 s flush and 24 h of log in the bucket (~$15). With 8 GB VPSes for headroom it's ~$30-34.</li>
+  <li>A single node gets under it: ~$9 on a VPS-1 with R2 holding 72 h, ~$8 on a VPS-2 with no bucket at all.</li>
+  <li>AWS is still decided by egress: ~$4.1k a month for 10 consumers outside AWS.</li>
+  <li>At 10x the cheapest HA is ~$124 (three VPS-4s). At 100x it's ~$3.4k, and $2.4k of that is edge boxes for the consumers.</li>
+</ul>
+</section>
+
+<section>
+<h2 id="shape">The write path</h2>
+<p>One stream log with one leader. Each node keeps its share of the PDS websockets and verifies their frames (most of the CPU). Verified events go to the leader, which checks the chain, applies, assigns the next seq and replicates to both followers. The commit point is two of three nodes holding the entry durably in their local commitlog (the recommended shape), and nothing is emitted before it.</p>
+<figure>
+<div class="svgscroll">
+<svg viewBox="0 0 900 360" role="img" aria-labelledby="f1t">
+  <title id="f1t">Write path: PDS to host owner to leader, replicate to two followers, ack, commit at two of three, emit</title>
+  <defs>
+    <marker id="am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-head-m"/></marker>
+    <marker id="aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-head-a"/></marker>
+  </defs>
+  <rect x="16" y="136" width="112" height="64" rx="6" class="d-box"/>
+  <text x="72" y="164" text-anchor="middle" class="d-t">PDSes</text>
+  <text x="72" y="182" text-anchor="middle" class="d-s">~2k active</text>
+  <rect x="168" y="128" width="150" height="80" rx="6" class="d-box"/>
+  <text x="243" y="156" text-anchor="middle" class="d-t">Host owners</text>
+  <text x="243" y="174" text-anchor="middle" class="d-s">every node, by host shard</text>
+  <text x="243" y="192" text-anchor="middle" class="d-s">verify (~55 µs/event)</text>
+  <line x1="128" y1="168" x2="164" y2="168" class="d-line" marker-end="url(#am)"/>
+  <rect x="368" y="104" width="196" height="128" rx="6" class="d-lead"/>
+  <text x="466" y="130" text-anchor="middle" class="d-t">Leader (epoch e)</text>
+  <text x="466" y="150" text-anchor="middle" class="d-s">check_chain, apply</text>
+  <text x="466" y="168" text-anchor="middle" class="d-s">seq = next counter</text>
+  <text x="466" y="186" text-anchor="middle" class="d-s">append + commitlog</text>
+  <text x="466" y="204" text-anchor="middle" class="d-m">group commit 2 ms</text>
+  <text x="466" y="222" text-anchor="middle" class="d-m">fsync</text>
+  <line x1="318" y1="168" x2="364" y2="168" class="d-line" marker-end="url(#am)"/>
+  <text x="341" y="160" text-anchor="middle" class="d-m">fwd</text>
+  <rect x="640" y="24" width="240" height="74" rx="6" class="d-box"/>
+  <text x="760" y="52" text-anchor="middle" class="d-t">Follower A</text>
+  <text x="760" y="72" text-anchor="middle" class="d-s">promised epoch ≥ e, commitlog fsync</text>
+  <text x="760" y="88" text-anchor="middle" class="d-m">ack (epoch, seq)</text>
+  <rect x="640" y="238" width="240" height="74" rx="6" class="d-box"/>
+  <text x="760" y="266" text-anchor="middle" class="d-t">Follower B</text>
+  <text x="760" y="286" text-anchor="middle" class="d-s">promised epoch ≥ e, commitlog fsync</text>
+  <text x="760" y="302" text-anchor="middle" class="d-m">ack (epoch, seq)</text>
+  <path d="M564 128 L636 72" class="d-acc" marker-end="url(#aa)"/>
+  <path d="M636 88 L568 142" class="d-ack" marker-end="url(#aa)"/>
+  <text x="566" y="92" class="d-a">replicate</text>
+  <text x="614" y="132" class="d-a">ack</text>
+  <path d="M564 208 L636 264" class="d-acc" marker-end="url(#aa)"/>
+  <path d="M636 248 L568 194" class="d-ack" marker-end="url(#aa)"/>
+  <text x="566" y="250" class="d-a">replicate</text>
+  <text x="612" y="210" class="d-a">ack</text>
+  <rect x="368" y="270" width="196" height="64" rx="6" class="d-box"/>
+  <text x="466" y="296" text-anchor="middle" class="d-t">Commit at 2 of 3</text>
+  <text x="466" y="316" text-anchor="middle" class="d-s">emit seqs ≤ commit index</text>
+  <line x1="466" y1="232" x2="466" y2="266" class="d-acc" marker-end="url(#aa)"/>
+  <rect x="168" y="270" width="150" height="64" rx="6" class="d-box"/>
+  <text x="243" y="296" text-anchor="middle" class="d-t">Consumers</text>
+  <text x="243" y="316" text-anchor="middle" class="d-s">on all three nodes</text>
+  <line x1="368" y1="302" x2="322" y2="302" class="d-acc" marker-end="url(#aa)"/>
+  <text x="760" y="336" text-anchor="middle" class="d-s">followers learn the commit index</text>
+  <text x="760" y="352" text-anchor="middle" class="d-s">on the next append, and emit up to it</text>
+</svg>
+</div>
+<figcaption>The ack waits for the faster of two followers, so one slow disk or a far third replica costs nothing. In the memory-only variant the fsyncs go away and a follower acks once the entry is in memory.</figcaption>
+</figure>
+<p>With 3 nodes and RF 3 every node is in every replica set anyway, so per-shard leaders would only spread the leader's ~2 cores of extra work at 100x. One log drops the k-way merge, the watermarks and the <code>seqck/</code> renumbering. Seqs are a plain counter assigned in one place.</p>
+</section>
+
+<section>
+<h2 id="seq">Seqs and the emit point</h2>
+<p>The leader assigns seqs at append. Entries carry <code>(epoch, seq)</code>, and a follower only accepts an entry whose predecessor it holds with the same epoch. Nothing reaches any consumer before a quorum holds it.</p>
+<ul>
+  <li>Every flush manifest carries a ceiling R = F + three flush intervals at the sized rate (~86k seqs today at 30 s). The leader never emits above the last committed R.</li>
+  <li>A leader change with a quorum alive continues densely. Uncommitted entries in the adopted tail keep their seqs, since nobody saw them. Entries only the dead leader held were never emitted, and the host owners resend them.</li>
+  <li>After a lost quorum, seqs resume at R + 1. Consumers see a jump forward, never a rewind. Events since the last flush come back from the PDSes under new seqs, so a consumer may see a commit again with the same rev, which sync 1.1 consumers already drop.</li>
+</ul>
+</section>
+
+<section>
+<h2 id="flush">The flush and recovery</h2>
+<p>The manifest is the only object recovery trusts, and it's written last with a CAS. Host cursors reach it through the log itself: host owners send acked cursors to the leader as log entries, and a manifest takes the latest cursor entry per host at or below F. An event counted in a cursor was committed before that cursor entry was appended, so cursors can't get ahead of the flushed log. The DID state is sealed at exactly F for the same reason.</p>
+<figure>
+<div class="svgscroll">
+<svg viewBox="0 0 900 430" role="img" aria-labelledby="f2t">
+  <title id="f2t">Flush: segments, state sealed at F, manifest last. Recovery: manifest, state at F, seqs from R plus one, PDSes replay from cursors.</title>
+  <defs>
+    <marker id="bm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-head-m"/></marker>
+    <marker id="bw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-head-w"/></marker>
+    <marker id="ba" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-head-a"/></marker>
+  </defs>
+  <text x="16" y="22" class="d-a">FLUSH every 30-60 s</text>
+  <rect x="16" y="36" width="170" height="112" rx="6" class="d-lead"/>
+  <text x="101" y="62" text-anchor="middle" class="d-t">Leader</text>
+  <text x="101" y="82" text-anchor="middle" class="d-s">F = commit index</text>
+  <text x="101" y="100" text-anchor="middle" class="d-s">seal state at F</text>
+  <text x="101" y="118" text-anchor="middle" class="d-s">cursor entries ≤ F</text>
+  <text x="101" y="136" text-anchor="middle" class="d-m">R = F + H</text>
+  <rect x="300" y="30" width="584" height="124" rx="8" class="d-bucket"/>
+  <text x="316" y="52" class="d-w">Bucket (R2 or S3)</text>
+  <rect x="316" y="64" width="170" height="76" rx="6" class="d-box"/>
+  <text x="401" y="88" text-anchor="middle" class="d-t">1 · segments</text>
+  <text x="401" y="106" text-anchor="middle" class="d-s">64 MiB zstd, create-only</text>
+  <text x="401" y="124" text-anchor="middle" class="d-m">qlog/seg/{seq}-{epoch}</text>
+  <rect x="500" y="64" width="170" height="76" rx="6" class="d-box"/>
+  <text x="585" y="88" text-anchor="middle" class="d-t">2 · state at F</text>
+  <text x="585" y="106" text-anchor="middle" class="d-s">SlateDB L0 + checkpoint</text>
+  <text x="585" y="124" text-anchor="middle" class="d-m">4 DID shards</text>
+  <rect x="684" y="64" width="186" height="76" rx="6" class="d-box"/>
+  <text x="777" y="88" text-anchor="middle" class="d-t">3 · manifest, last</text>
+  <text x="777" y="106" text-anchor="middle" class="d-s">CAS: epoch, F, R, cursors</text>
+  <text x="777" y="124" text-anchor="middle" class="d-m">the commit point</text>
+  <line x1="186" y1="92" x2="296" y2="92" class="d-wline" marker-end="url(#bw)"/>
+  <text x="240" y="84" text-anchor="middle" class="d-m">~20 A, ~36 B</text>
+  <text x="16" y="200" class="d-a">RECOVERY when no quorum holds the log</text>
+  <rect x="16" y="214" width="170" height="98" rx="6" class="d-box"/>
+  <text x="101" y="240" text-anchor="middle" class="d-t">New leader</text>
+  <text x="101" y="260" text-anchor="middle" class="d-s">CAS manifest e + 1</text>
+  <text x="101" y="278" text-anchor="middle" class="d-s">open state at F</text>
+  <text x="101" y="296" text-anchor="middle" class="d-s">next seq = R + 1</text>
+  <path d="M777 140 L777 176 L101 176 L101 210" class="d-line" marker-end="url(#bm)"/>
+  <text x="440" y="170" text-anchor="middle" class="d-m">read manifest, state checkpoint</text>
+  <rect x="300" y="226" width="200" height="74" rx="6" class="d-box"/>
+  <text x="400" y="252" text-anchor="middle" class="d-t">Each PDS</text>
+  <text x="400" y="272" text-anchor="middle" class="d-s">subscribeRepos?cursor=</text>
+  <text x="400" y="290" text-anchor="middle" class="d-s">its cursor at F</text>
+  <line x1="186" y1="262" x2="296" y2="262" class="d-line" marker-end="url(#bm)"/>
+  <path d="M500 262 L560 262" class="d-acc" marker-end="url(#ba)"/>
+  <rect x="564" y="226" width="306" height="74" rx="6" class="d-lead"/>
+  <text x="717" y="252" text-anchor="middle" class="d-t">Replay, verify, check_chain at F</text>
+  <text x="717" y="272" text-anchor="middle" class="d-s">~140 events per bsky.network PDS today (30 s)</text>
+  <text x="717" y="290" text-anchor="middle" class="d-s">catch-up 6-23 s at any load</text>
+  <text x="16" y="346" class="d-a">WHAT A CONSUMER SEES (seq line)</text>
+  <rect x="16" y="358" width="300" height="28" class="d-seg-ok"/>
+  <text x="166" y="377" text-anchor="middle" class="d-s">flushed, ≤ F</text>
+  <rect x="316" y="358" width="170" height="28" class="d-seg-lost"/>
+  <text x="401" y="377" text-anchor="middle" class="d-s">(F, emitted]: lost</text>
+  <rect x="486" y="358" width="150" height="28" class="d-seg-res"/>
+  <text x="561" y="377" text-anchor="middle" class="d-s">never used, ≤ R</text>
+  <rect x="636" y="358" width="248" height="28" class="d-seg-new"/>
+  <text x="760" y="377" text-anchor="middle" class="d-s">R + 1 on: re-ingested, then live</text>
+  <text x="316" y="404" text-anchor="middle" class="d-m">F</text>
+  <text x="636" y="404" text-anchor="middle" class="d-m">R</text>
+  <text x="16" y="424" class="d-s">The jump only happens when two nodes lose their logs. With the commitlog that means two disks.</text>
+</svg>
+</div>
+<figcaption>A crash before the manifest's CAS leaves the previous manifest in charge, and segments past it are ignored and later deleted. The manifest CAS with epoch + 1 also fences any older leader's flush.</figcaption>
+</figure>
+<div class="tablewrap"><table><thead><tr><th>load</th><th>flush</th><th>segment PUTs/s</th><th>Class A/s</th><th>Class B/s</th><th>R2 req $/mo, no free tier</th><th>R2 req $/mo</th><th>S3 req $/mo</th><th>bucket GB</th><th>R2 storage</th><th>S3 storage</th></tr></thead><tbody><tr><td>today</td><td>10 s</td><td>0.12</td><td>1.99</td><td>5.23</td><td>$28</td><td>$20</td><td>$32</td><td>323</td><td>$5</td><td>$7</td></tr><tr><td>today</td><td>30 s</td><td>0.05</td><td>0.67</td><td>2.81</td><td>$11</td><td>$3</td><td>$12</td><td>323</td><td>$5</td><td>$7</td></tr><tr><td>today</td><td>60 s</td><td>0.03</td><td>0.35</td><td>2.20</td><td>$6</td><td>$0</td><td>$7</td><td>323</td><td>$5</td><td>$7</td></tr><tr><td>10x</td><td>10 s</td><td>0.28</td><td>2.15</td><td>5.23</td><td>$30</td><td>$22</td><td>$34</td><td>3,228</td><td>$48</td><td>$74</td></tr><tr><td>10x</td><td>30 s</td><td>0.21</td><td>0.83</td><td>2.81</td><td>$13</td><td>$5</td><td>$14</td><td>3,228</td><td>$48</td><td>$74</td></tr><tr><td>10x</td><td>60 s</td><td>0.19</td><td>0.51</td><td>2.20</td><td>$8</td><td>$1</td><td>$9</td><td>3,228</td><td>$48</td><td>$74</td></tr><tr><td>100x</td><td>10 s</td><td>1.87</td><td>3.74</td><td>5.23</td><td>$49</td><td>$41</td><td>$55</td><td>32,281</td><td>$484</td><td>$742</td></tr><tr><td>100x</td><td>30 s</td><td>1.81</td><td>2.43</td><td>2.81</td><td>$31</td><td>$24</td><td>$35</td><td>32,281</td><td>$484</td><td>$742</td></tr><tr><td>100x</td><td>60 s</td><td>1.79</td><td>2.10</td><td>2.20</td><td>$27</td><td>$20</td><td>$30</td><td>32,281</td><td>$484</td><td>$742</td></tr></tbody></table></div>
+<h3>The re-ingest storm, worst case</h3>
+<p>The window is the flush interval plus ~2 s of upload and ~5 s of detection and takeover (both assumed). Per PDS it's small, and the reference PDS keeps far more history than a minute.</p>
+<div class="tablewrap"><table><thead><tr><th>load</th><th>flush</th><th>window</th><th>events re-requested</th><th>per bsky.network PDS</th><th>all other PDSes together</th><th>bytes</th><th>catch-up</th></tr></thead><tbody><tr><td>today</td><td>10 s</td><td>17 s</td><td>5,950</td><td>65</td><td>149</td><td>0.03 GB</td><td>5.8 s</td></tr><tr><td>today</td><td>30 s</td><td>37 s</td><td>12,950</td><td>142</td><td>324</td><td>0.07 GB</td><td>12.7 s</td></tr><tr><td>today</td><td>60 s</td><td>67 s</td><td>23,450</td><td>257</td><td>586</td><td>0.12 GB</td><td>23.0 s</td></tr><tr><td>10x</td><td>10 s</td><td>17 s</td><td>59,500</td><td>652</td><td>1,488</td><td>0.32 GB</td><td>5.8 s</td></tr><tr><td>10x</td><td>30 s</td><td>37 s</td><td>129,500</td><td>1,419</td><td>3,238</td><td>0.69 GB</td><td>12.7 s</td></tr><tr><td>10x</td><td>60 s</td><td>67 s</td><td>234,500</td><td>2,569</td><td>5,863</td><td>1.24 GB</td><td>23.0 s</td></tr><tr><td>100x</td><td>10 s</td><td>17 s</td><td>595,000</td><td>6,518</td><td>14,875</td><td>3.15 GB</td><td>5.8 s</td></tr><tr><td>100x</td><td>30 s</td><td>37 s</td><td>1,295,000</td><td>14,187</td><td>32,375</td><td>6.86 GB</td><td>12.7 s</td></tr><tr><td>100x</td><td>60 s</td><td>67 s</td><td>2,345,000</td><td>25,690</td><td>58,625</td><td>12.43 GB</td><td>23.0 s</td></tr></tbody></table></div>
+</section>
+
+<section>
+<h2 id="lead">Leadership, epochs and fencing</h2>
+<p>vlpds's leases fence the bucket. They don't fence memory: a zombie leader whose bucket writes all fail could still get a follower to ack an entry and emit it. So the bucket's CAS picks the leader of each epoch, and each follower's promised epoch fences the replication.</p>
+<figure>
+<div class="svgscroll">
+<svg viewBox="0 0 900 380" role="img" aria-labelledby="f3t">
+  <title id="f3t">Takeover: follower B CASes epoch e plus one in the bucket, collects promises and tails, adopts the longest; the old leader's appends and flushes are refused</title>
+  <defs>
+    <marker id="cm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-head-m"/></marker>
+    <marker id="ca" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-head-a"/></marker>
+    <marker id="cx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-head-x"/></marker>
+  </defs>
+  <rect x="300" y="16" width="300" height="84" rx="8" class="d-bucket"/>
+  <text x="450" y="40" text-anchor="middle" class="d-w">Bucket</text>
+  <text x="450" y="62" text-anchor="middle" class="d-m">qlog/leader {epoch, leader, members}</text>
+  <text x="450" y="82" text-anchor="middle" class="d-m">qlog/manifest {epoch, F, R, cursors}</text>
+  <rect x="24" y="200" width="200" height="96" rx="6" class="d-dim"/>
+  <text x="124" y="228" text-anchor="middle" class="d-t">Old leader A</text>
+  <text x="124" y="248" text-anchor="middle" class="d-s">epoch e, hung or cut off</text>
+  <text x="124" y="266" text-anchor="middle" class="d-s">can't commit: no quorum</text>
+  <text x="124" y="284" text-anchor="middle" class="d-m">steps down after timeout</text>
+  <rect x="350" y="200" width="200" height="96" rx="6" class="d-lead"/>
+  <text x="450" y="228" text-anchor="middle" class="d-t">Follower B → leader</text>
+  <text x="450" y="248" text-anchor="middle" class="d-s">epoch e + 1</text>
+  <text x="450" y="266" text-anchor="middle" class="d-s">adopts the longest tail</text>
+  <text x="450" y="284" text-anchor="middle" class="d-m">highest (epoch, seq)</text>
+  <rect x="676" y="200" width="200" height="96" rx="6" class="d-box"/>
+  <text x="776" y="228" text-anchor="middle" class="d-t">Follower C</text>
+  <text x="776" y="248" text-anchor="middle" class="d-s">promised e + 1</text>
+  <text x="776" y="266" text-anchor="middle" class="d-s">refuses epoch e</text>
+  <text x="776" y="284" text-anchor="middle" class="d-m">sends its tail</text>
+  <line x1="450" y1="196" x2="450" y2="104" class="d-acc" marker-end="url(#ca)"/>
+  <text x="458" y="156" class="d-a">2 · CAS e → e + 1</text>
+  <path d="M554 232 L672 232" class="d-acc" marker-end="url(#ca)"/>
+  <text x="613" y="224" text-anchor="middle" class="d-a">3 · promise e + 1?</text>
+  <path d="M672 264 L554 264" class="d-ack" marker-end="url(#ca)"/>
+  <text x="613" y="282" text-anchor="middle" class="d-a">4 · tail</text>
+  <path d="M228 220 L346 220" class="d-line" marker-end="url(#cm)"/>
+  <text x="287" y="206" text-anchor="middle" class="d-m">1 · heartbeats</text>
+  <text x="287" y="240" text-anchor="middle" class="d-m">stop</text>
+  <path d="M124 300 L124 340 L776 340 L776 300" class="d-bad" marker-end="url(#cx)"/>
+  <text x="450" y="334" text-anchor="middle" class="d-x">append (epoch e) refused by B and C</text>
+  <path d="M124 196 L124 72 L296 72" class="d-bad" marker-end="url(#cx)"/>
+  <text x="134" y="130" class="d-x">manifest CAS fails</text>
+  <text x="24" y="372" class="d-s">5 · B re-replicates the adopted tail, commits it under e + 1, resumes. Takeover ~0.5-2.5 s.</text>
+</svg>
+</div>
+<figcaption>Any two nodes share at least one member, so a promise quorum always contains every committed entry. That's Raft's election with the bucket's CAS in place of vote counting. Membership changes only at a flush barrier, so no joint consensus.</figcaption>
+</figure>
+<div class="tablewrap"><table><thead><tr><th>vlpds / vlRelay piece</th><th>Use here</th><th>Why</th></tr></thead><tbody><tr><td>CAS'd assignment with an epoch (<code>assign/{shard}</code>: owner, epoch)</td><td>yes, as <code>qlog/leader</code> {epoch, leader, members}</td><td>one leader per epoch, decided by the bucket's linearizable CAS, no clocks</td></tr><tr><td>create-only segment PUTs and the fence object</td><td>yes, as create-only segments and the manifest CAS</td><td>a zombie leader can't overwrite a segment or commit a flush</td></tr><tr><td>self fail-stop</td><td>yes</td><td>a leader that can't reach a quorum can't commit anyway, and it steps down after a heartbeat timeout</td></tr><tr><td>refused-probe fast path</td><td>yes</td><td>a refused peer port means the process is gone, so takeover starts in ~0.3 s</td></tr><tr><td>planned handoff with a barrier</td><td>yes, for moving leadership</td><td>stop appending, wait for a follower to hold the whole log, CAS the epoch to it</td></tr><tr><td>node leases (<code>nodes/</code>) for liveness</td><td>no (optional in a prototype)</td><td>they cost a CAS and two LISTs per node every 2 s (~$57 a month on R2 at TTL 10 s, tuning table below) and take TTL + skew (12 s) to notice a hung box. Peer heartbeats on the private network notice it in ~1 s for free</td></tr><tr><td><code>seq_floor</code> commit-wait, <code>set_revalidate</code>, lapse grace</td><td>no</td><td>seqs are counters, and safety comes from the quorum promise</td></tr><tr><td>host shard assignment judged by node leases (<code>assign-hosts/</code>)</td><td>moves into the log</td><td>the leader assigns host shards among the members it hears from, as a log entry, persisted in the manifest</td></tr></tbody></table></div>
+</section>
+
+<section>
+<h2 id="failover">Failover, case by case</h2>
+<div class="tablewrap"><table><thead><tr><th>Event</th><th>What happens</th><th>Emission pause</th><th>Lost</th></tr></thead><tbody><tr><td>A follower dies</td><td>the other follower carries the quorum</td><td>none</td><td>nothing</td></tr><tr><td>The leader's process dies</td><td>refused probe, CAS, promise, adopt</td><td>~0.5-1.5 s</td><td>nothing</td></tr><tr><td>The leader's box dies or hangs</td><td>heartbeat timeout, then as above</td><td>~1.5-2.5 s</td><td>nothing</td></tr><tr><td>A partition cuts one node off</td><td>the side with two carries on (with a new leader if needed) and the lone node stops emitting</td><td>none or as a takeover</td><td>nothing</td></tr><tr><td>Two nodes' processes die (a bad deploy)</td><td>memory-only: bucket recovery and re-ingest. Commitlog: the page cache kept their writes, so a normal takeover</td><td>seconds</td><td>memory-only: the tail since F, re-ingested. Commitlog: nothing</td></tr><tr><td>Power loss on all three</td><td>memory-only: bucket recovery. Commitlog with fsync: normal takeover from any two disks</td><td>until two boxes are back</td><td>memory-only: the tail, re-ingested. Commitlog: nothing</td></tr><tr><td>Two disks or boxes gone for good</td><td>bucket recovery, jump to R + 1, re-ingest</td><td>until a quorum is reachable or forced</td><td>the tail since F, re-ingested</td></tr><tr><td>The bucket is down</td><td>emission carries on until R, then stops</td><td>after H (3 intervals)</td><td>nothing</td></tr><tr><td>One slow disk</td><td>the quorum waits for the faster two</td><td>none</td><td>nothing</td></tr></tbody></table></div>
+<p>A minority never recovers on its own, since a node that can't reach the others can't tell "they're dead" from "I'm cut off". Recovery is automatic once a quorum is reachable again. Rejoining nodes report their last <code>(epoch, seq)</code>, truncate where they differ from the leader and fetch the rest from its local segments or the bucket. Replacing a box goes learner, caught up, flush barrier, CAS of the new member set, with a pause under a second.</p>
+<h3>Placement</h3>
+<div class="tablewrap"><table><thead><tr><th>Placement</th><th>Follower RTT</th><th>Quorum ack</th><th>What one event takes out</th></tr></thead><tbody><tr><td>one DC, three dedicated boxes</td><td>~0.2 ms</td><td>~2-4 ms</td><td>a DC power or network event takes all three</td></tr><tr><td>one metro, three DCs (Hetzner FSN1, NBG1, HEL1 on a private network. OVH RBX, GRA, SBG on the vRack)</td><td>~3 ms to the nearest</td><td>~5-7 ms</td><td>one DC</td></tr><tr><td>two regions (OVH Vint Hill and Us-west)</td><td>~65 ms</td><td>~67 ms</td><td>one region</td></tr></tbody></table></div>
+<p>A quorum waits only for the nearest follower, so the third replica can sit farther away for free. Hetzner Cloud's spread placement groups guarantee distinct hosts. OVH VPSes have no anti-affinity, so put them in three locations.</p>
+</section>
+
+<section>
+<h2 id="commitlog">Memory only, or a local commitlog</h2>
+<div class="decision"><p><strong>Recommendation:</strong> quorum plus a local NVMe commitlog, fsynced with group commit before the ack (Scylla's batch mode). The failures a 3-box cluster really sees are a bad deploy, a shared kernel or OOM bug and a DC power event. Memory alone turns each into a re-ingest and a seq jump. The commitlog turns them into a normal takeover, costs nothing on these hosts, adds a millisecond or two on a VPS, and is the single node's WAL anyway.</p></div>
+<div class="tablewrap"><table><thead><tr><th></th><th>Quorum in memory only</th><th>Quorum + local commitlog, fsynced before the ack</th></tr></thead><tbody><tr><td>Host cost</td><td>same hosts (every host on this page has local NVMe)</td><td>same, disk was already there</td></tr><tr><td>RAM</td><td>ring plus the unflushed tail: up to ~16 GB at 100x with a 60 s flush</td><td>ring only (~3 GB at 100x)</td></tr><tr><td>Ack latency</td><td>one RTT + group commit</td><td>the same plus an fsync on two of three nodes in parallel: +0.1 ms on datacenter NVMe, +0.5-2 ms on a VPS (assumed)</td></tr><tr><td>One node lost</td><td>nothing lost</td><td>nothing lost</td></tr><tr><td>A bad deploy or a shared bug kills all three processes</td><td>bucket recovery, jump, re-ingest</td><td>nothing lost: the page cache survives a process crash, even before the fsync</td></tr><tr><td>Power loss on all three</td><td>bucket recovery, jump, re-ingest</td><td>nothing lost: any two disks hold every committed entry</td></tr><tr><td>Two disks lost</td><td>bucket recovery, jump, re-ingest</td><td>the same</td></tr><tr><td>Promotion</td><td>replay the tail into state from the last flush</td><td>instant: every node applies committed entries to its local state</td></tr><tr><td>Code</td><td>replication, promise, log matching</td><td>the same, plus a commitlog that's the single node's WAL anyway</td></tr><tr><td>Disk wear</td><td>none</td><td>~0.16 TB a day today, 1.6 at 10x, 16 at 100x (below)</td></tr></tbody></table></div>
+<div class="tablewrap"><table><thead><tr><th>load</th><th>written a day (raw frames)</th><th>consumer 1 TB drive, 600 TBW</th><th>datacenter 1.92 TB, 1 DWPD for 5 years</th></tr></thead><tbody><tr><td>today</td><td>0.16 TB</td><td>10.3 years</td><td>59.9 years</td></tr><tr><td>10x</td><td>1.60 TB</td><td>1.0 years</td><td>6.0 years</td></tr><tr><td>100x</td><td>16.03 TB</td><td>0.1 years</td><td>0.6 years</td></tr></tbody></table></div>
+<div class="caveat"><p>Past ~10x a consumer drive wears out in about a year, so run datacenter NVMe there. A VPS's fsync may be acknowledged by the hypervisor's cache, so don't count on VPS commitlogs surviving a DC power cut until <code>fio --fsync=1</code> on the real host says so.</p></div>
+<div class="tablewrap"><table><thead><tr><th>device</th><th>fsync</th><th>a WAL emit adds (group commit)</th></tr></thead><tbody><tr><td>datacenter NVMe with power-loss protection (AX42, ADVANCE-2, EC2 instance store)</td><td>0.03-0.1 ms</td><td>up to 2 ms + 0.03-0.1 ms</td></tr><tr><td>VPS virtual NVMe (OVH VPS, Hetzner Cloud)</td><td>0.5-2 ms</td><td>up to 2 ms + 0.5-2 ms</td></tr><tr><td>consumer NVMe without power-loss protection</td><td>1-5 ms</td><td>up to 2 ms + 1-5 ms</td></tr></tbody></table></div>
+<div class="tablewrap"><table><thead><tr><th>follower placement</th><th>RTT</th><th>quorum ack, memory only</th><th>quorum ack, commitlog fsynced</th></tr></thead><tbody><tr><td>one DC</td><td>0.2 ms</td><td>2.2 ms</td><td>2.3 ms (dc) / 4.2 ms (vps)</td></tr><tr><td>one metro (FSN-NBG, RBX-GRA)</td><td>3 ms</td><td>5 ms</td><td>5.1 ms (dc) / 7 ms (vps)</td></tr><tr><td>cross-region (Vint Hill-Us-west)</td><td>65 ms</td><td>67 ms</td><td>67.1 ms (dc) / 69 ms (vps)</td></tr><tr><td>old design: 25 ms linger + an R2 PUT</td><td></td><td>~225 ms p50</td><td></td></tr></tbody></table></div>
+</section>
+
+<section>
+<h2 id="backfill">Catch-up and backfill</h2>
+<p>Reads come from the ring in memory (512 MB, ~290 s today), then local disk (every node keeps at least an hour, a VPS-1 ~4 h, an AX42 all 72 h), then the bucket. Segments are 64 MiB now, read with 8 MiB ranged GETs, so a 24 h replay from R2 is ~12k GETs (~$0.004) where the old 4-event segments took ~7.2M ($3). In memory-only the ring must also hold the unflushed tail, up to ~16 GB at 100x with a 60 s flush. With a commitlog the tail is on disk and the ring is just a cache.</p>
+</section>
+
+<section>
+<h2 id="tuning">Cost tuning</h2>
+<div class="tablewrap"><table><thead><tr><th>knob</th><th>today, 10 s</th><th>today, 60 s</th><th>100x, 10 s</th><th>100x, 60 s</th></tr></thead><tbody><tr><td>default: 64 MiB segments, 4 DID shards, peers</td><td>$28</td><td>$6</td><td>$49</td><td>$27</td></tr><tr><td>8 MiB segments</td><td>$30</td><td>$8</td><td>$196</td><td>$174</td></tr><tr><td>24 DID shards (the old cluster's count)</td><td>$158</td><td>$34</td><td>$179</td><td>$55</td></tr><tr><td>vlpds leases kept, TTL 30 s</td><td>$47</td><td>$25</td><td>$68</td><td>$46</td></tr><tr><td>vlpds leases kept, TTL 10 s</td><td>$85</td><td>$62</td><td>$105</td><td>$83</td></tr></tbody></table></div>
+<ul>
+  <li>Flush every 30-60 s. At 60 s the requests fit inside R2's free tier. A longer flush only widens the re-ingest window, which with a commitlog only matters when two disks are lost.</li>
+  <li>64 MiB segments. 8 MiB costs ~$150 a month more at 100x.</li>
+  <li>4 DID shards. The old cluster's 24 would cost ~5x the requests.</li>
+  <li>Peer heartbeats for liveness. vlpds's node leases at TTL 10 s cost ~$57 a month on R2, more than everything else in the bucket.</li>
+  <li>24 h of log in the bucket instead of 72 h saves ~$3 a month today, the last step from ~$18 to ~$15.</li>
+</ul>
+<div class="tablewrap"><table><thead><tr><th>load</th><th>old, 3 nodes</th><th>quorum HA, 30 s</th><th>old, one node</th><th>quorum single, 30 s</th></tr></thead><tbody><tr><td>today</td><td>$2,500</td><td>$11</td><td>$442</td><td>$11</td></tr><tr><td>10x</td><td>$2,765</td><td>$13</td><td>$477</td><td>$13</td></tr><tr><td>100x</td><td>$2,799</td><td>$31</td><td>$481</td><td>$31</td></tr></tbody></table></div>
+</section>
+
+<section>
+<h2 id="hosts">Hosts</h2>
+<p>CPU is tiny at today's load: ~0.03 cores for one node (65-70 µs an event measured on cores, 89-94 on threads), and the leader needs ~0.1 vCPU at the sized burst. RAM (~2.5 GB, assumed), disk (~23 GB, mostly DID state) and the port decide the host. Small VPSes run out of disk and port at 10x before CPU.</p>
+<div class="tablewrap"><table><thead><tr><th>load</th><th>flush</th><th>HA vCPUs</th><th>single vCPUs</th><th>HA RAM, memory only</th><th>HA RAM, commitlog</th><th>disk</th><th>HA public port</th><th>leader replication out</th><th>single public port</th></tr></thead><tbody><tr><td>today</td><td>10 s</td><td>0.10</td><td>0.12</td><td>2.5 GB (0.0 tail)</td><td>2.5 GB</td><td>23 GB</td><td>54 Mb/s</td><td>30 Mb/s</td><td>163 Mb/s</td></tr><tr><td>today</td><td>60 s</td><td>0.10</td><td>0.12</td><td>2.5 GB (0.2 tail)</td><td>2.5 GB</td><td>23 GB</td><td>54 Mb/s</td><td>30 Mb/s</td><td>163 Mb/s</td></tr><tr><td>10x</td><td>10 s</td><td>1.03</td><td>1.23</td><td>2.5 GB (0.3 tail)</td><td>2.5 GB</td><td>138 GB</td><td>544 Mb/s</td><td>297 Mb/s</td><td>1.6 Gb/s</td></tr><tr><td>10x</td><td>60 s</td><td>1.03</td><td>1.23</td><td>3.6 GB (1.6 tail)</td><td>2.6 GB</td><td>138 GB</td><td>544 Mb/s</td><td>297 Mb/s</td><td>1.6 Gb/s</td></tr><tr><td>100x</td><td>10 s</td><td>10.29</td><td>12.34</td><td>5.2 GB (3.1 tail)</td><td>2.7 GB</td><td>1,291 GB</td><td>5.4 Gb/s</td><td>3.0 Gb/s</td><td>16.3 Gb/s</td></tr><tr><td>100x</td><td>60 s</td><td>10.29</td><td>12.34</td><td>18.5 GB (15.8 tail)</td><td>3.3 GB</td><td>1,291 GB</td><td>5.4 Gb/s</td><td>3.0 Gb/s</td><td>16.3 Gb/s</td></tr></tbody></table></div>
+<div class="tablewrap"><table><thead><tr><th>host</th><th>$/mo each</th><th>today</th><th>10x</th><th>100x</th></tr></thead><tbody><tr><td>OVH VPS-1</td><td>$5</td><td>$22</td><td class="no">no: disk 138/40 GB, port 841 Mb/s/0.5 Gb/s</td><td class="no">no: CPU 10.3/2, disk 1,291/40 GB, port 8.4 Gb/s/0.5 Gb/s</td></tr><tr><td>OVH VPS-2</td><td>$8</td><td>$34</td><td class="no">no: disk 138/75 GB, port 841 Mb/s/1 Gb/s</td><td class="no">no: CPU 10.3/4, disk 1,291/75 GB, port 8.4 Gb/s/1 Gb/s</td></tr><tr><td>OVH VPS-3</td><td>$12</td><td>$45</td><td class="no">no: disk 138/100 GB</td><td class="no">no: CPU 10.3/6, disk 1,291/100 GB, port 8.4 Gb/s/2 Gb/s</td></tr><tr><td>OVH VPS-4</td><td>$23</td><td>$78</td><td>$124</td><td class="no">no: CPU 10.3/8, disk 1,291/200 GB, port 8.4 Gb/s/3 Gb/s</td></tr><tr><td>OVH ADVANCE-2</td><td>$198</td><td>$602</td><td>$648</td><td class="no">no: disk 1,291/960 GB, port 5.4 Gb/s/3 Gb/s</td></tr><tr><td>Hetzner CX33</td><td>$10</td><td>$38</td><td class="no">no: disk 138/80 GB, port 841 Mb/s/1 Gb/s</td><td class="no">no: CPU 10.3/4, disk 1,291/80 GB, port 8.4 Gb/s/1 Gb/s</td></tr><tr><td>Hetzner CAX21 (ARM)</td><td>$12</td><td>$46</td><td class="no">no: disk 138/80 GB, port 841 Mb/s/1 Gb/s</td><td class="no">no: CPU 10.3/4, disk 1,291/80 GB, port 8.4 Gb/s/1 Gb/s</td></tr><tr><td>Hetzner AX42</td><td>$109</td><td>$335</td><td>$708, 3 edges</td><td class="no">no: port 8.4 Gb/s/1 Gb/s</td></tr><tr><td>Hetzner AX42 + 10G</td><td>$157</td><td>$479</td><td>$1,038</td><td>$3,377, 22 edges</td></tr><tr><td>AWS c7gd.large</td><td>$66</td><td>$4,544</td><td class="no">no: disk 138/118 GB, port 841 Mb/s/0.94 Gb/s</td><td class="no">no: CPU 10.3/2, disk 1,291/118 GB, port 8.4 Gb/s/0.94 Gb/s</td></tr><tr><td>AWS c7gd.xlarge</td><td>$132</td><td>$4,743</td><td>$30k</td><td class="no">no: CPU 10.3/4, disk 1,291/237 GB, port 8.4 Gb/s/1.88 Gb/s</td></tr></tbody></table></div>
+<div class="tablewrap"><table><thead><tr><th>load</th><th>flush</th><th>HA + R2</th><th>HA + S3</th><th>single + R2</th></tr></thead><tbody><tr><td>today</td><td>10 s</td><td>$39 (OVH VPS-1)</td><td>$53 (OVH VPS-1)</td><td>$30 (OVH VPS-1)</td></tr><tr><td>today</td><td>30 s</td><td>$22 (OVH VPS-1)</td><td>$33 (OVH VPS-1)</td><td>$13 (OVH VPS-1)</td></tr><tr><td>today</td><td>60 s</td><td>$18 (OVH VPS-1)</td><td>$28 (OVH VPS-1)</td><td>$9 (OVH VPS-1)</td></tr><tr><td>10x</td><td>10 s</td><td>$141 (OVH VPS-4)</td><td>$178 (OVH VPS-4)</td><td>$94 (OVH VPS-4)</td></tr><tr><td>10x</td><td>30 s</td><td>$124 (OVH VPS-4)</td><td>$158 (OVH VPS-4)</td><td>$77 (OVH VPS-4)</td></tr><tr><td>10x</td><td>60 s</td><td>$120 (OVH VPS-4)</td><td>$153 (OVH VPS-4)</td><td>$73 (OVH VPS-4)</td></tr><tr><td>100x</td><td>10 s</td><td>$3,394, 22 edges (Hetzner AX42 + 10G)</td><td>$3,666, 22 edges (Hetzner AX42 + 10G)</td><td>$3,080, 22 edges (Hetzner AX42 + 10G)</td></tr><tr><td>100x</td><td>30 s</td><td>$3,377, 22 edges (Hetzner AX42 + 10G)</td><td>$3,646, 22 edges (Hetzner AX42 + 10G)</td><td>$3,063, 22 edges (Hetzner AX42 + 10G)</td></tr><tr><td>100x</td><td>60 s</td><td>$3,373, 22 edges (Hetzner AX42 + 10G)</td><td>$3,641, 22 edges (Hetzner AX42 + 10G)</td><td>$3,059, 22 edges (Hetzner AX42 + 10G)</td></tr></tbody></table></div>
+<div class="tablewrap"><table><thead><tr><th>load</th><th>peer bytes/event</th><th>cluster total</th><th>TB/mo</th><th>OVH vRack</th><th>Hetzner private network</th><th>AWS cross-AZ</th></tr></thead><tbody><tr><td>today</td><td>14.2 KB</td><td>40 Mb/s</td><td>13</td><td>$0</td><td>$0</td><td>$261</td></tr><tr><td>10x</td><td>14.2 KB</td><td>397 Mb/s</td><td>131</td><td>$0</td><td>$0</td><td>$2,613</td></tr><tr><td>100x</td><td>14.2 KB</td><td>4.0 Gb/s</td><td>1,306</td><td>$0</td><td>$0</td><td>$26k</td></tr></tbody></table></div>
+</section>
+
+<section>
+<h2 id="single">Single node</h2>
+<p>The same flush and re-ingest model with a local NVMe WAL as the durability and emit point: events are emitted once fsynced, with ~2 ms group commit. A process crash or power loss replays the WAL with no re-ingest and no jump. Only losing the disk falls back to the bucket, the re-ingest and the jump to R + 1. The bucket isn't needed to run, but a state-and-cursors bucket turns a lost disk from a gap into a re-ingest, and at a 60 s flush it fits in R2's free tier.</p>
+<div class="tablewrap"><table><thead><tr><th>load</th><th>flush</th><th>72 h log: A/s / B/s</th><th>R2 / S3 $/mo</th><th>state and cursors only: A/s / B/s</th><th>R2 / S3 $/mo</th></tr></thead><tbody><tr><td>today</td><td>10 s</td><td>1.99 / 5.23</td><td>$25 / $39</td><td>1.87 / 5.23</td><td>$19 / $30</td></tr><tr><td>today</td><td>30 s</td><td>0.67 / 2.81</td><td>$8 / $19</td><td>0.62 / 2.81</td><td>$3 / $11</td></tr><tr><td>today</td><td>60 s</td><td>0.35 / 2.20</td><td>$5 / $14</td><td>0.31 / 2.20</td><td>$0 / $7</td></tr><tr><td>10x</td><td>10 s</td><td>2.15 / 5.23</td><td>$71 / $108</td><td>1.87 / 5.23</td><td>$21 / $33</td></tr><tr><td>10x</td><td>30 s</td><td>0.83 / 2.81</td><td>$54 / $88</td><td>0.62 / 2.81</td><td>$5 / $14</td></tr><tr><td>10x</td><td>60 s</td><td>0.51 / 2.20</td><td>$50 / $83</td><td>0.31 / 2.20</td><td>$2 / $10</td></tr><tr><td>100x</td><td>10 s</td><td>3.74 / 5.23</td><td>$525 / $797</td><td>1.87 / 5.23</td><td>$41 / $64</td></tr><tr><td>100x</td><td>30 s</td><td>2.43 / 2.81</td><td>$508 / $777</td><td>0.62 / 2.81</td><td>$25 / $45</td></tr><tr><td>100x</td><td>60 s</td><td>2.10 / 2.20</td><td>$504 / $772</td><td>0.31 / 2.20</td><td>$22 / $40</td></tr></tbody></table></div>
+<div class="tablewrap"><table><thead><tr><th>host</th><th>$/mo</th><th>today</th><th>10x</th><th>100x</th></tr></thead><tbody><tr><td>OVH VPS-1</td><td>$5</td><td>$13 (4 h on disk)</td><td class="no">no: disk 138/40 GB, port 1.6 Gb/s/0.5 Gb/s</td><td class="no">no: CPU 12.3/2, disk 1,291/40 GB, port 16.3 Gb/s/0.5 Gb/s</td></tr><tr><td>OVH VPS-2</td><td>$8</td><td>$17 (11 h on disk)</td><td class="no">no: disk 138/75 GB, port 1.6 Gb/s/1 Gb/s</td><td class="no">no: CPU 12.3/4, disk 1,291/75 GB, port 16.3 Gb/s/1 Gb/s</td></tr><tr><td>OVH VPS-3</td><td>$12</td><td>$20 (16 h on disk)</td><td class="no">no: disk 138/100 GB, port 1.6 Gb/s/2 Gb/s</td><td class="no">no: CPU 12.3/6, disk 1,291/100 GB, port 16.3 Gb/s/2 Gb/s</td></tr><tr><td>OVH VPS-4</td><td>$23</td><td>$32 (35 h on disk)</td><td>$77 (2 h on disk)</td><td class="no">no: CPU 12.3/8, disk 1,291/200 GB, port 16.3 Gb/s/3 Gb/s</td></tr><tr><td>Hetzner CX33</td><td>$10</td><td>$53 (12 h on disk)</td><td class="no">no: disk 138/80 GB, port 1.6 Gb/s/1 Gb/s</td><td class="no">no: CPU 12.3/4, disk 1,291/80 GB, port 16.3 Gb/s/1 Gb/s</td></tr><tr><td>Hetzner CAX21 (ARM)</td><td>$12</td><td>$55 (12 h on disk)</td><td class="no">no: disk 138/80 GB, port 1.6 Gb/s/1 Gb/s</td><td class="no">no: CPU 12.3/4, disk 1,291/80 GB, port 16.3 Gb/s/1 Gb/s</td></tr><tr><td>Hetzner CPX22</td><td>$23</td><td>$66 (12 h on disk)</td><td class="no">no: disk 138/80 GB, port 1.6 Gb/s/1 Gb/s</td><td class="no">no: CPU 12.3/2, disk 1,291/80 GB, port 16.3 Gb/s/1 Gb/s</td></tr><tr><td>Hetzner AX42</td><td>$109</td><td>$117 (72 h on disk)</td><td>$490, 3 edges (36 h on disk)</td><td class="no">no: port 16.3 Gb/s/1 Gb/s</td></tr><tr><td>Hetzner AX42 + 10G</td><td>$157</td><td>$200 (72 h on disk)</td><td>$772 (36 h on disk)</td><td>$3,063, 22 edges (2 h on disk)</td></tr><tr><td>OVH ADVANCE-2</td><td>$198</td><td>$206 (72 h on disk)</td><td>$252 (17 h on disk)</td><td class="no">no: disk 1,291/960 GB, port 16.3 Gb/s/3 Gb/s</td></tr></tbody></table></div>
+</section>
+
+<section>
+<h2 id="risks">Risks and what to prototype first</h2>
+<h3>Risks</h3>
+<ul>
+  <li>Log matching and truncation are new to this codebase and are where correctness bugs would live.</li>
+  <li>Sealing the DID state at exactly F needs SlateDB to never flush a memtable on its own between barriers.</li>
+  <li>VPS fsyncs may not reach power-loss-protected media.</li>
+  <li>Shared vCPUs: a noisy neighbour on the leader is firehose latency.</li>
+  <li>A lost quorum sends repeated commits, and consumers that don't check revs would double-count.</li>
+  <li>The PDS replay window, the RAM baseline and the Hetzner Cloud prices are assumed. Nothing quorum-specific is measured.</li>
+</ul>
+<h3>Prototype order</h3>
+<ol class="steps">
+  <li>Replication with quorum ack and the promise round, with kill -9 and partition chaos and a checker that every emitted seq survives every takeover.</li>
+  <li>The commitlog with group-commit fsync, and the ack latency on the real hosts (an OVH VPS-2 and an AX42).</li>
+  <li>The flush: state sealed at F, segments, cursor entries, the manifest CAS, with a crash between every step.</li>
+  <li>Bucket recovery, the jump to R + 1 and the re-ingest storm at 10x against fakepds.</li>
+  <li>Membership change at a flush barrier, and a box replacement under load.</li>
+  <li>Wire <code>Store::counted</code> in and run an hour at today's rate to check the request table.</li>
+</ol>
+</section>
+</main>
+</div>

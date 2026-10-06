@@ -10,6 +10,7 @@ and how it was measured.
 |---|---|
 | [Design](design.html) | The design-session doc: the job, what carries over from vlpds, host and DID shards, sequencing, validation, policy, archival mode, replicas, cost and failure modes. Open it in a browser. |
 | [Cost](cost.md) | What it costs today and at 10x, 100x and 1000x: CPU, peer traffic, bucket requests and storage, consumer egress, priced on OVH, Hetzner and AWS with six object stores (`scripts/cost_model.py`) |
+| [Quorum study](quorum.md) | A design and cost study, not built: one sequenced log replicated to 3 nodes with quorum acks and a local commitlog, the bucket flushed every 10-60 s, and a single node on a local NVMe WAL, against a $10-15 a month benchmark (`scripts/cost_model.py --quorum`, [page](quorum-study.html)) |
 | [Build plan](PLAN.md) | The design session's decisions (linger, where signatures are checked, archival defaults) and who owns which module |
 
 ## Operations
