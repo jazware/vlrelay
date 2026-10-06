@@ -1757,7 +1757,13 @@ impl Node {
             }
             None => (Arc::new(qn::MemoryOnly), None),
         };
-        let floor = recovered.as_ref().map_or(0, |r| r.log.base().1);
+        // Where this node's emission can start: its log's base, or the last
+        // flush if that's later (a wiped or new disk restarts at 0 and is
+        // reset to the leader's log, above F). Cursors below it backfill
+        // from the bucket, gaps and all; a floor below a recovery's jump
+        // would send them to this node's own log, past the gaps' far side.
+        let flushed = crate::qlog::flush::read_manifest(&bucket.flush).await?.map_or(0, |(m, _)| m.flushed);
+        let floor = recovered.as_ref().map_or(0, |r| r.log.base().1).max(flushed);
         let scfg = cfg.serve_config();
         let incarnation = chrono::Utc::now().timestamp_micros() as u64;
         let emitter = emit::Emitter::with_store(&id, incarnation, scfg.ring_bytes, None, bucket.backfill.clone());

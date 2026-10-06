@@ -93,6 +93,7 @@ log() { echo "$(ms) $*" | tee -a "$out/events.log"; }
 nodepid() { pgrep -f "^$bin --quorum --node-id n$1 " | head -1; }
 
 pids=()
+cl_dir=${CL_DIR:-$out}
 cleanup() {
   touch "$out/stop" 2>/dev/null || true
   for i in $slots; do p=$(nodepid "$i" || true); [ -n "$p" ] && kill -CONT "$p" 2>/dev/null; done
