@@ -53,6 +53,8 @@ p256 = { version = "0.14", features = ["ecdsa", "getrandom"] }
 ring = "0.17"
 bs58 = "0.5"
 foldhash = "0.2"
+# the qlog commitlog's record checksums
+crc32fast = "1"
 
 [[bin]]
 name = "vlrelay"
@@ -70,6 +72,7 @@ path = "src/bin/devnet.rs"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
 # differential tests against a second atproto implementation, as vlpds does
 shrike = { version = "=0.7.0", default-features = false, features = ["syntax", "cbor", "crypto", "mst", "repo", "car", "sync"] }
 

@@ -117,7 +117,7 @@ async fn subscribe(
 }
 
 async fn status(State(n): State<Arc<super::node::Node>>, Query(q): Query<StatusParams>) -> Response {
-    let s = n.status();
+    let s = n.status_and(q.reset);
     if q.reset {
         n.stats.commit_us.lock().reset();
     }

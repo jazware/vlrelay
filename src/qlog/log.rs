@@ -20,6 +20,25 @@ pub struct Entry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mismatch;
 
+/// One change to a log's contents, as the commitlog records it. Replaying
+/// a log's ops in order rebuilds it (trimming aside, which isn't an op: it
+/// only drops what's committed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Op {
+    Append(Entry),
+    TruncateAfter(u64),
+    Reset {
+        epoch: u64,
+        seq: u64,
+    },
+    /// Not a log change: the highest epoch this node promised, and to whom
+    /// (empty if it only learned of the epoch).
+    Promise {
+        epoch: u64,
+        leader: String,
+    },
+}
+
 #[derive(Debug, Default)]
 pub struct Log {
     base_epoch: u64,
@@ -27,11 +46,54 @@ pub struct Log {
     entries: VecDeque<Entry>,
     commit: u64,
     bytes: usize,
+    /// Every change since the last `take_journal`, when journaling.
+    journal: Option<Vec<Op>>,
 }
 
 impl Log {
     pub fn new() -> Log {
         Log::default()
+    }
+
+    /// A log recovered from disk: `entries` follow `(base_epoch, base_seq)`
+    /// densely, and everything up to `commit` is committed.
+    pub fn from_parts(base_epoch: u64, base_seq: u64, entries: Vec<Entry>, commit: u64) -> Log {
+        let mut l = Log { base_epoch, base_seq, commit: base_seq, ..Log::default() };
+        for e in entries {
+            assert_eq!(e.seq, l.last_seq() + 1, "qlog: recovered entries aren't dense");
+            l.bytes += e.data.len();
+            l.entries.push_back(e);
+        }
+        l.set_commit(commit);
+        l
+    }
+
+    /// Records every change from now on, for [`Log::take_journal`].
+    pub fn journal(&mut self) {
+        self.journal.get_or_insert_with(Vec::new);
+    }
+
+    pub fn take_journal(&mut self) -> Vec<Op> {
+        self.journal.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// A promise, ordered with the log's changes on disk.
+    pub fn record_promise(&mut self, epoch: u64, leader: &str) {
+        self.record(|| Op::Promise { epoch, leader: leader.to_string() });
+    }
+
+    fn record(&mut self, op: impl FnOnce() -> Op) {
+        if let Some(j) = &mut self.journal {
+            j.push(op());
+        }
+    }
+
+    fn push(&mut self, e: Entry) {
+        self.bytes += e.data.len();
+        if self.journal.is_some() {
+            self.record(|| Op::Append(e.clone()));
+        }
+        self.entries.push_back(e);
     }
 
     pub fn base(&self) -> (u64, u64) {
@@ -83,8 +145,7 @@ impl Log {
     /// The leader's append: the next seq, under `epoch`.
     pub fn append(&mut self, epoch: u64, data: Bytes) -> u64 {
         let seq = self.last_seq() + 1;
-        self.bytes += data.len();
-        self.entries.push_back(Entry { epoch, seq, data });
+        self.push(Entry { epoch, seq, data });
         seq
     }
 
@@ -113,8 +174,7 @@ impl Log {
                 Some(_) => self.truncate_after(e.seq - 1),
                 None => {}
             }
-            self.bytes += e.data.len();
-            self.entries.push_back(e);
+            self.push(e);
         }
         Ok(matched)
     }
@@ -134,6 +194,7 @@ impl Log {
             let e = self.entries.pop_back().expect("len checked");
             self.bytes -= e.data.len();
         }
+        self.record(|| Op::TruncateAfter(seq));
     }
 
     /// Raises the commit index to `c`, capped at the last entry held.
@@ -157,6 +218,7 @@ impl Log {
         self.base_epoch = epoch;
         self.base_seq = seq;
         self.commit = seq;
+        self.record(|| Op::Reset { epoch, seq });
     }
 
     /// Re-tags every entry above `seq` with `epoch`: a new leader takes the
@@ -168,6 +230,14 @@ impl Log {
         let from = seq.saturating_sub(self.base_seq) as usize;
         for e in self.entries.iter_mut().skip(from) {
             e.epoch = epoch;
+        }
+        // on disk it's a rewrite, so the last record of a seq is its state
+        if self.journal.is_some() && seq < self.last_seq() {
+            self.record(|| Op::TruncateAfter(seq));
+            let tail: Vec<Entry> = self.entries.iter().skip(from).cloned().collect();
+            for e in tail {
+                self.record(|| Op::Append(e));
+            }
         }
     }
 

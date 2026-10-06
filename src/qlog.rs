@@ -10,12 +10,16 @@
 //! - `client`: a host owner's submit-and-resend side.
 //! - `check`: the emission checker the tests and the chaos harness share.
 //!
-//! Phase 1 is memory only: the commitlog plugs in at `node::Durability`
-//! (before a follower's ack and before the leader counts itself), and the
-//! bucket flush comes later.
+//! - `commitlog`: the local, group-fsynced log behind `node::Durability`
+//!   (before a follower's ack, the leader counting itself, and a promise),
+//!   and the single node's WAL.
+//!
+//! Memory-only (`node::MemoryOnly`) remains for comparison. The bucket
+//! flush comes later.
 
 pub mod check;
 pub mod client;
+pub mod commitlog;
 pub mod emit;
 pub mod log;
 pub mod node;

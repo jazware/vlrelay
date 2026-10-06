@@ -19,8 +19,9 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use vlrelay::qlog::check::{Checker, content_id};
 use vlrelay::qlog::client::{Client, info_name, parse_test_frame, test_frame};
+use vlrelay::qlog::commitlog::{self, CommitLog};
 use vlrelay::qlog::emit::{self, Emitter};
-use vlrelay::qlog::node::{Config, Faults, MemoryOnly, Node, Quantiles};
+use vlrelay::qlog::node::{Config, Durability, Faults, MemoryOnly, Node, Quantiles};
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -63,8 +64,23 @@ struct NodeArgs {
     prefix: String,
     #[arg(long, default_value_t = 512)]
     ring_mb: usize,
-    #[arg(long, default_value_t = 512)]
-    retain_mb: usize,
+    /// Committed log kept in memory for replication (default: 64 with a
+    /// commitlog, which serves anything older; 512 without).
+    #[arg(long)]
+    retain_mb: Option<usize>,
+    /// The commitlog's directory; memory-only without.
+    #[arg(long)]
+    commitlog: Option<std::path::PathBuf>,
+    #[arg(long, default_value_t = 64)]
+    segment_mb: u64,
+    /// Local disk kept past what's been emitted (until Phase 3's flush
+    /// takes over trimming).
+    #[arg(long, default_value_t = 4096)]
+    disk_retain_mb: u64,
+    /// Chaos: SIGUSR1 is a power cut (the commitlog loses a random part of
+    /// what it wrote since its last fsync, plus a torn record, then abort).
+    #[arg(long)]
+    power_cut_on_usr1: bool,
     #[arg(long, default_value_t = 100)]
     heartbeat_ms: u64,
     #[arg(long, default_value_t = 1000)]
@@ -155,7 +171,7 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
     cfg.probe_after = Duration::from_millis(a.probe_ms);
     cfg.stagger = Duration::from_millis(a.stagger_ms);
     cfg.rpc_timeout = Duration::from_millis(a.rpc_ms);
-    cfg.retain_bytes = a.retain_mb << 20;
+    cfg.retain_bytes = a.retain_mb.unwrap_or(if a.commitlog.is_some() { 64 } else { 512 }) << 20;
     let s3 = vlpds::store::S3Config {
         endpoint: a.s3_endpoint,
         bucket: a.s3_bucket,
@@ -166,7 +182,38 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
     let store = vlpds::store::Store::s3(&s3, &a.prefix, None, 8)?;
     let listener = tokio::net::TcpListener::bind(&a.listen).await?;
     let emit = Emitter::new(&a.id, now_us() as u64, a.ring_mb << 20, None);
-    let node = Node::start(cfg, store, listener, emit, Arc::new(Faults::default()), Arc::new(MemoryOnly)).await?;
+    let (durability, recovered): (Arc<dyn Durability>, _) = match &a.commitlog {
+        Some(dir) => {
+            let o = commitlog::Options {
+                segment_bytes: a.segment_mb << 20,
+                retain_bytes: a.disk_retain_mb << 20,
+                memory_bytes: cfg.retain_bytes,
+                abort_on_error: true,
+                ..commitlog::Options::default()
+            };
+            let (cl, r) = CommitLog::open(dir, o)?;
+            if a.power_cut_on_usr1 {
+                let cl = cl.clone();
+                let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+                tokio::spawn(async move {
+                    sig.recv().await;
+                    use rand::Rng;
+                    let mut rng = rand::thread_rng();
+                    let garbage: Vec<u8> = (0..rng.gen_range(0..40)).map(|_| rng.r#gen()).collect();
+                    let keep = rng.gen_range(0.0..1.0);
+                    let r = cl.power_cut(keep, &garbage);
+                    eprintln!(
+                        "qlog: power cut (kept {keep:.2} of the unsynced tail, {} bytes torn): {r:?}",
+                        garbage.len()
+                    );
+                    std::process::abort();
+                });
+            }
+            (Arc::new(cl) as Arc<dyn Durability>, Some(r))
+        }
+        None => (Arc::new(MemoryOnly) as Arc<dyn Durability>, None),
+    };
+    let node = Node::start(cfg, store, listener, emit, Arc::new(Faults::default()), durability, recovered).await?;
     let http = tokio::net::TcpListener::bind(&a.http).await?;
     axum::serve(http, emit::router(node)).await?;
     Ok(())

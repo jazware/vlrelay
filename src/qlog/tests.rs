@@ -5,8 +5,9 @@
 
 use super::check::{Checker, content_id};
 use super::client::{Client, test_frame};
+use super::commitlog::{self, CommitLog};
 use super::emit::{Emitted, Emitter};
-use super::node::{Config, Faults, MemoryOnly, Node, Role};
+use super::node::{Config, Durability, Faults, MemoryOnly, Node, Role};
 use super::wire;
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -22,7 +23,10 @@ struct Running {
     rt: tokio::runtime::Runtime,
     node: Arc<Node>,
     faults: Arc<Faults>,
+    cl: Option<Arc<CommitLog>>,
 }
+
+type ConfigFn = Arc<dyn Fn(&str) -> Config + Send + Sync>;
 
 struct Cluster {
     ids: Vec<String>,
@@ -34,6 +38,10 @@ struct Cluster {
     checker: Arc<Mutex<Checker>>,
     /// Faults that outlive a restart: (node, peers it can't reach).
     blocks: Vec<(String, String)>,
+    /// Each node's commitlog lives under here (memory-only without).
+    disk: Option<(tempfile::TempDir, commitlog::Options)>,
+    /// Overrides `config` for nodes started from now on.
+    cfg: Option<ConfigFn>,
 }
 
 fn free_port() -> u16 {
@@ -53,6 +61,21 @@ fn config(id: &str, addrs: &HashMap<String, String>) -> Config {
 
 impl Cluster {
     async fn new(n: usize) -> Cluster {
+        Cluster::with(n, None).await
+    }
+
+    async fn durable(n: usize, sync_delay: Option<Duration>) -> Cluster {
+        let o = commitlog::Options {
+            segment_bytes: 1 << 20,
+            retain_bytes: 8 << 20,
+            memory_bytes: 1 << 20,
+            sync_delay,
+            ..commitlog::Options::default()
+        };
+        Cluster::with(n, Some((tempfile::tempdir().unwrap(), o))).await
+    }
+
+    async fn with(n: usize, disk: Option<(tempfile::TempDir, commitlog::Options)>) -> Cluster {
         let ids: Vec<String> = (1..=n).map(|i| format!("n{i}")).collect();
         let addrs = ids.iter().map(|id| (id.clone(), format!("127.0.0.1:{}", free_port()))).collect();
         let (tap, mut rx) = mpsc::unbounded_channel::<Emitted>();
@@ -76,6 +99,8 @@ impl Cluster {
             tap,
             checker,
             blocks: Vec::new(),
+            disk,
+            cfg: None,
         };
         for id in &ids {
             c.start(id).await;
@@ -97,8 +122,23 @@ impl Cluster {
             }
         }
         let emit = Emitter::new(id, inc, 64 << 20, Some(self.tap.clone()));
-        let (cfg, store, addr, f) =
-            (config(id, &self.addrs), self.store.clone(), self.addrs[id].clone(), faults.clone());
+        let (cl, recovered) = match &self.disk {
+            Some((dir, o)) => {
+                let (cl, r) = CommitLog::open(&dir.path().join(id), o.clone()).unwrap();
+                (Some(cl), Some(r))
+            }
+            None => (None, None),
+        };
+        let durability: Arc<dyn Durability> = match &cl {
+            Some(cl) => Arc::new(cl.clone()),
+            None => Arc::new(MemoryOnly),
+        };
+        let (cfg, store, addr, f) = (
+            self.cfg.as_ref().map_or_else(|| config(id, &self.addrs), |f| f(id)),
+            self.store.clone(),
+            self.addrs[id].clone(),
+            faults.clone(),
+        );
         let (tx, rx) = tokio::sync::oneshot::channel();
         rt.spawn(async move {
             let t = Instant::now();
@@ -112,16 +152,33 @@ impl Cluster {
                     Err(e) => panic!("bind {addr}: {e}"),
                 }
             };
-            let n = Node::start(cfg, store, listener, emit, f, Arc::new(MemoryOnly)).await.unwrap();
+            let n = Node::start(cfg, store, listener, emit, f, durability, recovered).await.unwrap();
             let _ = tx.send(n);
         });
         let node = rx.await.unwrap();
-        self.nodes.insert(id.to_string(), Running { rt, node, faults });
+        self.nodes.insert(id.to_string(), Running { rt, node, faults, cl });
     }
 
     /// kill -9: the runtime goes, with every task, socket and byte of memory.
+    /// What the commitlog wrote stays (the page cache outlives a process).
     fn kill(&mut self, id: &str) {
         if let Some(r) = self.nodes.remove(id) {
+            r.rt.shutdown_background();
+            if let Some(cl) = r.cl {
+                cl.halt();
+            }
+        }
+    }
+
+    /// The box loses power: as kill, and the commitlog also loses a random
+    /// part of what it wrote since its last fsync, ending in a torn record.
+    fn power_cut(&mut self, id: &str, rng: &mut impl Rng) {
+        if let Some(r) = self.nodes.remove(id) {
+            // the disk is cut first: nothing after this point reaches it
+            if let Some(cl) = &r.cl {
+                let garbage: Vec<u8> = (0..rng.gen_range(0..40)).map(|_| rng.r#gen()).collect();
+                cl.power_cut(rng.gen_range(0.0..1.0), &garbage).unwrap();
+            }
             r.rt.shutdown_background();
         }
     }
@@ -461,6 +518,206 @@ async fn random_chaos_loses_nothing_emitted() {
     c.converge(Duration::from_secs(15)).await;
     let r = c.finish(&acked);
     eprintln!("seed {seed}: {actions:?}\n{r:?}");
+    assert_clean(&r);
+    c.shutdown();
+}
+
+fn status_line(c: &Cluster) -> String {
+    let mut v: Vec<String> = c
+        .nodes
+        .values()
+        .map(|r| {
+            let s = r.node.status();
+            format!("{} {:?} e{} last {} commit {}", s.id, s.role, s.epoch, s.last, s.commit)
+        })
+        .collect();
+    v.sort();
+    v.join("; ")
+}
+
+/// With the commitlog, a restarted node is whole at once: kill -9 the
+/// leader again and again and each victim comes back intact, with its log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_restarts_are_intact_at_once() {
+    let mut c = Cluster::durable(3, None).await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let l = c.wait_leader(Duration::from_secs(5)).await;
+        let before = c.nodes[&l].node.status().commit;
+        c.kill(&l);
+        c.start(&l).await;
+        let st = c.nodes[&l].node.status();
+        assert!(st.intact, "{l} restarted not intact");
+        assert!(st.last >= before, "{l} came back with less than it committed: {} < {before}", st.last);
+    }
+    let acked = load.stop().await;
+    c.converge(Duration::from_secs(10)).await;
+    let r = c.finish(&acked);
+    eprintln!("{r:?}");
+    assert_clean(&r);
+    c.shutdown();
+}
+
+/// Two nodes killed at once (the leader among them), then all three: with
+/// the commitlog it's a normal takeover each time, not a lost quorum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_two_and_three_node_kills_lose_nothing() {
+    let mut c = Cluster::durable(3, None).await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    for round in 0..6 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let l = c.wait_leader(Duration::from_secs(10)).await;
+        let victims: Vec<String> = if round % 2 == 0 {
+            let other = c.ids.iter().find(|id| **id != l).unwrap().clone();
+            vec![l, other]
+        } else {
+            c.ids.clone()
+        };
+        let sent = load.sent.load(Ordering::Relaxed);
+        for v in &victims {
+            c.kill(v);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for v in &victims {
+            c.start(v).await;
+        }
+        let t = Instant::now();
+        while load.sent.load(Ordering::Relaxed) == sent {
+            assert!(t.elapsed() < Duration::from_secs(15), "no commits after killing {victims:?}: {}", status_line(&c));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    let acked = load.stop().await;
+    c.converge(Duration::from_secs(10)).await;
+    let r = c.finish(&acked);
+    eprintln!("{r:?}");
+    assert_clean(&r);
+    c.shutdown();
+}
+
+/// Power cuts on every node at once, under load, with a slow fsync: each
+/// box loses what it wrote since its last fsync (and gets a torn record).
+/// Every acked seq survives, because nothing is acked before its fsync.
+/// Acking before the fsync fails this (seqs acked but never emitted, or
+/// reissued with other contents).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_power_cuts_on_every_node_lose_nothing_acked() {
+    let seed: u64 = std::env::var("QLOG_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(11);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut c = Cluster::durable(3, Some(Duration::from_millis(3))).await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 8, 6, Duration::from_millis(1));
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(rng.gen_range(300..800))).await;
+        c.wait_leader(Duration::from_secs(10)).await;
+        let sent = load.sent.load(Ordering::Relaxed);
+        for id in c.ids.clone() {
+            c.power_cut(&id, &mut rng);
+        }
+        for id in c.ids.clone() {
+            c.start(&id).await;
+        }
+        let t = Instant::now();
+        while load.sent.load(Ordering::Relaxed) == sent {
+            assert!(t.elapsed() < Duration::from_secs(15), "no commits after the power cut: {}", status_line(&c));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    let acked = load.stop().await;
+    c.converge(Duration::from_secs(10)).await;
+    let r = c.finish(&acked);
+    eprintln!("seed {seed}: {r:?}");
+    assert_clean(&r);
+    c.shutdown();
+}
+
+/// Random kills, power cuts, restarts, partitions and heals, any number of
+/// nodes down at once, with the commitlog. Seeded (`QLOG_SEED`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_random_chaos_loses_nothing() {
+    let seed: u64 = std::env::var("QLOG_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(7);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut c = Cluster::durable(3, None).await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 8, Duration::from_millis(2));
+    let t = Instant::now();
+    let mut actions = Vec::new();
+    while t.elapsed() < Duration::from_secs(12) {
+        tokio::time::sleep(Duration::from_millis(rng.gen_range(200..900))).await;
+        let down: Vec<String> = c.ids.iter().filter(|id| !c.nodes.contains_key(*id)).cloned().collect();
+        let id = c.ids[rng.gen_range(0..c.ids.len())].clone();
+        match rng.gen_range(0..6) {
+            0 if c.nodes.contains_key(&id) => {
+                c.kill(&id);
+                actions.push(format!("kill {id}"));
+            }
+            1 if c.nodes.contains_key(&id) => {
+                c.power_cut(&id, &mut rng);
+                actions.push(format!("power cut {id}"));
+            }
+            2 | 3 if !down.is_empty() => {
+                c.start(&down[0]).await;
+                actions.push(format!("start {}", down[0]));
+            }
+            4 if c.blocks.is_empty() => {
+                c.isolate(&id);
+                actions.push(format!("isolate {id}"));
+            }
+            _ => {
+                c.heal();
+            }
+        }
+    }
+    c.heal();
+    for id in c.ids.clone() {
+        if !c.nodes.contains_key(&id) {
+            c.start(&id).await;
+        }
+    }
+    let acked = load.stop().await;
+    c.converge(Duration::from_secs(15)).await;
+    let r = c.finish(&acked);
+    eprintln!("seed {seed}: {actions:?}\n{r:?}");
+    assert_clean(&r);
+    c.shutdown();
+}
+
+/// A follower down for longer than the leader keeps in memory catches up
+/// from the leader's commitlog rather than jumping its stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lagging_follower_catches_up_from_disk() {
+    let mut c = Cluster::durable(3, None).await;
+    for id in c.ids.clone() {
+        c.kill(&id);
+    }
+    let addrs = c.addrs.clone();
+    // a small in-memory window, so the lag is served from disk
+    let cfg = move |id: &str| {
+        let mut k = config(id, &addrs);
+        k.retain_bytes = 32 << 10;
+        k
+    };
+    c.cfg = Some(Arc::new(cfg));
+    for id in c.ids.clone() {
+        c.start(&id).await;
+    }
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    let f = c.ids.iter().find(|id| **id != l).unwrap().clone();
+    c.kill(&f);
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(1));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    c.start(&f).await;
+    let acked = load.stop().await;
+    c.converge(Duration::from_secs(10)).await;
+    let st = c.nodes[&f].node.status();
+    assert_eq!(st.resets, 0, "the follower was reset past its lag: {st:?}");
+    let reads: u64 = c.nodes.values().map(|r| r.node.status().disk_reads).sum();
+    assert!(reads > 0, "nothing was served from disk");
+    assert_eq!(st.emit_gaps, 0);
+    let r = c.finish(&acked);
     assert_clean(&r);
     c.shutdown();
 }

@@ -8,8 +8,9 @@
 //! `qlog/leader` to epoch + 1, collects promises from a quorum, adopts the
 //! longest tail among them, re-tags that tail with its epoch and carries on.
 
+use super::commitlog::{CommitLog, Recovered};
 use super::emit::Emitter;
-use super::log::{Entry, Log};
+use super::log::{Entry, Log, Op};
 use super::wire::{self, Append, AppendResp, Msg, PromiseResp};
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -106,18 +107,111 @@ pub async fn cas_leader(store: &Store, rec: &LeaderRecord, read: Option<Option<S
     }
 }
 
-/// Where an entry goes before its holder acks it (a follower) or counts
-/// itself toward the quorum (the leader). Memory-only acks at once; the
-/// commitlog (Phase 2) writes and group-fsyncs here.
+/// Where the log's changes go before its holder acks them (a follower),
+/// counts itself toward the quorum (the leader) or answers a promise.
+/// Memory-only acks at once; the commitlog writes and group-fsyncs.
+///
+/// `stage` is called under the node's lock, in the order the changes were
+/// made, so the disk replays them in that order; `wait` is awaited outside
+/// it.
 pub trait Durability: Send + Sync + 'static {
-    fn persist<'a>(&'a self, entries: &'a [Entry]) -> BoxFuture<'a, anyhow::Result<()>>;
+    /// Whether the log should journal its changes for `stage`.
+    fn journaling(&self) -> bool;
+    fn stage(&self, ops: Vec<Op>) -> u64;
+    /// The ticket of the last stage: waiting for it covers every op so far.
+    fn staged(&self) -> u64;
+    fn wait(&self, ticket: u64) -> BoxFuture<'_, anyhow::Result<()>>;
+    fn note_commit(&self, _seq: u64) {}
+    /// Everything at or below `seq` may leave local disk (once over budget).
+    fn set_floor(&self, _seq: u64) {}
+    /// The last seq readable back with `read`: in-memory trimming stays at
+    /// or below it, so a lagging follower can always be served.
+    fn written_last(&self) -> u64 {
+        u64::MAX
+    }
+    /// Committed entries from `from` (see `CommitLog::read`), off the
+    /// async runtime.
+    fn read(&self, _from: u64, _upto: u64, _max_bytes: usize) -> BoxFuture<'_, Option<(u64, Vec<Entry>)>> {
+        Box::pin(std::future::ready(None))
+    }
+    fn report(&self, _reset: bool) -> Option<DiskStatus> {
+        None
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DiskStatus {
+    pub fsyncs: u64,
+    pub fsync_us: Quantiles,
+    /// Ops per group commit.
+    pub batch_ops: Quantiles,
+    pub bytes_written: u64,
+    pub disk_bytes: u64,
+    pub rollovers: u64,
+    pub deleted: u64,
 }
 
 pub struct MemoryOnly;
 
 impl Durability for MemoryOnly {
-    fn persist<'a>(&'a self, _: &'a [Entry]) -> BoxFuture<'a, anyhow::Result<()>> {
+    fn journaling(&self) -> bool {
+        false
+    }
+    fn stage(&self, _: Vec<Op>) -> u64 {
+        0
+    }
+    fn staged(&self) -> u64 {
+        0
+    }
+    fn wait(&self, _: u64) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+impl Durability for Arc<CommitLog> {
+    fn journaling(&self) -> bool {
+        true
+    }
+    fn stage(&self, ops: Vec<Op>) -> u64 {
+        CommitLog::stage(self, ops)
+    }
+    fn staged(&self) -> u64 {
+        CommitLog::staged(self)
+    }
+    fn wait(&self, ticket: u64) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(CommitLog::wait(self, ticket))
+    }
+    fn note_commit(&self, seq: u64) {
+        CommitLog::note_commit(self, seq)
+    }
+    fn set_floor(&self, seq: u64) {
+        CommitLog::set_floor(self, seq)
+    }
+    fn written_last(&self) -> u64 {
+        CommitLog::written_last(self)
+    }
+    fn report(&self, reset: bool) -> Option<DiskStatus> {
+        let st = &self.stats;
+        let r = DiskStatus {
+            fsyncs: st.fsyncs.load(Ordering::Relaxed),
+            fsync_us: Quantiles::of(&st.fsync_us.lock()),
+            batch_ops: Quantiles::of(&st.batch_ops.lock()),
+            bytes_written: st.bytes.load(Ordering::Relaxed),
+            disk_bytes: self.disk_bytes(),
+            rollovers: st.rollovers.load(Ordering::Relaxed),
+            deleted: st.deleted.load(Ordering::Relaxed),
+        };
+        if reset {
+            st.fsync_us.lock().reset();
+            st.batch_ops.lock().reset();
+        }
+        Some(r)
+    }
+    fn read(&self, from: u64, upto: u64, max_bytes: usize) -> BoxFuture<'_, Option<(u64, Vec<Entry>)>> {
+        let cl = self.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || CommitLog::read(&cl, from, upto, max_bytes)).await.ok().flatten()
+        })
     }
 }
 
@@ -195,6 +289,9 @@ pub struct Stats {
     /// Seqs a node skipped emitting because it was reset past them.
     pub emit_gaps: AtomicU64,
     pub promise_rounds: AtomicU64,
+    /// Batches served from the commitlog (a follower or a candidate behind
+    /// what's in memory).
+    pub disk_reads: AtomicU64,
 }
 
 impl Default for Stats {
@@ -207,6 +304,7 @@ impl Default for Stats {
             resets: AtomicU64::new(0),
             emit_gaps: AtomicU64::new(0),
             promise_rounds: AtomicU64::new(0),
+            disk_reads: AtomicU64::new(0),
         }
     }
 }
@@ -230,7 +328,9 @@ pub struct Status {
     pub resets: u64,
     pub emit_gaps: u64,
     pub promise_rounds: u64,
+    pub disk_reads: u64,
     pub commit_us: Quantiles,
+    pub disk: Option<DiskStatus>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -272,8 +372,9 @@ pub struct Node {
 
 impl Node {
     /// Starts serving peers on `listener`. A node that finds no
-    /// `qlog/leader` is at genesis and whole; any other starts empty and
-    /// not intact (memory-only: it can't vouch for what it acked before).
+    /// `qlog/leader` is at genesis and whole, and so is one that recovered
+    /// its commitlog. Any other starts empty and not intact (memory-only or
+    /// a lost disk: it can't vouch for what it acked before).
     pub async fn start(
         cfg: Config,
         store: Store,
@@ -281,26 +382,36 @@ impl Node {
         emit: Arc<Emitter>,
         faults: Arc<Faults>,
         durability: Arc<dyn Durability>,
+        recovered: Option<Recovered>,
     ) -> anyhow::Result<Arc<Node>> {
         let genesis = read_leader(&store).await?.is_none();
+        let (mut log, promised, promised_to, whole) = match recovered {
+            Some(r) => (r.log, r.promised, r.promised_to, !r.fresh),
+            None => (Log::new(), 0, None, false),
+        };
+        if durability.journaling() {
+            log.journal();
+        }
+        let (emitted, commit) = (log.base().1, log.commit());
+        durability.note_commit(commit);
         let ctl =
             cfg.peers.iter().map(|(id, addr)| (id.clone(), Arc::new(Rpc::new(id, addr, faults.clone())))).collect();
         let node = Arc::new(Node {
             core: Mutex::new(Core {
-                log: Log::new(),
-                promised: 0,
+                log,
+                promised,
                 role: Role::Follower,
-                epoch: 0,
-                leader: None,
+                epoch: promised,
+                leader: promised_to,
                 last_heard: Instant::now(),
                 seen_record: 0,
                 electing: false,
                 probing: false,
                 retry_at: Instant::now(),
                 probed_for: None,
-                intact: genesis,
+                intact: genesis || whole,
                 need_upto: None,
-                emitted: 0,
+                emitted,
                 matched: HashMap::new(),
                 next: HashMap::new(),
                 acked_at: HashMap::new(),
@@ -311,14 +422,14 @@ impl Node {
             cfg,
             store,
             head: watch::channel(0).0,
-            commit: watch::channel(0).0,
+            commit: watch::channel(commit).0,
             faults,
             ctl,
             durability,
             emit,
             stats: Stats::default(),
         });
-        tracing::info!(id = %node.cfg.id, genesis, "qlog: node up");
+        tracing::info!(id = %node.cfg.id, genesis, whole, promised, emitted, commit, "qlog: node up");
         tokio::spawn(node.clone().accept(listener));
         tokio::spawn(node.clone().ticker());
         tokio::spawn(node.clone().emitter());
@@ -326,6 +437,12 @@ impl Node {
     }
 
     pub fn status(&self) -> Status {
+        self.status_and(false)
+    }
+
+    /// The status, then the latency histograms start over if `reset`.
+    pub fn status_and(&self, reset: bool) -> Status {
+        let disk = self.durability.report(reset);
         let c = self.core.lock();
         Status {
             id: self.cfg.id.clone(),
@@ -345,7 +462,9 @@ impl Node {
             resets: self.stats.resets.load(Ordering::Relaxed),
             emit_gaps: self.stats.emit_gaps.load(Ordering::Relaxed),
             promise_rounds: self.stats.promise_rounds.load(Ordering::Relaxed),
+            disk_reads: self.stats.disk_reads.load(Ordering::Relaxed),
             commit_us: Quantiles::of(&self.stats.commit_us.lock()),
+            disk,
         }
     }
 
@@ -402,8 +521,10 @@ impl Node {
                     continue;
                 }
                 Msg::Append(a) => Msg::AppendResp(self.on_append(a).await),
-                Msg::Promise { epoch, from } => Msg::PromiseResp(self.on_promise(epoch, &from)),
-                Msg::Fetch { epoch, from_seq, max_bytes, .. } => self.on_fetch(epoch, from_seq, max_bytes as usize),
+                Msg::Promise { epoch, from } => Msg::PromiseResp(self.on_promise(epoch, &from).await),
+                Msg::Fetch { epoch, from_seq, max_bytes, .. } => {
+                    self.on_fetch(epoch, from_seq, max_bytes as usize).await
+                }
                 Msg::Ping { .. } => Msg::Pong,
                 _ => continue,
             };
@@ -424,7 +545,7 @@ impl Node {
     /// quorum holds them (or failed if this node stops leading first; the
     /// sender then resends them to the next leader, under new seqs).
     pub async fn submit(self: &Arc<Self>, frames: Vec<(Bytes, Bytes)>) -> Msg {
-        let (rx, first, last, epoch, entries) = {
+        let (rx, first, last, epoch, ticket) = {
             let mut c = self.core.lock();
             if c.role != Role::Leader {
                 return Msg::NotLeader { hint: c.leader.clone().filter(|l| *l != self.cfg.id).unwrap_or_default() };
@@ -442,12 +563,12 @@ impl Node {
             let (tx, rx) = oneshot::channel();
             c.waiters.insert(last, tx);
             c.pending.push_back((first, last, Instant::now()));
-            let entries: Vec<Entry> = c.log.range(first - 1, last).cloned().collect();
-            (rx, first, last, epoch, entries)
+            let ticket = self.sync(&mut c);
+            (rx, first, last, epoch, ticket)
         };
         self.stats.appended.fetch_add(last - first + 1, Ordering::Relaxed);
         self.head.send_replace(last);
-        if let Err(e) = self.durability.persist(&entries).await {
+        if let Err(e) = self.durability.wait(ticket).await {
             let mut c = self.core.lock();
             self.step_down(&mut c, "persist failed");
             return Msg::Failed { reason: format!("persist: {e:#}") };
@@ -480,6 +601,7 @@ impl Node {
             return;
         }
         c.log.set_commit(q);
+        self.durability.note_commit(q);
         let now = Instant::now();
         {
             let mut h = self.stats.commit_us.lock();
@@ -522,7 +644,9 @@ impl Node {
         c.leader = Some(self.cfg.id.clone());
         c.intact = true;
         c.need_upto = None;
-        c.self_durable = last;
+        // the adopted, re-tagged tail counts once it's on disk
+        c.self_durable = commit;
+        let ticket = self.sync(c);
         c.matched = self.cfg.peers.keys().map(|p| (p.clone(), 0)).collect();
         c.next = self.cfg.peers.keys().map(|p| (p.clone(), last + 1)).collect();
         let now = Instant::now();
@@ -533,6 +657,37 @@ impl Node {
             tokio::spawn(self.clone().replicate(p.clone(), epoch));
         }
         self.head.send_replace(last);
+        let n = self.clone();
+        tokio::spawn(async move {
+            let r = n.durability.wait(ticket).await;
+            let mut c = n.core.lock();
+            if c.role != Role::Leader || c.epoch != epoch {
+                return;
+            }
+            match r {
+                Ok(()) => {
+                    c.self_durable = c.self_durable.max(last);
+                    n.advance_commit(&mut c);
+                }
+                Err(_) => n.step_down(&mut c, "persisting the adopted tail failed"),
+            }
+        });
+    }
+
+    /// Stages the log's journaled changes; the ticket covers everything
+    /// staged so far (call it under the lock, before acting on them).
+    fn sync(&self, c: &mut Core) -> u64 {
+        let ops = c.log.take_journal();
+        if ops.is_empty() { self.durability.staged() } else { self.durability.stage(ops) }
+    }
+
+    /// A promise is never forgotten: it's journaled with the log, and the
+    /// caller waits for it to be durable before answering.
+    fn raise_promised(&self, c: &mut Core, epoch: u64, to: &str) {
+        if epoch > c.promised {
+            c.promised = epoch;
+            c.log.record_promise(epoch, to);
+        }
     }
 
     async fn replicate(self: Arc<Self>, peer: String, epoch: u64) {
@@ -544,6 +699,18 @@ impl Node {
         loop {
             head.borrow_and_update();
             commit.borrow_and_update();
+            let behind = {
+                let c = self.core.lock();
+                let next = c.next.get(&peer).copied().unwrap_or(0);
+                (c.role == Role::Leader && c.epoch == epoch && next <= c.log.base().1).then(|| (next, c.log.base().1))
+            };
+            // behind what's in memory: committed entries from the commitlog
+            let from_disk = match behind {
+                Some((next, base)) => {
+                    self.durability.read(next, base, self.cfg.max_batch_bytes).await.map(|r| (next, r))
+                }
+                None => None,
+            };
             let req = {
                 let c = self.core.lock();
                 if c.role != Role::Leader || c.epoch != epoch {
@@ -552,7 +719,20 @@ impl Node {
                 let next = c.next[&peer];
                 let (base_epoch, base_seq) = c.log.base();
                 let fresh = next <= c.log.last_seq() || c.log.commit() > sent_commit;
-                if !fresh && last_send.elapsed() < self.cfg.heartbeat {
+                if let Some((from, (prev_epoch, entries))) = from_disk.filter(|(f, (_, e))| *f == next && !e.is_empty())
+                {
+                    self.stats.disk_reads.fetch_add(1, Ordering::Relaxed);
+                    Some(Append {
+                        epoch,
+                        leader: self.cfg.id.clone(),
+                        prev_epoch,
+                        prev_seq: from - 1,
+                        commit: c.log.commit(),
+                        leader_last: c.log.last_seq(),
+                        reset: false,
+                        entries,
+                    })
+                } else if !fresh && last_send.elapsed() < self.cfg.heartbeat {
                     None
                 } else {
                     let reset = next <= base_seq;
@@ -603,7 +783,8 @@ impl Node {
             return;
         }
         if r.promised > epoch {
-            c.promised = c.promised.max(r.promised);
+            self.raise_promised(&mut c, r.promised, "");
+            self.sync(&mut c);
             self.step_down(&mut c, "a follower promised a newer epoch");
             return;
         }
@@ -624,7 +805,7 @@ impl Node {
     // ---- follower
 
     async fn on_append(self: &Arc<Self>, a: Append) -> AppendResp {
-        let (resp, persisted, commit_moved) = {
+        let (resp, ticket, commit_moved) = {
             let mut c = self.core.lock();
             if a.epoch < c.promised {
                 return AppendResp {
@@ -639,7 +820,7 @@ impl Node {
             if c.role != Role::Follower {
                 self.step_down(&mut c, "a leader of the same or a newer epoch appended");
             }
-            c.promised = a.epoch;
+            self.raise_promised(&mut c, a.epoch, &a.leader);
             c.epoch = a.epoch;
             c.leader = Some(a.leader.clone());
             c.role = Role::Follower;
@@ -660,16 +841,14 @@ impl Node {
                 c.log.reset(a.prev_epoch, a.prev_seq);
             }
             let commit_before = c.log.commit();
-            let n = a.entries.len();
-            match c.log.try_append(a.prev_epoch, a.prev_seq, a.entries) {
+            let r = match c.log.try_append(a.prev_epoch, a.prev_seq, a.entries) {
                 Ok(m) => {
                     c.log.set_commit(a.commit.min(m));
+                    self.durability.note_commit(c.log.commit());
                     if !c.intact && c.need_upto.is_some_and(|n| m >= n) {
                         tracing::info!(id = %self.cfg.id, matched = m, "qlog: caught up after a restart, intact again");
                         c.intact = true;
                     }
-                    let persisted: Vec<Entry> =
-                        if n > 0 { c.log.range(a.prev_seq, m).cloned().collect() } else { Vec::new() };
                     let resp = AppendResp {
                         ok: true,
                         promised: c.promised,
@@ -678,7 +857,7 @@ impl Node {
                         last_seq: c.log.last_seq(),
                         intact: c.intact,
                     };
-                    (resp, persisted, c.log.commit() > commit_before)
+                    (resp, c.log.commit() > commit_before)
                 }
                 Err(_) => (
                     AppendResp {
@@ -689,34 +868,43 @@ impl Node {
                         last_seq: c.log.last_seq(),
                         intact: c.intact,
                     },
-                    Vec::new(),
                     false,
                 ),
-            }
+            };
+            (r.0, self.sync(&mut c), r.1)
         };
         if commit_moved {
             self.commit.send_replace(resp.commit);
         }
-        if !persisted.is_empty() && self.durability.persist(&persisted).await.is_err() {
-            return AppendResp { ok: false, ..resp };
+        // the ack (and the promise it carries) only once it's all on disk
+        if self.durability.wait(ticket).await.is_err() {
+            return AppendResp { ok: false, matched: 0, ..resp };
         }
         resp
     }
 
-    fn on_promise(&self, epoch: u64, from: &str) -> PromiseResp {
+    async fn on_promise(&self, epoch: u64, from: &str) -> PromiseResp {
+        let (resp, ticket) = self.promise_locked(epoch, from);
+        if self.durability.wait(ticket).await.is_err() {
+            return PromiseResp { ok: false, ..resp };
+        }
+        resp
+    }
+
+    fn promise_locked(&self, epoch: u64, from: &str) -> (PromiseResp, u64) {
         let mut c = self.core.lock();
         let ok =
             epoch > c.promised || (epoch == c.promised && c.leader.as_deref() == Some(from) && from != self.cfg.id);
         if ok && epoch > c.promised {
             self.step_down(&mut c, "promised a newer epoch");
-            c.promised = epoch;
+            self.raise_promised(&mut c, epoch, from);
             c.epoch = epoch;
             c.leader = Some(from.to_string());
             c.role = Role::Follower;
             c.last_heard = Instant::now();
         }
         let (last_epoch, last_seq) = c.log.last();
-        PromiseResp {
+        let resp = PromiseResp {
             ok,
             promised: c.promised,
             last_epoch,
@@ -724,10 +912,32 @@ impl Node {
             base_seq: c.log.base().1,
             commit: c.log.commit(),
             intact: c.intact,
-        }
+        };
+        (resp, self.sync(&mut c))
     }
 
-    fn on_fetch(&self, epoch: u64, from_seq: u64, max_bytes: usize) -> Msg {
+    async fn on_fetch(&self, epoch: u64, from_seq: u64, max_bytes: usize) -> Msg {
+        let below = {
+            let c = self.core.lock();
+            (epoch == c.promised && from_seq <= c.log.base().1).then(|| c.log.base().1)
+        };
+        // older than memory holds: committed, so straight from the commitlog
+        if let Some(base) = below
+            && let Some((prev_epoch, entries)) = self.durability.read(from_seq, base, max_bytes).await
+            && !entries.is_empty()
+        {
+            let c = self.core.lock();
+            if epoch == c.promised {
+                self.stats.disk_reads.fetch_add(1, Ordering::Relaxed);
+                return Msg::FetchResp {
+                    ok: true,
+                    base_epoch: prev_epoch,
+                    base_seq: from_seq - 1,
+                    last_seq: c.log.last_seq(),
+                    entries,
+                };
+            }
+        }
         let c = self.core.lock();
         let (base_epoch, base_seq) = c.log.base();
         if epoch != c.promised {
@@ -755,8 +965,9 @@ impl Node {
             }
             let act = {
                 let mut c = self.core.lock();
-                let upto = c.emitted;
+                let upto = c.emitted.min(self.durability.written_last());
                 c.log.trim(self.cfg.retain_bytes, upto);
+                self.durability.set_floor(c.emitted.min(c.log.commit()));
                 match c.role {
                     Role::Leader => {
                         let alive = 1 + c.acked_at.values().filter(|t| t.elapsed() < self.cfg.election_timeout).count();
@@ -902,17 +1113,21 @@ impl Node {
             c.last_heard = Instant::now();
             return Ok(());
         }
-        {
+        let own = {
             let mut c = self.core.lock();
             if c.promised >= epoch {
                 return Ok(());
             }
             self.step_down(&mut c, "taking over");
-            c.promised = epoch;
+            let me = self.cfg.id.clone();
+            self.raise_promised(&mut c, epoch, &me);
             c.epoch = epoch;
             c.role = Role::Candidate;
             c.leader = Some(self.cfg.id.clone());
-        }
+            self.sync(&mut c)
+        };
+        // our own promise counts toward the round only once it's durable
+        self.durability.wait(own).await?;
         tracing::info!(id = %self.cfg.id, epoch, "qlog: won qlog/leader, collecting promises");
         loop {
             {
@@ -936,7 +1151,8 @@ impl Node {
                 if let Ok(Msg::PromiseResp(p)) = r {
                     if p.promised > epoch {
                         let mut c = self.core.lock();
-                        c.promised = c.promised.max(p.promised);
+                        self.raise_promised(&mut c, p.promised, "");
+                        self.sync(&mut c);
                         self.step_down(&mut c, "a member promised a newer epoch");
                         return Ok(());
                     }
@@ -1060,6 +1276,8 @@ impl Node {
     /// index moves. Nothing above the commit index is ever handed over.
     async fn emitter(self: Arc<Self>) {
         let mut rx = self.commit.subscribe();
+        // a recovered commit index is emitted without waiting for a leader
+        rx.mark_changed();
         loop {
             if rx.changed().await.is_err() {
                 return;
