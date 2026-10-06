@@ -152,13 +152,48 @@ struct StatusParams {
     reset: bool,
 }
 
+/// Who may `POST /qlog/members`.
+#[derive(Clone, Debug)]
+pub enum Admin {
+    /// `Authorization: Bearer <token>`.
+    Token(String),
+    /// Anyone who can reach the port: only for an http port bound to
+    /// loopback (the chaos harness, tests).
+    Open,
+    /// Nobody: no token and a reachable port.
+    Refused,
+}
+
+impl Admin {
+    /// A token if one is set; otherwise open only on a loopback address.
+    pub fn for_listener(token: Option<String>, addr: std::net::SocketAddr) -> Admin {
+        match token.filter(|t| !t.is_empty()) {
+            Some(t) => Admin::Token(t),
+            None if addr.ip().is_loopback() => Admin::Open,
+            None => Admin::Refused,
+        }
+    }
+
+    fn allows(&self, h: &axum::http::HeaderMap) -> bool {
+        match self {
+            Admin::Open => true,
+            Admin::Refused => false,
+            Admin::Token(t) => h
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .is_some_and(|got| vlpds::auth::token_eq(t, got)),
+        }
+    }
+}
+
 /// subscribeRepos, `/qlog/status`, `POST /qlog/members` (a membership
-/// change, on the leader) and `/metrics` for one node.
-pub fn router(node: Arc<super::node::Node>) -> axum::Router {
+/// change, on the leader; gated by `admin`) and `/metrics` for one node.
+pub fn router(node: Arc<super::node::Node>, admin: Admin) -> axum::Router {
     axum::Router::new()
         .route("/xrpc/com.atproto.sync.subscribeRepos", axum::routing::get(subscribe))
         .route("/qlog/status", axum::routing::get(status))
-        .route("/qlog/members", axum::routing::post(members))
+        .route("/qlog/members", axum::routing::post(members).layer(axum::Extension(Arc::new(admin))))
         .route("/metrics", axum::routing::get(metrics))
         .with_state(node)
 }
@@ -171,8 +206,20 @@ pub struct MembersRequest {
     pub addrs: std::collections::BTreeMap<String, String>,
 }
 
-async fn members(State(n): State<Arc<super::node::Node>>, axum::Json(r): axum::Json<MembersRequest>) -> Response {
+async fn members(
+    State(n): State<Arc<super::node::Node>>,
+    axum::Extension(admin): axum::Extension<Arc<Admin>>,
+    h: axum::http::HeaderMap,
+    axum::Json(r): axum::Json<MembersRequest>,
+) -> Response {
     use axum::http::StatusCode;
+    if !admin.allows(&h) {
+        let why = match *admin {
+            Admin::Refused => "membership changes are off: start the node with --admin-token",
+            _ => "a bearer admin token is required",
+        };
+        return (StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({ "error": why }))).into_response();
+    }
     match n.change_members(r.members, r.addrs).await {
         Ok(s) => axum::Json(s).into_response(),
         Err(e) => {
@@ -211,4 +258,34 @@ async fn status(State(n): State<Arc<super::node::Node>>, Query(q): Query<StatusP
         n.stats.commit_us.lock().reset();
     }
     axum::Json(s).into_response()
+}
+
+#[cfg(test)]
+mod admin_tests {
+    use super::Admin;
+    use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+
+    fn with(auth: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(a) = auth {
+            h.insert(AUTHORIZATION, HeaderValue::from_str(a).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn membership_changes_need_the_token_off_loopback() {
+        let lo = "127.0.0.1:3161".parse().unwrap();
+        let public = "0.0.0.0:3161".parse().unwrap();
+        assert!(Admin::for_listener(None, lo).allows(&with(None)));
+        assert!(!Admin::for_listener(None, public).allows(&with(None)));
+        assert!(!Admin::for_listener(Some(String::new()), public).allows(&with(Some("Bearer "))));
+        let t = Admin::for_listener(Some("s3cret".into()), public);
+        assert!(t.allows(&with(Some("Bearer s3cret"))));
+        assert!(!t.allows(&with(Some("Bearer s3cre"))));
+        assert!(!t.allows(&with(Some("Basic s3cret"))));
+        assert!(!t.allows(&with(None)));
+        // a token set binds loopback too
+        assert!(!Admin::for_listener(Some("s3cret".into()), lo).allows(&with(None)));
+    }
 }

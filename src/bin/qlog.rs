@@ -62,6 +62,9 @@ struct MemberArgs {
     /// flags don't name it.
     #[arg(long = "addr")]
     addrs: Vec<String>,
+    /// The nodes' --admin-token.
+    #[arg(long, env = "QLOG_ADMIN_TOKEN")]
+    admin_token: Option<String>,
     /// Keep trying (a leader change, a crash mid-change) this long.
     #[arg(long, default_value_t = 120)]
     retry_secs: u64,
@@ -135,6 +138,10 @@ struct NodeArgs {
     /// subscribeRepos and /qlog/status.
     #[arg(long)]
     http: String,
+    /// Bearer token for `POST /qlog/members`. Unset, membership changes are
+    /// taken only on a loopback --http.
+    #[arg(long, env = "QLOG_ADMIN_TOKEN")]
+    admin_token: Option<String>,
     /// id=host:port, once per other member (how this node dials it).
     #[arg(long = "peer")]
     peers: Vec<String>,
@@ -405,7 +412,11 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
     };
     let node = Node::start(cfg, bucket, listener, emit, Arc::new(Faults::default()), durability, recovered).await?;
     let http = tokio::net::TcpListener::bind(&a.http).await?;
-    axum::serve(http, emit::router(node)).await?;
+    let admin = emit::Admin::for_listener(a.admin_token.clone(), http.local_addr()?);
+    if matches!(admin, emit::Admin::Refused) {
+        tracing::warn!("qlog: --http isn't loopback and no --admin-token: POST /qlog/members is refused");
+    }
+    axum::serve(http, emit::router(node, admin)).await?;
     Ok(())
 }
 
@@ -1202,10 +1213,21 @@ async fn member(a: MemberArgs) -> anyhow::Result<()> {
             }
             attempts += 1;
             let body = vlrelay::qlog::emit::MembersRequest { members: want.clone(), addrs: addrs.clone() };
-            match http.post(format!("http://{addr}/qlog/members")).json(&body).send().await {
+            match {
+                let mut req = http.post(format!("http://{addr}/qlog/members")).json(&body);
+                if let Some(t) = &a.admin_token {
+                    req = req.bearer_auth(t);
+                }
+                req
+            }
+            .send()
+            .await
+            {
                 Ok(r) => {
-                    let ok = r.status().is_success();
+                    let (ok, code) = (r.status().is_success(), r.status());
                     let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    // no retry fixes a missing or wrong token
+                    anyhow::ensure!(code != reqwest::StatusCode::UNAUTHORIZED, "member: {addr}: {v}");
                     if ok {
                         println!("{}", serde_json::json!({ "switch": v, "attempts": attempts }));
                     } else {

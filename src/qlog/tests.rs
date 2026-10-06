@@ -1061,14 +1061,30 @@ async fn an_old_leaders_flush_loses_to_a_takeover() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn old_cursors_backfill_from_the_bucket_then_the_local_log() {
     use futures::StreamExt;
-    let c = flushing(|_| flush::Options { interval: Duration::from_millis(700), ..flush_opts() }, 32 << 10).await;
-    c.wait_leader(Duration::from_secs(5)).await;
+    // flushes only when asked, so F stays where the test put it whatever
+    // this box's speed
+    let c = flushing(|_| flush::Options { interval: Duration::from_secs(3600), ..flush_opts() }, 32 << 10).await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
     let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
-    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let leader = c.nodes[&l].node.clone();
+    let until_commit = |n: u64| {
+        let leader = leader.clone();
+        async move {
+            let t = Instant::now();
+            while leader.status().commit < n {
+                assert!(t.elapsed() < Duration::from_secs(20), "commit didn't reach {n}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
+    until_commit(1000).await;
+    let f = leader.status().commit;
+    leader.flush.request(f);
+    wait_flushed(&c, f, Duration::from_secs(10)).await;
+    until_commit(f + 1000).await;
     let acked = load.stop().await;
     c.converge(Duration::from_secs(10)).await;
     let m = flush::read_manifest(&c.store).await.unwrap().unwrap().0;
-    let l = c.wait_leader(Duration::from_secs(5)).await;
     let id = c.ids.iter().find(|i| **i != l).unwrap().clone();
     let node = c.nodes[&id].node.clone();
     let top = node.status().commit;
@@ -1076,7 +1092,9 @@ async fn old_cursors_backfill_from_the_bucket_then_the_local_log() {
     let by_seq: HashMap<u64, u64> = acked.iter().copied().collect();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    c.nodes[&id].rt.spawn(async move { axum::serve(listener, super::emit::router(node)).await });
+    c.nodes[&id]
+        .rt
+        .spawn(async move { axum::serve(listener, super::emit::router(node, super::emit::Admin::Open)).await });
     for cursor in [0, m.flushed - 1, m.flushed, m.flushed + 1] {
         let url = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor={cursor}");
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -1208,8 +1226,16 @@ async fn a_follower_behind_the_leaders_disk_catches_up_from_the_bucket() {
     let f = c.ids.iter().find(|id| **id != l).unwrap().clone();
     let load = Load::start(c.client(), 4, 10, Duration::from_millis(1));
     tokio::time::sleep(Duration::from_millis(300)).await;
+    let behind = c.nodes[&f].node.status().last;
     c.kill(&f);
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // until the leader can't serve it from memory or disk, however fast
+    // this box fills and trims the leader's commitlog
+    let t = Instant::now();
+    while c.nodes[&l].node.readable_floor() <= behind + 1 {
+        assert!(t.elapsed() < Duration::from_secs(30), "the leader's disk still reaches {behind}: {}", status_line(&c));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    wait_flushed(&c, behind + 1, Duration::from_secs(10)).await;
     c.start(&f).await;
     let acked = load.stop().await;
     settle_and_verify(&c, &acked).await;
