@@ -131,3 +131,13 @@ docker-build-benchbox tag="":
 config-doc:
     cargo build --quiet --bin vlrelay
     {{bin}}/vlrelay --help | python3 build/config_doc.py > docs/operations/configuration.md
+
+# ---- docs site (/docs; docs/_style.md) -----------------------------------------
+
+# Validate the docs site (front matter, heroes, diagrams, links, no private names) and print its nav
+docs-check:
+    cd ui && npm install --no-audit --no-fund && npm run check-docs
+
+# Live preview of the docs and dashboard on :5790, reloading when a page changes
+dev-ui:
+    cd ui && npm install --no-audit --no-fund && npm run dev

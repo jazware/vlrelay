@@ -62,7 +62,7 @@ export function Quorum() {
       {learners.length > 0 && <Notice kind="info">Catching up as learners: {learners.join(', ')}. They join the member set once they hold the commit index.</Notice>}
       {leader?.paused && <Notice kind="warn">The leader is paused for a membership switch: appends wait until it finishes.</Notice>}
 
-      <div className="tiles">
+      <div className="tiles qtiles">
         <Tile k="Epoch" v={<span className="mono">{ref ? ref.epoch : '—'}</span>} sub={ref ? `promised ${ref.promised}, last entry's ${ref.last_epoch}` : undefined} />
         <Tile k="Leader" v={leader ? leader.id : '—'} tone={leader ? undefined : 'bad'} sub={leader ? `${fmtNum(leader.takeovers)} takeovers here` : 'none'} />
         <Tile k="Members answering" v={<>{answering}<small>of {members.length}</small></>} tone={answering < majority ? 'bad' : answering < members.length ? 'warn' : undefined} sub={`majority is ${majority}`} />

@@ -26,7 +26,7 @@ use std::{collections::BTreeMap, future::Future, sync::Arc};
 pub use diff::diff_json;
 pub use public::{PublicStats, public_routes};
 pub use settings::{ConfigEntry, SettingsView};
-pub use ui::{UiFiles, ui_routes};
+pub use ui::{UiFiles, docs_routes, ui_routes};
 
 // ---------------------------------------------------------------- shared enums
 

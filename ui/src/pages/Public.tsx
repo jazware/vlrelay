@@ -49,7 +49,7 @@ export function Public() {
 
   return (
     <>
-      <Topbar home="/" />
+      <Topbar />
       <main className="pub">
         <section className="pub-hero">
           <div>
@@ -65,9 +65,9 @@ export function Public() {
               <a href="#subscribe" className="btn primary">
                 Subscribe to the firehose
               </a>
-              <a href="/docs" className="btn">
+              <Link to="/docs" className="btn">
                 Read the docs
-              </a>
+              </Link>
               <Link to="/admin" className="btn quiet">
                 Operator console
               </Link>
@@ -102,9 +102,9 @@ export function Public() {
             <pre className="pub-cmd" aria-label="Example">
               <code>websocat '{firehose}'</code>
             </pre>
-            <a href="/docs" className="pub-more">
+            <Link to="/docs/subscribing" className="pub-more">
               How to consume it, limits and cursors <span aria-hidden="true">&rarr;</span>
-            </a>
+            </Link>
           </aside>
         </section>
 
@@ -221,7 +221,7 @@ export function Public() {
       </main>
       <footer className="footer">
         <span>vlRelay{s && <span className="mono muted"> {s.version}</span>}</span>
-        <a href="/docs">Docs</a>
+        <Link to="/docs">Docs</Link>
         <a href="/xrpc/_health">Health</a>
         <a href="/api/public/stats">Stats JSON</a>
         <Link to="/admin">Operator console</Link>

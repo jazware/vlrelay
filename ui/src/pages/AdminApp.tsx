@@ -96,7 +96,7 @@ export function AdminApp({ path }: { path: string }) {
   const current = (to: string) => (to === '/admin' ? p === '/admin' : p === to || p.startsWith(`${to}/`))
   return (
     <>
-      <Topbar where="Relay console">
+      <Topbar where="Relay console" console>
         <button type="button" className="btn sm quiet" onClick={() => setHelp((h) => !h)} aria-expanded={help}>
           Shortcuts <kbd>?</kbd>
         </button>
@@ -181,7 +181,7 @@ function Login() {
   const [error, setError] = useState<unknown>()
   return (
     <>
-      <Topbar where="Relay console" />
+      <Topbar where="Relay console" console />
       <main className="signin">
         <div className="card">
           <div className="inner">

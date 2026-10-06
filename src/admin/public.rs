@@ -122,9 +122,7 @@ pub fn quorum_health(q: &QuorumView) -> Health {
 pub fn project(o: &Overview, quorum: Option<&QuorumView>) -> PublicStats {
     let quorum = quorum.filter(|q| !q.nodes.is_empty());
     let (nodes, healthy) = match quorum {
-        _ if !o.by_node.is_empty() => {
-            (o.by_node.len() as u32, o.by_node.iter().filter(|n| !n.stale).count() as u32)
-        }
+        _ if !o.by_node.is_empty() => (o.by_node.len() as u32, o.by_node.iter().filter(|n| !n.stale).count() as u32),
         // no fleet numbers: the quorum log's members are the nodes
         Some(q) => {
             let current = q.nodes.iter().filter(|n| n.status.as_ref().is_none_or(|s| s["retired"] != true));

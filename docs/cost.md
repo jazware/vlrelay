@@ -1,6 +1,32 @@
-# vlRelay: cost
+---
+title: Cost
+section: Reference
+order: 303
+summary: "What vlRelay costs to run for the whole network today and at 10x, 100x and 1000x: hosts, bucket and bandwidth on OVH, Hetzner and AWS with six object stores."
+---
 
-What vlRelay would cost to run for the whole network today, and at 10x, 100x and 1000x that load: hosts, bucket and bandwidth, priced on OVH, Hetzner and AWS with S3, R2, Tigris, GCS, B2 and Wasabi. It follows vlpds's cost model (`vlpds/bench/results/cost-model-2026-10-02`). Every input is measured, counted from the code or assumed, and each table says which. `scripts/cost_model.py` regenerates every table here from the inputs and prices at its top.
+```hero
+diagram:
+  caption: Where a relay's money goes. Requests to the bucket follow the number of logs and host shards, not the traffic. Consumer egress follows the number of consumers times the whole stream, and decides the bill wherever egress is metered.
+  nodes:
+    - { id: pds, label: PDSes, sub: "~15 Mb/s in today", at: [0, 3], size: [8, 3], tone: muted, stack: true }
+    - { id: cores, label: 3 core nodes, sub: "~$600/mo on OVH", at: [12, 3], size: [9, 3], tone: accent }
+    - { id: bucket, label: Bucket requests, sub: "~$2.8k/mo on R2", at: [25, 0], size: [10, 2.6], shape: store, tone: amber }
+    - { id: store, label: Bucket storage, sub: "~$5/mo · 72 h of log", at: [25, 6], size: [10, 2.6], shape: store, tone: amber }
+    - { id: cons, label: 100 consumers, sub: "~490 TB/mo out", at: [39, 3], size: [9, 3], tone: blue, stack: true }
+  edges:
+    - pds -> cores
+    - "cores.r -> bucket.l: PUTs · GETs"
+    - "cores.r -> store.l"
+    - "cores.r -> cons.l: $0 on OVH · ~$27k on AWS"
+facts:
+  - { value: "~$3.4k", unit: /mo, label: 3 cores at today's load, note: "OVH + R2, 100 consumers; requests are $2.8k of it", tone: amber }
+  - { value: "~$1.0k", unit: /mo, label: one node with an edge, note: "no HA; OVH + R2", tone: accent }
+  - { value: "~$27k", unit: /mo, label: of egress on AWS, note: "100 consumers × the whole stream, today", tone: rust }
+  - { value: "~1M", unit: events/s, label: where the full mesh stops scaling, note: "every core streams to every other; a merge tier fixes it (not built)", tone: violet }
+```
+
+What vlRelay would cost to run for the whole network today, and at 10x, 100x and 1000x that load: hosts, bucket and bandwidth, priced on OVH, Hetzner and AWS with S3, R2, Tigris, GCS, B2 and Wasabi. It follows vlpds's cost model. Every input is measured, counted from the code or assumed, and each table says which. `scripts/cost_model.py` regenerates every table here from the inputs and prices at its top.
 
 ## Headline
 
@@ -27,15 +53,15 @@ What the numbers say, in order of size:
 
 | Input | Value | Source |
 |---|---|---|
-| Events/s | ~350 average, ~480 busiest hour, ~180 quietest | ClickHouse `repo_records`, 7 days ([reference notes](reference-notes.md#frame-sizes-and-rates)) |
-| Mean frame | ~5.3 KB (5,283-5,323 B measured) | refdiff against `relay1.us-east.bsky.network` (reference notes) |
-| Log compression | 1.56x at zstd -1 on production frames | [perf](perf.md) iteration 5 |
-| CPU per event | 65-70 µs (one node, 8 cores) · 89-94 µs (one node on SMT threads) · 142-156 µs (3-node cluster, threads) | perf iterations 5 and 6 |
-| Cluster overhead split | forward ~15 µs per forwarded event · log streams ~8 µs per event per peer copy · merge ~1 µs per event per node · the rest ~30 µs | perf iteration 6 profile, used to scale with the node count |
-| Peer bytes | 12.7-15.2 KB per event on 3 nodes | perf iteration 6 |
+| Events/s | ~350 average, ~480 busiest hour, ~180 quietest | the network's records, 7 days |
+| Mean frame | ~5.3 KB (5,283-5,323 B measured) | frames read off `relay1.us-east.bsky.network` |
+| Log compression | 1.56x at zstd -1 on production frames | [Performance](perf.md#compression) |
+| CPU per event | 65-70 µs (one node, 8 cores) · 89-94 µs (one node on SMT threads) · 142-156 µs (3-node cluster, threads) | [Performance](perf.md) |
+| Cluster overhead split | forward ~15 µs per forwarded event · log streams ~8 µs per event per peer copy · merge ~1 µs per event per node · the rest ~30 µs | the cluster profile ([Performance](perf.md#a-three-node-cluster)), used to scale with the node count |
+| Peer bytes | 12.7-15.2 KB per event on 3 nodes | [Performance](perf.md#a-three-node-cluster) |
 | Segment sealing | 25 ms linger from a segment's first event (`--linger-ms`), 32 PUTs in flight, 8 MiB raw cap | `src/seq.rs` |
 | Seal overhead | ~2.8 ms per seal | vlpds cost model |
-| Segment PUTs at low rates | ~20/s for 60 events/s on one node, ~35/s for 3 cores (2 with a log) | [shadow run](shadow.md#load-latency-and-the-bucket) |
+| Segment PUTs at low rates | ~20/s for 60 events/s on one node, ~35/s for 3 cores (2 with a log) | a two-hour run against ten real PDSes |
 | DID shard checkpoints | every 5 s per shard, an L0 flush each: ~4.4 Class A + ~9 Class B with the compaction it causes | `node.rs` + vlpds cost model |
 | SlateDB polls | ~0.4 GET/s per shard (manifest 10 s, compactor 30 s) | vlpds defaults, measured there |
 | DID shards | 4 on one node, 24 in a cluster | `--did-shards` default |
@@ -44,7 +70,7 @@ What the numbers say, in order of size:
 | PLC seeds | ~54 B a DID in SSTs (~3 GB for 56M) | [policy](policy.md#plc-export-seeding) |
 | Archival mirror | 154.2 B a record + 323 B a repo | vlpds `bench/results/storage-2026-10-02` (same layout) |
 | Network today | 56M repos, ~24B records, 89.9M PLC DIDs | vlpds cost model's ClickHouse queries |
-| Fan-out | ~0.025 cores and ~1.6 Gb/s per consumer at 33k events/s | perf "Fan-out at 33k" |
+| Fan-out | ~0.025 cores and ~1.6 Gb/s per consumer at 33k events/s | [Performance](perf.md#fan-out) |
 
 Assumptions the model adds:
 
@@ -88,7 +114,7 @@ The 1000x row is where the full mesh gives out. Each core streams its whole log 
 | 24 | 353 | 159 | 762k | 1.7M |
 | 48 | 580 | 159 | 927k | 3.4M |
 
-So the mesh tops out around 1M events/s however many nodes it has, and 960k sized needs ~58 of them at 675 µs an event. With cores streaming only to 3 merge nodes (a design sketch, not built), 14 cores cover it at ~159 µs. The scaling terms are iteration 6's profile split linearly, which nothing measured past 3 nodes.
+So the mesh tops out around 1M events/s however many nodes it has, and 960k sized needs ~58 of them at 675 µs an event. With cores streaming only to 3 merge nodes (a design sketch, not built), 14 cores cover it at ~159 µs. The scaling terms are the cluster bench's profile split linearly, which nothing measured past 3 nodes.
 
 Archival apply adds ~130 µs an event (69 when the tree is still in memory, [archival](archival.md#numbers)). That's nothing today and 12.5 threads at 100x sized, which takes the 3 nodes from 30% to ~56%.
 
@@ -103,7 +129,7 @@ Archival apply adds ~130 µs an event (69 when the tree is still in memory, [arc
 
 Per event, a 3-node cluster forwards two thirds of the frames to their DID owner (~3.6 KB) and streams the raw frame to both peers (~10.6 KB). The model gives 14.2 KB against 12.7-15.2 measured. Per node each way, that's about one full firehose at any node count, since a node receives every other node's log. What grows with the count is the cluster total.
 
-Peer traffic is free on OVH (the vRack, 25 Gb/s on ADVANCE) and Hetzner (internal traffic is unmetered). On AWS, nodes in three AZs pay $0.01/GB each way, so a 3-AZ cluster at 100x pays ~$17k a month to talk to itself. Compressed log streams ([perf](perf.md#not-done-next)) would cut the stream part by a third.
+Peer traffic is free on OVH (the vRack, 25 Gb/s on ADVANCE) and Hetzner (internal traffic is unmetered). On AWS, nodes in three AZs pay $0.01/GB each way, so a 3-AZ cluster at 100x pays ~$17k a month to talk to itself. Compressed log streams ([Performance](perf.md#what-s-next)) would cut the stream part by a third.
 
 ## The bucket
 
@@ -202,7 +228,7 @@ Each full-firehose consumer gets every frame, so it costs exactly one ingest's w
 | 1000x | 100 | 1,484 Gb/s | 487,828 | 212 | 85 | 22 |
 | 1000x | 1,000 | 14,840 Gb/s | 4.9M | 2,120 | 848 | 212 |
 
-Node counts are at 70% of the NIC. CPU isn't the limit: serving costs ~1 core per 64 Gb/s (perf "Fan-out at 33k"), so a 100 GbE edge needs ~1.1 cores for its consumers. What it costs per provider, picking each provider's cheapest SKU per usable Gb/s, and serving from the core nodes while half their spare port covers it:
+Node counts are at 70% of the NIC. CPU isn't the limit: serving costs ~1 core per 64 Gb/s ([Performance](perf.md#fan-out)), so a 100 GbE edge needs ~1.1 cores for its consumers. What it costs per provider, picking each provider's cheapest SKU per usable Gb/s, and serving from the core nodes while half their spare port covers it:
 
 | Load | Consumers | OVH | Hetzner | AWS |
 |---|---|---|---|---|
@@ -293,7 +319,7 @@ On OVH the split moves from the bucket (82% today) to edge boxes (78% at 100x). 
 
 ## The linger knob
 
-The relay's linger is 25 ms, chosen for time to firehose (PLAN.md decision 1). Segment PUTs and their S3 cost per month, at each load's node count, with nothing else changed:
+The relay's linger is 25 ms, chosen for time to firehose ([Design](design.md#decisions)). Segment PUTs and their S3 cost per month, at each load's node count, with nothing else changed:
 
 | Load | Nodes | 10 ms | 25 ms (default) | 50 ms | 100 ms | 250 ms |
 |---|---|---|---|---|---|---|
@@ -302,7 +328,7 @@ The relay's linger is 25 ms, chosen for time to firehose (PLAN.md decision 1). S
 | 100x | 3 | 235/s · $3,090 | 109/s · $1,428 | 57/s · $753 | 29/s · $387 | 22/s · $294 |
 | 1000x, as built | 58 | 4,516/s · $59k | 2,094/s · $28k | 1,105/s · $15k | 569/s · $7.5k | 231/s · $3.0k |
 
-R2 is 10% less. Going from 25 to 50 ms would save ~$450 a month today and ~$680 at 100x. It would add up to 25 ms to time to firehose, since a segment's first event waits the whole extra linger and its last waits none. At 250 ms and 100x, segments start sealing on size, so the line flattens. So the 25 ms default costs a few hundred dollars a month over the top of PLAN.md's 25-50 ms range, and that's the price of the lower latency.
+R2 is 10% less. Going from 25 to 50 ms would save ~$450 a month today and ~$680 at 100x. It would add up to 25 ms to time to firehose, since a segment's first event waits the whole extra linger and its last waits none. At 250 ms and 100x, segments start sealing on size, so the line flattens. So the 25 ms default costs a few hundred dollars a month over the top of the design's 25–50 ms range, and that's the price of the lower latency.
 
 ## Compared with vlpds
 
@@ -319,7 +345,7 @@ Both bills are request bills that don't follow traffic. Per node, the relay's se
 
 ## Caveats
 
-- The 100k events/s figure is extrapolated from one box on loopback. Iteration 6 ran 3 nodes of 3 cores plus SMT on benchbox, sharing one memory bus, one L3 and one MinIO, with loopback for the NICs. The per-event CPU numbers come from there, and so does everything at 100x and above.
+- The 100k events/s figure is extrapolated from one box on loopback. The cluster bench ran 3 nodes of 3 cores plus SMT on one 16-core box, sharing one memory bus, one L3 and one MinIO, with loopback for the NICs. The per-event CPU numbers come from there, and so does everything at 100x and above.
 - MinIO's latency isn't S3's or R2's. The model doesn't depend on PUT latency below ~1 s (32 in flight), but time to firehose does, and replica polling assumes ~25 ms GETs. R2 is often slower than S3 in-region, which would lower the replica GET rate and raise the cluster's time to firehose.
 - The host bookkeeping is counted from the code and hasn't been measured. Each term scales with the host shards that see traffic in a tick (at most 64), so a quieter network than assumed would pay less, never more.
 - 1000x goes far past anything measured. The node counts there extrapolate one profile's split of the cluster overhead linearly to 58 nodes. A 58-node full mesh would need 14.8 Gb/s each way per node just between cores and 861 Gb/s across the cluster, which no part of the system has been tried at.

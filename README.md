@@ -14,7 +14,7 @@ Jetstream read it unchanged.
 
 - The bucket is the only durable state. Events are group-committed into log segments with
   conditional PUTs, and per-account sync state lives in SlateDB on the same bucket. A node keeps
-  nothing on local disk, so losing one only costs you its caches. → [Design](docs/design.html)
+  nothing on local disk, so losing one only costs you its caches. → [Design](docs/design.md)
 - Nodes share the work with no coordinator. Host shards decide which node subscribes to which
   PDS, and DID shards decide which node keeps each account's state. Every core node merges every
   log into the same stream with the same seqs, so a consumer can resume on any node with its
@@ -34,20 +34,37 @@ Jetstream read it unchanged.
   are one versioned document that every node reloads. The defaults follow indigo's relay wherever it
   has a number.
   → [Policy](docs/policy.md)
-- The operator dashboard at `/admin` shows live rates, rejects, hosts, consumers, cases and the
-  cluster, and edits the policy and domain rules, throttles or bans hosts, and takes down
-  accounts. → [Admin API](docs/admin-api.md)
+- A public page at `/` shows safe aggregates (events/s, time to firehose, hosts, consumers, node
+  and quorum health) and how to subscribe, from an allow-listed `/api/public/stats`. The operator
+  console at `/admin` shows live rates, rejects, hosts, consumers, cases, the cluster, the quorum
+  log and the effective config, and edits the policy (limits and live tuning) and domain rules,
+  throttles or bans hosts, and takes down accounts. → [Admin API](docs/admin-api.md)
 - It's compatible with what reads Bluesky's relay today. indigo's consumer, the sync 1.1 checks,
-  `goat`, Jetstream and the sync API matched indigo's relay event for event on the same upstreams.
-  The exception is `@atproto/sync`, which rejects seqs above 2^53 (vlRelay's are ~4.6e17).
-  → [Compatibility](docs/compat.md)
+  `goat`, `@atproto/sync`, Jetstream and the sync API matched indigo's relay event for event on the
+  same upstreams, and the seqs matched too (they're dense, 1, 2, 3, …, the same on every node).
+  → [Compatibility](docs/compat.md), [Stream seqs](docs/seq.md)
 
-Archival mode (a full mirror of every repo, for getRepo) is designed but still in progress.
+Archival mode (a full mirror of the repos it chooses, for getRepo) works and is off by default.
+→ [Archival mode](docs/archival.md)
 
 The overview at the top is real traffic, from the [shadow run](docs/shadow.md) against ten PDSes.
 The demo backend's simulated 5,000-host relay shows the busy end of the hosts page:
 
 ![The hosts page on the demo backend: thousands of hosts by events per second, with tiers, error rates and throttles](docs/assets/dashboard-hosts.jpg)
+
+The public page, on the demo backend:
+
+![The public page: the relay's host name, how to subscribe to the firehose, live events in and out, time to firehose, connected hosts and consumers, and node and quorum health](docs/assets/dashboard-public-dark.jpg)
+
+The console's quorum log page, with each member's acked, committed and emitted seq, the flush
+point F and reserve R, membership changes and bucket recoveries:
+
+![The quorum log page on the demo backend: epoch, leader, members answering, commit index, F and R, per-member lag, flush stats, counters, membership changes and a typed-confirm membership editor](docs/assets/dashboard-quorum-dark.jpg)
+
+Tuning edits the live half of the policy document (transitions, cluster budgets, consumer limits,
+crawl admission, spam signals) against each field's default:
+
+![The tuning page: policy knobs grouped by area, each with its current value, its default and why it matters, saved as a new policy version with a note](docs/assets/dashboard-tuning-light.jpg)
 
 ## Quickstart
 
@@ -73,15 +90,26 @@ runs the relay against it. [Dev loop](docs/devloop.md) has the rest.
 
 ## Documentation
 
-[docs/index.md](docs/index.md) puts the pages in reading order.
+Every node serves the docs at `/docs`, with no auth (the quickstart's are at
+<http://127.0.0.1:2980/docs>). They're built from `docs/*.md` into the UI bundle, and
+`just docs-check` validates them. [docs/overview.md](docs/overview.md) is the front page, and
+[docs/_style.md](docs/_style.md) says how to write one.
 
-| Start here | Run it | How it works |
+| Start here | Run it | Reference |
 |---|---|---|
-| [Design](docs/design.html) | [Deploy](docs/operations/deploy.md) | [Cluster](docs/cluster.md) |
-| [Build plan](docs/PLAN.md) | [Configuration](docs/operations/configuration.md) | [Policy](docs/policy.md) |
-| [Dev loop](docs/devloop.md) | [Monitoring](docs/operations/monitoring.md) | [Performance](docs/perf.md) |
-| [Load fleet](docs/loadfleet.md) | [Admin API](docs/admin-api.md) | [Compatibility](docs/compat.md) |
-| | | [Reference notes](docs/reference-notes.md) |
+| [Overview](docs/overview.md) | [Operations](docs/operations/index.md) | [Admin API](docs/admin-api.md) |
+| [Subscribe to the firehose](docs/subscribing.md) | [Deploy](docs/operations/deploy.md) | [Compatibility](docs/compat.md) |
+| [Design](docs/design.md) | [Configuration](docs/operations/configuration.md) | [Performance](docs/perf.md) |
+| [Cluster](docs/cluster.md), [Stream seqs](docs/seq.md) | [Monitoring](docs/operations/monitoring.md) | [Cost](docs/cost.md) |
+| [Policy](docs/policy.md), [Archival mode](docs/archival.md) | | |
+
+Internal notes stay in the repository and off the site (`docs/_internal.txt`): the
+[design-session doc](docs/design.html), the [build plan](docs/PLAN.md), the [dev loop](docs/devloop.md),
+the [load fleet](docs/loadfleet.md), [chaos runs](docs/chaos.md), the [shadow run](docs/shadow.md),
+the [perf log](docs/perf-log.md), [reference notes](docs/reference-notes.md), the
+[quorum study](docs/quorum.md) and the cluster and policy wiring
+([cluster-internals](docs/cluster-internals.md), [policy-internals](docs/policy-internals.md)).
+[docs/index.md](docs/index.md) lists all of them in reading order.
 
 ## Status
 

@@ -1,6 +1,16 @@
 /* Quorum, Settings and Tuning. */
 
 /* ---- quorum */
+/* seqs are 11+ digits: smaller, so a tile holds one on a line */
+.qtiles .tile .v > .mono {
+  font-size: 17px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.qtiles .tile .v > .mono small {
+  display: block;
+  margin: 0;
+}
 td.lagcell {
   min-width: 120px;
 }

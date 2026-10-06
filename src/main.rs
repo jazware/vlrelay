@@ -49,7 +49,7 @@ struct Args {
     prefix: String,
     #[arg(long, default_value = "https://plc.directory", env = "VLRELAY_PLC_URL")]
     plc_url: String,
-    /// Segment linger (PLAN.md decision 1).
+    /// Segment linger: a segment seals this long after its first event (docs/design.md, "Decisions").
     #[arg(long, default_value_t = 25)]
     linger_ms: u64,
     /// Segment PUTs in flight at once.
@@ -61,7 +61,7 @@ struct Args {
     /// zstd level for log segments: 0 stores them uncompressed, negative
     /// levels are zstd's fast ones. Firehose frames are mostly hashes:
     /// on production frames -1 compresses 1.8x faster than 1 for 0.6% more
-    /// bytes (docs/perf.md, iteration 5).
+    /// bytes (docs/perf.md, "Compression").
     #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
     log_compression: i32,
     /// An upstream to subscribe to (repeatable). `http://` means plain
@@ -307,23 +307,26 @@ async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<
         app = app.merge(node.crawler.router());
     }
     let token = a.admin_token.clone().filter(|t| !t.is_empty());
-    // a core answers its peers' dashboards even without a dashboard of its own
-    let admin_src = (token.is_some() || node.cluster.is_some()).then(|| {
+    // always built: the public page's stats come from it, and a core answers
+    // its peers' dashboards even without a dashboard of its own
+    let admin_src = {
         let policy = node.policy.clone().expect("the relay always runs the policy engine");
         let demo = vlrelay::admin::demo::Demo::start(42);
         let src = NodeAdmin::new(node.clone(), policy, demo)
             .with_followers(a.admin_followers.clone(), token.clone().unwrap_or_default())
             .with_settings(settings);
         Arc::new(src)
-    });
-    if let (Some(g), Some(src)) = (&node.cluster, &admin_src) {
-        let _ = g.admin.set(Arc::downgrade(src));
+    };
+    if let Some(g) = &node.cluster {
+        let _ = g.admin.set(Arc::downgrade(&admin_src));
     }
     // admin_src stays bound for the life of `run`: the peer slot holds it weakly
-    if let (Some(token), Some(src)) = (token, admin_src.clone()) {
-        let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
-        app = app.merge(vlrelay::admin::app(src, token.clone(), ui));
+    let ui = Arc::new(vlrelay::admin::UiFiles::load(a.ui_dir.as_deref())?);
+    if let Some(token) = token {
+        app = app.merge(vlrelay::admin::app(admin_src.clone(), token.clone(), ui));
         app = app.merge(vlrelay::archive::admin::router(node.state.clone(), token));
+    } else {
+        app = app.merge(vlrelay::admin::docs_routes(ui)).merge(vlrelay::admin::public_routes(admin_src.clone()));
     }
     let app = with_real_ip(app.layer(middleware::map_response(server_header)), &a.trusted_proxies);
 
