@@ -139,6 +139,13 @@ for i in (1, 2, 3):
         f"  n{i} per flush: {fl['entries'] / n:.0f} entries, {fl['segments'] / n:.2f} segments, {fl['raw_bytes'] / n / 2**20:.2f} MiB raw, "
         f"{fl['segment_bytes'] / n / 2**20:.3f} MiB stored; requests per flush: {reqs}"
     )
+for i in (1, 2, 3):
+    s = load(f"status-n{i}.json", {})
+    fl = (s or {}).get("flush") or {}
+    tot = fl.get("requests_total")
+    if tot and fl.get("flushes"):
+        secs = (ld or {}).get("seconds") or 1
+        print(f"  n{i} all object-store requests, per second of load: " + ", ".join(f"{op} {c / secs:.2f}" for op, c in sorted(tot.items())))
 v = load("verify.json")
 if v is not None:
     print(

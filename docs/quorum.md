@@ -1,6 +1,6 @@
 # vlRelay: quorum replication (design and cost study)
 
-The first pass at vlRelay's economics didn't pan out. Three nodes on OVH with R2 came to ~$3.4k a month, and ~$2.8k of that was bucket requests: segments sealed every 25 ms on every node, plus host bookkeeping in bucket objects every 2-5 s. A non-archival sync 1.1 relay on one node costs about $10-15 a month to run. This page is a design and cost study for a vlRelay that keeps its recent log in replicas instead of the bucket, and writes the bucket rarely and in bulk. The replication core (Phase 1) and the commitlog (Phase 2) are built and measured, see [Implementation notes](#implementation-notes). The flush and the relay's wiring aren't built yet. `scripts/cost_model.py --quorum` generates every table above the notes.
+The first pass at vlRelay's economics didn't pan out. Three nodes on OVH with R2 came to ~$3.4k a month, and ~$2.8k of that was bucket requests: segments sealed every 25 ms on every node, plus host bookkeeping in bucket objects every 2-5 s. A non-archival sync 1.1 relay on one node costs about $10-15 a month to run. This page is a design and cost study for a vlRelay that keeps its recent log in replicas instead of the bucket, and writes the bucket rarely and in bulk. The replication core (Phase 1), the commitlog (Phase 2) and the flush (Phase 3) are built and measured, see [Implementation notes](#implementation-notes). Bucket recovery and the relay's wiring aren't built yet. `scripts/cost_model.py --quorum` generates every table above the notes.
 
 The idea is the one in vlpds's TODO ("Quorum in-memory durability"). A leader appends each event, replicates it to two other nodes and emits it once two of the three hold it. The bucket gets a flush every 10-60 s, and the host cursors ride in the same flush as the log they belong to. A relay suits this better than a PDS does, because the PDSes upstream are the source of truth. If the relay loses an unflushed tail, it asks each PDS to replay from its last flushed cursor. Losing a quorum costs a re-ingest and some time, and never a user's data. Jaz's call: the firehose holds every event back until a quorum has it, so consumers only see events that a takeover keeps.
 
@@ -89,11 +89,11 @@ Events in (F, last emitted] are gone from the relay. The re-ingest (section 2) b
 
 The bucket holds one object that recovery trusts, `qlog/manifest`, and it's written last with a CAS (`If-Match` on the ETag the leader wrote before). A flush at commit index F goes like this:
 
-1. The leader picks F as the current commit index. Only committed entries are ever flushed, since an uncommitted one could be dropped by a takeover.
-2. It seals the DID state at exactly F. The apply loop pauses at F while SlateDB's memtable is frozen (an in-memory swap), then carries on. The frozen memtable uploads as an L0 SST in the background.
-3. It uploads the log up to F. Segments are cut at 64 MiB of zstd as the log fills, each a create-only PUT named by its epoch and seq range (`qlog/seg/{first_seq}-{epoch}`), and the flush PUTs the partial one.
-4. It writes the manifest: epoch, F, R, the SlateDB checkpoint that holds the state at F, the host cursors as of F, the host registry rows that changed and the host counters. With ~6k hosts that's a few hundred KB.
-5. The manifest's CAS is the commit. A crash before it leaves the previous manifest in charge, and the segments past it are ignored and deleted later.
+1. The leader takes F as the seq its state has applied, which is committed. Only committed entries are ever flushed, since an uncommitted one could be dropped by a takeover.
+2. It seals the DID state at exactly F. The apply loop stops at F until a SlateDB checkpoint exists (the memtable's L0 upload, ~20-350 ms measured), then carries on. Nothing waits on it but the state: acks and emission don't apply state in this design.
+3. It uploads the log in (previous F, F] as vlpds segments, `log/qlog/{ordinal:012}.seg`, create-only, cut at 64 MiB raw. vlpds keys segments by a dense ordinal and keeps the seqs in the header, so vlpds's backfill reader serves them as they are.
+4. It writes the manifest: epoch, F, R, the segments this flush wrote and the next ordinal, the SlateDB checkpoint that holds the state at F, and the host cursors as of F. Registry rows and host counters would ride the same way once the relay is wired in.
+5. The manifest's CAS is the commit. A crash before it leaves the previous manifest in charge. A segment past it holds committed entries all the same, and the next flush adopts it if it starts where that flush's would.
 
 A single object can't do it, because SlateDB writes its own SSTs and manifest. So the state is referenced by a SlateDB checkpoint, and our manifest names it. Keeping segments as their own objects also spreads the upload over the interval and lets backfill GET a segment by name.
 
@@ -101,13 +101,13 @@ A single object can't do it, because SlateDB writes its own SSTs and manifest. S
 
 The danger is a cursor that says "PDS X is done through 1,000" in a flush whose log only holds X's events through 990. After a crash, the relay would ask X for 1,001 onwards and 991-1,000 would be gone. Cursors get into the log the same way events do:
 
-- Each host owner sends its hosts' acked cursors to the leader about once a second, as a cursor entry. An acked cursor C for host X means every event of X up to C is committed, a duplicate or refused.
-- The leader appends cursor entries to the log like events (replicated, never emitted). An event counted in C was committed before the host owner sent C, so its seq is below the cursor entry's.
-- The manifest's cursors are the latest cursor entry for each host at or below F.
+- Each host owner sends its hosts' acked cursors to the leader about once a second, on its next submit. An acked cursor C for host X means every event of X up to C is committed, a duplicate or refused.
+- The leader puts them on the first entry it appends after receiving them (replicated and journaled with it, never emitted). An event counted in C was committed before the host owner sent C, so its seq is below that entry's. They ride on an event rather than taking a seq of their own, which would put holes in the dense stream consumers see.
+- The manifest's cursors are the highest each host's entries carry at or below F.
 
 So every event a manifest's cursors count is at or below F, and in the flushed log. The same entries let a new leader resume a dead node's hosts from a cursor ~1 s old, from its own log, without the bucket.
 
-The state follows the same rule. If the DID state got ahead of the log, a re-ingested commit would hit a rev the state already holds and be dropped as a duplicate, which loses it. That's why step 2 seals the state at exactly F. It needs SlateDB never to flush a memtable between our barriers (WAL off, an L0 size above what an interval holds). That's a thing to check in the prototype.
+The state follows the same rule. If the DID state got ahead of the log, a re-ingested commit would hit a rev the state already holds and be dropped as a duplicate, which loses it. That's why step 2 seals the state at exactly F. SlateDB does flush memtables on its own (at its L0 size), and a flush or checkpoint only promises *at least* the writes before it, so the seal doesn't rely on barriers: the applier writes nothing past F until the checkpoint exists ([Phase 3](#the-flush-phase-3)).
 
 ### What a flush costs
 
@@ -433,7 +433,7 @@ The prices behind all of this:
 Risks, biggest first:
 
 - Log matching and truncation are where the correctness bugs would be. vlpds has none of this, since the bucket was its only log. It needs a model checker or a fault-injecting test harness before it carries traffic.
-- Sealing the DID state at exactly F depends on SlateDB not flushing a memtable on its own between barriers. If it can, the state gets ahead of the log and a re-ingest drops commits.
+- Sealing the DID state at exactly F. SlateDB can put writes past F into F's checkpoint, so the applier stops at F until the checkpoint exists, and the seal checks the checkpoint's `last_l0_seq` is F ([Phase 3](#the-flush-phase-3)). Settled.
 - VPS fsyncs may lie. The commitlog's claim to survive a DC power cut only holds on disks with power-loss protection, which a VPS doesn't promise.
 - Shared vCPUs. The leader's ack path is one node's, so a noisy neighbour shows up as firehose latency.
 - The re-ingest after a lost quorum sends repeated commits. Consumers that don't check revs (the reference says they should) would double-count. It only happens when two disks are lost, with the commitlog.
@@ -552,9 +552,9 @@ What the numbers say against the study's assumptions:
 Known gaps, for later phases:
 
 - The relay itself doesn't use the quorum log yet. The forward path, verify and state still run on the old node log. Wiring `cluster/forward.rs` to `Client::submit` (with its resend) and the DID state apply to committed entries is the integration step.
-- A follower more than `--retain-mb` behind is reset to the leader's base, and its stream jumps. Phase 3's bucket segments let it catch up instead. (Phase 2: with a commitlog it's served from the leader's disk first, and only a follower behind the leader's disk retention is reset.)
+- A follower more than `--retain-mb` behind is reset to the leader's base, and its stream jumps. (Phase 2: with a commitlog it's served from the leader's disk first, and only a follower behind the leader's disk retention is reset. Phase 3: with the flush on, it's served from the bucket after that, and only a follower behind the bucket's retention is reset.)
 - The pre-vote and the probe treat any I/O error from the leader as "dead". A flaky link can cost an unneeded takeover (availability, not safety).
-- Nothing is flushed, and a lost quorum is unrecoverable until Phase 4. Until then it stops emission rather than reissuing seqs.
+- A lost quorum is unrecoverable until Phase 4. Until then it stops emission rather than reissuing seqs. (Phase 3 writes everything Phase 4 recovers from.)
 - Membership is fixed (`--peer`).
 
 ### The commitlog (Phase 2)
@@ -657,6 +657,147 @@ What the numbers say against the study:
 - **Two- and three-process failures are now a normal takeover, as the study assumed.** Kill or power-cut two or all three and the cluster resumes in about two seconds with nothing lost and no jump. The only lost-quorum case left is losing two disks.
 - **Recovery time grows with what's kept on disk** (~0.35 s a GB). Phase 3's trimming at R keeps that to one flush interval plus a segment: at 100x with a 60 s flush that's ~11 GB, ~4 s. If that matters, a sealed segment could carry an index footer so recovery reads only the tail segment.
 - **One append in flight per follower caps a follower at `max_batch_bytes` (4 MiB) per RTT + fsync.** At a 2 ms fsync that's ~2 GB/s, ample. It only bit on the saturated shared disk (20 ms fsyncs, ~200 MB/s). Pipelining appends, or a larger batch, is the fix if a host's fsync is that slow.
+
+### The flush (Phase 3)
+
+`src/qlog/flush.rs` (the leader's flush loop, the manifest, the consistency check), `src/qlog/state.rs` (the state and its seal), plus cursor entries in `log.rs`, `wire.rs` and `commitlog.rs`, and one vlpds hook (`firehose::LocalTail`). The flush runs on the leader every `--flush-ms` (30 s by default). Each step below is in the order it runs.
+
+- **Fence.** A new leader first CASes `qlog/manifest` to its own epoch, with the content unchanged. That's one GET and one PUT per takeover, off the ack path. An older leader's flush then fails its CAS because the ETag moved, and one that reads the manifest afterwards sees a newer epoch and steps down. A flush that lands before the fence is harmless: everything it names is committed, and F and R only go up. The mutation proves the fence matters. Without it, an old leader stalled before its CAS commits its manifest over the new leader's (`an_old_leaders_flush_loses_to_a_takeover`).
+- **The state.** One SlateDB at `qlog/state` with the WAL off, written only by the leader. Opening it fences the previous writer. It stands in for the relay's DID state: per DID the seq and content of its last event, per host the highest cursor carried in the log, and `_applied`. The leader applies committed entries as they commit, so state never waits on acks or emission. Each batch is written with SlateDB's user seqnum set to the batch's last log seq. That makes a manifest's `last_l0_seq` the log seq its state reaches.
+  - **Followers don't keep a state.** The study had every follower apply committed entries, for an instant promotion. As built, a new leader opens `qlog/state` at whatever the old leader last flushed (at or past the manifest's F: it sealed before writing its manifest) and replays from its own log. That's 20-30 ms to open on a local MinIO, plus the replay of up to one interval.
+  - Every node already keeps its log above F (next point), so the replay always has what it needs. It's also Phase 4's path: open at a checkpoint, replay or re-ingest. The state stays one writer's in the bucket, and that's the cost model's one L0 flush per interval.
+  - In the real relay the leader's `check_chain` needs state at the head, so promotion would wait for that replay (a second or two of entries at 100x and a 60 s flush, estimated). If that's too slow, followers can apply too. That would cost their L0 flushes in the bucket, or a local SlateDB per node.
+- **State at exactly F, and what SlateDB does.** Reading the fork at `c7b29a06`:
+  - With the WAL off, a memtable freezes only on the write path, at `l0_sst_size_bytes`, on an explicit flush or checkpoint, or at close. There's no timer (`flush_interval` is WAL-only). The freeze itself happens between write batches.
+  - The flush tracker, though, targets the newest frozen memtable when it handles a request, and the manifest writer folds every contiguous uploaded memtable into one manifest update along with any pending checkpoint. So a `flush()` or a `create_checkpoint(All)` can land in a manifest that also holds writes made after it was asked for. It promises "at least F", never "exactly F".
+  - The design therefore doesn't rely on SlateDB staying quiet between barriers. The applier is the state's only writer and it writes nothing past F until `create_checkpoint(All)` returns. Then the seal reads the checkpoint's manifest back and refuses it unless `last_l0_seq` is F. Automatic flushes at other times are fine: they only ever hold seqs at or below what's applied.
+  - `a_seal_holds_exactly_its_point_across_automatic_flushes` seals four times with 16 KiB L0s, so memtables freeze and upload on their own before and between seals. Each checkpoint holds exactly its seal point, by manifest and by contents.
+  - No fork change was needed.
+  - SlateDB's default `l0_max_ssts` (8) made seals wait 1-5 s for the compactor at 2 s flushes. It's 32 here, as in vlpds.
+- **Cursor entries.** Host cursors ride on log entries (`Entry::cursors`, an `n | (host, cursor)*` blob) instead of taking seqs of their own, so the stream consumers see stays dense.
+  - A submit carries the submitter's cursors. The leader puts them on the first entry it appends next, holding them if the submit had no events.
+  - They're replicated with the entry and journaled as a new commitlog record (`T_APPEND_C`: epoch, seq, cursor length, cursors, data). The state applies them, and the manifest's cursors are the state's at F.
+  - An acked event's seq is below the entry its cursor rides on, so cursors at F never count an event above F. The check confirms it for every manifest, and a mutation catches it: cursors sent one batch ahead are reported as "ahead of the log at F".
+- **Segments.** vlpds's own segments, `log/qlog/{ordinal:012}.seg`. vlpds keys segments by a dense ordinal and keeps the first and last seq in the header, so it isn't `qlog/seg/{first_seq}-{epoch}` as §2 sketched. They're create-only, zstd at vlpds's level 1, built in a blocking task.
+  - Each flush writes exactly (previous F, F], cut at 64 MiB raw. A partial segment is never rewritten, so at today's rate a 30 s flush makes one ~40 MiB segment.
+  - A flush that finds its ordinal taken reads that segment's header. If it starts where this flush's would, and ends at or below F, the flush adopts it. That's a flush that died after a segment PUT, or a deposed leader's: committed entries are the same on every node. If it ends past F, the flush retries next tick. Anything else stops the flush.
+- **Manifest.** `qlog/manifest` is JSON: `{epoch, leader, flushed: F, reserve: R, next_ordinal, segments: [{ordinal, first, last, bytes}], state: {checkpoint, manifest_id, seq}, cursors: {host: cursor}, flushes, at_ms}`. It's a few KB with 64 hosts. It lists only this flush's segments: ordinals are dense from 0 and headers carry seqs, so the full list would only grow with retention. After the CAS the leader deletes the previous manifest's checkpoint. A new leader deletes any `qlog-*` checkpoint the manifest doesn't name, which covers flushes that died between seal and CAS.
+- **The reservation.** R = max(previous R, F + H), `--headroom`, 8.64M by default (three 30 s intervals at 100x). The leader caps the commit index itself at the last committed manifest's R, which caps emission on every node. Followers learn F and R from the append header, so a new leader starts with them, and its own fence read raises them. `commit_stops_at_the_reservation` holds commit at exactly R = H when no flush follows the first.
+- **Trim.** A node's commitlog floor is min(emitted, commit, F as it knows it). On the leader it's also every live follower's match: a follower heard from within `laggard_grace` (10 s) keeps the leader's disk back to it. The brief said min(emitted, commit, R), but R is never below the commit index, so the bound that matters is F: only what's in the bucket leaves local disk.
+  - A follower behind the leader's disk is now served from the bucket segments (one segment cached per replicator), not reset. The Phase 2 ceiling run's three resets, and a reset the first mid-trim run here hit, were exactly that case. With the bucket path off, the checker fails on the hole (`a_follower_behind_the_leaders_disk_catches_up_from_the_bucket`).
+  - When a follower is also behind the leader's disk with nothing flushed for it, the reset now lands at the oldest seq the disk holds, not at the in-memory base, which could have been past F.
+- **Backfill.** The quorum log's firehose gets the bucket (`Firehose::store`), so a cursor older than the ring backfills from the segments instead of getting `OutdatedCursor`. That alone isn't enough.
+  - vlpds's backfill assumes every emitted event is in the bucket ("everything ≤ the ring floor that exists was sent"). The quorum log emits up to a flush interval before it flushes, so a cursor between F and the ring floor would have skipped silently.
+  - The one vlpds change is `firehose::LocalTail`, opt-in and counted streams only. The backfill reads the bucket up to the tail's floor, then the node's own log (memory or commitlog) up to the ring. Every node keeps its log above F, so the two always meet.
+  - The merger's spill is off for this log (`set_max_queue_bytes(usize::MAX)`). One followed log never queues behind another, and the spill's read-back would look up bucket ordinals by the batches' ordinals, which don't match.
+  - `old_cursors_backfill_from_the_bucket_then_the_local_log` reads densely from cursors 0, F - 1, F and F + 1 with a 32 KiB ring. Every chaos run ends with a consumer from cursor 0 through all three tiers.
+- **Bucket retention isn't built.** Segments, and the state's SSTs past compaction, stay until something deletes them. Phase 6 adds vlpds's retention: the `retain/` report first, then deletes. The bucket path for lagging followers then resets only past that.
+
+### Tests, chaos and numbers (Phase 3)
+
+In-tree (`cargo test --lib qlog`, 29 tests, all passing):
+
+- the seal across automatic flushes;
+- a crash between two commitlog segment deletions (what's left is a readable suffix);
+- flushes under load across three leader kills, with the consistency check mid-run and at the end;
+- commit held at R;
+- a crash at each flush step, twice round (fenced, sealed, after a segment PUT, before and after the manifest CAS), each one killing the leader right there;
+- an old leader's stalled flush losing to a takeover;
+- backfill from every tier;
+- a follower catching up from the bucket;
+- seeded random kills, power cuts, partitions and flush crashes at 4% a step (`flushing_random_chaos_keeps_every_manifest_consistent`, seeds 1-10 clean).
+
+The check (`flush::verify`, also `qlog verify`) holds for any manifest:
+
+- the segments hold the log densely from 1 to F, and the last named one ends at F;
+- the state checkpoint's manifest has `last_l0_seq` = F;
+- the checkpoint's contents equal replaying those entries to F: every DID's seq and content, the count, `_applied`;
+- its cursors are the manifest's;
+- no host's cursor counts an event that isn't in the log at or below F;
+- segments past the manifest still continue the log.
+
+Restarting from a manifest is opening that checkpoint (a `DbReader` at it), so "the state a restart gets equals replaying the log to F" is the same check.
+
+The process harness (`tests/qlog/chaos.sh`) flushes every 2 s by default (`FLUSH_MS`). It runs `qlog verify` against the bucket every 20 s and at the end, and the checker finishes with a consumer from cursor 0. New scenarios:
+
+- `flush-crash`: SIGKILL at a random flush step, 5% a step;
+- `mid-trim`: SIGKILL between commitlog segment deletions, with a 32 MiB disk budget;
+- `mixed-flush`: `mixed-durable` with flush crashes on top.
+
+`RING_MB=16` keeps the ring small, so reconnecting consumers backfill through the bucket and the local tail. Results on benchbox, commitlogs on the shared NVMe:
+
+| run | faults | distinct seqs | violations | manifest checks |
+|---|---|---|---|---|
+| kill-leader, 3,500/s, 120 s | 7 x kill -9 (pause median 58 ms, max 73) | 420,455 | 0 | 5 + final, consistent |
+| kill-two, 3,500/s, 120 s | 7 (pause median 1.79 s) | 420,191 | 0 | 5 + final |
+| power-cut-all, 3,500/s, 120 s | 7 (pause median 2.57 s) | 420,052 | 0 | 5 + final |
+| partition-leader, 350/s, 120 s | 5 x isolated 5 s (pause ~1.01 s) | 42,011 | 0 | 6 + final |
+| flush-crash, 3,500/s, 180 s | 18 flush crashes (6 after the CAS, 5 before, 4 after the seal, 1 after a segment, 2 at the fence) | 631,119 | 0 | 5 + final |
+| flush-crash again | 11 flush crashes | 630,787 | 0 | 8 + final |
+| mid-trim, 3,500/s, 90 s | 3 crashes mid-trim | 315,087 | 0 | 4 + final |
+| mixed-flush, 3,500/s, 240 s | 23 flush crashes, 3 kill-all, 2 power-cut-all, 1 kill-two, 5 kill -9 and power cuts, 2 SIGSTOP | 841,381 | 0 | 10 + final |
+| mixed-durable (flushing), 3,500/s, 240 s | 2 power-cut-all, 2 power cuts, 3 kill -9, 2 partitions, 4 SIGSTOP | 840,541 | 0 | 10 + final |
+
+That's 4.6M seqs, every acked seq emitted with its content, and every consumer stream dense. Every manifest checked was consistent, and every run ended with 0 segments past the manifest (adopted or superseded). Every consumer from cursor 0 read the whole log densely through the bucket, the local tail and the ring, ~0.6M events a second.
+
+Three things the runs found, now fixed:
+
+- **Resets past what a follower had emitted.** The first `mid-trim` run crashed all three nodes every few seconds (30% a deletion). A follower fell behind the leader's disk and was reset, a hole in its stream (the Phase 1/2 reset). Lagging followers are now served from the bucket.
+- **Seals waiting 1-5 s** on SlateDB's L0 cap (8), at 2 s flushes. Raised to 32.
+- **The chaos harness** aborted a run when a fault picked a node the supervisor was restarting, which is common under flush crashes. The verifier also raced the next flush deleting the checkpoint it was about to read. It now opens the checkpoint first; SlateDB's GC keeps the files for minutes.
+
+Measured on benchbox, three nodes on loopback, commitlogs on tmpfs with a 1 ms emulated fsync (the "tmpfs + 1 ms" rows of Phase 2: the shared NVMe was noisier today, ~21-25 ms acks at 3,500/s with and without the flush). MinIO is local, on tmpfs. Frames are the load generator's ~5.3 KB, padded with one repeated byte, so they compress ~700x. Stored bytes below are meaningless; raw bytes aren't.
+
+| 95 s runs | 350/s, 30 s flush | 3,500/s, 30 s flush | 35,000/s, 10 s flush |
+|---|---|---|---|
+| flushes | 4 | 4 | 10 |
+| per flush: entries / raw / segments | 8.3k / 42 MiB / 1 | 83k / 420 MiB / 7 | 333k / 1.68 GiB / 26.7 |
+| flush duration (seal to CAS), p50 / max | 74 / 80 ms | 745 / 803 ms | 2.32 / 2.39 s |
+| applier paused for the seal, p50 / max | 21 / 24 ms | 126 / 132 ms | 346 / 373 ms |
+| leader CPU, flush off → on (cores) | 0.031 → 0.050 | 0.054 → 0.121 | 0.24 → 0.72 |
+| leader RSS, off → on | 295 → 318 MB | 698 → 795 MB | 770 → 1,815 MB |
+| ack p50 / p99, off | 1.19 / 1.80 ms | 1.32 / 1.82 | 2.65 / 3.46 |
+| ack p50 / p99, on | 1.23 / 1.90 ms | 1.33 / 1.96 | 2.45 / 3.64 |
+| worst per-second ack p99, seconds with a flush / without | 2.36 / 2.55 ms | 3.11 / 2.54 | 9.71 / 6.26 |
+| submit to first consumer p50, off / on | 3.32 / 3.37 ms | 2.53 / 2.52 | 4.05 / 3.89 |
+
+Requests per flush, counted by vlpds's object-store counters over each flush's window, which includes the state's own background work in it:
+
+| per flush | 350/s, 30 s | 3,500/s, 30 s | 35,000/s, 10 s |
+|---|---|---|---|
+| PUT create (segments + SlateDB SSTs and manifests) | 3.2 | 8.8 | 28.6 (+ 0.9 multipart uploads, 1.8 parts) |
+| PUT plain | 1.0 | 1.0 | 0.1 |
+| PUT CAS (our manifest) | 1.0 | 1.0 | 1.0 |
+| LIST | 0.8 | 0.8 | 0.9 |
+| GET | 9.8 | 10.8 | 15.3 |
+| Class A, less the log segments | ~5.0 | ~4.6 | ~5.0 |
+
+Over a whole steady run (350/s, 30 s flushes, 300 s, the leader process; followers send ~nothing), with the state's manifest polled every 10 s (SlateDB's default 1 s doubled the GETs, to ~4 a second):
+
+| per second | GET | GET range | HEAD | LIST | PUT | PUT CAS | PUT create | Class A | Class B |
+|---|---|---|---|---|---|---|---|---|---|
+| measured, one DID shard | 2.07 | 0.24 | 0.03 | 0.06 | 0.06 | 0.04 | 0.18 | 0.34 | 2.34 |
+| study, today, 30 s, four shards | | | | | | | | 0.67 | 2.81 |
+
+The rest of the GETs are the state's compactor and GC polls, which tick whether or not anything was flushed.
+
+What the numbers say:
+
+- **The flush doesn't touch the ack path.** Acks and emission are the same with the flush on and off at all three rates, within run-to-run noise. The flush's pause is the state applier's alone (20-350 ms), and nothing waits on the state. At 100x the worst per-second p99 rises from ~6 to ~10 ms in the seconds a flush runs: the leader's zstd and segment reads compete for CPU on a shared box.
+- **A flush costs the leader CPU in proportion to bytes.** ~0.5 cores at 100x for 1.7 GB raw every 10 s: reading the entries back, zstd and the PUTs. That's ~5% of the study's 10-vCPU leader at 100x. Followers don't flush or keep state, so their CPU is unchanged.
+- **Requests match the cost model.** Less the log segments, a flush with one DID shard is ~5 Class A and ~10-15 Class B. The study assumed ~4.4 A + ~9 B per shard plus the manifest (~5.4 A). Segments are one PUT per 64 MiB raw, as assumed. Over a whole run the leader sends 0.34 Class A and 2.3 Class B a second at today's rate with one shard, against the model's 0.67 and 2.81 with four. The model's "~0.4 GET/s of SlateDB polls per shard" holds only with the 10 s manifest poll vlpds also uses: at SlateDB's default 1 s it's ~2 GETs a second more per shard (~5M Class B a month, inside R2's free tier for one shard, not for 24).
+- **Flush duration is ~1.4 s a GB at 100x on a local MinIO.** That's two to three intervals of headroom for H at 10 s, and more at 30-60 s. On R2 add ~200 ms a PUT, run several in parallel (the PUTs here go one at a time). The study's "upload ~2 s" assumption holds at 10x, and at 100x it wants parallel segment PUTs.
+- **Leader RSS grows with the flush at 100x** (~1 GB more). That's the entries of one segment held while it's built and compressed, plus SlateDB's memtable for 333k DIDs. A 30 s flush at 100x would be ~3x the memtable. Budget ~1 GB for the state's memtable per 1M DIDs changed in an interval, or seal more often.
+- **The emit path and replication are unchanged** by cursors on entries. At one host-cursor update per second per host owner it's a few hundred bytes a second.
+
+### What Phase 4 needs
+
+- **Recovery from the manifest.** Open `qlog/state` at the manifest's checkpoint, not at its latest. After a lost quorum the latest durable state can be past F, since the old leader kept applying and SlateDB flushes on its own, and that's the state-ahead-of-the-log case the study warns about. SlateDB has no restore. Either clone the checkpoint to a fresh path (`create_clone_builder_from_source(CloneSourceSpec::with_checkpoint(...))`) and have the manifest name the path, or reopen the same path and rewrite every key written past F. The clone is cleaner, but a clone references its parent's SSTs, so old paths can't be deleted until compaction has rewritten them.
+- **Salvage.** Segments past the manifest (`qlog verify` counts them as orphans) are committed entries, flushed by a dead flush. Recovery can adopt them with their seqs, the same rule the flush uses, before starting at R + 1.
+- **Seqs from R + 1.** The leader then has to commit a log whose first seq is R + 1. `Log::reset(epoch, R)` and an append from there, with followers reset to it, and the firehose's `start_floor` at R (consumers between F and R get the stream from R + 1, which the counted stream's grace already handles).
+- **Re-ingest from cursors.** The manifest's cursors are per host. The relay's host owners need to take them as their resume points, and the load generator's `--hosts` is ready to stand in for fakepds (`did:q:{run}-h{h}:{n}` events, cursors once a second).
+- **Single-node WAL mode** is the commitlog plus this flush with a quorum of one. A one-member config should commit at its own fsync (quorum 1), but nothing tests it yet, nor a disk loss on it.
+- **Bucket retention** (Phase 6, but recovery reads it): a `retain/` report before deleting segments, and the state's GC holding the manifest's checkpoint (it does: checkpoints have no expiry).
 
 ### Measuring a real host (OVH, Hetzner)
 

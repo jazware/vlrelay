@@ -218,6 +218,9 @@ pub struct Status {
     /// Object-store requests sent while flushing (summed over flushes; the
     /// state's own background work in those windows counts too).
     pub requests: BTreeMap<String, u64>,
+    /// Every object-store request this process has sent, flushing or not
+    /// (the state's compactor and GC run between flushes).
+    pub requests_total: BTreeMap<String, u64>,
     pub applied: u64,
     pub last_flushed: u64,
     pub last_reserve: u64,
@@ -244,6 +247,7 @@ impl Shared {
             duration_us: q(&s.duration_us),
             seal_us: q(&s.seal_us),
             requests: s.requests.clone(),
+            requests_total: requests_by_op(),
             applied: s.applied,
             last_flushed: s.last.as_ref().map_or(0, |m| m.flushed),
             last_reserve: s.last.as_ref().map_or(0, |m| m.reserve),
@@ -718,6 +722,12 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
     if m.reserve < m.flushed {
         bad(&mut v, format!("R {} is below F {}", m.reserve, m.flushed));
     }
+    // first, while the manifest still names it (the next flush deletes it;
+    // SlateDB's GC keeps the files a while, so a reader opened now is fine)
+    let state = match &m.state {
+        Some(r) if m.flushed > 0 => Some((r.clone(), state::read_checkpoint(store, r).await?)),
+        _ => None,
+    };
     let mut dids: BTreeMap<String, [u8; 16]> = BTreeMap::new();
     let mut hosts: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     let mut last = 0u64;
@@ -762,13 +772,12 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
         bad(&mut v, format!("segments end at ordinal {ord}, the manifest names up to {}", m.next_ordinal));
     }
     if m.flushed > 0 {
-        match &m.state {
+        match state {
             None => bad(&mut v, "no state checkpoint".into()),
-            Some(r) => {
+            Some((r, (kv, l0))) => {
                 if r.seq != m.flushed {
                     bad(&mut v, format!("state checkpoint at {}, F is {}", r.seq, m.flushed));
                 }
-                let (kv, l0) = state::read_checkpoint(store, r).await?;
                 if l0 != m.flushed {
                     bad(&mut v, format!("checkpoint manifest's last_l0_seq {l0} isn't F {}", m.flushed));
                 }

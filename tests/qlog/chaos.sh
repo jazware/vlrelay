@@ -226,20 +226,22 @@ fault() {
       local victims=$who
       if [ "$kind" = kill-all ]; then victims="1 2 3"; else for j in 1 2 3; do [ "$j" != "$who" ] && { victims="$who $j"; break; }; done; fi
       local ps=()
-      for v in $victims; do ps+=("$(nodepid "$v")"); log "kill9 n$v $kind"; done
-      kill -9 "${ps[@]}"
+      # a node the supervisor is restarting (a flush crash) has no pid
+      for v in $victims; do p=$(nodepid "$v" || true); [ -n "$p" ] && { ps+=("$p"); log "kill9 n$v $kind"; }; done
+      [ ${#ps[@]} -gt 0 ] && kill -9 "${ps[@]}" || true
       ;;
     power-cut-leader | power-cut-all)
       local victims=$who ps=()
       [ "$kind" = power-cut-all ] && victims="1 2 3"
-      for v in $victims; do ps+=("$(nodepid "$v")"); log "powercut n$v $kind"; done
-      kill -USR1 "${ps[@]}"
+      for v in $victims; do p=$(nodepid "$v" || true); [ -n "$p" ] && { ps+=("$p"); log "powercut n$v $kind"; }; done
+      [ ${#ps[@]} -gt 0 ] && kill -USR1 "${ps[@]}" || true
       ;;
     kill-*)
       local p
-      p=$(nodepid "$who")
+      p=$(nodepid "$who" || true)
+      [ -n "$p" ] || { log "skip $kind: n$who is restarting"; return; }
       log "kill9 n$who $kind"
-      kill -9 "$p"
+      kill -9 "$p" 2>/dev/null || true
       ;;
     partition-*)
       log "isolate n$who $kind"
@@ -250,11 +252,12 @@ fault() {
       ;;
     pause-leader)
       local p
-      p=$(nodepid "$who")
+      p=$(nodepid "$who" || true)
+      [ -n "$p" ] || { log "skip $kind: n$who is restarting"; return; }
       log "stop n$who $kind"
-      kill -STOP "$p"
+      kill -STOP "$p" 2>/dev/null || true
       sleep 3
-      kill -CONT "$p"
+      kill -CONT "$p" 2>/dev/null || true
       log "cont n$who"
       ;;
   esac

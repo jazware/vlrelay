@@ -54,6 +54,9 @@ fn settings(l0_bytes: usize) -> slatedb::Settings {
         // default 8); 32 is minutes of flushes at any interval used here
         l0_max_ssts: 32,
         l0_max_ssts_per_key: 32,
+        // the default 1 s poll is most of the state's GETs (~4/s measured);
+        // vlpds polls every 10 s too
+        manifest_poll_interval: std::time::Duration::from_secs(10),
         ..Default::default()
     }
 }
