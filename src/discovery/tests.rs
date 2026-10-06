@@ -116,6 +116,10 @@ async fn a_new_leader_resumes_discovery_mid_list() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     eprintln!("{s:?}");
+    // the view goes over the peer protocol and the admin API as JSON
+    let v = jobs[&l2].view();
+    let back: crate::admin::DiscoveryView = serde_json::from_slice(&serde_json::to_vec(&v).unwrap()).unwrap();
+    assert_eq!(back.sources[0].state.url.as_deref(), Some(url.as_str()));
     assert!(s.state.resumed >= 1, "the new leader started over: {s:?}");
     assert!(s.state.hosts_seen >= EXTRA && s.state.hosts_seen <= EXTRA + PAGE, "{s:?}");
     assert_eq!(s.state.known, 5, "{s:?}");

@@ -67,6 +67,8 @@ vlrelay --node-id n1 --listen :2980 \
 | `--qlog-admin-token T` | | What a membership change must carry (`QLOG_ADMIN_TOKEN`). |
 | `--qlog-host-failover-ms MS` | 2000 | A member the leader hasn't heard from in this long loses its PDSes to the others. |
 | `--qlog-retain-hours H` | 72 | The leader deletes log segments older than this (0: never). |
+| `--durability MODE` | `page-cache` (three or more), `fsync` (one) | When an entry counts on a node: once in the commitlog's page cache (fdatasync'd every `--durability-sync-ms`, 100), after its fdatasync, or in `memory` only. A single node runs `fsync`. |
+| `--bootstrap-relay URL` | | A relay whose `listHosts` seeds host discovery on a first start ([Policy](policy.md#discovering-hosts)). |
 
 Every node points at the same bucket and `--prefix`. `--host` and `--crawl` work on any node: a
 PDS admitted anywhere goes into the leader's host table, and the leader gives it to a node.
@@ -94,7 +96,8 @@ so two sockets on one PDS can't mix up an account's order.
 | The leader's process dies | another node takes over in 50-120 ms (kill -9 at 10x); nothing committed is lost |
 | The leader hangs or is cut off | the others take over after 1 s of silence |
 | A follower dies | nothing for consumers; its PDSes move to the others after 2 s and resume from their cursors |
-| Two nodes' disks are lost | the log resumes from the bucket's last flush, with a jump in the seqs; the PDSes send the rest again |
+| Every process dies at once | a takeover once they're back; nothing is lost in any mode but `memory` (the page cache outlives a process) |
+| Two nodes lose power within ~100 ms (`page-cache`), or two disks are lost | the log resumes from the bucket's last flush, with a jump in the seqs; the PDSes send the rest again |
 
 The new leader opens the account records at the last flush and replays its own log from there
 before it takes events, which takes tens of milliseconds. A node that comes back catches up from

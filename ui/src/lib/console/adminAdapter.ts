@@ -58,10 +58,22 @@ async function optional<T>(endpoint: string, run: () => Promise<T>): Promise<Opt
 
 export const overview = () => api<Overview>('overview')
 
-export type HostSort = 'host' | 'events' | 'errors' | 'accounts' | 'seq' | 'tier' | 'status' | 'since' | 'lag'
-export type HostQuery = { q?: string; tier?: string; status?: HostStatus | ''; sort: HostSort; desc: boolean; limit?: number; offset?: number }
+export type HostSort = 'host' | 'events' | 'errors' | 'accounts' | 'seq' | 'tier' | 'status' | 'since' | 'lag' | 'throttled' | 'source'
+export type HostQuery = {
+  q?: string
+  tier?: string
+  status?: HostStatus | ''
+  /** a source, or a prefix ending in `:` or `*` (`bootstrap:` is every seed relay) */
+  source?: string
+  /** only hosts with (true) or without (false) throttled accounts */
+  throttled?: boolean
+  sort: HostSort
+  desc: boolean
+  limit?: number
+  offset?: number
+}
 /** Server-side filter, sort and page (`limit` default 10,000 on the server). */
-export const hosts = (q: HostQuery) => api<HostList>('hosts', { params: { q: q.q || undefined, tier: q.tier || undefined, status: q.status || undefined, sort: q.sort, desc: q.desc, limit: q.limit, offset: q.offset } })
+export const hosts = (q: HostQuery) => api<HostList>('hosts', { params: { q: q.q || undefined, tier: q.tier || undefined, status: q.status || undefined, source: q.source || undefined, throttled: q.throttled, sort: q.sort, desc: q.desc, limit: q.limit, offset: q.offset } })
 export const host = (h: string) => api<HostDetail>(`hosts/${enc(h)}`)
 export const hostAction = (h: string, a: HostAction) => api<HostRow>(`hosts/${enc(h)}/action`, { body: a })
 /** What hostAction sends, for the confirm dialog's footer. */

@@ -663,11 +663,42 @@ impl NodeAdmin {
         self.set_takedown(did, takedown, by, reason).await
     }
 
+    async fn local_usage(&self) -> AdminResult<admin::PolicyUsage> {
+        let (f, sd, a) = usage_counts(&self.node);
+        let (secs, df, ds, da) = {
+            let mut p = self.usage_prev.lock();
+            let secs = p.0.elapsed().as_secs_f64();
+            let d = (f.saturating_sub(p.1), sd.saturating_sub(p.2), a.saturating_sub(p.3));
+            if secs >= STORE_WINDOW.as_secs_f64() {
+                *p = (Instant::now(), f, sd, a);
+            }
+            (secs, d.0, d.1, d.2)
+        };
+        let per = |n: u64| if secs > 0.0 { n as f64 / secs } else { 0.0 };
+        let e = &self.policy.engine;
+        let c = e.snapshot().policy.body.cluster.clone();
+        Ok(admin::PolicyUsage {
+            node: self.id().to_string(),
+            plc_lookups_per_sec: per(df),
+            plc_lookups_budget: c.plc_lookups_per_sec,
+            plc_lookups_share: e.budget(crate::policy::budget::BudgetKind::PlcLookupsPerSec),
+            seeded_per_sec: per(ds),
+            new_accounts_per_min: per(da) * 60.0,
+            new_accounts_budget: c.new_accounts_per_min,
+            new_hosts_today: e.new_hosts_today().await.map_err(AdminError::Internal)?,
+            new_hosts_per_day: c.new_hosts_per_day,
+            window_secs: secs,
+        })
+    }
+
     fn sort_page(mut rows: Vec<admin::HostRow>, q: &admin::HostQuery) -> admin::HostList {
         rows.retain(|r| q.q.as_deref().is_none_or(|s| r.host.contains(s)));
         rows.retain(|r| q.tier.as_deref().is_none_or(|t| r.tier == t));
         rows.retain(|r| q.status.is_none_or(|s| r.status == s));
+        rows.retain(|r| q.keeps(r));
         match q.sort.as_deref() {
+            Some("throttled") => rows.sort_by_key(|r| r.throttled_accounts),
+            Some("source") => rows.sort_by(|a, b| a.source.cmp(&b.source)),
             Some("events") => rows.sort_by(|a, b| a.events_per_sec.total_cmp(&b.events_per_sec)),
             Some("errors") => rows.sort_by(|a, b| a.error_rate.total_cmp(&b.error_rate)),
             Some("accounts") => rows.sort_by_key(|r| r.accounts),
@@ -870,34 +901,19 @@ impl AdminSource for NodeAdmin {
         }
     }
 
+    /// This node's numbers, with the leader's new accounts (the account
+    /// gate runs on the leader, so it's the only one counting them).
     async fn policy_usage(&self) -> AdminResult<admin::PolicyUsage> {
-        let (f, sd, a) = usage_counts(&self.node);
-        let (secs, df, ds, da) = {
-            let mut p = self.usage_prev.lock();
-            let secs = p.0.elapsed().as_secs_f64();
-            let d = (f.saturating_sub(p.1), sd.saturating_sub(p.2), a.saturating_sub(p.3));
-            if secs >= STORE_WINDOW.as_secs_f64() {
-                *p = (Instant::now(), f, sd, a);
-            }
-            (secs, d.0, d.1, d.2)
-        };
-        let per = |n: u64| if secs > 0.0 { n as f64 / secs } else { 0.0 };
-        let e = &self.policy.engine;
-        let c = e.snapshot().policy.body.cluster.clone();
-        Ok(admin::PolicyUsage {
-            node: self.id().to_string(),
-            plc_lookups_per_sec: per(df),
-            plc_lookups_budget: c.plc_lookups_per_sec,
-            plc_lookups_share: e.budget(crate::policy::budget::BudgetKind::PlcLookupsPerSec),
-            seeded_per_sec: per(ds),
-            new_accounts_per_min: per(da) * 60.0,
-            new_accounts_budget: c.new_accounts_per_min,
-            new_hosts_today: e.new_hosts_today().await.map_err(AdminError::Internal)?,
-            new_hosts_per_day: c.new_hosts_per_day,
-            window_secs: secs,
-        })
+        let mut u = self.local_usage().await?;
+        let st = self.node.quorum.qnode.status();
+        if let Some(l) = st.leader.filter(|l| *l != self.id())
+            && let Ok(b) = self.node.quorum.ask_member(&l, "node:usage", Bytes::new()).await
+            && let Ok(lu) = serde_json::from_slice::<admin::PolicyUsage>(&b)
+        {
+            u.new_accounts_per_min = lu.new_accounts_per_min;
+        }
+        Ok(u)
     }
-
     async fn policy_signals(&self) -> AdminResult<admin::SignalsView> {
         use crate::policy::signals::SpamRule;
         let e = &self.policy.engine;
@@ -1277,6 +1293,7 @@ impl crate::node::quorum::LocalAsk for NodeAdmin {
             let v = match topic {
                 "node:consumers" => serde_json::to_value(self.local_consumers()).ok()?,
                 "node:settings" => serde_json::to_value(self.settings.as_ref()?).ok()?,
+                "node:usage" => serde_json::to_value(self.local_usage().await.ok()?).ok()?,
                 "node:kick" => {
                     let req: serde_json::Value = serde_json::from_slice(&body).ok()?;
                     let ok = self.node.quorum.admin_token().is_some_and(|t| req["token"].as_str() == Some(t));

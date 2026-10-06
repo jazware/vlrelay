@@ -1139,6 +1139,7 @@ impl AdminSource for Demo {
             .filter(|h| q.tier.as_deref().is_none_or(|t| h.tier == t))
             .filter(|h| q.status.is_none_or(|st| h.status == st))
             .map(|h| s.row(h))
+            .filter(|r| q.keeps(r))
             .collect();
         let key = q.sort.as_deref().unwrap_or("events");
         rows.sort_by(|a, b| {
@@ -1151,6 +1152,8 @@ impl AdminSource for Demo {
                 "seq" => a.last_upstream_seq.cmp(&b.last_upstream_seq),
                 "since" => a.connected_since_ms.cmp(&b.connected_since_ms),
                 "lag" => a.lag_ms.total_cmp(&b.lag_ms),
+                "throttled" => a.throttled_accounts.cmp(&b.throttled_accounts),
+                "source" => a.source.cmp(&b.source),
                 _ => a.events_per_sec.total_cmp(&b.events_per_sec),
             };
             if q.desc { o.reverse() } else { o }
@@ -1432,26 +1435,37 @@ impl AdminSource for Demo {
 
     async fn takedowns(&self) -> AdminResult<Vec<crate::policy::takedowns::TakedownEntry>> {
         let s = self.sim.lock();
-        let mut v: Vec<crate::policy::takedowns::TakedownEntry> = s
+        let mut by: BTreeMap<String, crate::policy::takedowns::TakedownEntry> = s
             .accounts
             .iter()
             .filter_map(|a| {
                 let t = a.takedown.as_ref()?;
-                Some(crate::policy::takedowns::TakedownEntry {
-                    did: a.did.clone(),
+                Some((a.did.clone(), (t, a.did.clone())))
+            })
+            .chain(s.takedowns.iter().map(|(d, t)| (d.clone(), (t, d.clone()))))
+            .map(|(d, (t, did))| {
+                let e = crate::policy::takedowns::TakedownEntry {
+                    did,
                     takedown: true,
                     at_ms: t.at_ms,
                     by: t.by.clone(),
                     reason: t.reason.clone(),
-                })
+                };
+                (d, e)
             })
             .collect();
+        // an operator's untakedown in the demo removes it from `takedowns`
+        // but not from a seeded account's own field
+        by.retain(|d, _| s.takedowns.contains_key(d) || s.accounts.iter().any(|a| a.did == *d && a.takedown.is_some()));
+        let mut v: Vec<_> = by.into_values().collect();
         v.sort_by_key(|e| std::cmp::Reverse(e.at_ms));
         Ok(v)
     }
 
     async fn quorum_history(&self) -> AdminResult<QuorumHistory> {
-        self.extra.lock().history(self.sim.lock().now_ms)
+        // sim before extra, as everywhere else
+        let now = self.sim.lock().now_ms;
+        self.extra.lock().history(now)
     }
 
     async fn flush_now(&self, _by: &str) -> AdminResult<serde_json::Value> {
@@ -1804,59 +1818,67 @@ impl AdminSource for Demo {
     }
 
     async fn discovery(&self) -> AdminResult<DiscoveryView> {
+        let d: crate::policy::doc::Discovery =
+            serde_json::from_value(self.full_policy().await?.policy["discovery"].clone()).unwrap_or_default();
         let now = self.sim.lock().now_ms;
         let (leader, ..) = self.extra.lock().roles();
         let hour = 3_600_000i64;
-        let relay = crate::discovery::SourceState {
-            url: Some("https://relay1.us-east.bsky.network".into()),
-            runs: 5,
-            last_started_ms: Some(now - 2 * hour - 340_000),
-            last_finished_ms: Some(now - 2 * hour),
-            hosts_seen: 2_412,
-            known: 2_371,
-            new: 41,
-            admitted: 33,
-            refused: 8,
-            throttled: 2,
-            pages: 3,
-            ..Default::default()
-        };
-        let plc = crate::discovery::SourceState {
-            runs: 1,
-            last_started_ms: Some(now - 26 * hour),
-            last_finished_ms: Some(now - 40_000),
-            hosts_seen: 1_960,
-            known: 1_902,
-            new: 58,
-            admitted: 44,
-            refused: 14,
-            ..Default::default()
-        };
+        let mut sources: Vec<DiscoverySource> = d
+            .seed_relays
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let k = 1 + (hash(&r.url) % 40);
+                let state = crate::discovery::SourceState {
+                    url: Some(r.url.clone()),
+                    runs: 5,
+                    last_started_ms: Some(now - 2 * hour - 340_000 - i as i64 * 60_000),
+                    last_finished_ms: Some(now - 2 * hour - i as i64 * 60_000),
+                    hosts_seen: 2_400 + k,
+                    known: 2_360,
+                    new: 40 + k,
+                    admitted: 32 + k,
+                    refused: 8,
+                    throttled: 2,
+                    pages: 3,
+                    ..Default::default()
+                };
+                DiscoverySource {
+                    key: crate::discovery::source_key(&r.url),
+                    enabled: r.enabled,
+                    refresh_interval_secs: Some(r.refresh_interval_secs),
+                    next_run_ms: r
+                        .enabled
+                        .then(|| state.last_finished_ms.unwrap_or(now) + r.refresh_interval_secs as i64 * 1000),
+                    pending: 0,
+                    state,
+                }
+            })
+            .collect();
+        sources.push(DiscoverySource {
+            key: crate::discovery::PLC_SOURCE.into(),
+            enabled: d.plc,
+            refresh_interval_secs: None,
+            next_run_ms: None,
+            pending: if d.plc { 3 } else { 0 },
+            state: crate::discovery::SourceState {
+                runs: 1,
+                last_started_ms: d.plc.then_some(now - 26 * hour),
+                last_finished_ms: d.plc.then_some(now - 40_000),
+                hosts_seen: if d.plc { 1_960 } else { 0 },
+                known: if d.plc { 1_902 } else { 0 },
+                new: if d.plc { 58 } else { 0 },
+                admitted: if d.plc { 44 } else { 0 },
+                refused: if d.plc { 14 } else { 0 },
+                ..Default::default()
+            },
+        });
         Ok(DiscoveryView {
             leader: Some(leader),
             leading: true,
-            connects_per_min: 120.0,
-            requests_per_sec: 2.0,
-            sources: vec![
-                DiscoverySource {
-                    key: "bootstrap:relay1.us-east.bsky.network".into(),
-                    url: relay.url.clone(),
-                    enabled: true,
-                    refresh_interval_secs: Some(6 * 3600),
-                    next_run_ms: Some(now + 4 * hour),
-                    pending: 0,
-                    state: relay,
-                },
-                DiscoverySource {
-                    key: crate::discovery::PLC_SOURCE.into(),
-                    url: None,
-                    enabled: true,
-                    refresh_interval_secs: None,
-                    next_run_ms: None,
-                    pending: 3,
-                    state: plc,
-                },
-            ],
+            connects_per_min: d.connects_per_min,
+            requests_per_sec: d.requests_per_sec,
+            sources,
         })
     }
 
@@ -2137,6 +2159,8 @@ mod tests {
         let q = d.quorum().await.unwrap();
         let st = q.nodes.iter().filter_map(|n| n.status.as_ref()).find(|s| s["role"] == "leader").unwrap();
         assert!(st["flush"]["last_at_ms"].as_i64().unwrap() > 0);
+        assert!(!st["flush"]["recent"].as_array().unwrap().is_empty());
+        assert!(st["history"].as_array().unwrap().iter().any(|e| e["kind"] == "lead"));
         let mut names: Vec<&str> = Vec::new();
         let all = d.hosts(HostQuery { limit: Some(10_000), ..Default::default() }).await.unwrap();
         names.extend(all.hosts.iter().map(|h| h.host.as_str()));
@@ -2152,7 +2176,10 @@ mod tests {
         assert!(
             sg["signals"][0]["top"].as_array().unwrap().iter().all(|k| k["estimate"].as_f64() >= k["lower"].as_f64())
         );
+        let did = d.sim.lock().accounts[0].did.clone();
+        d.takedown(&did, "spam".into(), "admin").await.unwrap();
         let td = json(call("GET", "/admin/api/takedowns", true).await.unwrap()).await;
+        assert!(td.as_array().unwrap().iter().any(|t| t["did"] == did.as_str() && t["reason"] == "spam"));
         assert!(td.as_array().unwrap().iter().all(|t| t["takedown"] == true));
         let hist = json(call("GET", "/admin/api/cluster/quorum/history", true).await.unwrap()).await;
         let ev = hist["events"].as_array().unwrap();
@@ -2172,6 +2199,8 @@ mod tests {
         assert!(cs.iter().all(|c| !c.read_tier.is_empty()));
 
         let dv = json(call("GET", "/admin/api/discovery", true).await.unwrap()).await;
+        let typed: DiscoveryView = serde_json::from_value(dv.clone()).unwrap();
+        assert!(typed.sources.iter().any(|s| s.state.url.is_some()), "{typed:?}");
         assert!(dv["sources"].as_array().unwrap().iter().any(|s| s["key"] == "plc" && s["hostsSeen"].is_u64()));
         let r = app
             .clone()
@@ -2190,6 +2219,19 @@ mod tests {
         let dv = json(r).await;
         assert!(dv["sources"].as_array().unwrap().iter().any(|s| s["key"] == "plc" && s["inProgress"] == true));
         assert!(all.hosts.iter().all(|h| h.source.is_some()));
+        let b = json(
+            call("GET", "/admin/api/hosts?source=bootstrap:&throttled=true&sort=throttled&desc=true", true)
+                .await
+                .unwrap(),
+        )
+        .await;
+        let hs = b["hosts"].as_array().unwrap();
+        assert!(!hs.is_empty());
+        assert!(
+            hs.iter().all(|h| h["source"].as_str().unwrap().starts_with("bootstrap:")
+                && h["throttledAccounts"].as_u64().unwrap() > 0)
+        );
+        assert!(hs.windows(2).all(|w| w[0]["throttledAccounts"].as_u64() >= w[1]["throttledAccounts"].as_u64()));
 
         let p = json(call("GET", "/admin/api/ops/plc", true).await.unwrap()).await;
         assert_eq!(p["enabled"], true);

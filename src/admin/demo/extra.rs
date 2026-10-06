@@ -108,6 +108,10 @@ impl Extra {
         // a couple of operator edits, so the Tuning page shows values off their defaults
         full["consumers"]["connectionsPerIp"] = json!(24);
         full["cluster"]["newHostsPerDay"] = json!(80);
+        full["discovery"]["seedRelays"] = json!([
+            {"url": "https://relay1.us-east.bsky.network", "enabled": true, "refreshIntervalSecs": 21_600},
+        ]);
+        full["discovery"]["plc"] = json!(true);
         full["transitions"]["promoteAfterDays"] = json!(5);
         let addrs =
             MEMBERS.iter().enumerate().map(|(i, m)| (m.to_string(), format!("10.0.7.{}:2981", 11 + i))).collect();
@@ -184,6 +188,18 @@ impl Extra {
         let up_secs = ((now - self.started_ms) / 1000).max(1) as u64;
         let appended = (ev * up_secs as f64) as u64;
         let q = |p50: u64, p99: u64| json!({"count": appended / 3, "p50": p50, "p90": p50 * 16 / 10, "p99": p99, "p999": p99 * 2, "max": p99 * 5});
+        let history: Vec<Value> = {
+            let mut v: Vec<Value> = self
+                .history(now)
+                .map(|h| h.events)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| e.node == id)
+                .map(|e| json!({"at_ms": e.at_ms, "kind": e.kind, "epoch": e.epoch, "from": e.from, "why": e.why}))
+                .collect();
+            v.reverse();
+            v
+        };
         let mut s = json!({
             "id": id,
             "role": if leading { "leader" } else { "follower" },
@@ -236,7 +252,18 @@ impl Extra {
             "last_epoch": self.epoch,
             "switches": [],
             "requests": requests(leading, up_secs),
+            "history": history,
         });
+        let recent: Vec<Value> = (0..12u64)
+            .rev()
+            .map(|k| {
+                let at = now - (now % 2_000) - k as i64 * 2_000;
+                let entries = (ev * 2.0) as u64;
+                json!({"at_ms": at, "epoch": self.epoch, "flushed": flushed.saturating_sub(k * entries), "entries": entries,
+                       "segments": 1, "bytes": entries * 1_100, "raw_bytes": entries * 4_700,
+                       "took_us": 160_000 + wobble(k as i64 + 11) * 9_000, "seal_us": 900 + wobble(k as i64 + 3) * 70})
+            })
+            .collect();
         if leading {
             let flushes = up_secs / 2;
             s["flush"] = json!({
@@ -257,6 +284,7 @@ impl Extra {
                 "last_flushed": flushed,
                 "last_reserve": flushed + 400_000,
                 "last_at_ms": now - (now % 2_000),
+                "recent": recent,
             });
             s["recovered"] = self
                 .recoveries

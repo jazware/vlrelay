@@ -236,7 +236,9 @@ impl DiscoveryJob {
         let mut sources = Vec::new();
         for r in &d.seed_relays {
             let key = source_key(&r.url);
-            let s = st.sources.get(&key).cloned().unwrap_or_default();
+            let mut s = st.sources.get(&key).cloned().unwrap_or_default();
+            // the policy's spelling of it, not the one a run last saved
+            s.url = Some(r.url.clone());
             let next = if !r.enabled {
                 None
             } else if s.in_progress {
@@ -246,7 +248,6 @@ impl DiscoveryJob {
             };
             sources.push(crate::admin::DiscoverySource {
                 key,
-                url: Some(r.url.clone()),
                 enabled: r.enabled,
                 refresh_interval_secs: Some(r.refresh_interval_secs),
                 next_run_ms: next,
@@ -257,7 +258,6 @@ impl DiscoveryJob {
         let s = st.sources.get(PLC_SOURCE).cloned().unwrap_or_default();
         sources.push(crate::admin::DiscoverySource {
             key: PLC_SOURCE.into(),
-            url: None,
             enabled: d.plc,
             refresh_interval_secs: None,
             next_run_ms: None,

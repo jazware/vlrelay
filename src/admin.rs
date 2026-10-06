@@ -214,7 +214,13 @@ pub struct HostQuery {
     pub q: Option<String>,
     pub tier: Option<String>,
     pub status: Option<HostStatus>,
-    /// `host`, `tier`, `status`, `events`, `errors`, `accounts`, `seq`, `since`, `lag`.
+    /// A source (`requestCrawl`, `plc`, `cli`, `bootstrap:<relay>`), or a
+    /// prefix of one ending in `:` or `*` (`bootstrap:` is every relay).
+    pub source: Option<String>,
+    /// Only hosts with (true) or without (false) throttled accounts.
+    pub throttled: Option<bool>,
+    /// `host`, `tier`, `status`, `events`, `errors`, `accounts`, `seq`,
+    /// `since`, `lag`, `throttled`, `source`.
     pub sort: Option<String>,
     #[serde(default)]
     pub desc: bool,
@@ -782,7 +788,6 @@ pub struct DiscoveryView {
 pub struct DiscoverySource {
     /// `bootstrap:<relay host>` or `plc`.
     pub key: String,
-    pub url: Option<String>,
     pub enabled: bool,
     pub refresh_interval_secs: Option<u64>,
     /// When its next run starts (now while one is in progress).
@@ -986,6 +991,21 @@ pub struct QuorumEvent {
 pub struct NodeQuery {
     /// A member's id; default the answering node.
     pub node: Option<String>,
+}
+
+impl HostQuery {
+    /// The filters past the name, tier and status ones.
+    pub fn keeps(&self, r: &HostRow) -> bool {
+        let src = self.source.as_deref().filter(|s| !s.is_empty()).is_none_or(|want| {
+            let have = r.source.as_deref().unwrap_or("");
+            match want.strip_suffix('*') {
+                Some(p) => have.starts_with(p),
+                None if want.ends_with(':') => have.starts_with(want),
+                None => have == want,
+            }
+        });
+        src && self.throttled.is_none_or(|t| (r.throttled_accounts > 0) == t)
+    }
 }
 
 // ---------------------------------------------------------------- source trait
