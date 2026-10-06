@@ -571,10 +571,24 @@ fn pct(v: &mut [u32], p: f64) -> u32 {
     v[((v.len() - 1) as f64 * p).round() as usize]
 }
 
+/// `n` consecutive free ports below the ephemeral range (32768 up on
+/// Linux), where an outgoing connection can't take one between the probe
+/// and the bind.
+fn free_ports(n: u16) -> anyhow::Result<u16> {
+    let start = 26_000 + (std::process::id() % 400) as u16 * 8;
+    for k in 0..400u16 {
+        let base = 26_000 + (start - 26_000 + k * 8) % 3_200;
+        if (0..n).all(|i| std::net::TcpListener::bind(("127.0.0.1", base + i)).is_ok()) {
+            return Ok(base);
+        }
+    }
+    anyhow::bail!("no {n} free ports in 26000..29200")
+}
+
 async fn selftest(o: SelftestOpts) -> anyhow::Result<()> {
-    let port_base = 39000 + (std::process::id() % 500) as u16 * 8;
-    let layout = Layout::new("selftest", "http://127.0.0.1", port_base);
     let hosts = 5u32;
+    let port_base = free_ports(hosts as u16)?;
+    let layout = Layout::new("selftest", "http://127.0.0.1", port_base);
     let mut faults = vec![HostFaults::default(); hosts as usize];
     for f in [
         "badsig:0:rate=0.03",
