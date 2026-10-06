@@ -349,10 +349,11 @@ Q_SEG_B = 64 * MIB          # code: raw bytes per bucket segment; each flush cut
 Q_DID_SHARDS = 1            # code: the leader's state is one SlateDB (the study's design had 4 shards)
 Q_MANIFEST_A = 1            # code: one CAS PUT per flush, cursors inline
 # Measured, the Phase 6 hour run (350/s, 30 s flushes, 3 nodes, state compactor and worker polling
-# every 30 s; docs/quorum.md "Counting"), per state:
-Q_STATE_FLUSH_A = 12.4      # measured, per flush: 6.0 SlateDB writes and compaction output, 4.4 GC deletes
-                            # (object_store sends each as a DeleteObjects POST: Class A), 2 for the
-                            # checkpoint the flush retires. The study used vlpds's 4.42 a shard.
+# every 30 s; docs/quorum.md "Counting"), per state, and confirmed on R2 (docs/quorum.md "Real R2 hour"):
+Q_STATE_FLUSH_A = 8.0       # measured, per flush: 6.0 SlateDB writes and compaction output, 2 for the
+                            # checkpoint the flush retires. The study used vlpds's 4.42 a shard. SlateDB's
+                            # GC deletes (4.4 a flush, each a one-key DeleteObjects POST) aren't in it: R2
+                            # billed none of them as Class A, and S3 and GCS don't bill deletes.
 Q_STATE_FLUSH_B = 12.0      # Phase 3's ~10-15 a flush (with the flush's own 3); the split of the hour run's
                             # 1.66 B/s between flushes and polls is that assumption
 Q_STATE_POLL_B = 1.26       # measured less the above: manifest 10 s, compactor and worker 30 s, GC 10 min

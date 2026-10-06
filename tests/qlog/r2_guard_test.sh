@@ -10,7 +10,8 @@
 # alone, no watchdog); wd-burst wd-burst-a wd-rate wd-stale (the watchdog
 # alone, nodes unarmed); the -a cases PUT, so Class A trips;
 # wd-restarts (kill -9s under the watchdog: counts summed per process, no
-# trip); calibrate (CAL_SEC, 2100, at 350/s with 30 s flushes and both
+# trip); tool-verify (the final verify under a 5 GET cap: it trips, retain
+# never runs, the watchdog's last count includes the tool); calibrate (CAL_SEC, 2100, at 350/s with 30 s flushes and both
 # guards at the hour's numbers: neither may trip).
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -21,7 +22,7 @@ B=$QLOG_BASE
 bin=${CARGO_TARGET_DIR:-target}/dev-release/qlog
 root=${OUT:-$crate/dev/r2-guard-test}
 real="--budget-a 3500 --budget-b 12000 --budget-rate-a 2.4 --budget-rate-b 8.3 --budget-window-s 120 --budget-burst-a 250 --budget-burst-b 300"
-cases=${*:-node-burst node-burst-a node-rate node-budget wd-burst wd-burst-a wd-rate wd-stale wd-restarts}
+cases=${*:-node-burst node-burst-a node-rate node-budget wd-burst wd-burst-a wd-rate wd-stale wd-restarts tool-verify}
 fail=0
 
 # case name, seconds of load, scenario, watchdog (1/0), node flags, [extra env...]
@@ -42,7 +43,7 @@ run() {
   local watchdog=""
   if [ "$wd" = 1 ]; then
     setsid python3 "$here/r2_watchdog.py" --node "n1=127.0.0.1:$((B + 11))" --node "n2=127.0.0.1:$((B + 12))" --node "n3=127.0.0.1:$((B + 13))" \
-      --pgid-file "$run/pgid" --kill-pattern "^$bin .*--prefix $prefix" --log "$out/watchdog.jsonl" \
+      --pgid-file "$run/pgid" --kill-pattern "^$bin .*--prefix $prefix" --log "$out/watchdog.jsonl" --count-glob "$run/budget-tool-*.json" \
       --tripped-file "$out/watchdog-tripped" --done-file "$out/done" ${WD_FLAGS:-} 2>"$out/watchdog.log" &
     watchdog=$!
   fi
@@ -99,6 +100,10 @@ if wd:
 PY
   case $name in
     node-*) { [ "$rc" = 86 ] && [ "$left" = 0 ]; } || { echo "  FAIL"; fail=1; } ;;
+    tool-*) { [ "$rc" = 86 ] && [ -e "$run/budget-tool-verify.tripped" ] && [ ! -s "$run/retain.json" ] && [ "$left" = 0 ] &&
+      grep -q '"event": "done".*budget-tool-verify' "$out/watchdog.jsonl"; } || { echo "  FAIL"; fail=1; }
+      cat "$run"/budget-tool-*.tripped 2>/dev/null | sed 's/^/  tool: /'
+      grep '"event": "done"' "$out/watchdog.jsonl" | cut -c1-300 | sed 's/^/  watchdog: /' ;;
     wd-restarts | calibrate) { [ ! -e "$out/watchdog-tripped" ] && [ ! -e "$run/budget-tripped" ]; } || { echo "  FAIL"; fail=1; } ;;
     wd-*) { [ "$wrc" = 3 ] && [ "$left" = 0 ]; } || { echo "  FAIL"; fail=1; } ;;
   esac
@@ -114,6 +119,7 @@ for c in $cases; do
     wd-burst-a) run wd-burst-a 60 baseline 1 "--runaway put:10" ;;
     wd-rate) run wd-rate 200 baseline 1 "--runaway get:4" ;;
     wd-stale) DURING="sleep 20; pkill -STOP -f -- '^$bin node --id n2 '" run wd-stale 120 baseline 1 "" ;;
+    tool-verify) run tool-verify 45 baseline 1 "" TOOL_BUDGET="--budget-b 5" FINAL_VERIFY=1 VERIFY_EVERY=0 ;;
     wd-restarts) run wd-restarts 75 kill-leader 1 "$real" ;;
     calibrate) run calibrate "${CAL_SEC:-2100}" baseline 1 "$real" STATUS_EVERY=60 ;;
     *) echo "unknown case $c" >&2; fail=1 ;;

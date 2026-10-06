@@ -20,7 +20,7 @@ diagram:
     - "nodes.r -> store.l"
     - "nodes.r -> cons.l: $0 on OVH · ~$4.1k on AWS"
 facts:
-  - { value: "~$19", unit: /mo, label: 3 nodes at today's load, note: "OVH VPS-1 + R2, 30 s flush, 10 consumers", tone: accent }
+  - { value: "~$18", unit: /mo, label: 3 nodes at today's load, note: "OVH VPS-1 + R2, 30 s flush, 10 consumers", tone: accent }
   - { value: "~$10", unit: /mo, label: one node, note: "OVH VPS-1 + R2, no HA", tone: violet }
   - { value: "~$1", unit: /mo, label: of bucket requests, note: "R2 after its free tier · ~$7 before it (measured over an hour)", tone: amber }
   - { value: "~$4.1k", unit: /mo, label: of egress on AWS, note: "10 consumers × the whole stream, today", tone: rust }
@@ -39,7 +39,7 @@ consumers, R2 after its free tier:
 
 | Setup | Flush | Total | Where it goes |
 |---|---|---|---|
-| 3 x OVH VPS-1, commitlog | 30 s | ~$19 | hosts $14, bucket requests $1, storage $5 |
+| 3 x OVH VPS-1, commitlog | 30 s | ~$18 | hosts $14, bucket requests $0, storage $5 |
 | 3 x OVH VPS-1, commitlog | 60 s | ~$18 | hosts $14, bucket requests $0, storage $5 |
 | 3 x OVH VPS-1, commitlog, 24 h of log in the bucket | 60 s | ~$15 | hosts $14, storage $2 |
 | 3 x Hetzner CAX21 (ARM), commitlog | 30 s | ~$43 | hosts $37, bucket $6 |
@@ -77,7 +77,7 @@ What the numbers say, in order of size:
 | Log compression | 1.56x at zstd -1 on production frames | [Performance](perf.md#compression) |
 | CPU per event | 65-70 µs one node on cores, 89-94 µs on SMT threads | [Performance](perf.md) |
 | Leader's share of a cluster's CPU | half (it checks and applies every event, and the others verify their hosts' share) | assumed |
-| A flush's bucket work | a manifest CAS, its segments (64 MiB raw, cut per flush), ~12.4 Class A and ~12 Class B for the state's share | measured over an hour at 350/s |
+| A flush's bucket work | a manifest CAS, its segments (64 MiB raw, cut per flush), ~8 Class A and ~12 Class B for the state's share | measured over an hour at 350/s, on MinIO and on R2 |
 | SlateDB polls | ~1.26 GET/s for the leader's one SlateDB | measured, same run |
 | Per-DID state | 121.8 B a DID in SSTs (243.6 B right after an update, before compaction) | measured on 1M DIDs in an in-memory bucket (2026-10-04) |
 | Network today | 56M repos, ~24B records, 89.9M PLC DIDs | vlpds cost model's queries |
@@ -131,13 +131,13 @@ with R2, or S3 on AWS):
 
 | Host | $/mo each | today | 10x | 100x |
 |---|---|---|---|---|
-| OVH VPS-1 | $5 | $19 | no: disk 138/40 GB, port 841 Mb/s/0.5 Gb/s | no: CPU, disk, port |
+| OVH VPS-1 | $5 | $18 | no: disk 138/40 GB, port 841 Mb/s/0.5 Gb/s | no: CPU, disk, port |
 | OVH VPS-2 | $8 | $31 | no: disk 138/75 GB, port 841 Mb/s/1 Gb/s | no: CPU, disk, port |
 | OVH VPS-4 | $23 | $76 | $123 | no: CPU 10.3/8, disk 1,291/200 GB, port 8.4/3 Gb/s |
 | OVH ADVANCE-2 | $198 | $600 | $647 | no: disk 1,291/960 GB, port 5.4/3 Gb/s |
 | Hetzner CAX21 (ARM) | $12 | $43 | no: disk 138/80 GB, port 841 Mb/s/1 Gb/s | no: CPU, disk, port |
 | Hetzner AX42 | $109 | $333 | $707, 3 edges | no: port 8.4/1 Gb/s |
-| Hetzner AX42 + 10G | $157 | $477 | $1,037 | $3,387, 22 edges |
+| Hetzner AX42 + 10G | $157 | $476 | $1,035 | $3,385, 22 edges |
 | AWS c7gd.large | $66 | $4,540 | no: disk 138/118 GB, port 841 Mb/s/0.94 Gb/s | no: CPU, disk, port |
 | AWS c7gd.xlarge | $132 | $4,739 | ~$30k | no: CPU, disk, port |
 
@@ -148,45 +148,47 @@ One node, NVMe commitlog, a 30 s flush, 10 consumers, R2 holding 72 h:
 | OVH VPS-1 | $5 | $10 (4 h on disk) | no: disk 138/40 GB, port 1.6/0.5 Gb/s | no |
 | OVH VPS-4 | $23 | $29 (35 h on disk) | $76 (2 h on disk) | no |
 | Hetzner AX42 | $109 | $115 (72 h on disk) | $489, 3 edges (36 h on disk) | no: port 16.3/1 Gb/s |
-| Hetzner AX42 + 10G | $157 | $197 (72 h on disk) | $771 (36 h on disk) | $3,073, 22 edges (2 h on disk) |
+| Hetzner AX42 + 10G | $157 | $196 (72 h on disk) | $769 (36 h on disk) | $3,071, 22 edges (2 h on disk) |
 | OVH ADVANCE-2 | $198 | $204 (72 h on disk) | $251 (17 h on disk) | no: disk, port |
 
 ## The bucket
 
 ### Requests
 
-A flush is a manifest CAS, its segments and the state's share: ~12.4 Class A and ~12 Class B for
-the state's L0, the checkpoint it seals and the one it retires, compaction and SlateDB's GC
-deletes, plus ~1.26 Class B a second of SlateDB's polls. Segments are cut at 64 MiB raw, so at
+A flush is a manifest CAS, its segments and the state's share: ~8 Class A and ~12 Class B for
+the state's L0, the checkpoint it seals and the one it retires and compaction, plus ~1.26 Class B a second of SlateDB's polls. Segments are cut at 64 MiB raw, so at
 today's rate a 30 s flush (~56 MB) is one PUT. The leader is the only node that writes, and
 followers send nothing in steady state.
 
 | Load | Flush | Segment PUTs/s | Class A/s | Class B/s | R2 $/mo, no free tier | R2 $/mo | S3 $/mo |
 |---|---|---|---|---|---|---|---|
-| today | 10 s | 0.10 | 1.44 | 2.46 | $19 | $13 | $22 |
-| today | 30 s | 0.03 | 0.48 | 1.66 | $7 | $1 | $8 |
-| today | 60 s | 0.03 | 0.26 | 1.46 | $4 | $0 | $5 |
-| 10x | 10 s | 0.30 | 1.64 | 2.46 | $22 | $15 | $24 |
-| 10x | 30 s | 0.30 | 0.75 | 1.66 | $10 | $4 | $12 |
-| 10x | 60 s | 0.28 | 0.51 | 1.46 | $7 | $1 | $8 |
-| 100x | 10 s | 2.80 | 4.14 | 2.46 | $51 | $44 | $57 |
-| 100x | 30 s | 2.77 | 3.21 | 1.66 | $40 | $34 | $44 |
-| 100x | 60 s | 2.77 | 2.99 | 1.46 | $37 | $31 | $41 |
+| today | 10 s | 0.10 | 1.00 | 2.46 | $14 | $7 | $16 |
+| today | 30 s | 0.03 | 0.33 | 1.66 | $6 | $0 | $6 |
+| today | 60 s | 0.03 | 0.18 | 1.46 | $4 | $0 | $4 |
+| 10x | 10 s | 0.30 | 1.20 | 2.46 | $17 | $10 | $18 |
+| 10x | 30 s | 0.30 | 0.60 | 1.66 | $9 | $3 | $10 |
+| 10x | 60 s | 0.28 | 0.43 | 1.46 | $7 | $1 | $7 |
+| 100x | 10 s | 2.80 | 3.70 | 2.46 | $46 | $39 | $51 |
+| 100x | 30 s | 2.77 | 3.07 | 1.66 | $38 | $32 | $42 |
+| 100x | 60 s | 2.77 | 2.92 | 1.46 | $36 | $30 | $40 |
 
 The today-at-30 s row is measured: three nodes, an hour at 350 events/s on a local MinIO, every
 request counted by purpose. It came to 0.48 Class A and 1.66 Class B a second, which the model
-reproduces. The rest is modeled from it. Takeovers, membership changes, recovery and retention are
+reproduces. An hour on a real R2 bucket counted the same (0.478 A, 1.725 B), and R2 billed none of
+SlateDB's GC deletes (one-key `DeleteObjects`, ~0.15 a second) as Class A, so the model leaves
+them out: 0.33 Class A a second today at 30 s ([quorum.md](quorum.md#real-r2-hour)). The rest is
+modeled from it. Takeovers, membership changes, recovery and retention are
 a few requests each, and backfill reads one GET per segment.
 
 The knobs, in R2 $/mo before the free tier, to show the slope:
 
 | Knob | today, 10 s | today, 60 s | 100x, 10 s | 100x, 60 s |
 |---|---|---|---|---|
-| default: 64 MiB segments, one state | $19 | $4 | $51 | $37 |
-| 8 MiB segments | $22 | $7 | $281 | $266 |
+| default: 64 MiB segments, one state | $14 | $4 | $46 | $36 |
+| 8 MiB segments | $17 | $6 | $276 | $265 |
 
-- Flush interval. At 60 s requests sit inside R2's free tier, at 30 s they're ~$1 after it and at
-  10 s ~$13. A longer flush only costs the re-ingest window ([below](#re-ingest-after-a-lost-tail)),
+- Flush interval. At 60 s requests sit inside R2's free tier, at 30 s they are too, and at
+  10 s they're ~$7 after it. A longer flush only costs the re-ingest window ([below](#re-ingest-after-a-lost-tail)),
   and with a commitlog that only matters when two disks are lost. So 30-60 s.
 - Segment size. 8 MiB segments are fine today but cost ~$230 a month more at 100x.
 - Bucket retention. 72 h of log (`--qlog-retain-hours`) is ~$5 a month on R2 today, and 24 h is
