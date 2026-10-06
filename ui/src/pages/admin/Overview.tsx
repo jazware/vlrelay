@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { openDialog, FormDialog } from '../../components/console/dialogs'
 import { Exchange } from '../../components/console/Exchange'
-import { Banners, Bars, Empty, Glyph, HealthLine, HostName, Kbd, Loaded, LiveVal, NeedsVersion, PageHead, Panel, RRow, Spark, Src, Swatch, Tiles, type HealthCell, type TileSpec, type Tone } from '../../components/console/kit'
+import { Banners, Bars, Empty, Glyph, HealthLine, HostName, Kbd, Loaded, LiveVal, PageHead, Panel, RRow, Spark, Src, Swatch, Tiles, type HealthCell, type TileSpec, type Tone } from '../../components/console/kit'
 import { LiveTail } from '../../components/console/LiveTail'
 import { openPanel } from '../../components/console/nav'
 import { toast } from '../../components/console/toast'
@@ -96,7 +96,7 @@ function healthCells(o: O, view: RelayView | undefined, cases: number, crit: num
       tone: held ? 'err' : 'ok',
       value: fmtNum(Math.max(0, q.commit - q.flushed)),
       unit: 'unflushed',
-      sub: `F ${seqS(q.flushed)} · R +${fmtSi(Math.max(0, q.reserve - q.commit))}`,
+      sub: q.lead?.flush?.last_at_ms ? `flushed ${ago(q.lead.flush.last_at_ms)} · R +${fmtSi(Math.max(0, q.reserve - q.commit))}` : `F ${seqS(q.flushed)} · R +${fmtSi(Math.max(0, q.reserve - q.commit))}`,
       to: '/admin/quorum',
       title: 'Committed entries the leader hasn’t flushed to the bucket yet (above F), and the headroom to R',
     })
@@ -168,7 +168,7 @@ export function Overview() {
     { label: 'Sent', right: 'all consumers', value: fmtSi(o.eventsOutPerSec), unit: '/s', sec: `${fmtBytes(o.bytesOutPerSec)}/s`, spark: <Spark data={h.eventsOut} color="c5" />, to: '/admin/consumers' },
     { label: 'Time to firehose', right: 'p99 · p50 dashed', value: fmtMs(o.timeToFirehoseP99Ms), sec: fmtMs(o.timeToFirehoseP50Ms), spark: <Spark data={h.ttfP99Ms} l2={h.ttfP50Ms} color="warn" /> },
     { label: 'Rejects', right: `${((o.rejectsPerSec / Math.max(1, o.eventsInPerSec)) * 100).toFixed(2)}%`, value: fmtSi(o.rejectsPerSec), unit: '/s', spark: <Spark data={rejSeries} color="err" /> },
-    { label: 'Durability lag', right: 'oldest not yet durable', value: fmtMs(o.logDurabilityLagMs), spark: <Spark data={h.durabilityLagMs} color="violet" /> },
+    { label: 'Durability lag', right: 'oldest not yet durable', value: fmtMs(o.commitLagMs), spark: <Spark data={h.durabilityLagMs} color="violet" /> },
     q
       ? { label: 'Commit', right: 'p99 · p50 dashed', value: commitP99.length ? fmtMs(commitP99[commitP99.length - 1]) : '—', sec: fmtMs(seriesOf('commit-p50').slice(-1)[0]), spark: <Spark data={commitP99} l2={seriesOf('commit-p50')} color="signal" />, to: '/admin/quorum' }
       : { label: 'Consumers', value: fmtNum(o.consumers), sec: `${fmtBytes(o.bytesOutPerSec)}/s`, to: '/admin/consumers' },
@@ -190,7 +190,7 @@ export function Overview() {
             title="The exchange"
             src={
               <>
-                <Src>overview · cluster · cluster/quorum</Src> <Src isNew>per-trunk history</Src>
+                <Src>overview · cluster · cluster/quorum</Src> <Src>overview.topHosts[].history</Src>
               </>
             }
             right={
@@ -238,7 +238,7 @@ export function Overview() {
                           <HostName host={r.host} short />
                         </td>
                         <td className="r">
-                          <Spark data={seriesOf(`host:${r.host}`)} size="inline" color={r.status === 'throttled' ? 'warn' : 'accent'} /> <LiveVal className="mono sm">{fmtSi(r.eventsPerSec)}</LiveVal>
+                          <Spark data={r.history ?? []} size="inline" color={r.status === 'throttled' ? 'warn' : 'accent'} /> <LiveVal className="mono sm">{fmtSi(r.eventsPerSec)}</LiveVal>
                         </td>
                         <td>
                           <NodeTag view={view} id={r.node} />
@@ -318,7 +318,7 @@ export function Overview() {
           </Panel>
           <Panel title="Open cases" to="/admin/moderation" src={<Src>cases?status=open</Src>}>
             {(cases.data ?? []).slice(0, 5).map((c) => (
-              <RRow key={c.id} to={`/admin/cases/${c.id}`} x={ago(c.openedAtMs)}>
+              <RRow key={c.id} onClick={() => openPanel('case', String(c.id))} x={ago(c.openedAtMs)}>
                 <Glyph k={c.severity === 'critical' ? 'err' : c.severity === 'high' ? 'warn' : c.severity === 'warn' ? 'warn' : 'info'} />
                 <span className="mono sm">{c.id}</span>
                 <span className="nm">
@@ -327,9 +327,6 @@ export function Overview() {
               </RRow>
             ))}
             {cases.data && !cases.data.length && <Empty>No open cases.</Empty>}
-          </Panel>
-          <Panel title="Monthly bill" to="/admin/store" src={<Src isNew>store/cost</Src>}>
-            <NeedsVersion what="The bill" endpoint="GET store/cost" />
           </Panel>
           <div className="muted sm" style={{ padding: '0 2px' }}>
             {plural(o.hostsConnected, 'host')} connected · {plural(o.consumers, 'consumer')} · as of {ov.at ? ago(ov.at) : '—'}

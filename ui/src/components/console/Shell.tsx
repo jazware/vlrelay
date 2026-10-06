@@ -219,7 +219,10 @@ function useCorePalette() {
           glyph: <Swatch color={n.color} />,
           title: n.id,
           desc: `${n.role}${n.addr ? ` · ${n.addr}` : ''}`,
-          run: () => navigate(SECTION.quorum.path),
+          run: () => {
+            if (!location.pathname.startsWith(SECTION.quorum.path)) navigate(SECTION.quorum.path)
+            openPanel('node', n.id)
+          },
         }))
         return [...goto, ...acts, ...nodes]
       },

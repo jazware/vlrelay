@@ -1,0 +1,171 @@
+/* Consumers, Quorum & cluster and Object store: the parts console.css doesn't have. Same cx-
+   prefix and tokens; kept in their own file so the sections built in parallel don't edit one. */
+
+.cx-chip.sig {
+  background: var(--signal-wash);
+  color: var(--signal);
+}
+
+/* the leadership ribbon: a band per epoch in its leader's colour, a glyph per change */
+.cx-ribbon {
+  position: relative;
+  height: 58px;
+  margin: 6px 14px 4px;
+}
+.cx-ribbon .band {
+  position: absolute;
+  top: 18px;
+  height: 16px;
+  border-radius: 2px;
+  opacity: 0.85;
+}
+.cx-ribbon .mk {
+  position: absolute;
+  top: 6px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  cursor: pointer;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 12px;
+}
+.cx-ribbon .mk .st {
+  width: 1px;
+  height: 24px;
+  background: var(--ink3);
+}
+.cx-ribbon .mk:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.cx-ribbon .ax {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 42px;
+  display: flex;
+  justify-content: space-between;
+  font: 10px var(--mono);
+  color: var(--ink3);
+}
+
+/* member sets: kept, added (dashed green), removed (struck red) */
+.cx-memchips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.cx-memchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 14px;
+  border: 1px solid var(--rule);
+  background: var(--raised);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.cx-memchip.add {
+  border-style: dashed;
+  border-color: var(--ok);
+  color: var(--ok);
+}
+.cx-memchip.rm {
+  text-decoration: line-through;
+  color: var(--err);
+  border-color: color-mix(in oklab, var(--err) 40%, var(--rule));
+}
+.cx-memchip button {
+  border: 0;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--ink3);
+  font-size: 13px;
+  line-height: 1;
+}
+.cx-memchip button:hover {
+  color: var(--ink);
+}
+.cx-dlg .cx-warnlist {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--warn);
+}
+.cx-dlg .cx-form-row .cx-inp {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+
+/* host shards: many hosts, so the cells shrink to fit */
+.cx-shardmap.dense {
+  grid-template-columns: repeat(auto-fill, minmax(11px, 1fr));
+  gap: 2px;
+}
+.cx-shardmap.dense .cx-shard {
+  aspect-ratio: 1;
+  border-radius: 2px;
+}
+.cx-shardmap .cx-shard.hl {
+  outline: 2px solid var(--ink);
+  outline-offset: -1px;
+}
+.cx-shardlegend {
+  display: flex;
+  gap: 4px 12px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  color: var(--ink2);
+}
+.cx-shardlegend button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: none;
+  border: 0;
+  padding: 2px 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.cx-lede {
+  color: var(--ink2);
+  font-size: 12.5px;
+  margin: 0;
+  max-width: 760px;
+}
+.cx-pn .cx-kv.pad {
+  padding: 10px 12px;
+  margin: 0;
+}
+.cx-scope {
+  font: 600 10.5px/1 var(--mono);
+  color: var(--ink3);
+  border: 1px dashed var(--rule);
+  border-radius: 3px;
+  padding: 2px 5px;
+  white-space: nowrap;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.cx-gauge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+@media (max-width: 760px) {
+  .cx-ribbon {
+    margin: 6px 10px 4px;
+  }
+}

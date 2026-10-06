@@ -242,43 +242,9 @@ export type Account = {
   rejectsLastHour: number
   didShard: number
   node: string
-  archive?: AccountArchive
-}
-
-export type AccountArchive = {
-  wanted: boolean
-  mirrored: boolean
-  rev: string | null
-  fetching: boolean
-  staging: boolean
-  lastError: string | null
-  takedownAtMs: number | null
 }
 
 // ---------------------------------------------------------------- operations
-
-export type ArchiveCounts = {
-  mirrored: number
-  queued: number
-  running: number
-  failed: number
-  fetched: number
-  retried: number
-  bytes: number
-  records: number
-  sstBytes: number
-  applied: number
-  mismatches: number
-  healed: number
-  sweptAtMs: number
-}
-export type ArchiveView = {
-  mode: string
-  policyVersion: number
-  totals: ArchiveCounts
-  nodes: { node: string; stale: boolean; counts: ArchiveCounts }[]
-  errors: { node: string; did: string; error: string }[]
-}
 
 export type PlcWindow = { fromMs: number; afterMs: number; untilMs: number | null; ops: number; done: boolean; progress: number }
 export type PlcView = {
@@ -376,6 +342,8 @@ export type QFlush = {
   applied: number
   last_flushed: number
   last_reserve: number
+  /** When F last moved (unix ms; newer builds). */
+  last_at_ms?: number
 }
 
 export type QSwitch = {
@@ -451,8 +419,32 @@ export type QStatus = {
   paused: boolean
   last_epoch: number
   switches: QSwitch[]
-  /** Bucket requests by class/purpose (newer builds). */
-  requests?: Record<string, unknown>
+  /** Every bucket request this process sent through the quorum log's clients (newer builds). */
+  requests?: QRequests
+  /** What the relay's hooks report (newer builds). */
+  relay?: QRelayReport
+}
+
+/** Requests by R2 class: A is every write and LIST, B every GET and HEAD, a DELETE is free. */
+export type QCounts = { a: number; b: number; free: number }
+/** `qlog::bucket::Requests`: counted since the process started, failed and cancelled ones too. */
+export type QRequests = {
+  total: QCounts
+  by_purpose: Record<string, QCounts>
+  /** `purpose/component` (log_segment, qlog_manifest, state_*, ...). */
+  by_component: Record<string, QCounts>
+  /** `purpose/op`. */
+  by_op: Record<string, number>
+}
+/** `RelayHooks::report`: the relay's admissions, its host table and the leader's retention runs. */
+export type QRelayReport = {
+  leading?: number | null
+  hosts?: number
+  owners?: Record<string, number> | null
+  retain_runs?: number
+  retain_deleted?: number
+  host_moves?: number
+  [k: string]: unknown
 }
 
 export type QuorumNode = { node: string; addr: string; stale: boolean; error: string | null; reportedMs: number; status: QStatus | null }
