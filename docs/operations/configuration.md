@@ -106,13 +106,46 @@ Time to firehose is about linger plus one segment PUT. Above ~50k events/s segme
 | `--lanes <LANES>` |  | `64` | Pipeline lanes; a DID always maps to the same one |
 | `--ingest-threads <INGEST_THREADS>` |  |  | Threads verifying events (default: the core count, at most 16) |
 
-## Cluster
+## Quorum cluster
 
-Without `--cluster` or `--role` the node runs alone. Core and edge nodes need `--peer-tls-dir` and `--internal-token`, and a replica needs neither ([Deploy](deploy.md#a-cluster), [Cluster](../cluster.md)).
+With `--quorum` the node is a member of a quorum cluster (one member is a single node with its commitlog as the WAL). Every member uses the same bucket and `--prefix` ([Quorum cluster](../quorum-cluster.md)).
+
+| Flag | Env | Default | What |
+|---|---|---|---|
+| `--quorum` | `VLRELAY_QUORUM` |  | Run on the quorum log |
+| `--qlog-listen <QLOG_LISTEN>` | `VLRELAY_QLOG_LISTEN` | `127.0.0.1:2978` | The peer protocol: replication, submits, members' questions |
+| `--qlog-peer <QLOG_PEERS>` | `VLRELAY_QLOG_PEERS` |  | Another node: `id=host:port` of its --qlog-listen (repeatable, or comma-separated) |
+| `--qlog-members <QLOG_MEMBERS>` | `VLRELAY_QLOG_MEMBERS` |  | The bootstrap member set (default: this node and its peers); after the first start, `qlog/leader` holds it |
+| `--qlog-dir <QLOG_DIR>` | `VLRELAY_QLOG_DIR` |  | The commitlog's directory (NVMe). Without one the log is memory only |
+| `--qlog-flush-ms <QLOG_FLUSH_MS>` |  | `30000` | The bucket flush interval |
+| `--qlog-headroom <QLOG_HEADROOM>` |  | `8640000` | Seqs reserved past each flush (R = F + H) |
+| `--qlog-admin-token <QLOG_ADMIN_TOKEN>` | `QLOG_ADMIN_TOKEN` |  | Bearer token membership changes need (`qlog member`, the dashboard) |
+| `--qlog-retain-hours <QLOG_RETAIN_HOURS>` |  | `72` | Bucket retention, run by the leader: segments older than this go (0: never) |
+| `--qlog-retain-secs <QLOG_RETAIN_SECS>` |  |  | Dev: retention in seconds instead |
+| `--qlog-retain-every-secs <QLOG_RETAIN_EVERY_SECS>` |  | `600` |  |
+| `--qlog-host-failover-ms <QLOG_HOST_FAILOVER_MS>` |  | `2000` | A member silent this long loses its hosts to the others |
+| `--qlog-host-poll-ms <QLOG_HOST_POLL_MS>` |  | `500` |  |
+| `--qlog-election-ms <QLOG_ELECTION_MS>` |  | `1000` |  |
+| `--qlog-heartbeat-ms <QLOG_HEARTBEAT_MS>` |  | `100` |  |
+| `--qlog-state-compactor-poll-ms <QLOG_STATE_COMPACTOR_POLL_MS>` |  | `30000` | The state's SlateDB compactor and worker poll |
+| `--qlog-no-auto-recover` |  |  | A lost quorum waits for an operator instead of recovering from the bucket |
+| `--qlog-segment-mb <QLOG_SEGMENT_MB>` |  | `64` |  |
+| `--qlog-disk-retain-mb <QLOG_DISK_RETAIN_MB>` |  | `4096` |  |
+| `--qlog-memory-mb <QLOG_MEMORY_MB>` |  |  | Committed log kept in memory (default 64 with --qlog-dir, else 512) |
+| `--qlog-crash-at <QLOG_CRASH_AT>` |  |  | Chaos: kill -9 at this flush step (or `any`), with --qlog-crash-prob |
+| `--qlog-crash-prob <QLOG_CRASH_PROB>` |  | `0.05` |  |
+| `--qlog-crash-stop-file <QLOG_CRASH_STOP_FILE>` |  |  | Chaos: no crash injected once this file exists |
+| `--qlog-power-cut-on-usr1` |  |  | Chaos: SIGUSR1 is a power cut |
+| `--qlog-fsync-delay-us <QLOG_FSYNC_DELAY_US>` |  |  | Chaos: sleep this long before each commitlog fsync (emulates a disk) |
+
+## Lease cluster
+
+The first cluster, kept for comparison: it runs only with `--legacy-cluster`. Without `--cluster` or `--role` the node runs alone. Core and edge nodes need `--peer-tls-dir` and `--internal-token`, and a replica needs neither ([Deploy](deploy.md#a-cluster), [Cluster](../cluster.md)).
 
 | Flag | Env | Default | What |
 |---|---|---|---|
 | `--node-id <NODE_ID>` | `VLRELAY_NODE_ID` | `relay` | Node id: the node log's id prefix, and the cluster member name |
+| `--legacy-cluster` | `VLRELAY_LEGACY_CLUSTER` |  | The lease cluster (`--role`, `--cluster`), which the quorum log (`--quorum`) supersedes: kept for comparison, off unless asked for |
 | `--cluster` |  |  | Run as a core cluster node (the same as --role core) |
 | `--role <ROLE>` |  |  | Cluster role: core (lease, shards, a log), edge (follows every log over peer mTLS) or replica (follows every log from the bucket) `core`: Lease, DID and host shards, a log; serves · `edge`: Follows every log over peer mTLS and serves. No lease, no shards · `replica`: Follows every log from the bucket (read-only) and serves |
 | `--peer-listen <PEER_LISTEN>` | `VLRELAY_PEER_LISTEN` | `127.0.0.1:2979` | The peer listener (node-to-node mTLS): forwarding, log streams |
@@ -121,3 +154,15 @@ Without `--cluster` or `--role` the node runs alone. Core and edge nodes need `-
 | `--internal-token <INTERNAL_TOKEN>` | `VLRELAY_INTERNAL_TOKEN` |  | Shared secret on every peer request |
 | `--lease-ttl-ms <LEASE_TTL_MS>` |  | `10000` | Node lease TTL: a crashed core node's shards move after about this plus a fifth of it |
 | `--host-shards <HOST_SHARDS>` |  | `64` | Host shards (used only when the bucket has no host layout yet) |
+
+## Other
+
+| Flag | Env | Default | What |
+|---|---|---|---|
+| `--admin-follower <ADMIN_FOLLOWERS>` | `VLRELAY_ADMIN_FOLLOWERS` |  | An edge's or a replica's public URL (repeatable, or comma-separated), for a core's dashboard to include its numbers and consumers. They answer with the same --admin-token |
+| `--retention-secs <RETENTION_SECS>` |  |  | Dev mode only: retention in seconds instead (overrides --retention), so a test can see `OutdatedCursor` |
+| `--max-lag-mb <MAX_LAG_MB>` |  |  | Dev mode only: how far a live consumer may fall behind before `ConsumerTooSlow`, in MiB (default 128) |
+| `--host-inflight-events <HOST_INFLIGHT_EVENTS>` |  | `8192` | Upstream frames one host may have read and not yet durable; past it (or its MB cap) the host's socket isn't read |
+| `--host-inflight-mb <HOST_INFLIGHT_MB>` |  | `64` |  |
+| `--inflight-events <INFLIGHT_EVENTS>` |  | `32768` | The same over every host together |
+| `--inflight-mb <INFLIGHT_MB>` |  | `384` |  |

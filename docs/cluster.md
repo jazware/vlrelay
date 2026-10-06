@@ -1,7 +1,7 @@
 ---
-title: Cluster
+title: Lease cluster
 section: vlRelay
-order: 5
+order: 8
 summary: "Core nodes share host shards and DID shards through leases in the bucket, merge every log into one stream, and hand shards over on SIGTERM or take them over after a crash. Edges and replicas add egress."
 ---
 
@@ -36,6 +36,9 @@ facts:
   - { value: "< 0.5 s", label: planned handoff, note: "SIGTERM; host shards at once, DID shards open 0.38–0.46 s later", tone: blue }
   - { value: "0", label: events missing or reordered, note: "5 streams through a kill -9 and a SIGTERM, same seqs on all", tone: amber }
 ```
+
+This is the first cluster design, kept for comparison: the [quorum cluster](quorum-cluster.md)
+replaces it, and a node runs it only with `--legacy-cluster`.
 
 A vlRelay cluster is several core nodes on one bucket and prefix. Each core holds a lease, owns
 some host shards (which PDSes it subscribes to) and some DID shards (whose state it keeps and

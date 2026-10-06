@@ -38,10 +38,22 @@ SECTIONS = [
     ),
     ("Pipeline and state", "", ["did-shards", "lanes", "ingest-threads"]),
     (
-        "Cluster",
-        "Without `--cluster` or `--role` the node runs alone. Core and edge nodes need `--peer-tls-dir` and "
+        "Quorum cluster",
+        "With `--quorum` the node is a member of a quorum cluster (one member is a single node with its "
+        "commitlog as the WAL). Every member uses the same bucket and `--prefix` "
+        "([Quorum cluster](../quorum-cluster.md)).",
+        ["quorum", "qlog-listen", "qlog-peer", "qlog-members", "qlog-dir", "qlog-flush-ms", "qlog-headroom",
+         "qlog-admin-token", "qlog-retain-hours", "qlog-retain-secs", "qlog-retain-every-secs",
+         "qlog-host-failover-ms", "qlog-host-poll-ms", "qlog-election-ms", "qlog-heartbeat-ms",
+         "qlog-state-compactor-poll-ms", "qlog-no-auto-recover", "qlog-segment-mb", "qlog-disk-retain-mb",
+         "qlog-memory-mb", "qlog-crash-at", "qlog-crash-prob", "qlog-crash-stop-file", "qlog-power-cut-on-usr1",
+         "qlog-fsync-delay-us"],
+    ),
+    (
+        "Lease cluster",
+        "The first cluster, kept for comparison: it runs only with `--legacy-cluster`. Without `--cluster` or `--role` the node runs alone. Core and edge nodes need `--peer-tls-dir` and "
         "`--internal-token`, and a replica needs neither ([Deploy](deploy.md#a-cluster), [Cluster](../cluster.md)).",
-        ["node-id", "cluster", "role", "peer-listen", "advertise-url", "peer-tls-dir", "internal-token",
+        ["node-id", "legacy-cluster", "cluster", "role", "peer-listen", "advertise-url", "peer-tls-dir", "internal-token",
          "lease-ttl-ms", "host-shards"],
     ),
 ]

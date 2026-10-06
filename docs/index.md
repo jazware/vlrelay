@@ -13,7 +13,8 @@ make sense next to the code.
 | [Subscribe to the firehose](subscribing.md) | For consumers: frames, seqs, cursors on any node, falling behind, takedowns, the sync endpoints |
 | [Design](design.md) | The job, where it's hard, what carries over from vlpds, where each check runs, decisions, failure modes |
 | [Stream seqs](seq.md) | Dense seqs as a function of the bucket, checkpoints, anchoring, cursor semantics |
-| [Cluster](cluster.md) | Roles, flags, peer authorization, restart dedupe, failure handling, resharding, the bucket, HA results |
+| [Quorum cluster](quorum-cluster.md) | The relay on the quorum log: running it, the path of an event, failures, members, the bucket |
+| [Lease cluster](cluster.md) | The first cluster (`--legacy-cluster`): roles, flags, peer authorization, restart dedupe, failure handling, resharding |
 | [Policy](policy.md) | Defaults, tiers, domain rules, admission, account caps, spam counting, takedowns, PLC export seeding |
 | [Archival mode](archival.md) | The mirror, keeping it current, bootstrap, takedowns, endpoints, numbers, gaps |
 | [Operations](operations/index.md) | [Deploy](operations/deploy.md), [Configuration](operations/configuration.md) (generated), [Monitoring](operations/monitoring.md) |
