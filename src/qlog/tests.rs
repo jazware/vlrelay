@@ -2074,3 +2074,36 @@ async fn a_partition_during_a_switch_loses_nothing() {
     settle_and_verify(&c, &acked).await;
     c.shutdown();
 }
+
+/// A single node grows into a three-node cluster under load (its WAL and
+/// bucket carry over; the two new boxes catch up as learners), loses a
+/// member without stopping, and shrinks back to one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_single_node_grows_to_three_and_back() {
+    let mut c = members_cluster(1, 2, |_| flush_opts()).await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    c.start("n2").await;
+    c.start("n3").await;
+    c.change_to(&["n1", "n2", "n3"], Duration::from_secs(20)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    let other = others(&["n1", "n2", "n3"], &[&l])[0];
+    c.kill(other);
+    let before = c.commit_of(&l);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(c.commit_of(&l) > before, "{}", status_line(&c));
+    c.start(other).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    c.change_to(&[&l], Duration::from_secs(20)).await;
+    let e = c.record().await.epoch;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    for gone in others(&["n1", "n2", "n3"], &[&l]) {
+        assert_never_counted(&c, gone, e);
+    }
+    let acked = load.stop().await;
+    settle_and_verify(&c, &acked).await;
+    c.shutdown();
+}

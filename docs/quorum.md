@@ -1,6 +1,6 @@
 # vlRelay: quorum replication (design and cost study)
 
-The first pass at vlRelay's economics didn't pan out. Three nodes on OVH with R2 came to ~$3.4k a month, and ~$2.8k of that was bucket requests: segments sealed every 25 ms on every node, plus host bookkeeping in bucket objects every 2-5 s. A non-archival sync 1.1 relay on one node costs about $10-15 a month to run. This page is a design and cost study for a vlRelay that keeps its recent log in replicas instead of the bucket, and writes the bucket rarely and in bulk. The replication core (Phase 1), the commitlog (Phase 2) and the flush (Phase 3) are built and measured, see [Implementation notes](#implementation-notes). Bucket recovery and the relay's wiring aren't built yet. `scripts/cost_model.py --quorum` generates every table above the notes.
+The first pass at vlRelay's economics didn't pan out. Three nodes on OVH with R2 came to ~$3.4k a month, and ~$2.8k of that was bucket requests: segments sealed every 25 ms on every node, plus host bookkeeping in bucket objects every 2-5 s. A non-archival sync 1.1 relay on one node costs about $10-15 a month to run. This page is a design and cost study for a vlRelay that keeps its recent log in replicas instead of the bucket, and writes the bucket rarely and in bulk. The replication core (Phase 1), the commitlog (Phase 2), the flush (Phase 3), bucket recovery (Phase 4) and membership changes (Phase 5) are built and measured, see [Implementation notes](#implementation-notes). The relay's wiring isn't built yet. `scripts/cost_model.py --quorum` generates every table above the notes.
 
 The idea is the one in vlpds's TODO ("Quorum in-memory durability"). A leader appends each event, replicates it to two other nodes and emits it once two of the three hold it. The bucket gets a flush every 10-60 s, and the host cursors ride in the same flush as the log they belong to. A relay suits this better than a PDS does, because the PDSes upstream are the source of truth. If the relay loses an unflushed tail, it asks each PDS to replay from its last flushed cursor. Losing a quorum costs a re-ingest and some time, and never a user's data. Jaz's call: the firehose holds every event back until a quorum has it, so consumers only see events that a takeover keeps.
 
@@ -223,7 +223,7 @@ The member set lives in `qlog/leader` and only changes at a flush barrier, so no
 2. When it's caught up, the leader pauses commits, flushes to the commit index and CASes `qlog/leader` with epoch + 1 and the new member set.
 3. Commits resume under the new set, and the removed node is told to stop.
 
-The pause is one flush plus one CAS, under a second. Replacing a dead box is the same steps.
+The pause is one flush plus one CAS, under a second. Replacing a dead box is the same steps. (As built, [Phase 5](#membership-phase-5): a flush just before the pause leaves the barrier's own flush small, so commits pause for ~10-60 ms on a local MinIO; a removed leader hands the new epoch to a member instead of stopping.)
 
 ### Placement
 
@@ -555,7 +555,7 @@ Known gaps, for later phases:
 - A follower more than `--retain-mb` behind is reset to the leader's base, and its stream jumps. (Phase 2: with a commitlog it's served from the leader's disk first, and only a follower behind the leader's disk retention is reset. Phase 3: with the flush on, it's served from the bucket after that, and only a follower behind the bucket's retention is reset.)
 - The pre-vote and the probe treat any I/O error from the leader as "dead". A flaky link can cost an unneeded takeover (availability, not safety).
 - A lost quorum is unrecoverable until Phase 4. Until then it stops emission rather than reissuing seqs. (Phase 3 writes everything Phase 4 recovers from.)
-- Membership is fixed (`--peer`).
+- Membership is fixed (`--peer`). (Phase 5: the set lives in `qlog/leader` and changes at a flush barrier.)
 
 ### The commitlog (Phase 2)
 
