@@ -79,9 +79,9 @@ struct S3Args {
     s3_endpoint: String,
     #[arg(long, default_value = "vlrelay")]
     s3_bucket: String,
-    #[arg(long, default_value = "minioadmin")]
+    #[arg(long, env = "QLOG_S3_ACCESS_KEY", default_value = "minioadmin", hide_env_values = true)]
     s3_access_key: String,
-    #[arg(long, default_value = "minioadmin")]
+    #[arg(long, env = "QLOG_S3_SECRET_KEY", default_value = "minioadmin", hide_env_values = true)]
     s3_secret_key: String,
     #[arg(long)]
     prefix: String,
@@ -212,6 +212,8 @@ struct NodeArgs {
     /// that, `qlog/leader` holds the set and `qlog member` changes it.
     #[arg(long, value_delimiter = ',')]
     members: Vec<String>,
+    #[command(flatten)]
+    budget: vlrelay::qlog::budget::BudgetArgs,
 }
 
 #[derive(Parser)]
@@ -270,6 +272,8 @@ struct CheckArgs {
     /// and re-ingest checks); without it any jump is a violation.
     #[arg(long)]
     s3_endpoint: Option<String>,
+    #[arg(long, default_value = "vlrelay")]
+    s3_bucket: String,
     #[arg(long)]
     prefix: Option<String>,
     /// The load generator's summary (`load --out`): every event it sent
@@ -326,6 +330,7 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
     vlrelay::qlog::state::set_compactor_poll(Duration::from_millis(a.state_compactor_poll_ms));
     cfg.retain_bytes = a.retain_mb.unwrap_or(if a.commitlog.is_some() { 64 } else { 512 }) << 20;
     let bucket = vlrelay::qlog::bucket::Bucket::new(a.s3.store()?);
+    vlrelay::qlog::budget::start(&a.budget, bucket.leader.clone())?;
     let die = |what: &str| {
         eprintln!("qlog: crash injected at {what}");
         // as sudden as a crash: no unwinding, no flush of anything
@@ -1055,9 +1060,9 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
         (Some(e), Some(p)) => {
             let s3 = S3Args {
                 s3_endpoint: e.clone(),
-                s3_bucket: "vlrelay".into(),
-                s3_access_key: "minioadmin".into(),
-                s3_secret_key: "minioadmin".into(),
+                s3_bucket: a.s3_bucket.clone(),
+                s3_access_key: std::env::var("QLOG_S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into()),
+                s3_secret_key: std::env::var("QLOG_S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into()),
                 prefix: p.clone(),
             };
             vlrelay::qlog::flush::read_manifest(&vlrelay::qlog::bucket::counted(&s3.store()?, "tool"))

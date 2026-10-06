@@ -1136,7 +1136,7 @@ Every difference from the study, explained:
 
 ### Measuring a real host (OVH, Hetzner)
 
-Nothing here touches a cloud host or real R2. To run on candidate hosts, with Jaz's OK:
+Measured so far: one real host, vps1 (an ex-vlpds OVH VPS), single node only; numbers [below](#vps1-one-ovh-vps-single-node). The 3-box run and real R2 are still to do (R2: [tests/qlog/R2_HOUR.md](../tests/qlog/R2_HOUR.md), with its request guards). To run on candidate hosts, with Jaz's OK:
 
 1. **fsync**, on each box, on the disk the commitlog would use (no root, needs `fio`):
    ```
@@ -1144,7 +1144,7 @@ Nothing here touches a cloud host or real R2. To run on candidate hosts, with Ja
    ```
    It prints fdatasync p50, p99 and p99.9 for 4 KiB, 64 KiB and 1 MiB appends with one writer, 64 KiB with three, and the unsynced write ceiling. Run it three times at different hours: VPS disks are shared. A VPS whose fdatasync is well under 0.1 ms is acknowledging from a cache (hypervisor or controller), so don't count on it surviving a host power cut.
 2. **The cluster**, three boxes (an OVH VPS-2 in each of three locations, or three Hetzner CX33/CAX21 in a spread placement group):
-   - Build `qlog` for the target (`cargo build --profile dev-release --bin qlog`, or `docker buildx` for linux/amd64 on the Mac) and copy it over.
+   - Build `qlog` for the target's CPU and copy it over. `.cargo/config.toml` builds for `target-cpu=native`, and a benchbox (Zen 5) binary dies with SIGILL on a VPS's Haswell vCPU: `RUSTFLAGS="-C target-cpu=haswell" CARGO_TARGET_DIR=<a separate dir> cargo build --profile dev-release --bin qlog`, then `objcopy --strip-debug` (330 MB to 39 MB). Or `docker buildx` for linux/amd64 on the Mac.
    - On box 1, MinIO for `qlog/leader` only (one GET and one CAS a takeover): `docker compose -f tests/qlog/compose.yml up -d --wait minio && docker compose -f tests/qlog/compose.yml run --rm minio-init`.
    - On each box `i`, with the peer port (3151) and the http port (3161) open to the others only:
      ```
@@ -1164,6 +1164,42 @@ Nothing here touches a cloud host or real R2. To run on candidate hosts, with Ja
      ```
    - Repeat at `--rate 350` and `35000`. Then kill -9 the leader's `qlog node` (and two, and all three) under `--rate 3500` and restart it, for the takeover pause and the restart recovery.
    - `report.py` gives the ack and end-to-end latency, each node's fsync p50 and p99 with the group-commit sizes, CPU and RSS. Paste them under the benchbox numbers above, against the "tmpfs + N ms" row that matches the host's fsync.
+3. **A single node** needs no docker or root: `tests/qlog/vps1/run_single.sh` runs one `chaos.sh` scenario on the host. It uses a userland MinIO (the binary from `vlpds-minio:local`, since dl.min.io no longer serves it) and puts the commitlog on the host's disk. It refuses to start with under 12 GB free, and deletes the run's data afterwards. `chaos.sh` takes `S3_ENDPOINT` for a MinIO it didn't start, and its timestamps work with Ubuntu 26.04's uutils `date`, which ignores `%3N`.
+
+#### vps1: one OVH VPS, single node
+
+The host: an OVH VPS in Us-west (the decommissioned vlpds-node1). It has 2 vCPU (KVM, "Intel Core Processor (Haswell, no TSX)"), 3.8 GB RAM and no swap. The disk is a 40 GB virtio `QEMU HARDDISK` (ext4, write cache "write back", `discard`), running Ubuntu 26.04 and kernel 7.0. Measured 2026-10-06 from 17:15 to 18:20 UTC. RTT from benchbox is 4.5 ms (same metro).
+
+`fsync_probe.sh`, three runs over 50 minutes (p50 / p99 in ms):
+
+| | 17:15 | 17:48 | 18:04 |
+|---|---|---|---|
+| fdatasync 4 KiB, 1 writer | 0.61 / 0.94 | 0.57 / 0.95 | 0.59 / 0.86 |
+| fdatasync 64 KiB, 1 writer | 0.68 / 0.95 | 0.63 / 1.07 | 0.65 / 1.07 |
+| fdatasync 1 MiB, 1 writer (MiB/s) | 1.12 / 2.15 (548) | 1.09 / 2.25 (548) | 1.12 / 1.53 (519) |
+| fdatasync 64 KiB, 3 writers (MiB/s) | 0.86 / 1.42 (175) | 0.86 / 1.35 (179) | 0.87 / 1.38 (173) |
+| unsynced write ceiling | 1,565 MiB/s | 1,499 | 1,428 |
+
+That's steady across the hour and well above 0.1 ms, so the flush really reaches the hypervisor's storage, not just a cache. It's 0.6-0.7 ms at commitlog-sized appends, the "0.5-2 ms VPS" the study assumed and 4x better than benchbox's consumer NVMe (2.7 ms). Three writers cost ~0.2 ms more, against 2x on benchbox. The 1 MiB rate (~550 MiB/s fsynced) is past what one member needs at 100x (~185 MB/s).
+
+Single node (`run_single.sh`): the commitlog on the disk, MinIO on the same disk, 30 s flushes, a 256 MiB ring. The load generator and the checker ran on the box too, so all four share its 2 vCPU. Frames ~5.3 KB, ack = submit to the node's fsynced ack, loopback:
+
+| | 350/s | 3,500/s | 30,000/s | 45,000/s | 60,000/s |
+|---|---|---|---|---|---|
+| ack p50 / p99 | 1.16 / 2.43 ms | 1.58 / 4.23 | 4.05 / 11.5 | 15.4 / 456 | saturated (commit p50 310 ms, p99 8.2 s) |
+| submit to the consumer, p50 / p99 | 8.6 / 38 ms | 3.2 / 6.6 | 6.6 / 16.8 | 23 / 899 | |
+| commitlog fsync p50 / p99 | 0.83 / 1.58 ms | 0.93 / 2.43 | 1.34 / 3.66 | 2.65 / 12.8 | 8.6 / 73 |
+| events a group commit | 2 | 18 | 150 | 225 (p99 4,275) | 2,101 |
+| node CPU (cores), max RSS | 0.11, 360 MB | 0.27, 527 MB | 0.86, 655 MB | 1.27, 959 MB | 1.14, 1.8 GB |
+| checker | PASS | PASS | PASS | PASS | none: the kernel OOM-killed a 1.7 GB qlog process, the checker (the node kept running) |
+
+- **The ceiling is ~30,000-40,000/s with everything on 2 vCPU,** about 85x today's rate. Above that the box runs out of CPU, not disk: 45,000/s is 240 MB/s fsynced, under half the fio rate. A dedicated node with its load arriving over the network would go higher. So 10x is easy on this class of VPS, and 100x is about the limit of a 2 vCPU box (a VPS-2 or bigger has more cores).
+- **Against the emulated rows.** At 3,500/s the commitlog fsync is 0.93 ms. The nearest benchbox row, "tmpfs + 1 ms", has a 3-node ack of 1.26 / 1.92 ms. vps1's single node acks at 1.58 / 4.23, with no replication RTT but with the load generator, checker and MinIO competing for 2 vCPU, so its p99 is the CPU's, not the disk's. The "ack ≈ RTT + 1-1.7x fsync" rule holds: 1.58 ms is 1.7x 0.93.
+- **At 350/s the consumer sees an event 8.6 ms after submit** (p99 38), against 3.2 ms at 3,500/s. The ack is 1.2 ms at both rates, so this is the emit side waking idle vCPUs, not the disk. That's worth a look on a real node: an idle merger tick pays a VPS's wake-up latency.
+- **Restarts.** kill -9 under 3,500/s: the emission pause was 1.6-3.2 s (median 2.4 s, n=5). A power cut (a random part of the unsynced tail lost, plus a torn record) paused 1.6-2.8 s (median 2.1 s, n=5). Both include the harness's 1 s restart delay, and recovery replayed 1.8 GB of commitlog. On benchbox the same single-node restart is 1.2-1.5 s. Both runs: PASS, nothing acked lost, the consumer from cursor 0 dense and matching.
+- **Over the internet.** The node on vps1, driven from benchbox through an ssh tunnel (4.5 ms RTT): ack p50 / p99 5.97 / 8.66 ms at 350/s and 6.79 / 11.6 ms at 3,500/s, so RTT + ~1.5-2.3 ms. That's what a host owner in the same metro sees.
+
+What it changes: nothing in the study's conclusions. The VPS fsync it assumed is right (0.6-0.9 ms, steady). A 2 vCPU VPS carries 10x on one node with room to spare. The 3-box run still has to measure replication across real hosts.
 
 ## Inputs
 
@@ -1179,7 +1215,7 @@ Nothing here touches a cloud host or real R2. To run on candidate hosts, with Ja
 | Hosts on the network | 6,260 listed, 1,956 active, 89 bsky.network PDSes with 23.4M of 24.0M accounts | measured (listHosts, reference notes) |
 | RAM baseline | 2 GB a node plus the ring | assumed (shadow run: 1.1 GB at 60 events/s) |
 | Flush upload, detection and takeover | ~2 s, ~5 s | assumed |
-| fsync | 0.03-0.1 ms datacenter NVMe, 0.5-2 ms VPS | assumed |
+| fsync | 0.03-0.1 ms datacenter NVMe, 0.5-2 ms VPS | assumed; one OVH VPS measured 0.57-0.68 ms p50 (fio, 4-64 KiB) and 0.83-0.93 ms in the commitlog ([vps1](#vps1-one-ovh-vps-single-node)) |
 | fsync, consumer NVMe | 2.7 ms p50, 5.9 ms p99 (fdatasync, one appending writer; 5.5 ms with three on one disk) | measured (benchbox, `tests/qlog/fsync_probe.sh`) |
 | RTT | 0.2 ms one DC, 3 ms one metro, 65 ms cross-region | assumed |
 | R2 PUT | ~200 ms p50 from benchbox | measured (vlpds `bench/results/spaces-r2-2026-10-05.md`) |

@@ -107,6 +107,9 @@ impl Counts {
 /// result counted (a failed or cancelled request is billed too).
 #[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
 pub struct Requests {
+    /// Tells a restarted process's counts (from zero again) from these.
+    #[serde(default)]
+    pub pid: u32,
     pub total: Counts,
     pub by_purpose: BTreeMap<String, Counts>,
     /// `purpose/component`.
@@ -117,7 +120,7 @@ pub struct Requests {
 
 pub fn requests() -> Requests {
     use prometheus::core::Collector;
-    let mut r = Requests::default();
+    let mut r = Requests { pid: std::process::id(), ..Default::default() };
     for mf in vlpds::metrics::OBJ_REQUESTS.collect() {
         for m in mf.get_metric() {
             let label = |k: &str| m.get_label().iter().find(|l| l.name() == k).map(|l| l.value().to_string());
