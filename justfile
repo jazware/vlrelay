@@ -99,6 +99,10 @@ compat *args:
 chaos scenario *args:
     tests/chaos/chaos.sh {{scenario}} {{args}}
 
+# The quorum log under kill -9, partitions and SIGSTOP on a local 3-node cluster, every node's stream checked (tests/qlog/chaos.sh, docs/quorum.md "Implementation notes"; `just qlog-chaos list`)
+qlog-chaos scenario *args:
+    tests/qlog/chaos.sh {{scenario}} {{args}}
+
 # ---- benchbox (scripts/benchbox.sh) --------------------------------------------
 
 # Ship the working tree (tracked + uncommitted) to benchbox:~/vlrelay-dev

@@ -9,6 +9,7 @@ pub mod identity;
 pub mod node;
 pub mod plc_seed;
 pub mod policy;
+pub mod qlog;
 pub mod seq;
 pub mod serve;
 pub mod state;

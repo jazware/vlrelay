@@ -1,0 +1,26 @@
+# MinIO for the quorum log's chaos harness (chaos.sh): it only holds
+# qlog/leader, so tmpfs and a small cap are plenty.
+services:
+  minio:
+    image: vlpds-minio:local
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    tmpfs: /data
+    mem_limit: 512m
+    ports:
+      - "127.0.0.1:${MINIO_PORT}:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 1s
+      retries: 60
+
+  minio-init:
+    image: vlpds-minio:local
+    depends_on:
+      minio:
+        condition: service_healthy
+    mem_limit: 128m
+    entrypoint: >
+      /bin/sh -c "mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null && mc mb -p local/vlrelay >/dev/null && echo bucket vlrelay ready"

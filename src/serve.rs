@@ -141,6 +141,7 @@ impl Serve {
             write_idle: firehose::DEFAULT_WRITE_IDLE,
             runtime,
             max_labelled: firehose::DEFAULT_MAX_LABELLED,
+            start_floor: None,
         };
         let fh = Firehose::new(opts);
         fh.set_max_queue_bytes(cfg.merge_queue_bytes);
