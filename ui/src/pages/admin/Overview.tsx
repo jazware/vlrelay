@@ -318,7 +318,7 @@ export function Overview() {
           </Panel>
           <Panel title="Open cases" to="/admin/moderation" src={<Src>cases?status=open</Src>}>
             {(cases.data ?? []).slice(0, 5).map((c) => (
-              <RRow key={c.id} to={`/admin/cases/${c.id}`} x={ago(c.openedAtMs)}>
+              <RRow key={c.id} onClick={() => openPanel('case', String(c.id))} x={ago(c.openedAtMs)}>
                 <Glyph k={c.severity === 'critical' ? 'err' : c.severity === 'high' ? 'warn' : c.severity === 'warn' ? 'warn' : 'info'} />
                 <span className="mono sm">{c.id}</span>
                 <span className="nm">

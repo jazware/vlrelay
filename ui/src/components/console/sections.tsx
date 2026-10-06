@@ -12,8 +12,8 @@ export const SECTIONS: Section[] = [
   { id: 'consumers', label: 'Consumers', key: 'c', group: 'Traffic', path: '/admin/consumers' },
   { id: 'quorum', label: 'Quorum & cluster', short: 'Quorum', key: 'q', group: 'The log', path: '/admin/quorum', aliases: ['/admin/cluster', '/admin/ops'] },
   { id: 'store', label: 'Object store', short: 'Store', key: 'b', group: 'The log', path: '/admin/store' },
-  { id: 'policy', label: 'Policy', key: 'p', group: 'Rules', path: '/admin/policy', aliases: ['/admin/tuning', '/admin/rules'] },
-  { id: 'moderation', label: 'Moderation', key: 'm', group: 'Rules', path: '/admin/moderation', aliases: ['/admin/cases', '/admin/accounts'] },
+  { id: 'policy', label: 'Policy', key: 'p', group: 'Rules', path: '/admin/policy', aliases: ['/admin/tuning'] },
+  { id: 'moderation', label: 'Moderation', key: 'm', group: 'Rules', path: '/admin/moderation', aliases: ['/admin/cases', '/admin/accounts', '/admin/rules'] },
   { id: 'settings', label: 'Settings', key: 's', group: 'System', path: '/admin/settings' },
 ]
 

@@ -1,15 +1,15 @@
 import { useEffect, type ReactNode } from 'react'
 import { registerDetail } from '../../components/console/Drawer'
+import { openPanel } from '../../components/console/nav'
 import { BIG_HOST_CAP, hostActionDialog, useHostsVersion } from '../../components/console/hostActions'
-import { Bars, Copy, Empty, Glyph, HostStatusChip, KV, Meter, Mini, Minis, NeedsVersion, Sec, Seg, Spark, Strip, TierTag } from '../../components/console/kit'
+import { Bars, Copy, Empty, Glyph, HostStatusChip, KV, Meter, Mini, Minis, Sec, Seg, Spark, Strip, TierTag } from '../../components/console/kit'
 import type { HostAction, HostDetail, RejectReason } from '../../lib/api'
-import { enc } from '../../lib/api'
 import { host as fetchHost } from '../../lib/console/adminAdapter'
 import { ago, dt, fmtMs, fmtNum, fmtRatio, fmtSi, plural, shortDid } from '../../lib/console/fmt'
 import { useLivePoll } from '../../lib/console/live'
 import { policyPoll } from '../../lib/console/polls'
 import { useRelay } from '../../lib/console/relay'
-import { Link } from '../../lib/router'
+import { releaseDialog } from './moderationDetail'
 import { NodeTag, REASON_WHAT, reasonLabel } from './relayUi'
 
 // A PDS host in the slide-over or on its own page: its rates and limits, why its frames are
@@ -160,7 +160,7 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
                   <tr key={i} title={x.detail}>
                     <td className="sm muted">{ago(x.atMs)}</td>
                     <td className="cx-did">
-                      <Link to={`/admin/accounts/${enc(x.did)}`}>{shortDid(x.did)}</Link>
+                      <button type="button" className="cx-linklike" onClick={() => openPanel('acct', x.did)}>{shortDid(x.did)}</button>
                     </td>
                     <td className="mono sm s-err">{reasonLabel(x.reason)}</td>
                     <td className="r mono sm t2">#{fmtNum(x.upstreamSeq)}</td>
@@ -184,7 +184,16 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
             ['Status', <span key="st"><HostStatusChip s={r.status} /> {r.connectedSinceMs ? `since ${ago(r.connectedSinceMs)}` : ''}</span>],
             ['Reader', <NodeTag key="n" view={view} id={r.node} />],
             ['Tier', <TierTag key="t" t={r.tier} />],
-            ['Domain rule', r.rule != null ? <Link key="r" to="/admin/rules">rule {r.rule}</Link> : <span key="r" className="muted">none</span>],
+            [
+              'Domain rule',
+              r.rule != null ? (
+                <button key="r" type="button" className="cx-linklike" onClick={() => openPanel('rule', String(r.rule))}>
+                  rule {r.rule}
+                </button>
+              ) : (
+                <span key="r" className="muted">none</span>
+              ),
+            ],
             ['Connected', r.connectedSinceMs ? dt(r.connectedSinceMs) : <span key="c" className="muted">not connected</span>],
           ]}
         />
@@ -273,15 +282,25 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
       {d.openCases.length > 0 && (
         <Sec title="Cases" digest={`${d.openCases.length} open`} open flush>
           {d.openCases.map((id) => (
-            <Link key={id} className="cx-rrow" to={`/admin/cases/${id}`}>
+            <button key={id} type="button" className="cx-rrow" onClick={() => openPanel('case', String(id))}>
               <Glyph k="warn" />
               <span className="mono sm">case {id}</span>
               <span className="x">open</span>
-            </Link>
+            </button>
           ))}
         </Sec>
       )}
-      {atCap && <NeedsVersion what="Lifting the accounts it created throttled" endpoint="POST hosts/{host}/release-throttled" />}
+      {atCap && (
+        <Sec title="Accounts created throttled" digest="past its cap" open flush>
+          <div className="cx-acts">
+            <Act title="Lift them" desc="Each gets #account active. Raise the cap first, or new ones keep arriving throttled.">
+              <button type="button" className="cx-btn sm" onClick={() => releaseDialog(r.host, atCap)}>
+                Lift…
+              </button>
+            </Act>
+          </div>
+        </Sec>
+      )}
     </>
   )
   return cols(page, main, side)

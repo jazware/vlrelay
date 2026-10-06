@@ -1,28 +1,26 @@
 import { useEffect, useState, type JSX, type ReactNode } from 'react'
 import { DetailPage, detailKind } from '../../components/console/Drawer'
-import { Empty, Glyph } from '../../components/console/kit'
+import { Empty } from '../../components/console/kit'
 import { Mark, Shell } from '../../components/console/Shell'
 import { SECTION, sectionOf, type Section } from '../../components/console/sections'
 import { ErrorNotice, Field, Spinner } from '../../components/ui'
 import { api, setAdminToken } from '../../lib/api'
 import { useAdminToken } from '../../lib/hooks'
 import { Link, match } from '../../lib/router'
-import { AccountDetail, Accounts } from '../Accounts'
-import { CaseDetail, Cases } from '../Cases'
-import { Policy } from '../Policy'
-import { Rules } from '../Rules'
-import { Settings } from '../Settings'
-import { Tuning } from '../Tuning'
 import { Consumers } from './Consumers'
 import './hostDetail'
 import { Hosts } from './Hosts'
+import { Moderation } from './Moderation'
+import './moderationDetail'
 import { Overview } from './Overview'
+import { Policy } from './Policy'
 import { Quorum } from './Quorum'
+import { Settings } from './Settings'
 import { Store } from './Store'
 
-// The operator console: the token gate, then the shell around one page per route. Sections
-// still on their pre-console pages render them inside <Legacy> until they're rebuilt
-// (CONSOLE.md lists which); their old paths keep working.
+// The operator console: the token gate, then the shell around one page per route. The classic
+// console's paths (/admin/cluster, /admin/ops, /admin/tuning, /admin/rules, /admin/cases/<id>,
+// /admin/accounts/<did>) still land on the section that took them over.
 
 type Route = { section: Section; page: JSX.Element; crumbs?: ReactNode; title?: string }
 
@@ -34,46 +32,9 @@ const crumb = (section: Section, last: ReactNode) => (
   </>
 )
 
-type Tab = { to: string; label: string }
-const TABS: Partial<Record<Section['id'], Tab[]>> = {
-  policy: [
-    { to: '/admin/policy', label: 'Limits' },
-    { to: '/admin/tuning', label: 'Tuning' },
-    { to: '/admin/rules', label: 'Domain rules' },
-  ],
-  moderation: [
-    { to: '/admin/moderation', label: 'Cases' },
-    { to: '/admin/accounts', label: 'Accounts' },
-  ],
-}
-
-/** An older console page shown inside the new shell, in its own type, until its section is rebuilt. */
-function Legacy({ section, path, children }: { section: Section; path: string; children: ReactNode }) {
-  const tabs = TABS[section.id]
-  return (
-    <div className="cx-legacy">
-      <div className="cx-legacy-note">
-        <Glyph k="idle" />
-        <span>The {section.label.toLowerCase()} pages are the classic console's until this section is rebuilt.</span>
-      </div>
-      {tabs && (
-        <nav className="cx-subtabs" aria-label={section.label}>
-          {tabs.map((t) => (
-            <Link key={t.to} to={t.to} aria-current={path === t.to || (t.to === '/admin/moderation' && path.startsWith('/admin/cases')) || path.startsWith(`${t.to}/`) ? 'page' : undefined}>
-              {t.label}
-            </Link>
-          ))}
-        </nav>
-      )}
-      {children}
-    </div>
-  )
-}
-
 function route(p: string): Route {
   let m: Record<string, string> | null
   const S = SECTION
-  const legacy = (section: Section, page: JSX.Element, last?: ReactNode): Route => ({ section, page: <Legacy section={section} path={p}>{page}</Legacy>, crumbs: last ? crumb(section, last) : undefined })
   switch (p) {
     case '/admin':
       return { section: S.overview, page: <Overview /> }
@@ -88,21 +49,19 @@ function route(p: string): Route {
     case '/admin/store':
       return { section: S.store, page: <Store /> }
     case '/admin/policy':
-      return legacy(S.policy, <Policy />)
     case '/admin/tuning':
-      return legacy(S.policy, <Tuning />, 'Tuning')
-    case '/admin/rules':
-      return legacy(S.policy, <Rules />, 'Domain rules')
+      return { section: S.policy, page: <Policy /> }
     case '/admin/moderation':
     case '/admin/cases':
-      return legacy(S.moderation, <Cases />)
     case '/admin/accounts':
-      return legacy(S.moderation, <Accounts />, 'Accounts')
+    case '/admin/rules':
+      return { section: S.moderation, page: <Moderation /> }
     case '/admin/settings':
-      return legacy(S.settings, <Settings />)
+      return { section: S.settings, page: <Settings /> }
   }
-  if ((m = match('/admin/cases/:id', p))) return legacy(S.moderation, <CaseDetail id={Number(m.id)} />, `case ${m.id}`)
-  if ((m = match('/admin/accounts/:did', p))) return legacy(S.moderation, <AccountDetail did={m.did} />, m.did)
+  // the classic console's case and account pages
+  if ((m = match('/admin/cases/:id', p))) return { section: S.moderation, page: <DetailPage key="case" type="case" id={m.id} />, crumbs: crumb(S.moderation, `case ${m.id}`) }
+  if ((m = match('/admin/accounts/:did', p))) return { section: S.moderation, page: <DetailPage key="acct" type="acct" id={m.did} />, crumbs: crumb(S.moderation, m.did) }
   // the classic console's host page
   if ((m = match('/admin/hosts/:host', p))) return { section: S.hosts, page: <DetailPage key="host" type="host" id={m.host} />, crumbs: crumb(S.hosts, m.host) }
   // a detail kind's full page: /admin/<section>/<type>/<id>
