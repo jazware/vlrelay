@@ -1,0 +1,417 @@
+import { useEffect, useRef, type ReactNode } from 'react'
+import { setAdminToken } from '../../lib/api'
+import { releaseHeld } from '../../lib/console/firehose'
+import { clock, dur, fmtSi } from '../../lib/console/fmt'
+import { getLive, togglePaused, toggleSources, useLiveState } from '../../lib/console/live'
+import { consumersPoll, isSlow, openCasesPoll, overviewPoll, policyFullPoll, slowLagMs, throttledPoll } from '../../lib/console/polls'
+import { useRelay } from '../../lib/console/relay'
+import { setTheme, useResolvedTheme } from '../../lib/hooks'
+import { Link, navigate, usePath } from '../../lib/router'
+import { closeDialog, DialogHost, isDialogOpen, openDialog } from './dialogs'
+import { detailPath, Drawer } from './Drawer'
+import { Jack, Kbd, Swatch } from './kit'
+import { closePanel, openPanel, panelOf } from './nav'
+import { isPaletteOpen, lookupProvider, Palette, registerPalette, setPaletteOpen, type PalItem } from './Palette'
+import { SECTION, SECTIONS, TABBAR, type Section, type SectionId } from './sections'
+import { Toasts } from './toast'
+
+// The frame around every console page: the top bar with the carrier rule, the patch-panel rail
+// (a tab bar on phones), the stale banner, and the hosts for the slide-over, palette, dialogs and
+// toasts. Owns the keyboard.
+
+/** Four PDS cords merging into one cobalt trunk that ends in the magenta carrier lamp. */
+export const Mark = () => (
+  <svg width="26" height="18" viewBox="0 0 26 18" aria-hidden="true">
+    <g fill="none" stroke="var(--accent)" strokeWidth="1.6" strokeLinecap="round">
+      <path d="M1 2C8 2 9 9 15 9" />
+      <path d="M1 6.7C7 6.7 9 9 15 9" />
+      <path d="M1 11.3C7 11.3 9 9 15 9" />
+      <path d="M1 16C8 16 9 9 15 9" />
+    </g>
+    <path d="M15 9H20.5" stroke="var(--accent)" strokeWidth="3" strokeLinecap="round" />
+    <circle cx="23" cy="9" r="2.6" fill="var(--signal)" />
+  </svg>
+)
+
+export const ThemeIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+    <circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" strokeWidth="1.5" />
+    <path d="M8 1.8 A6.2 6.2 0 0 1 8 14.2 Z" fill="currentColor" />
+  </svg>
+)
+
+export function useThemeToggle() {
+  const t = useResolvedTheme()
+  return { theme: t, toggle: () => setTheme(t === 'dark' ? 'light' : 'dark') }
+}
+
+const lock = () => setAdminToken(null)
+
+export function shortcutsDialog() {
+  const rows: [string[], string][] = [
+    [['⌘', 'K'], 'Command palette: hosts, DIDs, nodes, verbs like “ban …”'],
+    ...SECTIONS.map((s): [string[], string] => [['g', s.key], s.label]),
+    [['g', 'u'], 'The public page'],
+    [['j', 'k'], 'Move through rows'],
+    [['↵'], 'Open the row in a panel'],
+    [['o'], 'Open the panel as a full page'],
+    [['/'], 'Search on this page'],
+    [['space'], 'Pause or resume live updates'],
+    [['t'], 'Toggle light / dark'],
+    [['esc'], 'Close the panel, dialog or full page'],
+  ]
+  openDialog((close) => (
+    <div className="cx-dlg" role="dialog" aria-modal="true" aria-labelledby="cx-dlg-t">
+      <div className="dh">
+        <div className="ico" aria-hidden="true">
+          ⌘
+        </div>
+        <h2 id="cx-dlg-t">Keyboard shortcuts</h2>
+      </div>
+      <div className="cx-keys">
+        {rows.map(([k, d]) => (
+          <span key={d} style={{ display: 'contents' }}>
+            <span>
+              <Kbd k={k} />
+            </span>
+            <span>{d}</span>
+          </span>
+        ))}
+      </div>
+      <div className="df">
+        <button type="button" className="cx-btn" onClick={close} autoFocus>
+          Close
+        </button>
+      </div>
+    </div>
+  ))
+}
+
+type Badge = { k: 'warn' | 'err' | 'plain'; t: string; title?: string }
+
+function useBadges(): Partial<Record<SectionId, Badge>> {
+  const { view } = useRelay()
+  const cases = openCasesPoll.use()
+  const subs = consumersPoll.use()
+  const thr = throttledPoll.use()
+  const pol = policyFullPoll.use()
+  const cut = slowLagMs(pol.data)
+  const slow = subs.data?.filter((c) => isSlow(c, cut)).length ?? 0
+  const crit = cases.data?.some((c) => c.severity === 'critical')
+  const nCases = cases.data?.length ?? 0
+  const q = view?.quorum
+  const down = q ? q.members.length - q.answering.length : (view?.nodes.filter((n) => n.stale).length ?? 0)
+  const nThr = thr.data?.total ?? 0
+  return {
+    quorum: q?.health === 'down' ? { k: 'err', t: 'held', title: 'No quorum: the firehose is held' } : down ? { k: 'err', t: `${down} down` } : undefined,
+    hosts: nThr ? { k: 'warn', t: `${nThr} thr`, title: 'Throttled hosts' } : undefined,
+    consumers: slow ? { k: 'warn', t: `${slow} slow` } : undefined,
+    moderation: nCases ? { k: crit ? 'err' : 'warn', t: String(nCases), title: 'Open cases' } : undefined,
+  }
+}
+
+function Side({ current }: { current: Section }) {
+  const badges = useBadges()
+  const { view } = useRelay()
+  const live = useLiveState()
+  const self = view?.self ? view.byId.get(view.self) : view?.nodes[0]
+  let group = ''
+  return (
+    <aside className="cx-side" aria-label="Sections">
+      {SECTIONS.map((s) => {
+        const head = s.group !== group ? s.group : ''
+        group = s.group
+        const b = badges[s.id]
+        return (
+          <div key={s.id} style={{ display: 'contents' }}>
+            {head && <h6>{head}</h6>}
+            <Link to={s.path} className={`cx-nav${current.id === s.id ? ' on' : ''}`} title={`${s.label} (g ${s.key})`} aria-current={current.id === s.id ? 'page' : undefined}>
+              <Jack />
+              {s.label}
+              {b ? (
+                <span className={`cx-badge ${b.k}`} title={b.title}>
+                  {b.t}
+                </span>
+              ) : (
+                <span className="k">g {s.key}</span>
+              )}
+            </Link>
+          </div>
+        )
+      })}
+      <div className="cx-sidefoot">
+        {(view?.version || self?.version) && (
+          <>
+            vlRelay <span className="mono">{view?.version || self?.version}</span>
+            {self?.rev && (
+              <>
+                {' '}
+                · <span className="mono">{self.rev.slice(0, 8)}</span>
+              </>
+            )}
+            <br />
+          </>
+        )}
+        <Link to="/">Public page ↗</Link> ·{' '}
+        <button type="button" className="cx-linklike" onClick={toggleSources} aria-pressed={live.showSources}>
+          {live.showSources ? 'Hide' : 'Show'} data sources
+        </button>
+        <br />
+        <button type="button" className="cx-linklike" onClick={lock}>
+          Lock console
+        </button>{' '}
+        ·{' '}
+        <button type="button" className="cx-linklike" onClick={shortcutsDialog}>
+          shortcuts
+        </button>
+      </div>
+    </aside>
+  )
+}
+
+function StreamChip({ held }: { held: boolean }) {
+  const live = useLiveState()
+  const ov = overviewPoll.use()
+  const cls = live.stale ? ' stale' : held ? ' held' : live.paused ? ' paused' : ''
+  const text = live.stale ? 'not updating' : held ? 'firehose held' : live.paused ? 'paused' : 'live'
+  const rate = ov.data ? (ov.data.streamEventsPerSec ?? ov.data.eventsOutPerSec) : undefined
+  const det = live.stale ? `· last data ${live.lastOkAt ? dur(Date.now() - live.lastOkAt) : '—'} ago` : live.paused ? '· space to resume' : rate !== undefined ? `· 2 s · ${fmtSi(rate)} ev/s` : '· every 2 s'
+  return (
+    <button
+      type="button"
+      className={`cx-stream${cls}`}
+      title={live.stale ? 'Retry now' : 'Live updates: click or press space to pause'}
+      onClick={() => (live.stale ? overviewPoll.refresh() : togglePaused())}
+    >
+      <span className="dot" />
+      <span>{text}</span>
+      <span className="det muted mono">{det}</span>
+    </button>
+  )
+}
+
+/** The shell's own palette entries: sections, console actions, nodes. */
+function useCorePalette() {
+  const { view } = useRelay()
+  const viewRef = useRef(view)
+  viewRef.current = view
+  const { toggle } = useThemeToggle()
+  const toggleRef = useRef(toggle)
+  toggleRef.current = toggle
+  useEffect(() => {
+    const offLookup = registerPalette(lookupProvider)
+    const off = registerPalette({
+      items: () => {
+        const live = getLive()
+        const goto: PalItem[] = [
+          ...SECTIONS.map((s): PalItem => ({ group: 'Go to', glyph: '○', title: s.label, keys: ['g', s.key], always: true, run: () => navigate(s.path) })),
+          { group: 'Go to', glyph: '○', title: 'Public page', desc: 'what anyone sees at /', keys: ['g', 'u'], run: () => navigate('/') },
+        ]
+        const acts: PalItem[] = [
+          { group: 'Actions', title: live.paused ? 'Resume live updates' : 'Pause live updates', keys: ['space'], always: true, run: togglePaused },
+          { group: 'Actions', title: 'Toggle light / dark', keys: ['t'], always: true, run: () => toggleRef.current() },
+          { group: 'Actions', title: 'Keyboard shortcuts', keys: ['?'], always: true, run: shortcutsDialog },
+          { group: 'Actions', title: live.showSources ? 'Hide data sources' : 'Show data sources', desc: 'which endpoint feeds each panel', run: toggleSources },
+          { group: 'Actions', title: 'Lock console', desc: 'forget the admin token in this tab', run: lock },
+        ]
+        const nodes: PalItem[] = (viewRef.current?.nodes ?? []).map((n) => ({
+          group: 'Nodes',
+          glyph: <Swatch color={n.color} />,
+          title: n.id,
+          desc: `${n.role}${n.addr ? ` · ${n.addr}` : ''}`,
+          run: () => navigate(SECTION.quorum.path),
+        }))
+        return [...goto, ...acts, ...nodes]
+      },
+    })
+    return () => {
+      off()
+      offLookup()
+    }
+  }, [])
+}
+
+function useKeyboard(path: string) {
+  const { toggle } = useThemeToggle()
+  const kb = useRef(-1)
+  const gAt = useRef(0)
+  const toggleRef = useRef(toggle)
+  toggleRef.current = toggle
+  useEffect(() => {
+    kb.current = -1
+  }, [path])
+  useEffect(() => {
+    const rows = () => [...document.querySelectorAll<HTMLElement>('.cx-view [data-open]')].filter((r) => r.offsetParent !== null && !r.closest('[hidden]'))
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        setPaletteOpen(!isPaletteOpen())
+        return
+      }
+      if (isPaletteOpen() || isDialogOpen()) return
+      const t = e.target as HTMLElement
+      const inField = !!t.closest?.('input,textarea,select,[contenteditable="true"]')
+      if (e.key === 'Escape') {
+        if (inField) return t.blur()
+        const p = panelOf(new URLSearchParams(location.search))
+        if (p) return closePanel()
+        const m = location.pathname.match(/^(\/admin\/[^/]+)\/[^/]+\/[^/]+$/)
+        if (m && document.querySelector('.cx-fullpage')) navigate(m[1])
+        return
+      }
+      if (inField || e.metaKey || e.ctrlKey || e.altKey) return
+      if (Date.now() - gAt.current < 1200) {
+        gAt.current = 0
+        if (e.key === 'u') {
+          e.preventDefault()
+          navigate('/')
+          return
+        }
+        const s = SECTIONS.find((x) => x.key === e.key)
+        if (s) {
+          e.preventDefault()
+          navigate(s.path)
+        }
+        return
+      }
+      switch (e.key) {
+        case 'g':
+          gAt.current = Date.now()
+          return
+        case '/': {
+          e.preventDefault()
+          const f = document.querySelector<HTMLInputElement>('.cx-view [data-search]')
+          if (f) f.focus()
+          else setPaletteOpen(true)
+          return
+        }
+        case '?':
+          return shortcutsDialog()
+        case 't':
+          return toggleRef.current()
+        case ' ':
+          if (t.closest?.('button,a,summary')) return
+          e.preventDefault()
+          return togglePaused()
+        case 'o': {
+          const p = panelOf(new URLSearchParams(location.search))
+          const to = p && detailPath(p.type, p.id)
+          if (to) navigate(to)
+          return
+        }
+        case 'Enter': {
+          if (t.closest?.('button,a,summary')) return
+          const r = rows()[kb.current]
+          if (r) r.click()
+          return
+        }
+      }
+      const down = e.key === 'j' || (e.key === 'ArrowDown' && kb.current >= 0)
+      const up = e.key === 'k' || (e.key === 'ArrowUp' && kb.current >= 0)
+      if (!down && !up) return
+      const rs = rows()
+      if (!rs.length) return
+      e.preventDefault()
+      rs.forEach((r) => r.classList.remove('kb'))
+      kb.current = Math.max(0, Math.min(rs.length - 1, kb.current + (down ? 1 : -1)))
+      const r = rs[kb.current]
+      r.classList.add('kb')
+      r.scrollIntoView({ block: 'nearest' })
+      const open = r.dataset.open ?? ''
+      const i = open.indexOf(':')
+      if (panelOf(new URLSearchParams(location.search)) && i > 0 && !open.startsWith('row:')) openPanel(open.slice(0, i), open.slice(i + 1), { replace: true })
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [])
+}
+
+export function Shell({ section, crumbs, children }: { section: Section; crumbs?: ReactNode; children: ReactNode }) {
+  const path = usePath()
+  const live = useLiveState()
+  const { view } = useRelay()
+  const { theme, toggle } = useThemeToggle()
+  useKeyboard(path)
+  useCorePalette()
+  const wasPaused = useRef(live.paused)
+  useEffect(() => {
+    if (wasPaused.current && !live.paused) releaseHeld()
+    wasPaused.current = live.paused
+  }, [live.paused])
+  // a dialog belongs to the page it was opened on
+  useEffect(() => closeDialog, [path])
+  const held = view?.quorum?.health === 'down'
+  const self = view?.self ? view.byId.get(view.self) : undefined
+  const lead = view?.quorum?.leader
+  return (
+    <div className={`cx${live.stale ? ' is-stale' : ''}${held ? ' is-held' : ''}${live.paused ? ' is-paused' : ''}`} data-theme-resolved={theme}>
+      <header className="cx-top">
+        <Link to="/admin" className="cx-wordmark" aria-label="Console overview">
+          <Mark />
+          vlRelay<span className="where">operator · {location.host}</span>
+        </Link>
+        <nav className="cx-crumbs" aria-label="Breadcrumb">
+          {crumbs ?? <b>{section.label}</b>}
+        </nav>
+        <div className="cx-spacer" />
+        {self && !view?.single && (
+          <div className="cx-via" title="Any member answers the console and asks the others for their numbers.">
+            via <Swatch color={self.color} />
+            <span className="mono">{self.id}</span>
+            {lead === self.id && <span className="muted">(leader)</span>}
+          </div>
+        )}
+        <StreamChip held={held} />
+        <button type="button" className="cx-kbtn" onClick={() => setPaletteOpen(true)} title="Command palette (⌘K)">
+          <svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true">
+            <circle cx="7" cy="7" r="5" fill="none" stroke="currentColor" strokeWidth="1.6" />
+            <path d="M11 11l3.5 3.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+          </svg>
+          <span className="lbl">Jump to host, DID, node…</span>
+          <kbd>⌘K</kbd>
+        </button>
+        <button type="button" className="cx-iconbtn" onClick={toggle} title="Toggle theme (t)" aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>
+          <ThemeIcon />
+        </button>
+      </header>
+      <Side current={section} />
+      <main className="cx-main" id="cx-main">
+        {live.stale && (
+          <div className="cx-stalebar" role="status">
+            <b>◌ Not updating.</b>
+            <span>
+              {live.lastOkAt ? (
+                <>
+                  Showing the relay as of <span className="mono">{clock(live.lastOkAt)}</span>.{' '}
+                </>
+              ) : (
+                'Nothing loaded yet. '
+              )}
+              The relay keeps serving; the console lost <span className="mono">{self?.id ?? location.host}</span>
+              {live.staleError ? ` (${live.staleError})` : ''}. Retrying every 2 s…
+            </span>
+          </div>
+        )}
+        <div className="cx-view" key={path}>
+          {children}
+        </div>
+      </main>
+      <nav className="cx-tabbar" aria-label="Sections">
+        {TABBAR.map((id) => (
+          <Link key={id} to={SECTION[id].path} className={section.id === id ? 'on' : undefined}>
+            <Jack />
+            {SECTION[id].short ?? SECTION[id].label}
+          </Link>
+        ))}
+        <button type="button" onClick={() => setPaletteOpen(true)}>
+          <Jack />
+          More
+        </button>
+      </nav>
+      <Drawer />
+      <Palette />
+      <DialogHost />
+      <Toasts />
+    </div>
+  )
+}
