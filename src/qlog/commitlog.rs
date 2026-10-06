@@ -533,9 +533,9 @@ impl CommitLog {
                 n += l.len as usize;
                 to += 1;
             }
-            (prev, read_locs(&s.segs, &s.index, from, to - 1).ok()?)
+            (prev, resolve(&s.segs, &s.index, from, to - 1).ok()?)
         };
-        Some((prev, entries))
+        Some((prev, read_resolved(entries).ok()?))
     }
 
     /// Stops the writer; whatever is staged and not yet written is lost (a
@@ -563,16 +563,32 @@ impl CommitLog {
     }
 }
 
-fn read_locs(segs: &[Seg], index: &Index, from: u64, to: u64) -> std::io::Result<Vec<Entry>> {
+type Resolved = Vec<(u64, Loc, Arc<File>)>;
+
+/// Where `from..=to` are, with their files held open (under the lock).
+fn resolve(segs: &[Seg], index: &Index, from: u64, to: u64) -> std::io::Result<Resolved> {
     let mut out = Vec::with_capacity(to.saturating_sub(from) as usize + 1);
     for seq in from..=to {
         let l = index.get(seq).ok_or_else(|| std::io::Error::other("seq not in the index"))?;
         let seg = segs.iter().find(|s| s.no == l.seg).ok_or_else(|| std::io::Error::other("segment gone"))?;
-        let mut data = vec![0u8; l.len as usize];
-        seg.file.read_exact_at(&mut data, l.off)?;
-        out.push(Entry { epoch: l.epoch, seq, data: Bytes::from(data) });
+        out.push((seq, l, seg.file.clone()));
     }
     Ok(out)
+}
+
+/// The reads themselves, outside the lock.
+fn read_resolved(r: Resolved) -> std::io::Result<Vec<Entry>> {
+    r.into_iter()
+        .map(|(seq, l, f)| {
+            let mut data = vec![0u8; l.len as usize];
+            f.read_exact_at(&mut data, l.off)?;
+            Ok(Entry { epoch: l.epoch, seq, data: Bytes::from(data) })
+        })
+        .collect()
+}
+
+fn read_locs(segs: &[Seg], index: &Index, from: u64, to: u64) -> std::io::Result<Vec<Entry>> {
+    read_resolved(resolve(segs, index, from, to)?)
 }
 
 struct Writer {
@@ -737,8 +753,10 @@ impl Writer {
                 return Ok(());
             }
             let epoch = s.index.epoch_at(base).expect("base is held");
-            (base, epoch, read_locs(&s.segs, &s.index, base + 1, s.index.last_seq())?)
+            (base, epoch, resolve(&s.segs, &s.index, base + 1, s.index.last_seq())?)
         };
+        // only this thread changes the index, so the tail can't move meanwhile
+        let tail = read_resolved(tail)?;
         let no = self.no + 1;
         let path = seg_path(&cl.dir, no);
         self.buf.clear();

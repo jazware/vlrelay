@@ -50,8 +50,14 @@ for i in (1, 2, 3):
     if s:
         print(
             f"  n{i}: {s.get('role')} epoch {s.get('epoch')} commit {s.get('commit')} takeovers {s.get('takeovers')} "
-            f"step_downs {s.get('step_downs')} resets {s.get('resets')} emit_gaps {s.get('emit_gaps')} promise_rounds {s.get('promise_rounds')}"
+            f"step_downs {s.get('step_downs')} resets {s.get('resets')} emit_gaps {s.get('emit_gaps')} promise_rounds {s.get('promise_rounds')} disk_reads {s.get('disk_reads')}"
         )
+        d = s.get("disk")
+        if d:
+            print(
+                f"  n{i} commitlog: {d['fsyncs']} fsyncs, fsync {q(d['fsync_us'])}; ops per group commit p50 {d['batch_ops']['p50']} p99 {d['batch_ops']['p99']}; "
+                f"{d['bytes_written'] / 2**20:.0f} MiB written, {d['disk_bytes'] / 2**20:.0f} MiB on disk, {d['rollovers']} rollovers, {d['deleted']} deleted"
+            )
 
 pauses = []
 try:
@@ -64,8 +70,13 @@ try:
     with open(os.path.join(out, "events.log")) as f:
         for l in f:
             p = l.split()
-            if len(p) >= 3 and p[1] in ("kill9", "isolate", "stop"):
-                faults.append((int(p[0]), p[1], p[2]))
+            if len(p) >= 3 and p[1] in ("kill9", "isolate", "stop", "powercut"):
+                kind = p[3] if len(p) > 3 and p[3] in ("kill-two", "kill-all", "power-cut-all") else p[1]
+                # one fault on several nodes at once is one fault
+                if faults and faults[-1][1] == kind and int(p[0]) - faults[-1][0] < 200:
+                    faults[-1] = (faults[-1][0], kind, faults[-1][2] + "+" + p[2])
+                else:
+                    faults.append((int(p[0]), kind, p[2]))
 except OSError:
     pass
 if faults:

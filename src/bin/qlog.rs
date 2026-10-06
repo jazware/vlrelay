@@ -78,9 +78,13 @@ struct NodeArgs {
     #[arg(long, default_value_t = 4096)]
     disk_retain_mb: u64,
     /// Chaos: SIGUSR1 is a power cut (the commitlog loses a random part of
-    /// what it wrote since its last fsync, plus a torn record, then abort).
+    /// what it wrote since its last fsync, plus a torn record, then SIGKILL).
     #[arg(long)]
     power_cut_on_usr1: bool,
+    /// Benches: sleep this long before every fsync, to emulate a slower
+    /// device on tmpfs.
+    #[arg(long)]
+    fsync_delay_us: Option<u64>,
     #[arg(long, default_value_t = 100)]
     heartbeat_ms: u64,
     #[arg(long, default_value_t = 1000)]
@@ -189,6 +193,7 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
                 retain_bytes: a.disk_retain_mb << 20,
                 memory_bytes: cfg.retain_bytes,
                 abort_on_error: true,
+                sync_delay: a.fsync_delay_us.map(Duration::from_micros),
                 ..commitlog::Options::default()
             };
             let (cl, r) = CommitLog::open(dir, o)?;
@@ -206,7 +211,8 @@ async fn node(a: NodeArgs) -> anyhow::Result<()> {
                         "qlog: power cut (kept {keep:.2} of the unsynced tail, {} bytes torn): {r:?}",
                         garbage.len()
                     );
-                    std::process::abort();
+                    // as sudden as the power going: no unwinding, no core dump
+                    unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
                 });
             }
             (Arc::new(cl) as Arc<dyn Durability>, Some(r))

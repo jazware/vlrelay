@@ -11,14 +11,22 @@
 #
 # Env: QLOG_BASE (3150: ports B+1..3 peer, B+11..13 http, B+29 proxy
 # control, B+30..38 proxy routes, B+40 MinIO), PROXY (1; 0 dials peers
-# directly), QLOG_PROFILE (dev-release), QLOG_NO_BUILD=1, RESTART_SEC (1),
+# directly), COMMITLOG (1: each node keeps a commitlog under OUT, and
+# SIGUSR1 is a power cut; 0: memory only), CL_DIR (where the commitlogs
+# go, OUT by default: /dev/shm for a device with no fsync cost),
+# DISK_RETAIN_MB, FSYNC_DELAY_US (emulates a slower device), RETAIN_MB,
+# QLOG_PROFILE (dev-release), QLOG_NO_BUILD=1, RESTART_SEC (1),
 # OUT (dev/state-qlog-$B/<scenario>), KEEP=1 (leave MinIO up).
+#
+# kill-two kills the leader and a follower at once, kill-all every node;
+# power-cut-* also makes each victim's commitlog lose a random part of what
+# it wrote since its last fsync, ending in a torn record (COMMITLOG=1 only).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 crate="$(cd "$here/../.." && pwd)"
 cd "$crate"
 
-scenarios="baseline kill-leader kill-follower partition-leader partition-follower pause-leader mixed"
+scenarios="baseline kill-leader kill-follower partition-leader partition-follower pause-leader mixed kill-two kill-all power-cut-leader power-cut-all mixed-durable"
 scenario=${1:-}
 [ -n "$scenario" ] && shift || true
 if [ -z "$scenario" ] || [ "$scenario" = list ]; then
@@ -66,6 +74,7 @@ cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
   for i in 1 2 3; do pkill -9 -f "^$bin node --id n$i " 2>/dev/null || true; done
   wait 2>/dev/null || true
+  [ "$cl_dir" = "$out" ] || rm -rf "$cl_dir"
   [ "${KEEP:-}" = 1 ] || docker compose -f "$here/compose.yml" down -v >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -83,8 +92,15 @@ if [ "$proxy" = 1 ]; then
   pids+=($!)
 fi
 
+commitlog=${COMMITLOG:-1}
+cl_dir=${CL_DIR:-$out}
+[ "$cl_dir" = "$out" ] || { rm -rf "$cl_dir"; mkdir -p "$cl_dir"; }
 supervise() {
-  local i=$1 peers=()
+  local i=$1 peers=() disk=()
+  [ "$commitlog" = 1 ] && disk=(--commitlog "$cl_dir/cl-n$i" --power-cut-on-usr1)
+  [ -n "${RETAIN_MB:-}" ] && disk+=(--retain-mb "$RETAIN_MB")
+  [ -n "${DISK_RETAIN_MB:-}" ] && disk+=(--disk-retain-mb "$DISK_RETAIN_MB")
+  [ -n "${FSYNC_DELAY_US:-}" ] && disk+=(--fsync-delay-us "$FSYNC_DELAY_US")
   for j in 1 2 3; do
     [ "$i" = "$j" ] && continue
     if [ "$proxy" = 1 ]; then peers+=(--peer "n$j=127.0.0.1:$(route "$i" "$j")"); else peers+=(--peer "n$j=127.0.0.1:$(peer "$j")"); fi
@@ -92,7 +108,7 @@ supervise() {
   while [ ! -e "$out/stop" ]; do
     set +e
     "$bin" node --id "n$i" --listen "127.0.0.1:$(peer "$i")" --http "127.0.0.1:$(http "$i")" "${peers[@]}" \
-      --s3-endpoint "http://127.0.0.1:$minio" --prefix "$prefix" >>"$out/n$i.log" 2>&1
+      --s3-endpoint "http://127.0.0.1:$minio" --prefix "$prefix" "${disk[@]}" >>"$out/n$i.log" 2>&1
     local rc=$?
     set -e
     echo "$(ms) exit n$i $rc" >>"$out/events.log"
@@ -163,11 +179,24 @@ heal() {
 fault() {
   local kind=$1 who
   case $kind in
-    kill-leader | partition-leader | pause-leader) who=$(leader) ;;
+    kill-leader | partition-leader | pause-leader | power-cut-leader | kill-two) who=$(leader) ;;
     *) who=$(follower) ;;
   esac
   [ -n "$who" ] || { log "skip $kind: no leader"; return; }
   case $kind in
+    kill-two | kill-all)
+      local victims=$who
+      if [ "$kind" = kill-all ]; then victims="1 2 3"; else for j in 1 2 3; do [ "$j" != "$who" ] && { victims="$who $j"; break; }; done; fi
+      local ps=()
+      for v in $victims; do ps+=("$(nodepid "$v")"); log "kill9 n$v $kind"; done
+      kill -9 "${ps[@]}"
+      ;;
+    power-cut-leader | power-cut-all)
+      local victims=$who ps=()
+      [ "$kind" = power-cut-all ] && victims="1 2 3"
+      for v in $victims; do ps+=("$(nodepid "$v")"); log "powercut n$v $kind"; done
+      kill -USR1 "${ps[@]}"
+      ;;
     kill-*)
       local p
       p=$(nodepid "$who")
@@ -194,11 +223,13 @@ fault() {
 }
 
 kinds="kill-leader kill-follower partition-leader partition-follower pause-leader"
+durable_kinds="kill-leader kill-follower kill-two kill-all power-cut-leader power-cut-all partition-leader pause-leader"
 start=$(date +%s)
 sleep "$every"
 while [ $(($(date +%s) - start + 12)) -lt "$duration" ] && [ "$scenario" != baseline ]; do
   case $scenario in
     mixed) set -- $kinds; shift $((RANDOM % 5)); k=$1 ;;
+    mixed-durable) set -- $durable_kinds; shift $((RANDOM % 8)); k=$1 ;;
     *) k=$scenario ;;
   esac
   if [ "$proxy" != 1 ] && [[ $k == partition-* ]]; then log "skip $k: PROXY=0"; else fault "$k"; fi

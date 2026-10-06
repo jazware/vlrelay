@@ -215,6 +215,14 @@ impl Durability for Arc<CommitLog> {
     }
 }
 
+/// What a staged change waits on, and what it makes durable.
+#[derive(Clone, Copy, Debug)]
+struct Ticket {
+    n: u64,
+    last: u64,
+    cut: u64,
+}
+
 /// In-process partitions for tests: requests to and from a blocked peer
 /// are dropped (a blackhole, not a refusal).
 #[derive(Default)]
@@ -268,6 +276,11 @@ struct Core {
     intact: bool,
     need_upto: Option<u64>,
     emitted: u64,
+    /// This node's log is on its own disk up to here: it emits no further,
+    /// so a power cut never leaves it behind what its consumers saw.
+    durable: u64,
+    /// Bumped by every truncation, which lowers `durable`.
+    cut: u64,
     // leader only
     matched: HashMap<String, u64>,
     next: HashMap<String, u64>,
@@ -392,7 +405,7 @@ impl Node {
         if durability.journaling() {
             log.journal();
         }
-        let (emitted, commit) = (log.base().1, log.commit());
+        let (emitted, commit, log_last) = (log.base().1, log.commit(), log.last_seq());
         durability.note_commit(commit);
         let ctl =
             cfg.peers.iter().map(|(id, addr)| (id.clone(), Arc::new(Rpc::new(id, addr, faults.clone())))).collect();
@@ -412,6 +425,8 @@ impl Node {
                 intact: genesis || whole,
                 need_upto: None,
                 emitted,
+                durable: if durability.journaling() { log_last } else { u64::MAX },
+                cut: 0,
                 matched: HashMap::new(),
                 next: HashMap::new(),
                 acked_at: HashMap::new(),
@@ -568,7 +583,7 @@ impl Node {
         };
         self.stats.appended.fetch_add(last - first + 1, Ordering::Relaxed);
         self.head.send_replace(last);
-        if let Err(e) = self.durability.wait(ticket).await {
+        if let Err(e) = self.settle(ticket).await {
             let mut c = self.core.lock();
             self.step_down(&mut c, "persist failed");
             return Msg::Failed { reason: format!("persist: {e:#}") };
@@ -659,7 +674,7 @@ impl Node {
         self.head.send_replace(last);
         let n = self.clone();
         tokio::spawn(async move {
-            let r = n.durability.wait(ticket).await;
+            let r = n.settle(ticket).await;
             let mut c = n.core.lock();
             if c.role != Role::Leader || c.epoch != epoch {
                 return;
@@ -676,9 +691,30 @@ impl Node {
 
     /// Stages the log's journaled changes; the ticket covers everything
     /// staged so far (call it under the lock, before acting on them).
-    fn sync(&self, c: &mut Core) -> u64 {
+    fn sync(&self, c: &mut Core) -> Ticket {
         let ops = c.log.take_journal();
-        if ops.is_empty() { self.durability.staged() } else { self.durability.stage(ops) }
+        for op in &ops {
+            if let Op::TruncateAfter(s) | Op::Reset { seq: s, .. } = op {
+                c.durable = c.durable.min(*s);
+                c.cut += 1;
+            }
+        }
+        let n = if ops.is_empty() { self.durability.staged() } else { self.durability.stage(ops) };
+        Ticket { n, last: c.log.last_seq(), cut: c.cut }
+    }
+
+    /// Waits for `t` to be durable; this node may then emit up to its last
+    /// seq, unless the log was cut back since (a later ticket covers that).
+    async fn settle(&self, t: Ticket) -> anyhow::Result<()> {
+        self.durability.wait(t.n).await?;
+        let mut c = self.core.lock();
+        if c.cut == t.cut && t.last > c.durable {
+            c.durable = t.last;
+            if c.log.commit() > c.emitted {
+                self.commit.send_modify(|_| {});
+            }
+        }
+        Ok(())
     }
 
     /// A promise is never forgotten: it's journaled with the log, and the
@@ -877,7 +913,7 @@ impl Node {
             self.commit.send_replace(resp.commit);
         }
         // the ack (and the promise it carries) only once it's all on disk
-        if self.durability.wait(ticket).await.is_err() {
+        if self.settle(ticket).await.is_err() {
             return AppendResp { ok: false, matched: 0, ..resp };
         }
         resp
@@ -885,13 +921,13 @@ impl Node {
 
     async fn on_promise(&self, epoch: u64, from: &str) -> PromiseResp {
         let (resp, ticket) = self.promise_locked(epoch, from);
-        if self.durability.wait(ticket).await.is_err() {
+        if self.settle(ticket).await.is_err() {
             return PromiseResp { ok: false, ..resp };
         }
         resp
     }
 
-    fn promise_locked(&self, epoch: u64, from: &str) -> (PromiseResp, u64) {
+    fn promise_locked(&self, epoch: u64, from: &str) -> (PromiseResp, Ticket) {
         let mut c = self.core.lock();
         let ok =
             epoch > c.promised || (epoch == c.promised && c.leader.as_deref() == Some(from) && from != self.cfg.id);
@@ -1127,7 +1163,7 @@ impl Node {
             self.sync(&mut c)
         };
         // our own promise counts toward the round only once it's durable
-        self.durability.wait(own).await?;
+        self.settle(own).await?;
         tracing::info!(id = %self.cfg.id, epoch, "qlog: won qlog/leader, collecting promises");
         loop {
             {
@@ -1285,7 +1321,7 @@ impl Node {
             loop {
                 let (from, upto, events) = {
                     let mut c = self.core.lock();
-                    let upto = c.log.commit();
+                    let upto = c.log.commit().min(c.durable);
                     if upto <= c.emitted {
                         break;
                     }
