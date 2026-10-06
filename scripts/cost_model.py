@@ -345,9 +345,18 @@ def table(head, rows):
 # Labels as above: measured, code (counted from the source) or assumed.
 Q_LOADS = [("today", 1), ("10x", 10), ("100x", 100)]
 Q_FLUSHES = [10, 30, 60]
-Q_SEG_B = 64 * MIB          # design: zstd bytes per bucket segment, cut by size as the log fills
-Q_DID_SHARDS = 4            # design: the leader's DID state shards (the single node's default today)
-Q_MANIFEST_A = 1            # design: one CAS PUT per flush, cursors and host rows inline
+Q_SEG_B = 64 * MIB          # code: raw bytes per bucket segment; each flush cuts its own (Phase 3)
+Q_DID_SHARDS = 1            # code: the leader's state is one SlateDB (the study's design had 4 shards)
+Q_MANIFEST_A = 1            # code: one CAS PUT per flush, cursors inline
+# Measured, the Phase 6 hour run (350/s, 30 s flushes, 3 nodes, state compactor and worker polling
+# every 30 s; docs/quorum.md "Counting"), per state:
+Q_STATE_FLUSH_A = 12.4      # measured, per flush: 6.0 SlateDB writes and compaction output, 4.4 GC deletes
+                            # (object_store sends each as a DeleteObjects POST: Class A), 2 for the
+                            # checkpoint the flush retires. The study used vlpds's 4.42 a shard.
+Q_STATE_FLUSH_B = 12.0      # Phase 3's ~10-15 a flush (with the flush's own 3); the split of the hour run's
+                            # 1.66 B/s between flushes and polls is that assumption
+Q_STATE_POLL_B = 1.26       # measured less the above: manifest 10 s, compactor and worker 30 s, GC 10 min
+                            # (the study used vlpds's 0.4 a shard; SlateDB's GC boundary reads are ~a third)
 # Steady control-plane requests, cluster-wide (A/s, B/s). "peers": liveness over the private
 # network and a bucket CAS only on an epoch change (design). The lease rows are vlpds's lease
 # loop as measured there (CTL_*_PER_NODE at TTL 10 s, a third of it at TTL 30 s).
@@ -419,10 +428,11 @@ def q_bucket(mult, flush_s, store, *, seg_b=Q_SEG_B, shards=Q_DID_SHARDS, ctl="p
     zps = r * FRAME_B / ZSTD_RATIO
     out = {"a": 0.0, "b": 0.0, "seg_puts": 0.0, "gb": 0.0}
     if bucket != "none":
-        seg = (zps / seg_b + 1.0 / flush_s) if bucket == "full" else 0.0  # full segments + the flush's partial one
+        # each flush cuts its own segments by raw bytes (the last one partial)
+        seg = math.ceil(r * FRAME_B * flush_s / seg_b) / flush_s if bucket == "full" else 0.0
         out["seg_puts"] = seg
-        out["a"] = seg + (Q_MANIFEST_A + shards * FLUSH_A) / flush_s
-        out["b"] = shards * FLUSH_B / flush_s + shards * POLL_B_PER_SHARD
+        out["a"] = seg + (Q_MANIFEST_A + shards * Q_STATE_FLUSH_A) / flush_s
+        out["b"] = shards * Q_STATE_FLUSH_B / flush_s + shards * Q_STATE_POLL_B
         dids = DIDS_TODAY * mult
         state = dids * DID_STATE_B * TRANSIENT / GB + PLC_DIDS_TODAY * mult * PLC_SEED_B_PER_DID * TRANSIENT / GB
         out["gb"] = state + (zps * retention_s / GB if bucket == "full" else 0.0)
@@ -714,8 +724,9 @@ def quorum_main():
 
     print("## Tuning, 3-node HA on R2 (requests $/mo, no free tier, to show the slope)\n")
     rows = []
-    for label, kw in (("default: 64 MiB segments, 4 DID shards, peers", {}),
+    for label, kw in (("default: 64 MiB segments, one state, peers", {}),
                       ("8 MiB segments", {"seg_b": 8 * MIB}),
+                      ("4 DID shards (the study's design)", {"shards": 4}),
                       ("24 DID shards (the old cluster's count)", {"shards": 24}),
                       ("vlpds leases kept, TTL 30 s", {"ctl": "vlpds leases, TTL 30 s"}),
                       ("vlpds leases kept, TTL 10 s", {"ctl": "vlpds leases, TTL 10 s"})):

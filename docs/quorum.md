@@ -1,6 +1,6 @@
 # vlRelay: quorum replication (design and cost study)
 
-The first pass at vlRelay's economics didn't pan out. Three nodes on OVH with R2 came to ~$3.4k a month, and ~$2.8k of that was bucket requests: segments sealed every 25 ms on every node, plus host bookkeeping in bucket objects every 2-5 s. A non-archival sync 1.1 relay on one node costs about $10-15 a month to run. This page is a design and cost study for a vlRelay that keeps its recent log in replicas instead of the bucket, and writes the bucket rarely and in bulk. The replication core (Phase 1), the commitlog (Phase 2), the flush (Phase 3), bucket recovery (Phase 4) and membership changes (Phase 5) are built and measured, see [Implementation notes](#implementation-notes). The relay's wiring isn't built yet. `scripts/cost_model.py --quorum` generates every table above the notes.
+The first pass at vlRelay's economics didn't pan out. Three nodes on OVH with R2 came to ~$3.4k a month, and ~$2.8k of that was bucket requests: segments sealed every 25 ms on every node, plus host bookkeeping in bucket objects every 2-5 s. A non-archival sync 1.1 relay on one node costs about $10-15 a month to run. This page is a design and cost study for a vlRelay that keeps its recent log in replicas instead of the bucket, and writes the bucket rarely and in bulk. The replication core (Phase 1), the commitlog (Phase 2), the flush (Phase 3), bucket recovery (Phase 4), membership changes (Phase 5) and request counting with retention deletes (Phase 6) are built and measured, see [Implementation notes](#implementation-notes). The bucket figures here are the Phase 6 hour run's. The relay's wiring isn't built yet ([what's left](#whats-left-to-make-the-relay-run-on-the-quorum-log)). `scripts/cost_model.py --quorum` generates every table above the notes.
 
 The idea is the one in vlpds's TODO ("Quorum in-memory durability"). A leader appends each event, replicates it to two other nodes and emits it once two of the three hold it. The bucket gets a flush every 10-60 s, and the host cursors ride in the same flush as the log they belong to. A relay suits this better than a PDS does, because the PDSes upstream are the source of truth. If the relay loses an unflushed tail, it asks each PDS to replay from its last flushed cursor. Losing a quorum costs a re-ingest and some time, and never a user's data. Jaz's call: the firehose holds every event back until a quorum has it, so consumers only see events that a takeover keeps.
 
@@ -14,14 +14,14 @@ Today's load (~350 events/s), 10 full-firehose consumers, R2 after its free tier
 |---|---|---|---|
 | Old design, 3 nodes, OVH ADVANCE-2 + R2 | 25 ms linger | $3,131 | bucket requests $2,532, hosts $594 |
 | Old design, one node, OVH ADVANCE-2 + R2 | 25 ms linger | $658 | bucket requests $455, hosts $198 |
-| Quorum HA, 3 x OVH VPS-1, commitlog | 30 s | $22 | hosts $14, bucket requests $3, storage $5 |
+| Quorum HA, 3 x OVH VPS-1, commitlog | 30 s | $19 | hosts $14, bucket requests $1, storage $5 |
 | Quorum HA, 3 x OVH VPS-1, commitlog | 60 s | $18 | hosts $14, bucket requests $0, storage $5 |
 | Quorum HA, 3 x OVH VPS-1, commitlog, 24 h of log in the bucket | 60 s | $15 | hosts $14, bucket requests $0, storage $2 |
-| Quorum HA, 3 x Hetzner CAX21 (ARM), commitlog | 30 s | $46 | hosts $37, bucket $8 |
-| Quorum HA, 3 x Hetzner AX42, commitlog | 30 s | $335 | hosts $327, bucket $8 |
-| Quorum HA, 3 x OVH ADVANCE-2, commitlog | 30 s | $602 | hosts $594, bucket $8 |
-| Quorum HA, 3 x AWS c7gd.large + S3, consumers outside AWS | 30 s | $4,544 | egress and cross-AZ $4,326, hosts $199, bucket $19 |
-| Single node, OVH VPS-1, NVMe WAL + R2 (72 h of log) | 30 s | $13 | host $5, bucket requests $3, storage $5 |
+| Quorum HA, 3 x Hetzner CAX21 (ARM), commitlog | 30 s | $43 | hosts $37, bucket $6 |
+| Quorum HA, 3 x Hetzner AX42, commitlog | 30 s | $333 | hosts $327, bucket $6 |
+| Quorum HA, 3 x OVH ADVANCE-2, commitlog | 30 s | $600 | hosts $594, bucket $6 |
+| Quorum HA, 3 x AWS c7gd.large + S3, consumers outside AWS | 30 s | $4,540 | egress and cross-AZ $4,326, hosts $199, bucket $15 |
+| Single node, OVH VPS-1, NVMe WAL + R2 (72 h of log) | 30 s | $10 | host $5, bucket requests $1, storage $5 |
 | Single node, OVH VPS-1, NVMe WAL + R2 (72 h of log) | 60 s | $9 | host $5, bucket requests $0, storage $5 |
 | Single node, OVH VPS-2, NVMe WAL + R2 for state and cursors only | 60 s | $9 | host $8, bucket $0 |
 | Single node, OVH VPS-2, NVMe only |  | $8 | no bucket: losing the disk loses the cursors |
@@ -29,12 +29,12 @@ Today's load (~350 events/s), 10 full-firehose consumers, R2 after its free tier
 
 What the numbers say:
 
-- The bucket stops mattering. Requests go from ~$2.5k a month on 3 nodes to ~$11 before R2's free tier and ~$0-3 after it, at a 30-60 s flush. What's left in the bucket bill is storage for 72 h of log (~$5 on R2).
+- The bucket stops mattering. Requests go from ~$2.5k a month on 3 nodes to ~$7 before R2's free tier and ~$0-1 after it, at a 30-60 s flush (measured over an hour at today's rate in Phase 6, see [Counting](#counting-phase-6)). What's left in the bucket bill is storage for 72 h of log (~$5 on R2).
 - Hosts are the bill now. At today's load the leader needs ~0.1 vCPU at the sized rate, so the smallest NVMe VPS carries a node. Three OVH VPS-1 come to $14 a month, and with the log kept 24 h in the bucket the cluster lands at ~$15.
-- So 3-node HA lands right at the top of the $10-15 benchmark only on 4 GB VPSes with a 60 s flush and a 24 h bucket window. On 8 GB VPSes (the size this page recommends for headroom) it's ~$30-34. On dedicated boxes it's whatever three boxes cost ($335 on AX42s, $602 on ADVANCE-2s).
+- So 3-node HA lands right at the top of the $10-15 benchmark only on 4 GB VPSes with a 60 s flush and a 24 h bucket window. On 8 GB VPSes (the size this page recommends for headroom) it's ~$30-31. On dedicated boxes it's whatever three boxes cost ($333 on AX42s, $600 on ADVANCE-2s).
 - A single node gets under the benchmark: ~$9 on an OVH VPS-1 with R2 holding 72 h of log, ~$8 on a VPS-2 with no bucket at all.
 - AWS is still decided by egress. Ten consumers outside AWS cost ~$4.1k a month in egress, and replication across three AZs adds ~$260.
-- At 10x the cheapest HA is ~$124 (three VPS-4s, where disk and the port run out first). At 100x it's ~$3.4k, and $2.4k of that is edge boxes for the 10 consumers' 14.8 Gb/s. The bucket is ~$500 a month of storage there, still not requests.
+- At 10x the cheapest HA is ~$123 (three VPS-4s, where disk and the port run out first). At 100x it's ~$3.4k, and $2.4k of that is edge boxes for the 10 consumers' 14.8 Gb/s. The bucket is ~$500 a month of storage there, still not requests.
 
 ## The shape
 
@@ -113,23 +113,23 @@ The state follows the same rule. If the DID state got ahead of the log, a re-ing
 
 | load | flush | segment PUTs/s | Class A/s | Class B/s | R2 req $/mo, no free tier | R2 req $/mo | S3 req $/mo | bucket GB | R2 storage | S3 storage |
 |---|---|---|---|---|---|---|---|---|---|---|
-| today | 10 s | 0.12 | 1.99 | 5.23 | $28 | $20 | $32 | 323 | $5 | $7 |
-| today | 30 s | 0.05 | 0.67 | 2.81 | $11 | $3 | $12 | 323 | $5 | $7 |
-| today | 60 s | 0.03 | 0.35 | 2.20 | $6 | $0 | $7 | 323 | $5 | $7 |
-| 10x | 10 s | 0.28 | 2.15 | 5.23 | $30 | $22 | $34 | 3,228 | $48 | $74 |
-| 10x | 30 s | 0.21 | 0.83 | 2.81 | $13 | $5 | $14 | 3,228 | $48 | $74 |
-| 10x | 60 s | 0.19 | 0.51 | 2.20 | $8 | $1 | $9 | 3,228 | $48 | $74 |
-| 100x | 10 s | 1.87 | 3.74 | 5.23 | $49 | $41 | $55 | 32,281 | $484 | $742 |
-| 100x | 30 s | 1.81 | 2.43 | 2.81 | $31 | $24 | $35 | 32,281 | $484 | $742 |
-| 100x | 60 s | 1.79 | 2.10 | 2.20 | $27 | $20 | $30 | 32,281 | $484 | $742 |
+| today | 10 s | 0.10 | 1.44 | 2.46 | $19 | $13 | $22 | 323 | $5 | $7 |
+| today | 30 s | 0.03 | 0.48 | 1.66 | $7 | $1 | $8 | 323 | $5 | $7 |
+| today | 60 s | 0.03 | 0.26 | 1.46 | $4 | $0 | $5 | 323 | $5 | $7 |
+| 10x | 10 s | 0.30 | 1.64 | 2.46 | $22 | $15 | $24 | 3,228 | $48 | $74 |
+| 10x | 30 s | 0.30 | 0.75 | 1.66 | $10 | $4 | $12 | 3,228 | $48 | $74 |
+| 10x | 60 s | 0.28 | 0.51 | 1.46 | $7 | $1 | $8 | 3,228 | $48 | $74 |
+| 100x | 10 s | 2.80 | 4.14 | 2.46 | $51 | $44 | $57 | 32,281 | $484 | $742 |
+| 100x | 30 s | 2.77 | 3.21 | 1.66 | $40 | $34 | $44 | 32,281 | $484 | $742 |
+| 100x | 60 s | 2.77 | 2.99 | 1.46 | $37 | $31 | $41 | 32,281 | $484 | $742 |
 
-A flush is a manifest PUT, the partial segment and one L0 flush per DID shard (with the compaction it causes, ~4.4 Class A and ~9 Class B, vlpds's measured numbers), plus SlateDB's own polls. Full 64 MiB segments add ~0.02 PUTs a second today and ~1.8 at 100x. Against the old design:
+A flush is a manifest CAS, its segments (cut at 64 MiB raw, the last one partial) and the state's share: ~12.4 Class A and ~12 Class B a flush for its L0, the checkpoint it seals and the one it retires, the compaction and SlateDB's GC deletes, plus ~1.26 Class B a second of SlateDB's polls. Those are the Phase 6 hour run's numbers for the one SlateDB the leader keeps ([Counting](#counting-phase-6)); the study had assumed four DID shards at vlpds's ~4.4 Class A and ~9 Class B an L0 flush and ~0.4 GETs a second of polls each. Segments are one PUT a flush today and ~2.8 a second at 100x. Against the old design:
 
 | load | old, 3 nodes | quorum HA, 30 s | old, one node | quorum single, 30 s |
 |---|---|---|---|---|
-| today | $2,500 | $11 | $442 | $11 |
-| 10x | $2,765 | $13 | $477 | $13 |
-| 100x | $2,799 | $31 | $481 | $31 |
+| today | $2,500 | $7 | $442 | $7 |
+| 10x | $2,765 | $10 | $477 | $10 |
+| 100x | $2,799 | $40 | $481 | $40 |
 
 Nothing in this bill follows host shards any more. The ~$1.3k of host bookkeeping (`hostck/` every 2 s, counters and the registry every 5 s, each a GET and a CAS per host shard, plus every node re-reading them) folds into one manifest per flush. Registry changes that must be seen at once (an admission, an operator ban) go into the log as entries and land in the next manifest.
 
@@ -299,16 +299,17 @@ The knobs, in the order they matter:
 
 | knob | today, 10 s | today, 60 s | 100x, 10 s | 100x, 60 s |
 |---|---|---|---|---|
-| default: 64 MiB segments, 4 DID shards, peers | $28 | $6 | $49 | $27 |
-| 8 MiB segments | $30 | $8 | $196 | $174 |
-| 24 DID shards (the old cluster's count) | $158 | $34 | $179 | $55 |
-| vlpds leases kept, TTL 30 s | $47 | $25 | $68 | $46 |
-| vlpds leases kept, TTL 10 s | $85 | $62 | $105 | $83 |
+| default: 64 MiB segments, one state, peers | $19 | $4 | $51 | $37 |
+| 8 MiB segments | $22 | $7 | $281 | $266 |
+| 4 DID shards (the study's design) | $70 | $16 | $102 | $48 |
+| 24 DID shards (the old cluster's count) | $410 | $92 | $442 | $125 |
+| vlpds leases kept, TTL 30 s | $38 | $23 | $70 | $55 |
+| vlpds leases kept, TTL 10 s | $75 | $61 | $107 | $93 |
 
-- Flush interval. Each flush costs ~20 Class A and ~36 Class B with 4 DID shards. At 60 s that's inside R2's free tier (1M Class A a month), at 30 s it's ~$3 after it and at 10 s ~$20. A longer flush only costs the re-ingest window, and with the commitlog that window only matters when two disks are lost. So 30-60 s.
-- Segment size. 8 MiB segments are fine today but cost ~$150 a month more at 100x. Use 64 MiB.
-- DID shards. Each one costs an L0 flush per interval. The old cluster's 24 shards would cost 5x the requests of 4. The leader owns all of them, so 4 is plenty until the state outgrows one SlateDB's compactor.
-- Liveness. Keeping vlpds's node leases at TTL 10 s adds ~$57 a month on R2 and ~$70 on S3, which is more than everything else on the bucket. Use peer heartbeats.
+- Flush interval. Each flush costs ~14 Class A and ~12 Class B with the one state (measured), on top of ~1.3 Class B a second of polls. At 60 s that's inside R2's free tier (1M Class A a month), at 30 s it's ~$1 after it and at 10 s ~$13. A longer flush only costs the re-ingest window, and with the commitlog that window only matters when two disks are lost. So 30-60 s.
+- Segment size. 8 MiB segments are fine today but cost ~$230 a month more at 100x. Use 64 MiB.
+- DID shards. Each one costs its flush share and its polls. As built the leader keeps one SlateDB, and four (the study's design) would cost ~3.5x its requests at a 10 s flush, the old cluster's 24 ~20x. One is enough until the state outgrows one SlateDB's compactor.
+- Liveness. Keeping vlpds's node leases at TTL 10 s adds ~$56 a month on R2 and ~$62 on S3, which is more than everything else on the bucket. Use peer heartbeats.
 - Bucket retention. 72 h of log is ~$5 a month on R2 today, and 24 h is ~$1.6. That's the last lever between ~$18 and ~$15 on VPS-1s.
 - Host size. Hosts are now the bill. Size them by RAM, disk and port, since CPU barely registers below 10x (section 6).
 
@@ -333,30 +334,30 @@ Is the bucket needed at all? Not to run. An NVMe-only node keeps its whole log l
 
 | load | flush | 72 h log: A/s / B/s | R2 / S3 $/mo | state and cursors only: A/s / B/s | R2 / S3 $/mo |
 |---|---|---|---|---|---|
-| today | 10 s | 1.99 / 5.23 | $25 / $39 | 1.87 / 5.23 | $19 / $30 |
-| today | 30 s | 0.67 / 2.81 | $8 / $19 | 0.62 / 2.81 | $3 / $11 |
-| today | 60 s | 0.35 / 2.20 | $5 / $14 | 0.31 / 2.20 | $0 / $7 |
-| 10x | 10 s | 2.15 / 5.23 | $71 / $108 | 1.87 / 5.23 | $21 / $33 |
-| 10x | 30 s | 0.83 / 2.81 | $54 / $88 | 0.62 / 2.81 | $5 / $14 |
-| 10x | 60 s | 0.51 / 2.20 | $50 / $83 | 0.31 / 2.20 | $2 / $10 |
-| 100x | 10 s | 3.74 / 5.23 | $525 / $797 | 1.87 / 5.23 | $41 / $64 |
-| 100x | 30 s | 2.43 / 2.81 | $508 / $777 | 0.62 / 2.81 | $25 / $45 |
-| 100x | 60 s | 2.10 / 2.20 | $504 / $772 | 0.31 / 2.20 | $22 / $40 |
+| today | 10 s | 1.44 / 2.46 | $17 / $29 | 1.34 / 2.46 | $11 / $21 |
+| today | 30 s | 0.48 / 1.66 | $6 / $15 | 0.45 / 1.66 | $1 / $8 |
+| today | 60 s | 0.26 / 1.46 | $5 / $12 | 0.22 / 1.46 | $0 / $5 |
+| 10x | 10 s | 1.64 / 2.46 | $63 / $98 | 1.34 / 2.46 | $13 / $24 |
+| 10x | 30 s | 0.75 / 1.66 | $53 / $86 | 0.45 / 1.66 | $3 / $11 |
+| 10x | 60 s | 0.51 / 1.46 | $50 / $82 | 0.22 / 1.46 | $2 / $8 |
+| 100x | 10 s | 4.14 / 2.46 | $529 / $799 | 1.34 / 2.46 | $33 / $54 |
+| 100x | 30 s | 3.21 / 1.66 | $518 / $786 | 0.45 / 1.66 | $23 / $41 |
+| 100x | 60 s | 2.99 / 1.46 | $515 / $783 | 0.22 / 1.46 | $22 / $38 |
 
-Against the benchmark: one OVH VPS-1 with R2 holding 72 h is ~$9 a month at a 60 s flush and ~$13 at 30 s. A VPS-2 (8 GB, more headroom) is ~$9 with a state-and-cursors bucket and ~$8 with none. All of those are inside or under $10-15. What dominates is the host, then 72 h of log storage. The fit across hosts:
+Against the benchmark: one OVH VPS-1 with R2 holding 72 h is ~$9 a month at a 60 s flush and ~$10 at 30 s. A VPS-2 (8 GB, more headroom) is ~$9 with a state-and-cursors bucket and ~$8 with none. All of those are inside or under $10-15. What dominates is the host, then 72 h of log storage. The fit across hosts:
 
 | host | $/mo | today | 10x | 100x |
 |---|---|---|---|---|
-| OVH VPS-1 | $5 | $13 (4 h on disk) | no: disk 138/40 GB, port 1.6 Gb/s/0.5 Gb/s | no: CPU 12.3/2, disk 1,291/40 GB, port 16.3 Gb/s/0.5 Gb/s |
-| OVH VPS-2 | $8 | $17 (11 h on disk) | no: disk 138/75 GB, port 1.6 Gb/s/1 Gb/s | no: CPU 12.3/4, disk 1,291/75 GB, port 16.3 Gb/s/1 Gb/s |
-| OVH VPS-3 | $12 | $20 (16 h on disk) | no: disk 138/100 GB, port 1.6 Gb/s/2 Gb/s | no: CPU 12.3/6, disk 1,291/100 GB, port 16.3 Gb/s/2 Gb/s |
-| OVH VPS-4 | $23 | $32 (35 h on disk) | $77 (2 h on disk) | no: CPU 12.3/8, disk 1,291/200 GB, port 16.3 Gb/s/3 Gb/s |
-| Hetzner CX33 | $10 | $53 (12 h on disk) | no: disk 138/80 GB, port 1.6 Gb/s/1 Gb/s | no: CPU 12.3/4, disk 1,291/80 GB, port 16.3 Gb/s/1 Gb/s |
-| Hetzner CAX21 (ARM) | $12 | $55 (12 h on disk) | no: disk 138/80 GB, port 1.6 Gb/s/1 Gb/s | no: CPU 12.3/4, disk 1,291/80 GB, port 16.3 Gb/s/1 Gb/s |
-| Hetzner CPX22 | $23 | $66 (12 h on disk) | no: disk 138/80 GB, port 1.6 Gb/s/1 Gb/s | no: CPU 12.3/2, disk 1,291/80 GB, port 16.3 Gb/s/1 Gb/s |
-| Hetzner AX42 | $109 | $117 (72 h on disk) | $490, 3 edges (36 h on disk) | no: port 16.3 Gb/s/1 Gb/s |
-| Hetzner AX42 + 10G | $157 | $200 (72 h on disk) | $772 (36 h on disk) | $3,063, 22 edges (2 h on disk) |
-| OVH ADVANCE-2 | $198 | $206 (72 h on disk) | $252 (17 h on disk) | no: disk 1,291/960 GB, port 16.3 Gb/s/3 Gb/s |
+| OVH VPS-1 | $5 | $10 (4 h on disk) | no: disk 138/40 GB, port 1.6 Gb/s/0.5 Gb/s | no: CPU 12.3/2, disk 1,291/40 GB, port 16.3 Gb/s/0.5 Gb/s |
+| OVH VPS-2 | $8 | $14 (11 h on disk) | no: disk 138/75 GB, port 1.6 Gb/s/1 Gb/s | no: CPU 12.3/4, disk 1,291/75 GB, port 16.3 Gb/s/1 Gb/s |
+| OVH VPS-3 | $12 | $18 (16 h on disk) | no: disk 138/100 GB, port 1.6 Gb/s/2 Gb/s | no: CPU 12.3/6, disk 1,291/100 GB, port 16.3 Gb/s/2 Gb/s |
+| OVH VPS-4 | $23 | $29 (35 h on disk) | $76 (2 h on disk) | no: CPU 12.3/8, disk 1,291/200 GB, port 16.3 Gb/s/3 Gb/s |
+| Hetzner CX33 | $10 | $50 (12 h on disk) | no: disk 138/80 GB, port 1.6 Gb/s/1 Gb/s | no: CPU 12.3/4, disk 1,291/80 GB, port 16.3 Gb/s/1 Gb/s |
+| Hetzner CAX21 (ARM) | $12 | $53 (12 h on disk) | no: disk 138/80 GB, port 1.6 Gb/s/1 Gb/s | no: CPU 12.3/4, disk 1,291/80 GB, port 16.3 Gb/s/1 Gb/s |
+| Hetzner CPX22 | $23 | $63 (12 h on disk) | no: disk 138/80 GB, port 1.6 Gb/s/1 Gb/s | no: CPU 12.3/2, disk 1,291/80 GB, port 16.3 Gb/s/1 Gb/s |
+| Hetzner AX42 | $109 | $115 (72 h on disk) | $489, 3 edges (36 h on disk) | no: port 16.3 Gb/s/1 Gb/s |
+| Hetzner AX42 + 10G | $157 | $197 (72 h on disk) | $771 (36 h on disk) | $3,073, 22 edges (2 h on disk) |
+| OVH ADVANCE-2 | $198 | $204 (72 h on disk) | $251 (17 h on disk) | no: disk 1,291/960 GB, port 16.3 Gb/s/3 Gb/s |
 
 The 4 GB VPS-1 runs today's load at ~2.5 GB (assumed: the shadow run's 1.1 GB at 60 events/s, with the identity cache growing with the rate), which is tight. Hetzner's CX33 would be ~$10 for the host, but its 20 TB of included traffic runs out at four full-firehose consumers, and the listing shows the line as not orderable.
 
@@ -377,31 +378,31 @@ So at today's load the limits are RAM (2.5 GB), disk (~23 GB: OS, 8.5 GB of DID 
 
 | host | $/mo each | today | 10x | 100x |
 |---|---|---|---|---|
-| OVH VPS-1 | $5 | $22 | no: disk 138/40 GB, port 841 Mb/s/0.5 Gb/s | no: CPU 10.3/2, disk 1,291/40 GB, port 8.4 Gb/s/0.5 Gb/s |
-| OVH VPS-2 | $8 | $34 | no: disk 138/75 GB, port 841 Mb/s/1 Gb/s | no: CPU 10.3/4, disk 1,291/75 GB, port 8.4 Gb/s/1 Gb/s |
-| OVH VPS-3 | $12 | $45 | no: disk 138/100 GB | no: CPU 10.3/6, disk 1,291/100 GB, port 8.4 Gb/s/2 Gb/s |
-| OVH VPS-4 | $23 | $78 | $124 | no: CPU 10.3/8, disk 1,291/200 GB, port 8.4 Gb/s/3 Gb/s |
-| OVH ADVANCE-2 | $198 | $602 | $648 | no: disk 1,291/960 GB, port 5.4 Gb/s/3 Gb/s |
-| Hetzner CX33 | $10 | $38 | no: disk 138/80 GB, port 841 Mb/s/1 Gb/s | no: CPU 10.3/4, disk 1,291/80 GB, port 8.4 Gb/s/1 Gb/s |
-| Hetzner CAX21 (ARM) | $12 | $46 | no: disk 138/80 GB, port 841 Mb/s/1 Gb/s | no: CPU 10.3/4, disk 1,291/80 GB, port 8.4 Gb/s/1 Gb/s |
-| Hetzner AX42 | $109 | $335 | $708, 3 edges | no: port 8.4 Gb/s/1 Gb/s |
-| Hetzner AX42 + 10G | $157 | $479 | $1,038 | $3,377, 22 edges |
-| AWS c7gd.large | $66 | $4,544 | no: disk 138/118 GB, port 841 Mb/s/0.94 Gb/s | no: CPU 10.3/2, disk 1,291/118 GB, port 8.4 Gb/s/0.94 Gb/s |
-| AWS c7gd.xlarge | $132 | $4,743 | $30k | no: CPU 10.3/4, disk 1,291/237 GB, port 8.4 Gb/s/1.88 Gb/s |
+| OVH VPS-1 | $5 | $19 | no: disk 138/40 GB, port 841 Mb/s/0.5 Gb/s | no: CPU 10.3/2, disk 1,291/40 GB, port 8.4 Gb/s/0.5 Gb/s |
+| OVH VPS-2 | $8 | $31 | no: disk 138/75 GB, port 841 Mb/s/1 Gb/s | no: CPU 10.3/4, disk 1,291/75 GB, port 8.4 Gb/s/1 Gb/s |
+| OVH VPS-3 | $12 | $43 | no: disk 138/100 GB | no: CPU 10.3/6, disk 1,291/100 GB, port 8.4 Gb/s/2 Gb/s |
+| OVH VPS-4 | $23 | $76 | $123 | no: CPU 10.3/8, disk 1,291/200 GB, port 8.4 Gb/s/3 Gb/s |
+| OVH ADVANCE-2 | $198 | $600 | $647 | no: disk 1,291/960 GB, port 5.4 Gb/s/3 Gb/s |
+| Hetzner CX33 | $10 | $36 | no: disk 138/80 GB, port 841 Mb/s/1 Gb/s | no: CPU 10.3/4, disk 1,291/80 GB, port 8.4 Gb/s/1 Gb/s |
+| Hetzner CAX21 (ARM) | $12 | $43 | no: disk 138/80 GB, port 841 Mb/s/1 Gb/s | no: CPU 10.3/4, disk 1,291/80 GB, port 8.4 Gb/s/1 Gb/s |
+| Hetzner AX42 | $109 | $333 | $707, 3 edges | no: port 8.4 Gb/s/1 Gb/s |
+| Hetzner AX42 + 10G | $157 | $477 | $1,037 | $3,387, 22 edges |
+| AWS c7gd.large | $66 | $4,540 | no: disk 138/118 GB, port 841 Mb/s/0.94 Gb/s | no: CPU 10.3/2, disk 1,291/118 GB, port 8.4 Gb/s/0.94 Gb/s |
+| AWS c7gd.xlarge | $132 | $4,739 | $30k | no: CPU 10.3/4, disk 1,291/237 GB, port 8.4 Gb/s/1.88 Gb/s |
 
 | load | flush | HA + R2 | HA + S3 | single + R2 |
 |---|---|---|---|---|
-| today | 10 s | $39 (OVH VPS-1) | $53 (OVH VPS-1) | $30 (OVH VPS-1) |
-| today | 30 s | $22 (OVH VPS-1) | $33 (OVH VPS-1) | $13 (OVH VPS-1) |
-| today | 60 s | $18 (OVH VPS-1) | $28 (OVH VPS-1) | $9 (OVH VPS-1) |
-| 10x | 10 s | $141 (OVH VPS-4) | $178 (OVH VPS-4) | $94 (OVH VPS-4) |
-| 10x | 30 s | $124 (OVH VPS-4) | $158 (OVH VPS-4) | $77 (OVH VPS-4) |
+| today | 10 s | $31 (OVH VPS-1) | $43 (OVH VPS-1) | $22 (OVH VPS-1) |
+| today | 30 s | $19 (OVH VPS-1) | $29 (OVH VPS-1) | $10 (OVH VPS-1) |
+| today | 60 s | $18 (OVH VPS-1) | $26 (OVH VPS-1) | $9 (OVH VPS-1) |
+| 10x | 10 s | $133 (OVH VPS-4) | $169 (OVH VPS-4) | $87 (OVH VPS-4) |
+| 10x | 30 s | $123 (OVH VPS-4) | $156 (OVH VPS-4) | $76 (OVH VPS-4) |
 | 10x | 60 s | $120 (OVH VPS-4) | $153 (OVH VPS-4) | $73 (OVH VPS-4) |
-| 100x | 10 s | $3,394, 22 edges (Hetzner AX42 + 10G) | $3,666, 22 edges (Hetzner AX42 + 10G) | $3,080, 22 edges (Hetzner AX42 + 10G) |
-| 100x | 30 s | $3,377, 22 edges (Hetzner AX42 + 10G) | $3,646, 22 edges (Hetzner AX42 + 10G) | $3,063, 22 edges (Hetzner AX42 + 10G) |
-| 100x | 60 s | $3,373, 22 edges (Hetzner AX42 + 10G) | $3,641, 22 edges (Hetzner AX42 + 10G) | $3,059, 22 edges (Hetzner AX42 + 10G) |
+| 100x | 10 s | $3,398, 22 edges (Hetzner AX42 + 10G) | $3,668, 22 edges (Hetzner AX42 + 10G) | $3,084, 22 edges (Hetzner AX42 + 10G) |
+| 100x | 30 s | $3,387, 22 edges (Hetzner AX42 + 10G) | $3,655, 22 edges (Hetzner AX42 + 10G) | $3,073, 22 edges (Hetzner AX42 + 10G) |
+| 100x | 60 s | $3,384, 22 edges (Hetzner AX42 + 10G) | $3,652, 22 edges (Hetzner AX42 + 10G) | $3,070, 22 edges (Hetzner AX42 + 10G) |
 
-Can three small VPSes run HA? At today's load, yes: three OVH VPS-1s carry it at ~$18-22 a month, and three VPS-2s at ~$30-34 with room for 2x growth and a misbehaving identity cache. Replication is ~30 Mb/s out of the leader, under a tenth of a VPS-1's 500 Mb/s port. The risk with shared vCPUs is a noisy neighbour. The quorum masks a stalled follower, but a stalled leader holds up every ack. Past 10x, small VPSes run out of disk and port before CPU.
+Can three small VPSes run HA? At today's load, yes: three OVH VPS-1s carry it at ~$18-19 a month, and three VPS-2s at ~$30-31 with room for 2x growth and a misbehaving identity cache. Replication is ~30 Mb/s out of the leader, under a tenth of a VPS-1's 500 Mb/s port. The risk with shared vCPUs is a noisy neighbour. The quorum masks a stalled follower, but a stalled leader holds up every ack. Past 10x, small VPSes run out of disk and port before CPU.
 
 Replication bandwidth is free where the boxes are:
 
@@ -1022,6 +1023,117 @@ That's 8.1M distinct seqs, 41 membership changes and 38 removed members checked,
 - **The relay itself on the quorum log:** `cluster/forward.rs` submitting through `Client::submit_acked`, the DID state applied from committed entries, host shard assignment as log entries among the members the leader hears from (the study's "moves into the log" row), and membership reading the same `qlog/leader`.
 - Optional, from the numbers above: a learner that starts at F, or a rate limit on catch-up, for hosts on a 0.5-1 Gb/s port; parallel segment PUTs for 100x flushes on R2.
 
+### Counting (Phase 6)
+
+`src/qlog/bucket.rs`. Every request the quorum log sends goes through vlpds's `Store::counted`, which counts it at the bottom of the stack (retries and SlateDB's own traffic included) in `vlpds_object_store_requests_total` by op, key component and client. A node now holds one counted client per purpose, all over one uncounted S3 store, so each request is billed to what sent it:
+
+| client | what it carries |
+|---|---|
+| `qlog_flush` | the leader's fence, segment PUTs, the manifest CAS, checkpoint deletes |
+| `qlog_state` | the leader's SlateDB: memtable uploads, the seal's checkpoint, its manifest polls, compactor, compaction worker and GC |
+| `qlog_leader` | `qlog/leader` reads and CASes (takeovers, membership) |
+| `qlog_recovery` | a bucket recovery: manifest, orphans, the state's clone and seal, salvaged segments |
+| `qlog_backfill` | segments read for a follower behind the leader's disk, a recovery's catch-up emit, consumers' old cursors |
+| `qlog_retain` | `qlog retain` and its deletes |
+| `qlog_tool` | `qlog verify`, `qlog check` |
+
+vlpds's `component()` now knows the quorum log's paths (`qlog_manifest`, `qlog_leader`, `state_*` under `qlog/state*`; segments were already `log_segment`), so a request is also labelled by what it touched. `/qlog/status` has `requests`: totals by R2 class, and by purpose, by `purpose/component` and by `purpose/op`. The node's http port serves `/metrics` (Prometheus text, the same counter with `client="qlog_*"`). Classes follow R2 and the vlpds cost model: Class A is every PUT, LIST, copy, multipart step and `DeleteObjects` POST, Class B every GET and HEAD, a single DELETE and a multipart abort are free.
+
+One counting detail matters for the bill: object_store 0.14 sends even a single `delete` as a `DeleteObjects` POST for one key, so every SlateDB GC delete is counted as a `delete_batch` (Class A) as well as a free `delete`. vlpds counts it the same way. R2's pricing page lists DeleteObject as free and doesn't name DeleteObjects, so this is the conservative reading; it's ~0.15 A/s here (below).
+
+`tests/qlog/chaos.sh` samples every node's status every `STATUS_EVERY` seconds into `status.jsonl`, and `report.py` turns the samples into rates per class, purpose and component, per month and in R2 dollars before and after the free tier.
+
+### Bucket retention deletes (Phase 6)
+
+`qlog retain --apply` deletes what the report marks deletable, after checking each item again against the manifest as it is at the time (`retain::apply`):
+
+- **Segments past the horizon.** `pruned_seq` in `retain/qlog` is raised to the last one's end and published first, as vlpds's retention does, so a reader that checked the floor never misses data silently. Then they're deleted oldest first, so a pass cut short leaves a dense suffix. Each is below the manifest's next ordinal and at or below F, so neither a restart nor a recovery reads it again: the state checkpoint covers it.
+- **Old state paths.** A path goes whole only if it isn't the manifest's, nothing the current state reads lists it in `external_dbs` (followed transitively: a clone's source can itself be a clone), and it's an older epoch's than the current path. A newer path may be a recovery's clone in progress, and an older one can't become current again: a recovery's manifest CAS is against the manifest it read, which the current one replaced. The report now applies the same rule, so it only marks what `--apply` would delete.
+- **Not deleted:** stale segments past the manifest (the flush or a recovery deletes one when it reaches its ordinal; a delete here could race that and take the fresh segment written at the same key) and stale `qlog-*` checkpoints (a flush between its seal and its CAS holds one the manifest doesn't name yet; the leader clears them at its fence).
+
+`flush::verify` reads `pruned_seq` and walks a pruned bucket from the oldest segment left, which must continue the log from the floor; a DID the state holds but the remaining log doesn't must be at or below the floor, and a host's cursor is checked against its events' run from the first one left.
+
+`retention_deletes_only_what_it_reports_and_recovery_still_works` runs two wipe-all recoveries under load (so the state is a clone of a clone), plants a lost recovery's clone at an older epoch and one in progress at a newer epoch, applies a 1 s horizon, and checks: exactly the planned segments are gone and the next one is there, `pruned_seq` is published, the lost clone is deleted and the in-progress, current and referenced paths are kept, the manifest verifies over the pruned bucket, and a third wipe-all recovers from it with the checker clean (no holes, nothing lost) and the final manifest verified.
+
+### Membership changes need a token (Phase 6)
+
+`POST /qlog/members` takes `Authorization: Bearer <token>` matching the node's `--admin-token` (or `QLOG_ADMIN_TOKEN`). With no token set it's open only when `--http` is bound to loopback (the chaos harness, tests) and refused otherwise, with a warning at start. `qlog member` sends the token from the same flag or variable and stops at a 401 instead of retrying. `GET /qlog/status` and `/metrics` stay open.
+
+### Two tests made timing-proof (Phase 6)
+
+Both failed on the Mac on `e06da6d8`, run alone, because they asserted a condition at a fixed moment:
+
+- `old_cursors_backfill_from_the_bucket_then_the_local_log` wanted F well behind the head after a fixed 1.6 s of load with a 700 ms flush; on a slower box the flush caught up. The flush interval is now an hour and the test flushes on request (`flush::Shared::request`) once 1,000 entries are committed, then loads until the head is 1,000 past F.
+- `a_follower_behind_the_leaders_disk_catches_up_from_the_bucket` slept 4 s with the follower down and hoped the leader had trimmed past it. It now waits until the leader's memory and commitlog no longer reach the follower's last seq (`readable_floor`) and F is past it.
+
+Both looped 5 times, and 3 more pinned to two CPUs, clean.
+
+### The hour run (Phase 6)
+
+Three nodes on benchbox, commitlogs on tmpfs with a 1 ms emulated fsync, local MinIO, `qlog load` at 350/s over 64 hosts (5.3 KB frames), 30 s flushes, one hour, no faults, every node's status sampled each minute (`STATUS_EVERY=60`). Rates are over the last 58 minutes (from a minute in, past the start's reads and the first fence), all nodes summed. Run 1 had the state's SlateDB at its default compactor and worker polls (5 s), run 2 at 30 s, as vlpds runs them (now the default, `--state-compactor-poll-ms`). A 15-minute run at 10x (3,500/s) used run 2's settings.
+
+All three: 0 violations, 0 holes, nothing acked lost (1,260,001 and 3,150,017 distinct seqs), every mid-run and final manifest consistent, ack p50 1.2-1.3 ms and p99 under 2 ms. Run 1's final consumer from cursor 0 didn't run, because the harness script was edited while it ran and bash stopped at the edit after the load had finished. Its sampled counters cover the hour all the same.
+
+| cluster-wide, per second | Class A | Class B | free | per month A / B | R2 $/mo, no free tier | R2 $/mo |
+|---|---|---|---|---|---|---|
+| study, today, 30 s (four DID shards) | 0.67 | 2.81 | | 1.77M / 7.39M | $11 | $3 |
+| run 1, 350/s, SlateDB's 5 s polls | 0.481 | 2.398 | 0.146 | 1.27M / 6.31M | $7.97 | $1.20 |
+| run 2, 350/s, 30 s polls | 0.478 | 1.660 | 0.146 | 1.26M / 4.36M | $7.23 | $1.16 |
+| study, 10x, 30 s | 0.83 | 2.81 | | 2.18M / 7.39M | $13 | $5 |
+| 10x, 15 min, 30 s polls | 0.634 | 1.479 | 0.045 | 1.67M / 3.89M | $8.91 | $3.01 |
+
+By purpose and what it touched, run 2 (per second; the purposes left out sent nothing):
+
+| purpose / component | Class A | Class B | free | study's term |
+|---|---|---|---|---|
+| flush / `log_segment` | 0.033 | | | segments: 0.051 |
+| flush / `qlog_manifest` (the CAS) | 0.033 | | | manifest: 0.033 |
+| flush / `state_manifest`, `state_gc_boundary` (retiring the last checkpoint) | 0.067 | 0.100 | | in the L0 flush |
+| state / `state_sst` (L0s and compaction output; compaction's ranged reads) | 0.117 | 0.461 | 0.038 | L0 flush and compaction, four shards: 0.589 A, 1.209 B |
+| state / `state_manifest` (writes, the seal's checkpoint, the 10 s poll) | 0.127 | 0.295 | 0.067 | |
+| state / `state_compactions` (compactor and worker) | 0.095 | 0.257 | 0.041 | |
+| state / `state_gc_boundary` (read with every latest-manifest and compactions read) | 0.003 | 0.547 | | polls, four shards: 1.6 B |
+| state / `state_wal` (opening it) | 0.003 | | | |
+| leader / `qlog_leader` | 0 | 0 | | 0 (peers for liveness) |
+| followers, the whole hour | 0 | 3 requests each, at start | | 0 |
+
+Of the state's 0.345 Class A, 0.146 is SlateDB's GC deleting replaced SSTs, manifests and compaction records. object_store sends each delete as a one-key `DeleteObjects` POST, counted Class A (see [Counting](#counting-phase-6)); if R2 bills that as the free DeleteObject, the hour's Class A drops to 0.33 a second. In the first six minutes, before GC's first pass (every 10 min, for files older than 5), the state sent 0.158 Class A a second; the 10x run's 13-minute window caught fewer passes (0.045 a second of deletes).
+
+Every difference from the study, explained:
+
+- **One state, not four shards.** The study gave the leader four DID shards, each with its own L0 flush, compaction and polls. As built it keeps one SlateDB, so the state's whole share is one shard's. That's most of why both classes come in under the study.
+- **Each state costs more than vlpds's shard did.** Per flush, the state's share is ~12.4 Class A (6.0 for the L0, the seal's checkpoint and compaction output, 4.4 for GC deletes, 2 for retiring the previous checkpoint) against vlpds's 4.42 an L0 flush. The checkpoint pair is the price of sealing at exactly F (Phase 3), and the GC deletes weren't in the vlpds figure the study used.
+- **Polls are ~1.26 GETs a second for one SlateDB, not 0.4.** SlateDB reads its GC boundary file with every latest-manifest and compactions read (0.55 a second on its own), and the compactor and its worker each poll the manifest and the compactions record. At SlateDB's default 5 s compactor and worker polls (run 1) the state sent 2.3 Class B a second, 0.74 more. Nothing waits on those polls here (one writer, one L0 a flush, `l0_max_ssts` 32), so the state now polls every 30 s, as vlpds does.
+- **Segments are one PUT a flush at today's rate, not 0.051 a second.** A 30 s flush is ~56 MB raw, under one 64 MiB segment, and each flush cuts its own. The study added full segments by compressed bytes on top of the partial one, which double counts below 64 MiB a flush. The other way round, segments are cut at 64 MiB *raw* (Phase 3), not 64 MiB of zstd, so above that they're 1.56x what the study assumed: 8.71 a flush at 10x (0.29 a second against 0.21), ~2.8 a second at 100x against 1.8 (~$12 a month more on R2 there, before the free tier). Cutting by compressed size would close that if it matters.
+- **The leader record, recovery, backfill and retention cost nothing in steady state,** as designed: `qlog/leader` is a GET and a CAS a takeover and two a membership change (Phases 1 and 5), and followers sent 3 requests each in the hour, all at start.
+- **The bill:** at today's rate and a 30 s flush, R2 requests come to ~$7 a month before the free tier and ~$1 after it, against the study's $11 and $3. The bucket is still storage (72 h of log) and hosts, as the study concluded. Storage wasn't measured here: the harness's padded frames compress ~600x.
+
+`scripts/cost_model.py` now uses these numbers (Q_DID_SHARDS 1, Q_STATE_FLUSH_A 12.4, Q_STATE_FLUSH_B 12, Q_STATE_POLL_B 1.26, segments cut per flush by raw bytes), and every table above the notes is regenerated from it. The model reproduces run 2 exactly (0.48 A, 1.66 B) and is within 20% of the 10x run's short window. What moved: 3-node HA on VPS-1s at 30 s is $19 (was $22), the single VPS-1 at 30 s $10 (was $13), §2's request table, the old-against-quorum table, and the tuning table, where 8 MiB segments at 100x now cost ~$230 more (raw-cut segments) and four shards ~3.5x one. The 60 s figures barely move (they were already inside the free tier), and the 100x totals rise ~$10 (segments).
+
+### What changed from the study, across the phases
+
+- **Takeover is faster when a process dies** (15-80 ms on loopback, ~0.25-0.3 s with R2's CAS) and the same ~1 s when a leader hangs or is cut off. The emit path is the firehose's 2 ms merger tick plus the RTT, not replication (Phase 1).
+- **Replication CPU is small** (~6 µs an event on the leader at 100x); verify and apply still size the leader (Phase 1).
+- **The commitlog ack is RTT + 1-1.7x fsync.** Fsynced disk bandwidth, not CPU, is the ceiling: 100x is borderline on consumer NVMe, and two members must never share a disk. With the commitlog, two or three process deaths are a normal takeover and RAM drops to the ring (Phases 1-2).
+- **Followers keep no state.** A new leader opens the state at the last flush and replays its own log (20-30 ms to open, plus up to an interval of replay), so the bucket sees one L0 flush an interval, not three (Phase 3).
+- **Exactly-F state needs the applier to pause** until SlateDB's checkpoint exists, since SlateDB only promises "at least F"; 20-350 ms a flush, off the ack path (Phase 3).
+- **Flushes take ~1.4 s a GB on a local MinIO;** at 100x on R2 they want parallel segment PUTs (Phase 3).
+- **Lost-quorum recovery is cheap on the bucket side** (an O(1) clone, 33-146 ms here, ~1-1.5 s on R2); the pause is detection. A survivor back within its timeout keeps its quorum. Each recovery skips H seqs, and the repeat window consumers see is the flush interval (Phase 4).
+- **Membership changes pause commits ~10 ms here** (~0.6-1 s of round trips on R2). Replacing a box is mostly copying the leader's local log to it, and replacing the leader is a 15-50 ms handoff, not a takeover (Phase 5).
+- **The bucket bill is lower than modeled** (~$7 a month of requests before R2's free tier at 30 s, ~$1 after, against $11 and $3), because the state is one SlateDB. Per SlateDB it's ~3x vlpds's per-shard figures: the checkpoint pair, GC deletes and SlateDB's own polls. Segments cut by raw bytes cost 1.5x the model's PUTs at 10x and up (Phase 6).
+- **What the study concluded still holds:** bucket requests stop mattering, hosts are the bill, three small VPSes carry today's load at ~$18-19 a month, and a single node lands at ~$9-10.
+
+### What's left to make the relay run on the quorum log
+
+- **Forwarding:** `cluster/forward.rs` submits through `qlog::client::Client::submit_acked`, with the host owner's acked cursors on its submits, in place of today's forward to a shard owner.
+- **DID state from committed entries:** the leader's `check_chain` and apply against the real per-DID sync state, applied from committed entries and sealed at F, replacing `state.rs`'s stand-in (per DID seq and content). Registry rows and host counters ride in the manifest.
+- **Host shards as log entries:** host assignment among the members the leader hears from, written as log entries (the study's "moves into the log" row), so a dead node's hosts resume from the cursor entries.
+- **Membership from `qlog/leader`:** the relay's cluster membership and its admin read the same record, through `qlog member` (now behind `--admin-token`).
+- **Retention as a loop:** `qlog retain --apply` is a command; the leader (or a cron) should run it on an interval.
+- **Learners at F:** a new box could start at F and read below it from the bucket, rather than copying the leader's local log, or the catch-up could be rate-limited, for 0.5-1 Gb/s ports.
+- **Parallel segment PUTs** for 100x flushes on R2 (and, if the PUT count matters there, cutting segments by compressed size).
+- **Real hosts and R2,** with Jaz's OK: fsync on OVH and Hetzner VPSes and the 3-box run in [Measuring a real host](#measuring-a-real-host-ovh-hetzner), and an hour against a real R2 bucket to confirm the request table (and whether R2 bills `DeleteObjects` as Class A) and the ~200 ms round trips the recovery and membership estimates assume.
+
 ### Measuring a real host (OVH, Hetzner)
 
 Nothing here touches a cloud host or real R2. To run on candidate hosts, with Jaz's OK:
@@ -1060,8 +1172,8 @@ Nothing here touches a cloud host or real R2. To run on candidate hosts, with Ja
 | Events/s, frame size, zstd ratio, peak hour | ~350 (480 peak hour), 5.3 KB, 1.56x | measured ([cost](cost.md#inputs)) |
 | CPU per event | 65-70 µs one node on cores, 89-94 on threads, 142-156 a 3-node cluster | measured ([perf](perf.md)) |
 | Leader's share of the cluster's CPU | half | assumed |
-| L0 flush with its compaction | ~4.4 Class A, ~9 Class B | measured in vlpds |
-| SlateDB polls | ~0.4 GET/s per shard | vlpds defaults, measured there |
+| The state's share of a flush (its L0, the checkpoint sealed and the one retired, compaction, GC deletes) | ~12.4 Class A, ~12 Class B, one SlateDB | measured (Phase 6 hour run; the B split is Phase 3's per-flush count). The study used vlpds's ~4.4 A and ~9 B an L0 flush, four shards |
+| SlateDB polls | ~1.26 GET/s, one SlateDB (manifest 10 s, compactor and worker 30 s) | measured (Phase 6). The study used vlpds's ~0.4 a shard |
 | vlpds lease loop | 1.5 Class A + 1 Class B per node per second at TTL 10 s | measured in vlpds |
 | Per-DID state | 121.8 B a DID (243.6 B right after an update) | measured (`tests/state_bulk.rs`) |
 | Hosts on the network | 6,260 listed, 1,956 active, 89 bsky.network PDSes with 23.4M of 24.0M accounts | measured (listHosts, reference notes) |
@@ -1071,7 +1183,7 @@ Nothing here touches a cloud host or real R2. To run on candidate hosts, with Ja
 | fsync, consumer NVMe | 2.7 ms p50, 5.9 ms p99 (fdatasync, one appending writer; 5.5 ms with three on one disk) | measured (benchbox, `tests/qlog/fsync_probe.sh`) |
 | RTT | 0.2 ms one DC, 3 ms one metro, 65 ms cross-region | assumed |
 | R2 PUT | ~200 ms p50 from benchbox | measured (vlpds `bench/results/spaces-r2-2026-10-05.md`) |
-| Segment size, read size, DID shards, group commit | 64 MiB, 8 MiB, 4, 2 ms | design |
+| Segment size, read size, DID shards, group commit | 64 MiB raw (cut per flush), 8 MiB, 1, 2 ms | code (the study: 64 MiB of zstd, 4 shards) |
 | R2 free tier | 1M Class A, 10M Class B, 10 GB-month a month | developers.cloudflare.com/r2/pricing (2026-10-06) |
 | OVH VPS-1 to VPS-4 | $4.54, $8.50, $12.32, $23.37 | us.ovhcloud.com/vps (2026-10-06) |
 | Hetzner Cloud CX33, CAX21, CPX22 | $9.99, $12.49, $22.99 (EUR 8.49, 10.49, 19.49) | costgoat.com listing (2026-09-05), not Hetzner's own page, which didn't render |
