@@ -3,7 +3,7 @@
 //! (the forwarder's retry, docs/quorum.md §1 "Leader change with a quorum
 //! alive").
 
-use super::wire::{self, Msg};
+use super::wire::{self, Item, Msg, Outcome};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -221,6 +221,99 @@ impl Client {
             }
             self.retries.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// What a leader decided about each of a batch of relay events.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decided {
+    pub outcomes: Vec<Outcome>,
+    pub generation: u64,
+}
+
+impl Client {
+    /// Relay events (`Msg::SubmitEvents`), sent until a leader answers for
+    /// all of them: resent to the next leader when one fails or goes quiet,
+    /// as `submit_acked`. An event the old leader appended and committed
+    /// comes back from the new one as a duplicate (the hooks' state has
+    /// it), and one it lost is decided afresh.
+    pub async fn submit_events(
+        &self,
+        items: Vec<Item>,
+        cursors: Bytes,
+        control: Bytes,
+        cursor_generation: u64,
+    ) -> Decided {
+        let m = Msg::SubmitEvents { items, cursors, control, generation: cursor_generation };
+        loop {
+            match self.leader_call(&m).await {
+                Msg::SubmittedEvents { outcomes, generation } => return Decided { outcomes, generation },
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+            self.retries.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Asks whichever node leads (`Msg::Ask`); None if no leader answered
+    /// within `patience`, or it couldn't say.
+    pub async fn ask_leader(&self, topic: &str, body: Bytes, patience: Duration) -> Result<Bytes, String> {
+        let m = Msg::Ask { topic: topic.to_string(), body };
+        let until = std::time::Instant::now() + patience;
+        let mut last = "no leader answered".to_string();
+        while std::time::Instant::now() < until {
+            match tokio::time::timeout(until - std::time::Instant::now(), self.leader_call(&m)).await {
+                Ok(Msg::Answer { body }) => return Ok(body),
+                Ok(Msg::Failed { reason }) => {
+                    last = reason;
+                    if last.starts_with("unauthorized") || last.starts_with("bad request") {
+                        return Err(last);
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                Err(_) => break,
+            }
+        }
+        Err(last)
+    }
+
+    /// One call to the leader: follows NotLeader hints and moves off a node
+    /// that times out. Returns anything but NotLeader and a lost call.
+    async fn leader_call(&self, m: &Msg) -> Msg {
+        loop {
+            let Some(c) = self.conn().await else {
+                self.retries.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            };
+            match c.call(m, self.timeout).await {
+                Some(Msg::NotLeader { hint }) => {
+                    if !hint.is_empty() {
+                        *self.hint.lock() = Some(hint);
+                    }
+                    self.drop_conn(&c).await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Some(r) => return r,
+                None => {
+                    c.dead.store(true, Ordering::Release);
+                    *self.avoid.lock() = Some((c.addr.clone(), std::time::Instant::now() + 2 * self.timeout));
+                    self.drop_conn(&c).await;
+                }
+            }
+        }
+    }
+}
+
+/// One question to one node over the peer protocol (`Msg::Ask`).
+pub async fn ask(addr: &str, topic: &str, body: Bytes, timeout: Duration) -> anyhow::Result<Bytes> {
+    let c = Conn::open(addr).await?;
+    match c.call(&Msg::Ask { topic: topic.to_string(), body }, timeout).await {
+        Some(Msg::Answer { body }) => Ok(body),
+        Some(Msg::Failed { reason }) => anyhow::bail!("{reason}"),
+        Some(Msg::NotLeader { hint }) => anyhow::bail!("not the leader (try {hint})"),
+        Some(m) => anyhow::bail!("unexpected answer {m:?}"),
+        None => anyhow::bail!("no answer from {addr}"),
     }
 }
 

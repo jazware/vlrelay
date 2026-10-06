@@ -42,4 +42,4 @@ pub mod state;
 pub mod wire;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

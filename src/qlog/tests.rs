@@ -21,23 +21,25 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use vlpds::store::Store;
 
-struct Running {
+pub(crate) struct Running {
     rt: tokio::runtime::Runtime,
-    node: Arc<Node>,
+    pub(crate) node: Arc<Node>,
     faults: Arc<Faults>,
     cl: Option<Arc<CommitLog>>,
 }
 
-type ConfigFn = Arc<dyn Fn(&str, &HashMap<String, String>) -> Config + Send + Sync>;
+pub(crate) type ConfigFn = Arc<dyn Fn(&str, &HashMap<String, String>) -> Config + Send + Sync>;
 
-struct Cluster {
+pub(crate) struct Cluster {
     ids: Vec<String>,
     addrs: HashMap<String, String>,
-    store: Store,
-    nodes: HashMap<String, Running>,
+    pub(crate) store: Store,
+    pub(crate) nodes: HashMap<String, Running>,
     incarnations: HashMap<String, u64>,
     tap: mpsc::UnboundedSender<Emitted>,
     checker: Arc<Mutex<Checker>>,
+    /// Every batch emitted, by stream (`node#incarnation`).
+    pub(crate) emitted: Arc<Mutex<Vec<(String, u64, Bytes)>>>,
     /// Faults that outlive a restart: (node, peers it can't reach).
     blocks: Vec<(String, String)>,
     /// Each node's commitlog lives under here (memory-only without).
@@ -50,7 +52,7 @@ struct Cluster {
 /// Each port handed out once per process, below the ephemeral range: an
 /// OS-picked port can come back to a cluster running alongside, whose
 /// nodes would then append to this one's.
-fn free_port() -> u16 {
+pub(crate) fn free_port() -> u16 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let base = 15_000 + (std::process::id() as u64 % 20) * 500;
     loop {
@@ -61,7 +63,7 @@ fn free_port() -> u16 {
     }
 }
 
-fn config(id: &str, addrs: &HashMap<String, String>) -> Config {
+pub(crate) fn config(id: &str, addrs: &HashMap<String, String>) -> Config {
     let peers = addrs.iter().filter(|(k, _)| *k != id).map(|(k, v)| (k.clone(), v.clone())).collect();
     let mut c = Config::new(id, peers);
     c.heartbeat = Duration::from_millis(50);
@@ -77,7 +79,7 @@ impl Cluster {
         Cluster::with(n, None).await
     }
 
-    async fn durable(n: usize, sync_delay: Option<Duration>) -> Cluster {
+    pub(crate) async fn durable(n: usize, sync_delay: Option<Duration>) -> Cluster {
         let o = commitlog::Options {
             segment_bytes: 1 << 20,
             retain_bytes: 8 << 20,
@@ -92,7 +94,7 @@ impl Cluster {
         Cluster::with_cfg(n, disk, None, 64 << 20).await
     }
 
-    async fn with_cfg(
+    pub(crate) async fn with_cfg(
         n: usize,
         disk: Option<(tempfile::TempDir, commitlog::Options)>,
         cfg: Option<ConfigFn>,
@@ -114,10 +116,12 @@ impl Cluster {
         let addrs = ids.iter().map(|id| (id.clone(), format!("127.0.0.1:{}", free_port()))).collect();
         let (tap, mut rx) = mpsc::unbounded_channel::<Emitted>();
         let checker = Arc::new(Mutex::new(Checker::new()));
-        let ck = checker.clone();
+        let emitted: Arc<Mutex<Vec<(String, u64, Bytes)>>> = Default::default();
+        let (ck, em) = (checker.clone(), emitted.clone());
         tokio::spawn(async move {
             while let Some(e) = rx.recv().await {
                 let stream = format!("{}#{}", e.node, e.incarnation);
+                em.lock().extend(e.events.iter().map(|(s, d)| (stream.clone(), *s as u64, d.clone())));
                 let mut c = ck.lock();
                 for (seq, data) in &e.events {
                     match parse_test_frame(data) {
@@ -137,6 +141,7 @@ impl Cluster {
             incarnations: HashMap::new(),
             tap,
             checker,
+            emitted,
             blocks: Vec::new(),
             disk,
             cfg,
@@ -148,7 +153,7 @@ impl Cluster {
         c
     }
 
-    async fn start(&mut self, id: &str) {
+    pub(crate) async fn start(&mut self, id: &str) {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         let inc = {
             let i = self.incarnations.entry(id.to_string()).or_default();
@@ -202,7 +207,7 @@ impl Cluster {
 
     /// kill -9: the runtime goes, with every task, socket and byte of memory.
     /// What the commitlog wrote stays (the page cache outlives a process).
-    fn kill(&mut self, id: &str) {
+    pub(crate) fn kill(&mut self, id: &str) {
         if let Some(r) = self.nodes.remove(id) {
             r.rt.shutdown_background();
             if let Some(cl) = r.cl {
@@ -213,7 +218,7 @@ impl Cluster {
 
     /// The box loses power: as kill, and the commitlog also loses a random
     /// part of what it wrote since its last fsync, ending in a torn record.
-    fn power_cut(&mut self, id: &str, rng: &mut impl Rng) {
+    pub(crate) fn power_cut(&mut self, id: &str, rng: &mut impl Rng) {
         if let Some(r) = self.nodes.remove(id) {
             // the disk is cut first: nothing after this point reaches it
             if let Some(cl) = &r.cl {
@@ -225,7 +230,7 @@ impl Cluster {
     }
 
     /// The disk is gone: kill -9, and its commitlog with it.
-    fn wipe(&mut self, id: &str) {
+    pub(crate) fn wipe(&mut self, id: &str) {
         self.kill(id);
         if let Some((dir, _)) = &self.disk {
             let _ = std::fs::remove_dir_all(dir.path().join(id));
@@ -257,7 +262,7 @@ impl Cluster {
         }
     }
 
-    fn leader(&self) -> Option<String> {
+    pub(crate) fn leader(&self) -> Option<String> {
         let mut leaders: Vec<(u64, String)> = self
             .nodes
             .values()
@@ -269,7 +274,7 @@ impl Cluster {
         leaders.pop().map(|l| l.1)
     }
 
-    async fn wait_leader(&self, within: Duration) -> String {
+    pub(crate) async fn wait_leader(&self, within: Duration) -> String {
         let t = Instant::now();
         loop {
             if let Some(l) = self.leader() {
@@ -280,7 +285,7 @@ impl Cluster {
         }
     }
 
-    fn client(&self) -> Arc<Client> {
+    pub(crate) fn client(&self) -> Arc<Client> {
         Client::new(self.ids.iter().map(|id| (id.clone(), self.addrs[id].clone())).collect())
     }
 
@@ -293,7 +298,7 @@ impl Cluster {
 
     /// Waits until every running member has emitted the same, full commit
     /// (a removed node stops where it was removed).
-    async fn converge(&self, within: Duration) {
+    pub(crate) async fn converge(&self, within: Duration) {
         let t = Instant::now();
         loop {
             let members = self.members();
@@ -320,7 +325,7 @@ impl Cluster {
         }
     }
 
-    fn finish(&self, acked: &[(u64, u64)]) -> super::check::Report {
+    pub(crate) fn finish(&self, acked: &[(u64, u64)]) -> super::check::Report {
         let members = self.members();
         let mut c = self.checker.lock();
         for id in self.nodes.keys().filter(|id| !members.contains(id)) {
@@ -337,7 +342,7 @@ impl Cluster {
         c.finish(&logs)
     }
 
-    fn shutdown(mut self) {
+    pub(crate) fn shutdown(mut self) {
         for id in self.ids.clone() {
             self.kill(&id);
         }

@@ -56,6 +56,30 @@ pub struct PromiseResp {
     pub generation: u64,
 }
 
+/// One relay event submitted to the leader: the frame around its seq, and
+/// what the host owner checked (opaque here; the leader's `node::Hooks`
+/// read it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Item {
+    pub prefix: Bytes,
+    pub suffix: Bytes,
+    pub meta: Bytes,
+}
+
+/// What became of one [`Item`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Committed at this seq.
+    Appended(u64),
+    /// Already in the log (committed by the time this is answered): done.
+    Duplicate,
+    /// Dropped by a check: done too.
+    Rejected(String),
+    /// Not decided now (the leader's state isn't ready, an identity lookup
+    /// failed): the host owner sends it again later.
+    Retry(String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Msg {
     Append(Append),
@@ -123,6 +147,27 @@ pub enum Msg {
         epoch: u64,
         from: String,
     },
+    /// A host owner's checked events, each decided by the leader's hooks
+    /// before it's appended (`Node::submit_events`). `control` is the
+    /// hooks' too: changes that ride the log without an event of their own.
+    SubmitEvents {
+        items: Vec<Item>,
+        cursors: Bytes,
+        control: Bytes,
+        generation: u64,
+    },
+    SubmittedEvents {
+        outcomes: Vec<Outcome>,
+        generation: u64,
+    },
+    /// A question for a node (`status`) or its hooks (anything else).
+    Ask {
+        topic: String,
+        body: Bytes,
+    },
+    Answer {
+        body: Bytes,
+    },
 }
 
 impl Msg {
@@ -143,6 +188,10 @@ impl Msg {
             Msg::Cursors => 13,
             Msg::CursorsResp { .. } => 14,
             Msg::Lead { .. } => 15,
+            Msg::SubmitEvents { .. } => 16,
+            Msg::SubmittedEvents { .. } => 17,
+            Msg::Ask { .. } => 18,
+            Msg::Answer { .. } => 19,
         }
     }
 
@@ -240,6 +289,43 @@ pub fn encode(rid: u64, m: &Msg) -> Bytes {
             b.put_u64(*epoch);
             put_str(&mut b, from);
         }
+        Msg::SubmitEvents { items, cursors, control, generation } => {
+            b.put_u32(items.len() as u32);
+            for it in items {
+                put_bytes(&mut b, &it.prefix);
+                put_bytes(&mut b, &it.suffix);
+                put_bytes(&mut b, &it.meta);
+            }
+            put_bytes(&mut b, cursors);
+            put_bytes(&mut b, control);
+            b.put_u64(*generation);
+        }
+        Msg::SubmittedEvents { outcomes, generation } => {
+            b.put_u32(outcomes.len() as u32);
+            for o in outcomes {
+                match o {
+                    Outcome::Appended(seq) => {
+                        b.put_u8(0);
+                        b.put_u64(*seq);
+                    }
+                    Outcome::Duplicate => b.put_u8(1),
+                    Outcome::Rejected(r) => {
+                        b.put_u8(2);
+                        put_str(&mut b, r);
+                    }
+                    Outcome::Retry(r) => {
+                        b.put_u8(3);
+                        put_str(&mut b, r);
+                    }
+                }
+            }
+            b.put_u64(*generation);
+        }
+        Msg::Ask { topic, body } => {
+            put_str(&mut b, topic);
+            put_bytes(&mut b, body);
+        }
+        Msg::Answer { body } => put_bytes(&mut b, body),
     }
     let n = (b.len() - 4) as u32;
     b[..4].copy_from_slice(&n.to_be_bytes());
@@ -248,11 +334,19 @@ pub fn encode(rid: u64, m: &Msg) -> Bytes {
 
 fn entries_len(m: &Msg) -> usize {
     match m {
-        Msg::Append(a) => a.entries.iter().map(|e| e.data.len() + e.cursors.len() + 24).sum(),
-        Msg::FetchResp { entries, .. } => entries.iter().map(|e| e.data.len() + e.cursors.len() + 24).sum(),
+        Msg::Append(a) => a.entries.iter().map(|e| e.data.len() + e.cursors.len() + e.meta.len() + 28).sum(),
+        Msg::FetchResp { entries, .. } => {
+            entries.iter().map(|e| e.data.len() + e.cursors.len() + e.meta.len() + 28).sum()
+        }
         Msg::Submit { frames, cursors, .. } => {
             frames.iter().map(|(p, s)| p.len() + s.len() + 8).sum::<usize>() + cursors.len()
         }
+        Msg::SubmitEvents { items, cursors, control, .. } => {
+            items.iter().map(|i| i.prefix.len() + i.suffix.len() + i.meta.len() + 12).sum::<usize>()
+                + cursors.len()
+                + control.len()
+        }
+        Msg::Answer { body } => body.len(),
         _ => 0,
     }
 }
@@ -273,6 +367,7 @@ fn put_entries(b: &mut BytesMut, es: &[Entry]) {
         b.put_u64(e.seq);
         put_bytes(b, &e.data);
         put_bytes(b, &e.cursors);
+        put_bytes(b, &e.meta);
     }
 }
 
@@ -311,7 +406,13 @@ impl Rd {
         let n = self.u32()? as usize;
         let mut out = Vec::with_capacity(n.min(1 << 16));
         for _ in 0..n {
-            out.push(Entry { epoch: self.u64()?, seq: self.u64()?, data: self.bytes()?, cursors: self.bytes()? });
+            out.push(Entry {
+                epoch: self.u64()?,
+                seq: self.u64()?,
+                data: self.bytes()?,
+                cursors: self.bytes()?,
+                meta: self.bytes()?,
+            });
         }
         Ok(out)
     }
@@ -379,6 +480,30 @@ pub fn decode(body: Bytes) -> R<(u64, Msg)> {
         13 => Msg::Cursors,
         14 => Msg::CursorsResp { generation: r.u64()?, known: r.bool()?, cursors: r.bytes()? },
         15 => Msg::Lead { epoch: r.u64()?, from: r.string()? },
+        16 => {
+            let n = r.u32()? as usize;
+            let mut items = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                items.push(Item { prefix: r.bytes()?, suffix: r.bytes()?, meta: r.bytes()? });
+            }
+            Msg::SubmitEvents { items, cursors: r.bytes()?, control: r.bytes()?, generation: r.u64()? }
+        }
+        17 => {
+            let n = r.u32()? as usize;
+            let mut outcomes = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                outcomes.push(match r.u8()? {
+                    0 => Outcome::Appended(r.u64()?),
+                    1 => Outcome::Duplicate,
+                    2 => Outcome::Rejected(r.string()?),
+                    3 => Outcome::Retry(r.string()?),
+                    _ => return Err("unknown outcome"),
+                });
+            }
+            Msg::SubmittedEvents { outcomes, generation: r.u64()? }
+        }
+        18 => Msg::Ask { topic: r.string()?, body: r.bytes()? },
+        19 => Msg::Answer { body: r.bytes()? },
         _ => return Err("unknown message"),
     };
     if r.0.has_remaining() {
@@ -420,7 +545,13 @@ mod tests {
     fn round_trip() {
         let ents = vec![
             Entry::new(3, 9, Bytes::from_static(b"abc")),
-            Entry { epoch: 3, seq: 10, data: Bytes::new(), cursors: Bytes::from_static(b"cur") },
+            Entry {
+                epoch: 3,
+                seq: 10,
+                data: Bytes::new(),
+                cursors: Bytes::from_static(b"cur"),
+                meta: Bytes::from_static(b"m"),
+            },
         ];
         let msgs = vec![
             Msg::Append(Append {
@@ -463,6 +594,27 @@ mod tests {
             Msg::NotLeader { hint: "n1".into() },
             Msg::Failed { reason: "x".into() },
             Msg::Lead { epoch: 6, from: "n4".into() },
+            Msg::SubmitEvents {
+                items: vec![Item {
+                    prefix: Bytes::from_static(b"p"),
+                    suffix: Bytes::from_static(b"s"),
+                    meta: Bytes::from_static(b"m"),
+                }],
+                cursors: Bytes::from_static(b"c"),
+                control: Bytes::from_static(b"x"),
+                generation: 2,
+            },
+            Msg::SubmittedEvents {
+                outcomes: vec![
+                    Outcome::Appended(7),
+                    Outcome::Duplicate,
+                    Outcome::Rejected("no".into()),
+                    Outcome::Retry("later".into()),
+                ],
+                generation: 2,
+            },
+            Msg::Ask { topic: "status".into(), body: Bytes::from_static(b"{}") },
+            Msg::Answer { body: Bytes::from_static(b"{}") },
         ];
         for (i, m) in msgs.into_iter().enumerate() {
             let b = encode(i as u64, &m);

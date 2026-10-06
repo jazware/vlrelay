@@ -256,7 +256,11 @@ struct CheckArgs {
     stop_file: String,
     /// The load generator's acks, read at the end.
     #[arg(long)]
-    acked: String,
+    acked: Option<String>,
+    /// The streams carry real relay frames (`vlrelay --quorum`), not the
+    /// load generator's: each is identified by its bytes.
+    #[arg(long)]
+    relay_frames: bool,
     #[arg(long)]
     out: String,
     /// Global emission pauses longer than this are logged.
@@ -828,12 +832,32 @@ enum Seen {
     Fresh { node: String },
 }
 
+/// (seq, did, sent) of a test frame, or for a relay frame (`relay`) its
+/// seq and its bytes' id in place of a DID (every node emits the same bytes
+/// for a seq), sent now.
+fn parse_frame(b: &[u8], relay: bool) -> Option<(u64, String, i64)> {
+    if !relay {
+        return parse_test_frame(b);
+    }
+    use vlpds::cbor::ValueRef;
+    let (hdr, n) = ValueRef::decode_prefix(b).ok()?;
+    if !matches!(hdr.get("op"), Some(ValueRef::Int(1))) {
+        return None;
+    }
+    let seq = match ValueRef::decode(&b[n..]).ok()?.get("seq") {
+        Some(ValueRef::Int(i)) if *i > 0 => *i as u64,
+        _ => return None,
+    };
+    Some((seq, format!("{:016x}", content_id(b)), now_us()))
+}
+
 async fn consume(
     node: String,
     addr: String,
     tx: mpsc::UnboundedSender<Seen>,
     cursor: Arc<AtomicU64>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    relay: bool,
 ) {
     let mut fresh = true;
     while !stop.load(Ordering::Acquire) {
@@ -858,7 +882,7 @@ async fn consume(
                 Ok(Message::Close(_)) | Err(_) => break,
                 Ok(_) => continue,
             };
-            if let Some((seq, did, sent)) = parse_test_frame(&b) {
+            if let Some((seq, did, sent)) = parse_frame(&b, relay) {
                 cursor.store(seq, Ordering::Release);
                 let _ = tx.send(Seen::Event { node: node.clone(), seq, did, sent, at: now_us() });
             } else if info_name(&b).as_deref() == Some("OutdatedCursor") {
@@ -886,7 +910,7 @@ struct CheckOut {
 /// Reads `addr`'s stream from cursor 0 up to `upto` into the checker as
 /// its own stream (dense, and each seq with the content every other
 /// consumer saw).
-async fn backfill_from_zero(addr: &str, upto: u64, ck: &mut Checker) -> anyhow::Result<u64> {
+async fn backfill_from_zero(addr: &str, upto: u64, ck: &mut Checker, relay: bool) -> anyhow::Result<u64> {
     let url = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor=0");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
     let mut n = 0u64;
@@ -904,7 +928,7 @@ async fn backfill_from_zero(addr: &str, upto: u64, ck: &mut Checker) -> anyhow::
             Message::Close(_) => anyhow::bail!("closed after {n} events"),
             _ => continue,
         };
-        if let Some((seq, did, _)) = parse_test_frame(&b) {
+        if let Some((seq, did, _)) = parse_frame(&b, relay) {
             let d = content_id(did.as_bytes());
             ck.observe_event("backfill", seq, d, d);
             n += 1;
@@ -925,7 +949,7 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
     for (id, addr) in &nodes {
         let c = Arc::new(AtomicU64::new(0));
         cursors.insert(id.clone(), c.clone());
-        tokio::spawn(consume(id.clone(), addr.clone(), tx.clone(), c, stop.clone()));
+        tokio::spawn(consume(id.clone(), addr.clone(), tx.clone(), c, stop.clone(), a.relay_frames));
     }
     drop(tx);
     let mut ck = Checker::new();
@@ -1024,7 +1048,7 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
         && let Some(upto) = ck.last(id)
     {
         let t = Instant::now();
-        let r = backfill_from_zero(addr, upto, &mut ck).await;
+        let r = backfill_from_zero(addr, upto, &mut ck, a.relay_frames).await;
         tracing::info!(node = %id, upto, secs = t.elapsed().as_secs_f64(), "check: consumer from cursor 0 done: {r:?}");
         match r {
             Ok(n) => backfilled = Some((n, t.elapsed().as_secs_f64())),
@@ -1034,7 +1058,11 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
             }
         }
     }
-    for line in std::fs::read_to_string(&a.acked)?.lines() {
+    let acked = match &a.acked {
+        Some(f) => std::fs::read_to_string(f)?,
+        None => String::new(),
+    };
+    for line in acked.lines() {
         // a load generator killed mid-write leaves a last line without its did
         if let Some((s, d)) = line.split_once(' ')
             && !d.is_empty()

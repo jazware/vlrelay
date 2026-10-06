@@ -13,7 +13,7 @@ use super::commitlog::{CommitLog, Recovered};
 use super::emit::Emitter;
 use super::flush;
 use super::log::{Entry, Log, Op, encode_cursors, merge_cursors};
-use super::wire::{self, Append, AppendResp, Msg, PromiseResp};
+use super::wire::{self, Append, AppendResp, Item, Msg, Outcome, PromiseResp};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use object_store::path::Path;
@@ -71,6 +71,74 @@ pub struct Config {
     /// ...and this long, with commits paused, for everything appended to
     /// commit, the learners to hold it and the flush to cover it.
     pub switch_timeout: Duration,
+    /// What the relay plugs in (`SubmitEvents`, the state, every committed
+    /// entry); None for a bare log.
+    pub hooks: HooksSlot,
+    /// The bearer token a membership change sent over the peer protocol
+    /// (`Ask members`) must carry; None refuses them there.
+    pub admin_token: Option<String>,
+}
+
+/// What the relay plugs into the log (docs/quorum.md, "The relay on the
+/// log"). All but `committed` and `answer` run on the leader only, for its
+/// `epoch`.
+pub trait Hooks: Send + Sync + 'static {
+    /// Decides each submitted event before it's appended, in order. Runs
+    /// while no membership barrier can begin, and its `Verdict::Append`s are
+    /// appended in this order, unless the node stops leading `epoch` first
+    /// (then nothing is, and the term's decisions are void). `control` is
+    /// the submitter's, for the hooks.
+    fn admit<'a>(&'a self, epoch: u64, items: &'a [Item], control: Bytes) -> BoxFuture<'a, Admission>;
+    /// Where each `Verdict::Append` went: (ticket, seq).
+    fn appended(&self, epoch: u64, seqs: Vec<(u64, u64)>);
+    /// The state is open, applied up to `applied`, and nothing has been
+    /// admitted yet this term: `node.read_tail` gives what's above it.
+    fn state_opened<'a>(
+        &'a self,
+        node: &'a Arc<Node>,
+        epoch: u64,
+        db: slatedb::Db,
+        applied: u64,
+    ) -> BoxFuture<'a, anyhow::Result<()>>;
+    /// Everything up to `upto` is written to the state.
+    fn state_applied(&self, epoch: u64, upto: u64);
+    /// The term's flush loop stopped (the node no longer leads `epoch`).
+    fn term_ended(&self, epoch: u64);
+    /// Every node: committed entries in seq order, as they're emitted (a
+    /// bucket recovery's catch-up included).
+    fn committed(&self, entries: &[Entry]);
+    /// `Msg::Ask` topics the node doesn't answer itself.
+    fn answer<'a>(&'a self, topic: &'a str, body: Bytes) -> BoxFuture<'a, Option<Bytes>>;
+    /// For the node's status.
+    fn report(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+}
+
+/// The hooks' decisions on a batch, in order, and what they hold until the
+/// batch is appended (or given up): what they decided must reach the log in
+/// the order they decided it, which a concurrent batch could break.
+pub struct Admission {
+    pub verdicts: Vec<Verdict>,
+    pub hold: Option<Box<dyn std::any::Any + Send>>,
+}
+
+/// The hooks' decision on one submitted event.
+pub enum Verdict {
+    /// Append it with this meta; `ticket` comes back from `appended`.
+    Append { meta: Bytes, ticket: u64 },
+    /// Answer with this once the entry at `after` (already in the log, if
+    /// any) has committed.
+    Answer { outcome: Outcome, after: Option<u64> },
+}
+
+#[derive(Clone, Default)]
+pub struct HooksSlot(pub Option<Arc<dyn Hooks>>);
+
+impl std::fmt::Debug for HooksSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Hooks" } else { "None" })
+    }
 }
 
 impl Config {
@@ -94,6 +162,8 @@ impl Config {
             auto_recover: true,
             catch_up_timeout: Duration::from_secs(300),
             switch_timeout: Duration::from_secs(10),
+            hooks: HooksSlot::default(),
+            admin_token: None,
         }
     }
 }
@@ -340,7 +410,10 @@ struct Core {
     acked_at: HashMap<String, Instant>,
     self_durable: u64,
     /// Submits waiting for their last seq to commit.
-    waiters: BTreeMap<u64, oneshot::Sender<Result<(), String>>>,
+    waiters: BTreeMap<u64, Vec<oneshot::Sender<Result<(), String>>>>,
+    /// Leader: `SubmitEvents` between their capacity check and their
+    /// append (a membership barrier waits for none).
+    admitting: usize,
     /// (first, last, appended at) per submit, for the commit latency.
     pending: VecDeque<(u64, u64, Instant, usize)>,
     pending_bytes: usize,
@@ -461,6 +534,9 @@ pub struct Status {
     /// Every bucket request this process has sent, by R2 class, purpose and
     /// key component (`bucket::requests`).
     pub requests: super::bucket::Requests,
+    /// What the hooks report (the relay's admissions, its host table).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<serde_json::Value>,
 }
 
 /// One membership change, as the leader that ran it saw it.
@@ -601,6 +677,7 @@ impl Node {
                 acked_at: HashMap::new(),
                 self_durable: 0,
                 waiters: BTreeMap::new(),
+                admitting: 0,
                 pending: VecDeque::new(),
                 pending_bytes: 0,
                 flushed: manifest.as_ref().map_or(0, |m| m.flushed),
@@ -692,6 +769,7 @@ impl Node {
             last_epoch: c.log.last().0,
             switches: self.switches.lock().clone(),
             requests: super::bucket::requests(),
+            relay: self.cfg.hooks.0.as_ref().map(|h| h.report()),
         }
     }
 
@@ -726,6 +804,28 @@ impl Node {
 
     pub fn emitted(&self) -> u64 {
         self.core.lock().emitted
+    }
+
+    /// Leader of `epoch`: the members it has heard from within `within`,
+    /// itself included (who can own hosts). None when not leading it.
+    pub fn live_members(&self, epoch: u64, within: Duration) -> Option<Vec<String>> {
+        let c = self.core.lock();
+        if c.role != Role::Leader || c.epoch != epoch {
+            return None;
+        }
+        let now = Instant::now();
+        Some(
+            c.members
+                .iter()
+                .filter(|m| **m == self.cfg.id || c.acked_at.get(*m).is_some_and(|t| now.duration_since(*t) < within))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// The address this node dials `id` at, if it knows one.
+    pub fn addr_of(&self, id: &str) -> Option<String> {
+        self.addrs.lock().get(id).cloned()
     }
 
     /// A committed manifest's F and R: the commit index may rise to R, and
@@ -831,6 +931,22 @@ impl Node {
                     });
                     continue;
                 }
+                Msg::SubmitEvents { items, cursors, control, generation } => {
+                    let (n, tx) = (self.clone(), tx.clone());
+                    tokio::spawn(async move {
+                        let r = n.submit_events(items, cursors, control, generation).await;
+                        let _ = tx.send(wire::encode(rid, &r));
+                    });
+                    continue;
+                }
+                Msg::Ask { topic, body } => {
+                    let (n, tx) = (self.clone(), tx.clone());
+                    tokio::spawn(async move {
+                        let r = n.ask(&topic, body).await;
+                        let _ = tx.send(wire::encode(rid, &r));
+                    });
+                    continue;
+                }
                 Msg::Append(a) => Msg::AppendResp(self.on_append(a).await),
                 Msg::Promise { epoch, from } => Msg::PromiseResp(self.on_promise(epoch, &from).await),
                 Msg::Fetch { epoch, from_seq, max_bytes, .. } => {
@@ -908,7 +1024,7 @@ impl Node {
                     }
                     let last = c.log.last_seq();
                     let (tx, rx) = oneshot::channel();
-                    c.waiters.insert(last, tx);
+                    c.waiters.entry(last).or_default().push(tx);
                     let bytes = c.log.range(first - 1, last).map(|e| e.data.len()).sum();
                     c.pending.push_back((first, last, Instant::now(), bytes));
                     c.pending_bytes += bytes;
@@ -942,6 +1058,197 @@ impl Node {
             Ok(Err(reason)) => Msg::Failed { reason },
             Err(_) => Msg::Failed { reason: "dropped".into() },
         }
+    }
+
+    /// A host owner's checked events (`Msg::SubmitEvents`): the hooks decide
+    /// each, the ones they accept are appended in order with their meta,
+    /// and each is answered once its entry (or the one it duplicates) has
+    /// committed. An event is decided only once the leader can append it,
+    /// so a decision is never left standing without its entry while this
+    /// term lasts; if the term ends first, the hooks drop the term's
+    /// decisions and the submitter resends to the next leader.
+    pub async fn submit_events(
+        self: &Arc<Self>,
+        items: Vec<Item>,
+        cursors: Bytes,
+        control: Bytes,
+        generation: u64,
+    ) -> Msg {
+        let Some(hooks) = self.cfg.hooks.0.clone() else {
+            return Msg::Failed { reason: "this log takes no relay events".into() };
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let mut commits = self.commit.subscribe();
+        let mut paused = self.paused.subscribe();
+        let epoch = loop {
+            {
+                let mut c = self.core.lock();
+                if c.role != Role::Leader {
+                    return Msg::NotLeader { hint: c.leader.clone().filter(|l| *l != self.cfg.id).unwrap_or_default() };
+                }
+                if !c.paused && c.pending_bytes < self.cfg.max_pending_bytes {
+                    c.admitting += 1;
+                    break c.epoch;
+                }
+            }
+            tokio::select! {
+                _ = commits.changed() => {}
+                _ = paused.changed() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Msg::Failed { reason: "busy: too much uncommitted, or a membership change".into() };
+                }
+            }
+        };
+        let admitting = Admitting(self);
+        let Admission { verdicts, hold } = hooks.admit(epoch, &items, control).await;
+        let mut outcomes = vec![Outcome::Retry("undecided".into()); items.len()];
+        let mut appended = Vec::new();
+        let (rx, first, last, ticket) = {
+            let mut c = self.core.lock();
+            if c.role != Role::Leader || c.epoch != epoch {
+                return Msg::NotLeader { hint: c.leader.clone().filter(|l| *l != self.cfg.id).unwrap_or_default() };
+            }
+            if generation >= c.generation {
+                merge_cursors(&mut c.pending_cursors, &cursors);
+            }
+            let first = c.log.last_seq() + 1;
+            let mut wait_for = 0u64;
+            let mut ride = Bytes::new();
+            for (i, (it, v)) in items.iter().zip(verdicts).enumerate() {
+                match v {
+                    Verdict::Append { meta, ticket } => {
+                        if c.log.last_seq() + 1 == first {
+                            ride = encode_cursors(&std::mem::take(&mut c.pending_cursors));
+                        }
+                        let seq = c.log.last_seq() + 1;
+                        c.log.append_meta(
+                            epoch,
+                            wire::splice_seq(&it.prefix, &it.suffix, seq),
+                            std::mem::take(&mut ride),
+                            meta,
+                        );
+                        appended.push((ticket, seq));
+                        outcomes[i] = Outcome::Appended(seq);
+                        wait_for = seq;
+                    }
+                    Verdict::Answer { outcome, after } => {
+                        outcomes[i] = outcome;
+                        if let Some(a) = after {
+                            wait_for = wait_for.max(a);
+                        }
+                    }
+                }
+            }
+            let last = c.log.last_seq();
+            let n = last + 1 - first;
+            let ticket = (n > 0).then(|| {
+                let bytes = c.log.range(first - 1, last).map(|e| e.data.len()).sum();
+                c.pending.push_back((first, last, Instant::now(), bytes));
+                c.pending_bytes += bytes;
+                self.sync(&mut c)
+            });
+            let rx = (wait_for > c.log.commit()).then(|| {
+                let (tx, rx) = oneshot::channel();
+                c.waiters.entry(wait_for).or_default().push(tx);
+                rx
+            });
+            (rx, first, last, ticket)
+        };
+        drop(admitting);
+        if !appended.is_empty() {
+            hooks.appended(epoch, appended);
+        }
+        drop(hold);
+        if last >= first {
+            self.stats.appended.fetch_add(last + 1 - first, Ordering::Relaxed);
+            self.head.send_replace(last);
+        }
+        if let Some(ticket) = ticket {
+            if let Err(e) = self.settle(ticket).await {
+                let mut c = self.core.lock();
+                self.step_down(&mut c, "persist failed");
+                return Msg::Failed { reason: format!("persist: {e:#}") };
+            }
+            let mut c = self.core.lock();
+            if c.role == Role::Leader && c.epoch == epoch {
+                c.self_durable = c.self_durable.max(last);
+                self.advance_commit(&mut c);
+            }
+        }
+        if let Some(rx) = rx {
+            match rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => return Msg::Failed { reason },
+                Err(_) => return Msg::Failed { reason: "dropped".into() },
+            }
+        }
+        Msg::SubmittedEvents { outcomes, generation: self.core.lock().generation }
+    }
+
+    async fn ask(self: &Arc<Self>, topic: &str, body: Bytes) -> Msg {
+        match topic {
+            "status" => Msg::Answer { body: serde_json::to_vec(&self.status()).unwrap_or_default().into() },
+            "members" => {
+                #[derive(Deserialize)]
+                struct Req {
+                    token: String,
+                    members: Vec<String>,
+                    #[serde(default)]
+                    addrs: BTreeMap<String, String>,
+                }
+                let r: Req = match serde_json::from_slice(&body) {
+                    Ok(r) => r,
+                    Err(e) => return Msg::Failed { reason: format!("bad request: {e}") },
+                };
+                let allowed = self
+                    .cfg
+                    .admin_token
+                    .as_deref()
+                    .is_some_and(|t| !t.is_empty() && vlpds::auth::token_eq(t, &r.token));
+                if !allowed {
+                    return Msg::Failed { reason: "unauthorized: the qlog admin token is required".into() };
+                }
+                match self.change_members(r.members, r.addrs).await {
+                    Ok(st) => Msg::Answer { body: serde_json::to_vec(&st).unwrap_or_default().into() },
+                    Err(e) => match e.downcast_ref::<NotLeading>() {
+                        Some(NotLeading(l)) => Msg::NotLeader { hint: l.clone() },
+                        None => Msg::Failed { reason: format!("{e:#}") },
+                    },
+                }
+            }
+            t if t.starts_with("leader:") && self.core.lock().role != Role::Leader => {
+                let c = self.core.lock();
+                Msg::NotLeader { hint: c.leader.clone().filter(|l| *l != self.cfg.id).unwrap_or_default() }
+            }
+            t => match &self.cfg.hooks.0 {
+                Some(h) => match h.answer(t, body).await {
+                    Some(b) => Msg::Answer { body: b },
+                    None => Msg::Failed { reason: format!("nothing to say about {t}") },
+                },
+                None => Msg::Failed { reason: format!("unknown topic {t}") },
+            },
+        }
+    }
+
+    /// Entries from `from` on, about `max_bytes` of them (at least one if
+    /// any is held): committed ones from memory or the commitlog, the
+    /// uncommitted tail from memory. Empty past the last.
+    pub async fn read_tail(&self, from: u64, max_bytes: usize) -> anyhow::Result<Vec<Entry>> {
+        let commit = self.core.lock().log.commit();
+        if from <= commit {
+            return self.committed_chunk(from, commit, max_bytes).await;
+        }
+        let c = self.core.lock();
+        let mut n = 0;
+        let mut out = Vec::new();
+        for e in c.log.range(from - 1, c.log.last_seq()) {
+            if !out.is_empty() && n + e.data.len() > max_bytes {
+                break;
+            }
+            n += e.data.len();
+            out.push(e.clone());
+        }
+        Ok(out)
     }
 
     fn advance_commit(&self, c: &mut Core) {
@@ -980,7 +1287,7 @@ impl Node {
             }
         }
         let rest = c.waiters.split_off(&(q + 1));
-        for (_, w) in std::mem::replace(&mut c.waiters, rest) {
+        for w in std::mem::replace(&mut c.waiters, rest).into_values().flatten() {
             let _ = w.send(Ok(()));
         }
         self.commit.send_replace(q);
@@ -995,7 +1302,7 @@ impl Node {
         c.role = Role::Follower;
         c.leader = None;
         c.last_heard = Instant::now();
-        for (_, w) in std::mem::take(&mut c.waiters) {
+        for w in std::mem::take(&mut c.waiters).into_values().flatten() {
             let _ = w.send(Err(format!("not leader: {why}")));
         }
         c.pending.clear();
@@ -1868,6 +2175,9 @@ impl Node {
         }
         if !catch_up.is_empty() && catch_up[0].seq == c.emitted + 1 {
             let upto = catch_up.last().expect("non-empty").seq;
+            if let Some(h) = &self.cfg.hooks.0 {
+                h.committed(&catch_up);
+            }
             let ev: Vec<(i64, Bytes)> = catch_up.into_iter().map(|e| (e.seq as i64, e.data)).collect();
             self.emit.emit(c.emitted, upto, ev);
             c.emitted = upto;
@@ -2222,6 +2532,7 @@ impl Node {
                 let last = c.log.last_seq();
                 let holders = self.holders(&c, &target, last);
                 if c.log.commit() == last
+                    && c.admitting == 0
                     && learners.iter().all(|l| holders.contains(l))
                     && holders.len() + quorum(target.len()) > target.len()
                 {
@@ -2419,15 +2730,28 @@ impl Node {
                         break;
                     }
                     let from = c.emitted;
-                    let ev: Vec<(i64, Bytes)> =
-                        c.log.range(from, upto).map(|e| (e.seq as i64, e.data.clone())).collect();
-                    debug_assert_eq!(ev.first().map(|e| e.0 as u64), Some(from + 1));
+                    let ents: Vec<Entry> = c.log.range(from, upto).cloned().collect();
+                    debug_assert_eq!(ents.first().map(|e| e.seq), Some(from + 1));
                     c.emitted = upto;
-                    (from, upto, ev)
+                    (from, upto, ents)
                 };
-                self.emit.emit(from, upto, events);
+                if let Some(h) = &self.cfg.hooks.0 {
+                    h.committed(&events);
+                }
+                self.emit.emit(from, upto, events.into_iter().map(|e| (e.seq as i64, e.data)).collect());
             }
         }
+    }
+}
+
+/// A `SubmitEvents` past its capacity check: a membership barrier waits
+/// until it has appended (or given up).
+struct Admitting<'a>(&'a Node);
+
+impl Drop for Admitting<'_> {
+    fn drop(&mut self) {
+        self.0.core.lock().admitting -= 1;
+        self.0.commit.send_modify(|_| {});
     }
 }
 

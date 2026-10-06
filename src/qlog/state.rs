@@ -3,10 +3,12 @@
 //! `qlog/state`, WAL off, written only by the current leader (opening it
 //! fences the previous one's writer).
 //!
-//! It stands in for the relay's DID state: per DID the seq and content of
-//! its last event (`d/{did}`), per host the highest cursor carried in the
-//! log (`c/{host}`), and the last seq applied (`_applied`). Each applied
-//! batch is written with SlateDB seqnum = its last log seq, so a manifest's
+//! What an entry writes is the leader's to decide (`log::Meta::writes`): the
+//! relay's DID records and host table, keyed as the relay reads them. A
+//! bare test frame (no meta) writes the seq and content of its DID's last
+//! event (`d/{did}`). Every entry's host cursors are kept per host
+//! (`c/{host}`), and the last seq applied as `_applied`. Each applied batch
+//! is written with SlateDB seqnum = its last log seq, so a manifest's
 //! `last_l0_seq` *is* the log seq its state reaches.
 //!
 //! Exactly F: SlateDB only promises a flush or checkpoint holds *at least*
@@ -20,7 +22,7 @@
 
 use super::check::content_id;
 use super::client::parse_test_frame;
-use super::log::{Entry, decode_cursors};
+use super::log::{Entry, Meta, decode_cursors};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use slatedb::config::{CheckpointOptions, CheckpointScope, WriteOptions};
@@ -122,13 +124,23 @@ pub fn did_value(seq: u64, content: u64) -> [u8; 16] {
     v
 }
 
-/// A DID and its state value.
-pub type DidValue = (String, [u8; 16]);
+/// What one entry writes to the state (the verifier replays the same): its
+/// meta's writes, or for a bare test frame its DID's `d/` row; and the host
+/// cursors it carries.
+/// An entry's state writes and the host cursors it carries.
+pub type Effects = (Vec<(Bytes, Bytes)>, Vec<(String, u64)>);
 
-/// What one entry does to the state (the verifier replays the same).
-pub fn effects(e: &Entry) -> (Option<DidValue>, Vec<(String, u64)>) {
-    let did = parse_test_frame(&e.data).map(|(_, did, _)| (did, did_value(e.seq, content_id(&e.data))));
-    (did, decode_cursors(&e.cursors))
+pub fn effects(e: &Entry) -> Effects {
+    let writes = if e.meta.is_empty() {
+        parse_test_frame(&e.data)
+            .map(|(_, did, _)| {
+                vec![(Bytes::from(did_key(&did)), Bytes::copy_from_slice(&did_value(e.seq, content_id(&e.data))))]
+            })
+            .unwrap_or_default()
+    } else {
+        Meta::decode(&e.meta).map(|m| m.writes).unwrap_or_default()
+    };
+    (writes, decode_cursors(&e.cursors))
 }
 
 pub struct State {
@@ -222,6 +234,12 @@ impl State {
         &self.cursors
     }
 
+    /// The database, for readers of what's applied (the relay's leader
+    /// reads its DID records here); only `apply` and `jump` write it.
+    pub fn db(&self) -> Db {
+        self.db.clone()
+    }
+
     /// Applies `entries` (consecutive, from `applied + 1`) as one batch.
     pub async fn apply(&mut self, entries: &[Entry]) -> anyhow::Result<()> {
         let Some(last) = entries.last() else { return Ok(()) };
@@ -233,9 +251,9 @@ impl State {
         );
         let mut b = WriteBatch::new();
         for e in entries {
-            let (did, cursors) = effects(e);
-            if let Some((did, v)) = did {
-                b.put(did_key(&did), v);
+            let (writes, cursors) = effects(e);
+            for (k, v) in writes {
+                b.put(k, v);
             }
             for (h, c) in cursors {
                 let cur = self.cursors.entry(h.clone()).or_default();

@@ -22,7 +22,7 @@
 //! deleted on their own. Recovery truncates a torn tail in the last segment
 //! at its first bad record. Anything past the last fsync was never acked.
 
-use super::log::{Entry, Log, Op};
+use super::log::{Entry, Log, Op, decode_side, encode_side};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -44,8 +44,8 @@ const T_TRUNCATE: u8 = 2;
 const T_RESET: u8 = 3;
 const T_PROMISE: u8 = 4;
 const T_COMMIT: u8 = 5;
-/// An append whose entry carries host cursors: `epoch, seq, clen u32,
-/// cursors, data`.
+/// An append whose entry carries host cursors or meta: `epoch, seq, slen
+/// u32, side, data`, the side being `log::encode_side`.
 const T_APPEND_C: u8 = 6;
 const T_HEADER: u8 = 0x10;
 
@@ -112,7 +112,8 @@ pub struct Recovered {
 struct Loc {
     epoch: u64,
     seg: u64,
-    /// Where the data starts; the cursors (`clen` bytes) sit right before it.
+    /// Where the data starts; the side (`clen` bytes: cursors and meta) sits
+    /// right before it.
     off: u64,
     len: u32,
     clen: u32,
@@ -269,17 +270,22 @@ fn rec(buf: &mut Vec<u8>, ty: u8, parts: &[&[u8]]) -> usize {
 
 /// Appends an entry's record; returns where its data starts in `buf`.
 fn rec_append(buf: &mut Vec<u8>, e: &Entry) -> usize {
-    if e.cursors.is_empty() {
+    let side = encode_side(&e.cursors, &e.meta);
+    if side.is_empty() {
         return rec(buf, T_APPEND, &[&e.epoch.to_le_bytes(), &e.seq.to_le_bytes(), &e.data]) + 16;
     }
-    let clen = e.cursors.len() as u32;
-    rec(buf, T_APPEND_C, &[&e.epoch.to_le_bytes(), &e.seq.to_le_bytes(), &clen.to_le_bytes(), &e.cursors, &e.data])
+    let slen = side.len() as u32;
+    rec(buf, T_APPEND_C, &[&e.epoch.to_le_bytes(), &e.seq.to_le_bytes(), &slen.to_le_bytes(), &side, &e.data])
         + 20
-        + e.cursors.len()
+        + side.len()
+}
+
+fn side_len(e: &Entry) -> u32 {
+    if e.cursors.is_empty() && e.meta.is_empty() { 0 } else { (4 + e.cursors.len() + e.meta.len()) as u32 }
 }
 
 fn loc_of(e: &Entry, seg: u64, off: u64) -> Loc {
-    Loc { epoch: e.epoch, seg, off, len: e.data.len() as u32, clen: e.cursors.len() as u32 }
+    Loc { epoch: e.epoch, seg, off, len: e.data.len() as u32, clen: side_len(e) }
 }
 
 fn rec_header(buf: &mut Vec<u8>, base_epoch: u64, base_seq: u64, p: &Promised) {
@@ -399,7 +405,7 @@ impl CommitLog {
                         let (head, clen) = if ty == T_APPEND_C {
                             let clen = u32::from_le_bytes(pl[16..20].try_into().expect("4 bytes")) as usize;
                             if 20 + clen > pl.len() {
-                                return Err(bad("a cursor length past the record"));
+                                return Err(bad("a side length past the record"));
                             }
                             (20 + clen, clen)
                         } else {
@@ -631,8 +637,8 @@ fn read_resolved(r: Resolved) -> std::io::Result<Vec<Entry>> {
             let mut b = vec![0u8; (l.clen + l.len) as usize];
             f.read_exact_at(&mut b, l.off - l.clen as u64)?;
             let mut data = Bytes::from(b);
-            let cursors = data.split_to(l.clen as usize);
-            Ok(Entry { epoch: l.epoch, seq, data, cursors })
+            let (cursors, meta) = decode_side(data.split_to(l.clen as usize));
+            Ok(Entry { epoch: l.epoch, seq, data, cursors, meta })
         })
         .collect()
 }

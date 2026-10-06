@@ -20,12 +20,85 @@ pub struct Entry {
     /// events at lower seqs, so the state and a flush at any seq F hold
     /// cursors that never get ahead of the log at F.
     pub cursors: Bytes,
+    /// What the relay's leader decided about the event (`node::Hooks`):
+    /// its state change and where it came from. Replicated, journaled and
+    /// flushed with it, never emitted; empty for a bare frame.
+    pub meta: Bytes,
 }
 
 impl Entry {
     pub fn new(epoch: u64, seq: u64, data: Bytes) -> Entry {
-        Entry { epoch, seq, data, cursors: Bytes::new() }
+        Entry { epoch, seq, data, cursors: Bytes::new(), meta: Bytes::new() }
     }
+}
+
+/// An entry's meta as the log reads it: the state writes the leader decided
+/// on (applied once the entry commits, in seq order, and replayed the same
+/// by `flush::verify`), and the rest, which only the hooks read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Meta {
+    pub writes: Vec<(Bytes, Bytes)>,
+    pub ext: Bytes,
+}
+
+impl Meta {
+    /// `n u16 | (klen u16 | key | vlen u32 | value)* | ext`, little endian.
+    pub fn encode(&self) -> Bytes {
+        let mut b = Vec::with_capacity(
+            2 + self.writes.iter().map(|(k, v)| 6 + k.len() + v.len()).sum::<usize>() + self.ext.len(),
+        );
+        b.extend_from_slice(&(self.writes.len() as u16).to_le_bytes());
+        for (k, v) in &self.writes {
+            b.extend_from_slice(&(k.len() as u16).to_le_bytes());
+            b.extend_from_slice(k);
+            b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            b.extend_from_slice(v);
+        }
+        b.extend_from_slice(&self.ext);
+        b.into()
+    }
+
+    /// None for malformed meta.
+    pub fn decode(m: &Bytes) -> Option<Meta> {
+        let mut m = m.clone();
+        let take = |m: &mut Bytes, n: usize| (m.len() >= n).then(|| m.split_to(n));
+        let n = u16::from_le_bytes(take(&mut m, 2)?.as_ref().try_into().ok()?) as usize;
+        let mut writes = Vec::with_capacity(n);
+        for _ in 0..n {
+            let kl = u16::from_le_bytes(take(&mut m, 2)?.as_ref().try_into().ok()?) as usize;
+            let k = take(&mut m, kl)?;
+            let vl = u32::from_le_bytes(take(&mut m, 4)?.as_ref().try_into().ok()?) as usize;
+            writes.push((k, take(&mut m, vl)?));
+        }
+        Some(Meta { writes, ext: m })
+    }
+}
+
+/// An entry's cursors and meta in one blob, for the commitlog and the
+/// bucket segments: `cursors len u32 | cursors | meta` (empty when both are).
+pub fn encode_side(cursors: &[u8], meta: &[u8]) -> Bytes {
+    if cursors.is_empty() && meta.is_empty() {
+        return Bytes::new();
+    }
+    let mut b = Vec::with_capacity(4 + cursors.len() + meta.len());
+    b.extend_from_slice(&(cursors.len() as u32).to_le_bytes());
+    b.extend_from_slice(cursors);
+    b.extend_from_slice(meta);
+    b.into()
+}
+
+/// (cursors, meta) of an [`encode_side`] blob; malformed input yields none.
+pub fn decode_side(mut side: Bytes) -> (Bytes, Bytes) {
+    if side.len() < 4 {
+        return (Bytes::new(), Bytes::new());
+    }
+    let n = u32::from_le_bytes(side[..4].try_into().expect("4 bytes")) as usize;
+    if 4 + n > side.len() {
+        return (Bytes::new(), Bytes::new());
+    }
+    let _ = side.split_to(4);
+    let cursors = side.split_to(n);
+    (cursors, side)
 }
 
 /// `n u32 | (len u16 | host | cursor u64)*`, little endian.
@@ -200,8 +273,12 @@ impl Log {
     }
 
     pub fn append_with(&mut self, epoch: u64, data: Bytes, cursors: Bytes) -> u64 {
+        self.append_meta(epoch, data, cursors, Bytes::new())
+    }
+
+    pub fn append_meta(&mut self, epoch: u64, data: Bytes, cursors: Bytes, meta: Bytes) -> u64 {
         let seq = self.last_seq() + 1;
-        self.push(Entry { epoch, seq, data, cursors });
+        self.push(Entry { epoch, seq, data, cursors, meta });
         seq
     }
 
@@ -343,6 +420,19 @@ impl Log {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meta_and_side_round_trip() {
+        let m = Meta {
+            writes: vec![(Bytes::from_static(b"k1"), Bytes::from_static(b"v1")), (Bytes::new(), Bytes::new())],
+            ext: Bytes::from_static(b"ext"),
+        };
+        assert_eq!(Meta::decode(&m.encode()), Some(m.clone()));
+        assert_eq!(Meta::decode(&Bytes::from_static(b"\x01")), None);
+        let side = encode_side(b"cur", &m.encode());
+        assert_eq!(decode_side(side), (Bytes::from_static(b"cur"), m.encode()));
+        assert!(encode_side(b"", b"").is_empty());
+    }
     use rand::{Rng, SeedableRng};
 
     fn e(epoch: u64, seq: u64) -> Entry {

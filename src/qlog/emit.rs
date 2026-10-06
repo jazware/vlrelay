@@ -40,7 +40,7 @@ pub struct Emitter {
     /// backfilled from there, and above the last flush from the node's own
     /// log (`set_local_tail`).
     store: Option<vlpds::store::Store>,
-    owner: OnceLock<Weak<super::node::Node>>,
+    owner: Arc<OnceLock<Weak<super::node::Node>>>,
 }
 
 impl Emitter {
@@ -58,7 +58,7 @@ impl Emitter {
             ordinal: AtomicU64::new(0),
             tap,
             store: None,
-            owner: OnceLock::new(),
+            owner: Arc::new(OnceLock::new()),
         })
     }
 
@@ -85,30 +85,37 @@ impl Emitter {
         self.live.get().map(|l| &l.fh)
     }
 
+    /// Starts the firehose now, counting from `floor` (where this node's
+    /// emission will start, as its recovered log says), with `opts` (the
+    /// relay's serving options): the relay serves it before anything
+    /// commits. A later first emission above the floor is a jump, as for
+    /// any node reset past what it emitted.
+    pub fn start_firehose(&self, floor: u64, opts: firehose::Options) -> Arc<Firehose> {
+        self.live.get_or_init(|| self.make(floor, opts)).fh.clone()
+    }
+
+    fn make(&self, floor: u64, opts: firehose::Options) -> Live {
+        let fh = Firehose::new(firehose::Options { start_floor: Some(floor as i64), ..opts });
+        if let Some(store) = &self.store {
+            *fh.store.write() = Some(store.clone());
+            // one followed log never waits on another, so nothing queues;
+            // and a spill's read-back would want bucket ordinals, which
+            // these batches don't have
+            fh.set_max_queue_bytes(usize::MAX);
+            fh.set_local_tail(Arc::new(Tail(self.owner.clone())));
+        }
+        let (_, wm) = fh.add_remote(LOG_ID);
+        let (tx, rx) = mpsc::unbounded_channel();
+        fh.spawn_merger(rx);
+        Live { fh, tx, wm }
+    }
+
     /// Committed entries `(after, upto]`, in order. The batch goes in before
     /// the watermark moves: the merger reads the watermark, then drains, so
     /// it never holds a watermark past events it hasn't been given.
     pub fn emit(&self, after: u64, upto: u64, events: Vec<(i64, Bytes)>) {
         let live = self.live.get_or_init(|| {
-            let fh = Firehose::new(firehose::Options {
-                ring_bytes: self.ring_bytes,
-                start_floor: Some(after as i64),
-                ..firehose::Options::default()
-            });
-            if let Some(store) = &self.store {
-                *fh.store.write() = Some(store.clone());
-                // one followed log never waits on another, so nothing queues;
-                // and a spill's read-back would want bucket ordinals, which
-                // these batches don't have
-                fh.set_max_queue_bytes(usize::MAX);
-                if let Some(n) = self.owner.get() {
-                    fh.set_local_tail(Arc::new(Tail(n.clone())));
-                }
-            }
-            let (_, wm) = fh.add_remote(LOG_ID);
-            let (tx, rx) = mpsc::unbounded_channel();
-            fh.spawn_merger(rx);
-            Live { fh, tx, wm }
+            self.make(after, firehose::Options { ring_bytes: self.ring_bytes, ..firehose::Options::default() })
         });
         if let Some(tap) = &self.tap {
             let _ =
@@ -120,11 +127,19 @@ impl Emitter {
     }
 }
 
-struct Tail(Weak<super::node::Node>);
+/// The node is attached after the emitter is made (and maybe after its
+/// firehose starts), so it's looked up on each read.
+struct Tail(Arc<OnceLock<Weak<super::node::Node>>>);
+
+impl Tail {
+    fn node(&self) -> Option<Arc<super::node::Node>> {
+        self.0.get().and_then(|w| w.upgrade())
+    }
+}
 
 impl firehose::LocalTail for Tail {
     fn floor(&self) -> i64 {
-        self.0.upgrade().map_or(i64::MAX, |n| n.readable_floor() as i64)
+        self.node().map_or(i64::MAX, |n| n.readable_floor() as i64)
     }
 
     fn read(
@@ -134,7 +149,7 @@ impl firehose::LocalTail for Tail {
         max_bytes: usize,
     ) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<(i64, Bytes)>>> {
         Box::pin(async move {
-            let n = self.0.upgrade().ok_or_else(|| anyhow::anyhow!("node gone"))?;
+            let n = self.node().ok_or_else(|| anyhow::anyhow!("node gone"))?;
             let es = n.committed_chunk(after as u64 + 1, until as u64, max_bytes).await?;
             Ok(es.into_iter().map(|e| (e.seq as i64, e.data)).collect())
         })
@@ -195,6 +210,15 @@ pub fn router(node: Arc<super::node::Node>, admin: Admin) -> axum::Router {
         .route("/qlog/status", axum::routing::get(status))
         .route("/qlog/members", axum::routing::post(members).layer(axum::Extension(Arc::new(admin))))
         .route("/metrics", axum::routing::get(metrics))
+        .with_state(node)
+}
+
+/// `/qlog/status` and `POST /qlog/members` alone, for a relay node that
+/// serves subscribeRepos and `/metrics` itself.
+pub fn control_router(node: Arc<super::node::Node>, admin: Admin) -> axum::Router {
+    axum::Router::new()
+        .route("/qlog/status", axum::routing::get(status))
+        .route("/qlog/members", axum::routing::post(members).layer(axum::Extension(Arc::new(admin))))
         .with_state(node)
 }
 

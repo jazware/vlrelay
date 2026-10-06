@@ -375,6 +375,14 @@ pub async fn lead(node: Arc<Node>, epoch: u64, o: Options) {
     if let Err(e) = l.run().await {
         tracing::warn!(epoch, "qlog flush: stopped: {e:#}");
         l.node.flush.s.lock().failed += 1;
+        // a leader with no flush loop has no applier either: whatever needs
+        // its state would wait on it for good
+        if l.node.cfg.hooks.0.is_some() {
+            l.node.step_down_from(epoch, "the flush loop stopped");
+        }
+    }
+    if let Some(h) = &l.node.cfg.hooks.0 {
+        h.term_ended(epoch);
     }
 }
 
@@ -473,6 +481,12 @@ impl Leader {
             self.man.flushed
         );
         tracing::info!(epoch = self.epoch, applied = st.applied(), "qlog flush: state open");
+        if let Some(h) = self.node.cfg.hooks.0.clone()
+            && let Err(e) = h.state_opened(&self.node, self.epoch, st.db(), st.applied()).await
+        {
+            st.close().await;
+            return Err(e.context("the hooks' state"));
+        }
         let r = self.drive(&mut st).await;
         if !self.crashed {
             st.close().await;
@@ -490,6 +504,9 @@ impl Leader {
             while st.applied() < commit {
                 let chunk = self.node.committed_chunk(st.applied() + 1, commit, 4 << 20).await?;
                 st.apply(&chunk).await?;
+                if let Some(h) = &self.node.cfg.hooks.0 {
+                    h.state_applied(self.epoch, st.applied());
+                }
                 if !urgent && tokio::time::Instant::now() >= next_flush {
                     break;
                 }
@@ -747,10 +764,10 @@ async fn load_segment(store: &Store, ord: u64, cache: &mut SegCache) -> anyhow::
     {
         return Ok(Some(es.clone()));
     }
-    let Some(segment::LogObject::Segment(_, ents)) = nodelog::read_object(store, LOG_ID, ord).await? else {
+    let Some((_, ents)) = read_segment(store, ord).await? else {
         return Ok(None);
     };
-    let es: Arc<Vec<Entry>> = Arc::new(ents.into_iter().map(|e| Entry::new(e.epoch, e.seq as u64, e.frame)).collect());
+    let es: Arc<Vec<Entry>> = Arc::new(ents);
     *cache = Some((ord, es.clone()));
     Ok(Some(es))
 }
@@ -819,8 +836,49 @@ impl std::fmt::Display for Crash {
 
 impl std::error::Error for Crash {}
 
+/// An entry's cursors and meta ride its segment entry as one mutation, so
+/// what's flushed replays the state exactly (`verify`, recovery's orphans,
+/// a follower caught up from the bucket).
+const SIDE_KEY: &[u8] = b"qside";
+
 fn push(b: &mut SegmentBuilder, e: &Entry) {
-    b.push(e.seq as i64, ShardId(0), e.epoch, |out| out.extend_from_slice(&e.data), &[]);
+    let side = super::log::encode_side(&e.cursors, &e.meta);
+    let muts = if side.is_empty() {
+        Vec::new()
+    } else {
+        vec![segment::Mutation { key: bytes::Bytes::from_static(SIDE_KEY), val: Some(side) }]
+    };
+    b.push(e.seq as i64, ShardId(0), e.epoch, |out| out.extend_from_slice(&e.data), &muts);
+}
+
+fn entry_of(e: segment::SegEntry) -> Entry {
+    let mut out = Entry::new(e.epoch, e.seq as u64, e.frame);
+    if let Some(side) = e.muts.into_iter().find(|m| m.key.as_ref() == SIDE_KEY).and_then(|m| m.val) {
+        (out.cursors, out.meta) = super::log::decode_side(side);
+    }
+    out
+}
+
+/// Segment `ord`'s entries with their cursors and meta, if it exists.
+pub async fn read_entries(store: &Store, ord: u64) -> anyhow::Result<Option<Vec<Entry>>> {
+    Ok(read_segment(store, ord).await?.map(|(_, es)| es))
+}
+
+/// A segment with its entries' cursors and meta (vlpds's `read_object`
+/// skips mutations).
+async fn read_segment(store: &Store, ord: u64) -> anyhow::Result<Option<(segment::SegHeader, Vec<Entry>)>> {
+    let data = match store.raw.get(&nodelog::segment_path(store, LOG_ID, ord)).await {
+        Ok(r) => r.bytes().await?,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    match segment::parse(data, true, None)? {
+        segment::LogObject::Segment(h, ents) => {
+            nodelog::check_header(&h, LOG_ID, ord)?;
+            Ok(Some((h, ents.into_iter().map(entry_of).collect())))
+        }
+        segment::LogObject::Fence { .. } => anyhow::bail!("qlog: ordinal {ord} is a fence"),
+    }
 }
 
 /// What `verify` found.
@@ -843,6 +901,8 @@ pub struct Verified {
     /// segment left, which must continue the log from here.
     pub pruned: u64,
     pub entries: u64,
+    /// Entries with the relay's meta (state writes the leader decided).
+    pub relay_entries: u64,
     pub dids: u64,
     pub hosts: u64,
 }
@@ -886,17 +946,20 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
         Some(r) if m.flushed > 0 => Some((r.clone(), state::read_checkpoint(store, r).await?)),
         _ => None,
     };
-    let mut dids: BTreeMap<String, [u8; 16]> = BTreeMap::new();
+    let mut rows: BTreeMap<bytes::Bytes, bytes::Bytes> = BTreeMap::new();
     let mut hosts: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     v.pruned = super::retain::pruned_seq(store).await?;
     let mut last = v.pruned;
     let mut ord = if v.pruned > 0 { oldest_segment(store).await?.unwrap_or(m.next_ordinal) } else { 0 };
     v.gaps = m.gaps.len() as u64;
     loop {
-        let Some(obj) = nodelog::read_object(store, LOG_ID, ord).await? else { break };
-        let segment::LogObject::Segment(h, ents) = obj else {
-            bad(&mut v, format!("ordinal {ord} is a fence"));
-            break;
+        let (h, ents) = match read_segment(store, ord).await {
+            Ok(Some(x)) => x,
+            Ok(None) => break,
+            Err(e) => {
+                bad(&mut v, format!("ordinal {ord}: {e:#}"));
+                break;
+            }
         };
         if ord >= m.next_ordinal && (h.first_seq as u64) <= m.flushed {
             v.stale += 1;
@@ -907,20 +970,22 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
             bad(&mut v, format!("segment {ord} starts at {}, after {last}", h.first_seq));
         }
         for e in ents {
-            if !m.continues(last, e.seq as u64) {
+            if !m.continues(last, e.seq) {
                 bad(&mut v, format!("segment {ord}: seq {} after {last}", e.seq));
             }
-            last = e.seq as u64;
+            last = e.seq;
             if ord >= m.next_ordinal || last > m.flushed {
                 continue;
             }
             v.entries += 1;
-            let ent = Entry::new(e.epoch, last, e.frame.clone());
-            if let (Some((did, val)), _) = state::effects(&ent) {
-                if let Some((h, n)) = host_event(&did) {
+            if !e.meta.is_empty() {
+                v.relay_entries += 1;
+            }
+            for (k, val) in state::effects(&e).0 {
+                if let Some((h, n)) = k.strip_prefix(b"d/").and_then(|d| host_event(std::str::from_utf8(d).ok()?)) {
                     hosts.entry(h.to_string()).or_default().push(n);
                 }
-                dids.insert(did, val);
+                rows.insert(k, val);
             }
         }
         if ord < m.next_ordinal {
@@ -953,29 +1018,41 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
                 if applied != Some(m.flushed) {
                     bad(&mut v, format!("state's _applied is {applied:?}, F is {}", m.flushed));
                 }
-                let mut state_dids = 0u64;
-                let mut pruned_dids = 0u64;
+                let mut state_rows = 0u64;
+                let mut pruned_rows = 0u64;
                 let mut state_cursors = BTreeMap::new();
                 for (k, val) in &kv {
-                    if let Some(did) = k.strip_prefix(b"d/") {
-                        state_dids += 1;
-                        let did = String::from_utf8_lossy(did);
-                        let seq = u64::from_be_bytes(val[..8].try_into().unwrap_or([0; 8]));
-                        match dids.get(did.as_ref()) {
-                            Some(x) if x[..] == val[..] => {}
-                            Some(_) => bad(&mut v, format!("state holds {did} at another seq or content than the log")),
-                            None if seq <= v.pruned => pruned_dids += 1,
-                            None => bad(&mut v, format!("state holds {did}, which isn't in the log up to F")),
-                        }
-                    } else if let Some(h) = k.strip_prefix(b"c/") {
+                    if k.as_ref() == state::applied_key() {
+                        continue;
+                    }
+                    if let Some(h) = k.strip_prefix(b"c/") {
                         state_cursors.insert(
                             String::from_utf8_lossy(h).into_owned(),
                             u64::from_be_bytes(val[..8].try_into().unwrap_or([0; 8])),
                         );
+                        continue;
+                    }
+                    state_rows += 1;
+                    let name = || String::from_utf8_lossy(k).into_owned();
+                    match rows.get(k) {
+                        Some(x) if x == val => {}
+                        Some(_) => bad(&mut v, format!("state holds {} with another value than the log", name())),
+                        // a test frame's row carries its seq; the relay's
+                        // don't, so past retention a row the remaining log
+                        // doesn't hold is taken as pruned
+                        None if k.starts_with(b"d/") => {
+                            if u64::from_be_bytes(val[..8].try_into().unwrap_or([0; 8])) <= v.pruned {
+                                pruned_rows += 1;
+                            } else {
+                                bad(&mut v, format!("state holds {}, which isn't in the log up to F", name()));
+                            }
+                        }
+                        None if v.pruned > 0 => pruned_rows += 1,
+                        None => bad(&mut v, format!("state holds {}, which isn't in the log up to F", name())),
                     }
                 }
-                if state_dids != dids.len() as u64 + pruned_dids {
-                    bad(&mut v, format!("state holds {state_dids} DIDs, the log up to F {}", dids.len()));
+                if state_rows != rows.len() as u64 + pruned_rows {
+                    bad(&mut v, format!("state holds {state_rows} rows, the log up to F {}", rows.len()));
                 }
                 if state_cursors != m.cursors {
                     bad(&mut v, "the state's cursors aren't the manifest's".into());
@@ -987,6 +1064,12 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
         let mut ns = hosts.remove(h).unwrap_or_default();
         ns.sort_unstable();
         ns.dedup();
+        // a relay's host sends events the log never holds (duplicates,
+        // rejections), so only a test load's hosts are numbered densely
+        if ns.is_empty() && v.relay_entries > 0 {
+            v.hosts += 1;
+            continue;
+        }
         let from = match ns.first() {
             Some(&f) if v.pruned > 0 => f,
             // every event of it pruned: nothing left to hold the cursor to
@@ -1002,7 +1085,7 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
         }
         v.hosts += 1;
     }
-    v.dids = dids.len() as u64;
+    v.dids = rows.len() as u64;
     v.ok = v.messages.is_empty();
     Ok(v)
 }
@@ -1030,9 +1113,7 @@ pub struct RecoveryPoint {
     pub etag: String,
     /// Segments past the manifest that continue the log: a flush that died
     /// before its CAS. Every flush writes committed entries only, so they
-    /// are adopted and move F (their entries carry no host cursors:
-    /// segments don't keep them, so the cursors stay at the manifest's,
-    /// which only costs more re-ingest).
+    /// are adopted and move F, their entries' cursors and meta with them.
     pub orphans: Vec<(SegRef, Vec<Entry>)>,
     /// F': the manifest's F, or the last orphan's end.
     pub flushed: u64,
@@ -1047,7 +1128,7 @@ pub async fn recovery_point(store: &Store) -> anyhow::Result<Option<RecoveryPoin
     let mut last = m.flushed;
     let mut ord = m.next_ordinal;
     loop {
-        let Some(segment::LogObject::Segment(h, ents)) = nodelog::read_object(store, LOG_ID, ord).await? else {
+        let Some((h, es)) = read_segment(store, ord).await? else {
             break;
         };
         let first = h.first_seq as u64;
@@ -1061,7 +1142,6 @@ pub async fn recovery_point(store: &Store) -> anyhow::Result<Option<RecoveryPoin
             tracing::warn!(ord, first, last, "qlog recovery: a segment past the manifest doesn't continue the log");
             break;
         }
-        let es: Vec<Entry> = ents.into_iter().map(|e| Entry::new(e.epoch, e.seq as u64, e.frame)).collect();
         let Some(end) = es.last().map(|e| e.seq) else { break };
         // committed entries never pass R, so neither can a flush of them
         anyhow::ensure!(end <= m.reserve, "qlog recovery: segment {ord} ends at {end}, past R {}", m.reserve);
