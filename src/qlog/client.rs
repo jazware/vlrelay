@@ -84,6 +84,17 @@ pub struct Client {
     avoid: Mutex<Option<(String, std::time::Instant)>>,
     pub timeout: Duration,
     pub retries: AtomicU64,
+    /// The bucket recovery generation this submitter last rewound its hosts
+    /// for (`rewound`); every submit carries it.
+    generation: AtomicU64,
+}
+
+/// A commit: the first seq, how many, and the leader's recovery generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Acked {
+    pub first: u64,
+    pub n: u64,
+    pub generation: u64,
 }
 
 impl Client {
@@ -99,6 +110,7 @@ impl Client {
             // waiting much longer than that only adds to the pause.
             timeout: Duration::from_millis(1000),
             retries: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -142,7 +154,48 @@ impl Client {
     /// As `submit`, carrying host cursors (`log::encode_cursors`) that
     /// count only events already acked.
     pub async fn submit_with(&self, frames: Vec<(Bytes, Bytes)>, cursors: Bytes) -> (u64, u64) {
-        let m = Msg::Submit { frames, cursors };
+        let a = self.submit_acked(frames, cursors, self.generation()).await;
+        (a.first, a.n)
+    }
+
+    /// The generation this submitter has rewound for.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// The submitter has re-read its hosts from recovery `g`'s cursors:
+    /// its cursors count from there now.
+    pub fn rewound(&self, g: u64) {
+        self.generation.fetch_max(g, Ordering::AcqRel);
+    }
+
+    /// Where bucket recovery `at_least` (or a later one) left each host:
+    /// (generation, cursors). Asks until a leader knows.
+    pub async fn recovery_cursors(&self, at_least: u64) -> (u64, std::collections::BTreeMap<String, u64>) {
+        loop {
+            if let Some(c) = self.conn().await {
+                match c.call(&Msg::Cursors, self.timeout).await {
+                    Some(Msg::CursorsResp { generation, known: true, cursors }) if generation >= at_least => {
+                        return (generation, super::log::decode_cursors(&cursors).into_iter().collect());
+                    }
+                    Some(_) => {}
+                    None => {
+                        c.dead.store(true, Ordering::Release);
+                        self.drop_conn(&c).await;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// As `submit_with`, with `cursors` computed as of recovery generation
+    /// `cursor_generation` (read with them, under whatever lock orders them
+    /// with a rewind), and the leader's generation in the answer: higher
+    /// than `generation()`, the events since that recovery's cursors are to
+    /// be sent again (they may be lost).
+    pub async fn submit_acked(&self, frames: Vec<(Bytes, Bytes)>, cursors: Bytes, cursor_generation: u64) -> Acked {
+        let m = Msg::Submit { frames, cursors, generation: cursor_generation };
         loop {
             let Some(c) = self.conn().await else {
                 self.retries.fetch_add(1, Ordering::Relaxed);
@@ -150,7 +203,7 @@ impl Client {
                 continue;
             };
             match c.call(&m, self.timeout).await {
-                Some(Msg::Submitted { first, n }) => return (first, n),
+                Some(Msg::Submitted { first, n, generation }) => return Acked { first, n, generation },
                 Some(Msg::NotLeader { hint }) => {
                     if !hint.is_empty() {
                         *self.hint.lock() = Some(hint);

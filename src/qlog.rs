@@ -17,6 +17,13 @@
 //! - `flush`: every interval the leader seals `state` at a committed seq F,
 //!   uploads the log to F as vlpds segments and CASes `qlog/manifest`.
 //!
+//! - `retain`: what bucket retention could delete, reported first.
+//!
+//! A lost quorum (no quorum of intact logs can exist) is a bucket recovery:
+//! the log resumes at the last manifest's R + 1 (`flush::recover`, run by
+//! `node`'s takeover). A one-member config is the single node: its
+//! commitlog is the WAL and the emit point.
+//!
 //! Memory-only (`node::MemoryOnly`) remains for comparison.
 
 pub mod check;
@@ -26,6 +33,7 @@ pub mod emit;
 pub mod flush;
 pub mod log;
 pub mod node;
+pub mod retain;
 pub mod state;
 pub mod wire;
 

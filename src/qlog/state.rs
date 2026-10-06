@@ -31,16 +31,33 @@ use vlpds::store::Store;
 
 const APPLIED: &[u8] = b"_applied";
 
-/// The state a manifest names: a checkpoint of `qlog/state` at `seq`.
+/// Where the state lives until a bucket recovery clones it elsewhere.
+pub const DEFAULT_PATH: &str = "qlog/state";
+
+fn default_path() -> String {
+    DEFAULT_PATH.into()
+}
+
+/// The state a manifest names: a checkpoint of the SlateDB at `path`
+/// (under the store's prefix) at `seq`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateRef {
+    #[serde(default = "default_path")]
+    pub path: String,
     pub checkpoint: String,
     pub manifest_id: u64,
     pub seq: u64,
 }
 
-pub fn db_path(store: &Store) -> String {
-    format!("{}/qlog/state", store.prefix)
+pub fn db_path(store: &Store, rel: &str) -> String {
+    format!("{}/{rel}", store.prefix)
+}
+
+/// The path a bucket recovery by `epoch` clones the state to: one per
+/// attempt, so a recovery cut short is resumed (SlateDB's clone is
+/// idempotent for the same source) or left for the retention report.
+pub fn recovery_path(epoch: u64) -> String {
+    format!("qlog/state-e{epoch}")
 }
 
 fn settings(l0_bytes: usize) -> slatedb::Settings {
@@ -84,6 +101,7 @@ pub fn effects(e: &Entry) -> (Option<(String, [u8; 16])>, Vec<(String, u64)>) {
 
 pub struct State {
     db: Db,
+    rel: String,
     path: String,
     store: Store,
     applied: u64,
@@ -94,16 +112,16 @@ impl State {
     /// Opens `qlog/state` as its writer, at whatever its last durable flush
     /// reached (at or past the last manifest's F: the leader seals before it
     /// writes a manifest, and applies only committed entries).
-    pub async fn open(store: &Store) -> anyhow::Result<State> {
+    pub async fn open(store: &Store, rel: &str) -> anyhow::Result<State> {
         // a flush interval's state changes fit one memtable at today's rates
         // (~100 B a DID), so most seals upload one L0
-        State::open_with(store, 64 << 20).await
+        State::open_with(store, rel, 64 << 20).await
     }
 
     /// With L0s cut at `l0_bytes` (tests: small, so memtables freeze and
     /// upload on their own between seals).
-    pub async fn open_with(store: &Store, l0_bytes: usize) -> anyhow::Result<State> {
-        let path = db_path(store);
+    pub async fn open_with(store: &Store, rel: &str, l0_bytes: usize) -> anyhow::Result<State> {
+        let path = db_path(store, rel);
         let db = Db::builder(path.clone(), store.raw.clone()).with_settings(settings(l0_bytes)).build().await?;
         let applied = match db.get(APPLIED).await? {
             Some(v) => u64::from_be_bytes(v.as_ref().try_into()?),
@@ -115,7 +133,53 @@ impl State {
             let host = String::from_utf8_lossy(&kv.key[2..]).into_owned();
             cursors.insert(host, u64::from_be_bytes(kv.value.as_ref().try_into()?));
         }
-        Ok(State { db, path, store: store.clone(), applied, cursors })
+        Ok(State { db, rel: rel.to_string(), path, store: store.clone(), applied, cursors })
+    }
+
+    /// The state at exactly `from` (a manifest's checkpoint), as a new
+    /// database at `rel` that this process writes: SlateDB has no restore,
+    /// and the source's latest state can be past the checkpoint (the old
+    /// leader kept applying, and memtables flush on their own). A clone is
+    /// a new manifest over the checkpoint's SSTs, O(1) in the state's size;
+    /// rewriting every key changed past F in place would scan the whole
+    /// state. The clone pins its source with a checkpoint of its own, so
+    /// the source's SSTs stay until that's released. `None`: no flush ever
+    /// sealed a state, so it starts empty.
+    pub async fn recover(store: &Store, from: Option<&StateRef>, rel: &str) -> anyhow::Result<State> {
+        if let Some(r) = from {
+            anyhow::ensure!(r.path != rel, "qlog state: recovering {rel} onto itself");
+            slatedb::admin::Admin::builder(db_path(store, rel), store.raw.clone())
+                .build()
+                .create_clone_builder_from_source(slatedb::admin::CloneSourceSpec::with_checkpoint(
+                    db_path(store, &r.path),
+                    r.checkpoint.parse()?,
+                ))
+                .build()
+                .await?;
+        }
+        let st = State::open(store, rel).await?;
+        let want = from.map_or(0, |r| r.seq);
+        anyhow::ensure!(st.applied == want, "qlog state: the clone at {rel} is at {}, not {want}", st.applied);
+        Ok(st)
+    }
+
+    /// The path under the store's prefix.
+    pub fn rel(&self) -> &str {
+        &self.rel
+    }
+
+    /// Moves the applied point to `seq` with nothing applied in between:
+    /// the seqs skipped by a bucket recovery, which no entry will ever hold.
+    pub async fn jump(&mut self, seq: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(seq >= self.applied, "qlog state: jumping back from {} to {seq}", self.applied);
+        if seq == self.applied {
+            return Ok(());
+        }
+        let mut b = WriteBatch::new();
+        b.put(APPLIED, seq.to_be_bytes());
+        self.db.write_with_options(b, &WriteOptions { seqnum: seq, ..Default::default() }).await?;
+        self.applied = seq;
+        Ok(())
     }
 
     pub fn applied(&self) -> u64 {
@@ -179,7 +243,12 @@ impl State {
                 self.applied
             );
         }
-        Ok(StateRef { checkpoint: cp.id.to_string(), manifest_id: cp.manifest_id, seq: self.applied })
+        Ok(StateRef {
+            path: self.rel.clone(),
+            checkpoint: cp.id.to_string(),
+            manifest_id: cp.manifest_id,
+            seq: self.applied,
+        })
     }
 
     pub async fn close(self) {
@@ -187,9 +256,9 @@ impl State {
     }
 }
 
-/// Deletes every `qlog-*` checkpoint of `qlog/state` but `keep`'s.
-pub async fn delete_checkpoints_except(store: &Store, keep: Option<&str>) -> anyhow::Result<usize> {
-    let admin = slatedb::admin::Admin::builder(db_path(store), store.raw.clone()).build();
+/// Deletes every `qlog-*` checkpoint of the state at `rel` but `keep`'s.
+pub async fn delete_checkpoints_except(store: &Store, rel: &str, keep: Option<&str>) -> anyhow::Result<usize> {
+    let admin = slatedb::admin::Admin::builder(db_path(store, rel), store.raw.clone()).build();
     let mut n = 0;
     for c in admin.list_checkpoints(None).await? {
         if c.name.as_deref().is_some_and(|x| x.starts_with("qlog-")) && Some(c.id.to_string().as_str()) != keep {
@@ -200,9 +269,9 @@ pub async fn delete_checkpoints_except(store: &Store, keep: Option<&str>) -> any
     Ok(n)
 }
 
-/// Ids of the `qlog-*` checkpoints of `qlog/state`.
-pub async fn list_checkpoints(store: &Store) -> anyhow::Result<Vec<String>> {
-    let admin = slatedb::admin::Admin::builder(db_path(store), store.raw.clone()).build();
+/// Ids of the `qlog-*` checkpoints of the state at `rel`.
+pub async fn list_checkpoints(store: &Store, rel: &str) -> anyhow::Result<Vec<String>> {
+    let admin = slatedb::admin::Admin::builder(db_path(store, rel), store.raw.clone()).build();
     Ok(admin
         .list_checkpoints(None)
         .await?
@@ -212,8 +281,9 @@ pub async fn list_checkpoints(store: &Store) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
-pub async fn delete_checkpoint(store: &Store, id: &str) -> anyhow::Result<()> {
-    let admin = slatedb::admin::Admin::builder(db_path(store), store.raw.clone()).build();
+pub async fn delete_checkpoint(store: &Store, r: &StateRef) -> anyhow::Result<()> {
+    let admin = slatedb::admin::Admin::builder(db_path(store, &r.path), store.raw.clone()).build();
+    let id = &r.checkpoint;
     admin.delete_checkpoint(id.parse()?).await?;
     Ok(())
 }
@@ -221,12 +291,12 @@ pub async fn delete_checkpoint(store: &Store, id: &str) -> anyhow::Result<()> {
 /// The state a checkpoint holds: every key and value, plus the checkpoint
 /// manifest's `last_l0_seq` (what a restart from it would hold).
 pub async fn read_checkpoint(store: &Store, r: &StateRef) -> anyhow::Result<(BTreeMap<Bytes, Bytes>, u64)> {
-    let admin = slatedb::admin::Admin::builder(db_path(store), store.raw.clone()).build();
+    let admin = slatedb::admin::Admin::builder(db_path(store, &r.path), store.raw.clone()).build();
     let m = admin
         .read_manifest(Some(r.manifest_id))
         .await?
         .ok_or_else(|| anyhow::anyhow!("checkpoint manifest {} is gone", r.manifest_id))?;
-    let reader = DbReader::builder(db_path(store), store.raw.clone())
+    let reader = DbReader::builder(db_path(store, &r.path), store.raw.clone())
         .with_reader_mode(DbReaderMode::Checkpoint(r.checkpoint.parse()?))
         .build()
         .await?;
@@ -264,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn a_seal_holds_exactly_its_point_across_automatic_flushes() {
         let store = Store::memory(None);
-        let mut st = State::open_with(&store, 16 << 10).await.unwrap();
+        let mut st = State::open_with(&store, DEFAULT_PATH, 16 << 10).await.unwrap();
         let mut seq = 0;
         let mut refs = Vec::new();
         for round in 0..4 {
@@ -277,7 +347,7 @@ mod tests {
             assert_eq!(r.seq, seq, "round {round}");
             refs.push((r, st.cursors().clone()));
         }
-        let m = slatedb::admin::Admin::builder(db_path(&store), store.raw.clone())
+        let m = slatedb::admin::Admin::builder(db_path(&store, DEFAULT_PATH), store.raw.clone())
             .build()
             .read_manifest(None)
             .await
@@ -303,8 +373,49 @@ mod tests {
         }
         st.close().await;
         // a writer opened afterwards sees the last applied point and goes on
-        let st = State::open(&store).await.unwrap();
+        let st = State::open(&store, DEFAULT_PATH).await.unwrap();
         assert!(st.applied() >= refs.last().unwrap().0.seq);
         st.close().await;
+    }
+
+    /// Recovery from a checkpoint while the source has moved on past it:
+    /// the clone holds exactly the checkpoint (not the source's latest),
+    /// takes writes of its own, jumps, and seals at the jump; the source's
+    /// later writes never show up in it.
+    #[tokio::test]
+    async fn a_recovered_state_is_its_checkpoint_not_the_latest() {
+        let store = Store::memory(None);
+        let mut st = State::open_with(&store, DEFAULT_PATH, 16 << 10).await.unwrap();
+        let es: Vec<Entry> = (1..=500).map(|s| entry(s, 300)).collect();
+        st.apply(&es).await.unwrap();
+        let r = st.seal().await.unwrap();
+        let cursors_at = st.cursors().clone();
+        // the old leader keeps applying, and its memtables reach the bucket
+        let es: Vec<Entry> = (501..=900).map(|s| entry(s, 300)).collect();
+        st.apply(&es).await.unwrap();
+        st.close().await;
+        let rel = recovery_path(7);
+        let mut rec = State::recover(&store, Some(&r), &rel).await.unwrap();
+        assert_eq!(rec.applied(), 500);
+        assert_eq!(rec.cursors(), &cursors_at);
+        let es: Vec<Entry> = (501..=520).map(|s| entry(s, 300)).collect();
+        rec.apply(&es).await.unwrap();
+        rec.jump(10_000).await.unwrap();
+        let sealed = rec.seal().await.unwrap();
+        assert_eq!((sealed.seq, sealed.path.as_str()), (10_000, rel.as_str()));
+        let (kv, l0) = read_checkpoint(&store, &sealed).await.unwrap();
+        assert_eq!(l0, 10_000);
+        let dids = kv.keys().filter(|k| k.starts_with(b"d/")).count();
+        assert_eq!(dids, 520, "the clone holds the source's state past its checkpoint");
+        for (k, v) in &kv {
+            if k.starts_with(b"d/") {
+                assert!(u64::from_be_bytes(v[..8].try_into().unwrap()) <= 520);
+            }
+        }
+        rec.close().await;
+        // a clone that finished is opened again as it is
+        let again = State::open(&store, &rel).await.unwrap();
+        assert_eq!(again.applied(), 10_000);
+        again.close().await;
     }
 }

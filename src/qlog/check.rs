@@ -11,6 +11,20 @@
 //! - at the end, every seq a submitter was acked for was emitted with the
 //!   content it was acked with, and every node's committed log agrees with
 //!   everything emitted.
+//!
+//! After a bucket recovery (a lost quorum) the log skips the seqs in
+//! `(S, R]` (`flush::Manifest::gaps`). The end checks then also hold:
+//!
+//! - a stream may jump only across gaps: every seq it skipped without
+//!   notice is in one;
+//! - an acked seq in a gap was lost, and its event (by DID) must have been
+//!   emitted again above that gap (re-ingested);
+//! - every event the hosts sent is emitted at a seq outside every gap.
+//!
+//! An event emitted at two seqs isn't a violation: a host owner resends a
+//! batch whose ack it never got, and a re-ingest resends what follows the
+//! cursors. Both are counted (`duplicates`, and `duplicates_across_gaps`
+//! for the pairs a recovery separates).
 
 use std::collections::HashMap;
 
@@ -39,7 +53,12 @@ pub struct Checker {
     /// Seqs skipped in a stream without notice (violations) and with it.
     pub holes: u64,
     pub skipped: u64,
-    acked: Vec<(u64, u64)>,
+    acked: Vec<(u64, u64, Option<u64>)>,
+    /// Skips without notice, judged at the end against the gaps:
+    /// (stream, first skipped, last skipped).
+    jumps: Vec<(String, u64, u64)>,
+    /// Event (DID content id) -> the seqs it was emitted at.
+    dids: HashMap<u64, Vec<u64>>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -53,8 +72,19 @@ pub struct Report {
     pub streams: usize,
     pub holes: u64,
     pub skipped_with_notice: u64,
+    /// Seqs streams skipped across recovery gaps (the R + 1 jump).
+    pub jumped: u64,
     pub acked: u64,
     pub acked_missing: u64,
+    /// Acked seqs a recovery lost whose events were emitted again above
+    /// the gap.
+    pub reingested: u64,
+    /// Events emitted at more than one seq.
+    pub duplicates: u64,
+    /// Of them, with a recovery gap between two of the seqs.
+    pub duplicates_across_gaps: u64,
+    /// Events the hosts sent that were never emitted outside a gap.
+    pub events_lost: u64,
     pub log_mismatches: u64,
 }
 
@@ -88,15 +118,20 @@ impl Checker {
             Some(last) if seq <= last => {
                 self.violation(format!("{stream} went from seq {last} to {seq}: a repeat or a step back"))
             }
-            Some(last) if seq > last + 1 => {
-                self.holes += seq - last - 1;
-                self.violation(format!("{stream} skipped seqs {}..={}", last + 1, seq - 1));
-            }
+            Some(last) if seq > last + 1 => self.jumps.push((stream.to_string(), last + 1, seq - 1)),
             _ => {}
         }
         if self.streams.get(stream).is_none_or(|&l| seq > l) {
             self.streams.insert(stream.to_string(), seq);
         }
+    }
+
+    /// As `observe`, for an event identified by `did` (its DID's content id).
+    pub fn observe_event(&mut self, stream: &str, seq: u64, content: u64, did: u64) {
+        if !self.by_seq.contains_key(&seq) {
+            self.dids.entry(did).or_default().push(seq);
+        }
+        self.observe(stream, seq, content);
     }
 
     /// The stream was told it skipped to `to` (e.g. `OutdatedCursor`).
@@ -115,7 +150,12 @@ impl Checker {
 
     /// A submitter was told `seq` committed with this content.
     pub fn acked(&mut self, seq: u64, content: u64) {
-        self.acked.push((seq, content));
+        self.acked.push((seq, content, None));
+    }
+
+    /// As `acked`, for an event identified by `did`.
+    pub fn acked_event(&mut self, seq: u64, content: u64, did: u64) {
+        self.acked.push((seq, content, Some(did)));
     }
 
     pub fn last(&self, stream: &str) -> Option<u64> {
@@ -125,9 +165,54 @@ impl Checker {
     /// Final checks against the acks and each node's committed log
     /// ((seq, content) pairs).
     pub fn finish(&mut self, logs: &[(String, Vec<(u64, u64)>)]) -> Report {
+        self.finish_with(logs, &[], None)
+    }
+
+    /// As `finish`, after recoveries that skipped `gaps` (`(after, upto]`),
+    /// and with `expected` the content ids of every event the hosts sent.
+    pub fn finish_with(
+        &mut self,
+        logs: &[(String, Vec<(u64, u64)>)],
+        gaps: &[(u64, u64)],
+        expected: Option<&[u64]>,
+    ) -> Report {
+        let gap_of = |seq: u64| gaps.iter().copied().find(|&(a, u)| seq > a && seq <= u);
+        let mut jumped = 0;
+        for (stream, from, to) in std::mem::take(&mut self.jumps) {
+            // the skipped range must be covered by gaps, one after another
+            let mut s = from;
+            while s <= to {
+                match gap_of(s) {
+                    Some((_, u)) => s = u + 1,
+                    None => break,
+                }
+            }
+            if s > to {
+                jumped += to - from + 1;
+            } else {
+                self.holes += to - from + 1;
+                self.violation(format!("{stream} skipped seqs {from}..={to} ({s} isn't in a recovery gap)"));
+            }
+        }
+        let emitted_above = |dids: &HashMap<u64, Vec<u64>>, did: u64, u: u64| {
+            dids.get(&did).is_some_and(|ss| ss.iter().any(|&x| x > u))
+        };
         let acked = std::mem::take(&mut self.acked);
         let mut acked_missing = 0;
-        for &(seq, content) in &acked {
+        let mut reingested = 0;
+        for &(seq, content, did) in &acked {
+            if let Some((a, u)) = gap_of(seq) {
+                match did {
+                    Some(d) if emitted_above(&self.dids, d, u) => reingested += 1,
+                    _ => {
+                        acked_missing += 1;
+                        self.violation(format!(
+                            "acked seq {seq} was lost in the recovery gap ({a}, {u}] and never re-ingested"
+                        ));
+                    }
+                }
+                continue;
+            }
             match self.by_seq.get(&seq) {
                 Some(&c) if c == content => {}
                 Some(_) => self.violation(format!("acked seq {seq} was emitted with other content")),
@@ -135,6 +220,27 @@ impl Checker {
                     acked_missing += 1;
                     self.violation(format!("acked seq {seq} was never emitted"));
                 }
+            }
+        }
+        let mut events_lost = 0;
+        if let Some(exp) = expected {
+            for d in exp {
+                let ok = self.dids.get(d).is_some_and(|ss| ss.iter().any(|&x| gap_of(x).is_none()));
+                if !ok {
+                    events_lost += 1;
+                    self.violation(format!("event {d:016x} was never emitted outside a recovery gap"));
+                }
+            }
+        }
+        let (mut duplicates, mut duplicates_across_gaps) = (0, 0);
+        for ss in self.dids.values() {
+            if ss.len() < 2 {
+                continue;
+            }
+            duplicates += 1;
+            let (lo, hi) = (ss.iter().min().expect("two"), ss.iter().max().expect("two"));
+            if gaps.iter().any(|&(_, u)| *lo <= u && *hi > u) {
+                duplicates_across_gaps += 1;
             }
         }
         let mut log_mismatches = 0;
@@ -152,7 +258,7 @@ impl Checker {
             // everything emitted that this node's log covers must be in it
             if let (Some(lo), Some(hi)) = (log.first().map(|x| x.0), log.last().map(|x| x.0)) {
                 let held: std::collections::HashSet<u64> = log.iter().map(|x| x.0).collect();
-                for &seq in self.by_seq.keys().filter(|&&s| s >= lo && s <= hi) {
+                for &seq in self.by_seq.keys().filter(|&&s| s >= lo && s <= hi && gap_of(s).is_none()) {
                     if !held.contains(&seq) {
                         log_mismatches += 1;
                         if log_mismatches < 5 {
@@ -178,8 +284,13 @@ impl Checker {
             streams: self.streams.len(),
             holes: self.holes,
             skipped_with_notice: self.skipped,
+            jumped,
             acked: acked.len() as u64,
             acked_missing,
+            reingested,
+            duplicates,
+            duplicates_across_gaps,
+            events_lost,
             log_mismatches,
         }
     }
@@ -201,14 +312,51 @@ mod tests {
         c.observe("a", 2, 20);
         assert_eq!(c.violations, 2, "repeat");
         c.observe("a", 5, 50);
-        assert_eq!((c.violations, c.holes), (3, 2), "hole");
         c.skip("a", 9);
         c.observe("a", 10, 100);
-        assert_eq!(c.violations, 3, "a skip with notice is no hole");
+        assert_eq!(c.violations, 2, "a skip with notice is no hole");
         c.acked(10, 100);
         c.acked(11, 110);
         let r = c.finish(&[]);
-        assert_eq!((r.acked_missing, r.violations), (1, 4));
+        assert_eq!((r.acked_missing, r.holes, r.violations), (1, 2, 4), "{r:#?}");
         assert!(!r.ok);
+    }
+
+    /// A recovery that kept 1..=3 and resumed at 11: streams may jump
+    /// across (3, 10], an acked seq lost there is fine once its event is
+    /// emitted again above 10, and a jump or duplicate anywhere else isn't.
+    #[test]
+    fn jumps_and_reingest_across_a_recovery_gap() {
+        let gaps = [(3, 10)];
+        let mut c = Checker::new();
+        for (s, d) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)] {
+            c.observe_event("a", s, 100 + s, d);
+        }
+        // the old stream ran to 5; the recovered one starts at 11 and
+        // re-ingests events 4 and 5
+        for (s, d) in [(11, 4), (12, 5), (13, 6)] {
+            c.observe_event("a", s, 100 + s, d);
+        }
+        for (s, d) in [(1, 1), (2, 2), (3, 3), (11, 4), (12, 5), (13, 6)] {
+            c.observe_event("b", s, 100 + s, d);
+        }
+        c.acked_event(5, 105, 5);
+        c.acked_event(13, 113, 6);
+        let r = c.finish_with(&[], &gaps, Some(&[1, 2, 3, 4, 5, 6]));
+        assert!(r.ok, "{r:#?}");
+        assert_eq!((r.jumped, r.reingested, r.duplicates, r.duplicates_across_gaps), (12, 1, 2, 2), "{r:#?}");
+
+        let mut c = Checker::new();
+        c.observe_event("a", 1, 101, 1);
+        c.observe_event("a", 2, 102, 2);
+        c.observe_event("a", 5, 105, 1);
+        c.observe_event("a", 11, 111, 2);
+        c.acked_event(9, 109, 9);
+        let r = c.finish_with(&[], &gaps, Some(&[1, 2, 9]));
+        // 3..=4 isn't all gap; acked 9 lost, never re-sent, and event 9
+        // never emitted; event 1 twice below the gap is a resend
+        assert_eq!((r.holes, r.duplicates, r.duplicates_across_gaps), (2, 2, 1), "{r:#?}");
+        assert_eq!((r.acked_missing, r.events_lost), (1, 1), "{r:#?}");
+        assert_eq!(r.violations, 3, "{r:#?}");
     }
 }

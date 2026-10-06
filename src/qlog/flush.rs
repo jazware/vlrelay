@@ -51,6 +51,12 @@ pub enum Step {
     BeforeManifest,
     /// The manifest CAS succeeded; the old checkpoint isn't deleted yet.
     AfterManifest,
+    /// Bucket recovery: the clone is sealed at R.
+    RecoverSealed,
+    /// Bucket recovery: salvage is uploaded, the manifest isn't written.
+    RecoverBeforeManifest,
+    /// Bucket recovery: the manifest is written; the node doesn't lead yet.
+    RecoverAfterManifest,
 }
 
 impl std::str::FromStr for Step {
@@ -62,6 +68,9 @@ impl std::str::FromStr for Step {
             "segment" => Step::SegmentPut,
             "before-manifest" => Step::BeforeManifest,
             "after-manifest" => Step::AfterManifest,
+            "recover-sealed" => Step::RecoverSealed,
+            "recover-before-manifest" => Step::RecoverBeforeManifest,
+            "recover-after-manifest" => Step::RecoverAfterManifest,
             _ => return Err(format!("unknown flush step {s}")),
         })
     }
@@ -123,6 +132,59 @@ pub struct Manifest {
     pub cursors: BTreeMap<String, u64>,
     pub flushes: u64,
     pub at_ms: i64,
+    /// Seqs `(after, upto]` that a bucket recovery skipped: never held by
+    /// the log, so never emitted again (any emitted before the recovery
+    /// were lost and re-ingested above `upto`). Kept for good: verify and
+    /// readers walk the segments across them.
+    #[serde(default)]
+    pub gaps: Vec<(u64, u64)>,
+    /// The last bucket recovery, if any.
+    #[serde(default)]
+    pub recovery: Option<Recovery>,
+}
+
+/// What a bucket recovery decided (docs/quorum.md, "Bucket recovery").
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recovery {
+    /// Recoveries so far: host owners compare it to the one they last
+    /// rewound for.
+    pub generation: u64,
+    pub epoch: u64,
+    /// The log held everything up to here (the old manifest's F, adopted
+    /// orphan segments and salvaged committed entries)...
+    pub after: u64,
+    /// ...and resumes at `base + 1` (the old manifest's R).
+    pub base: u64,
+    /// Each host's cursor at `after`: host owners re-read from here, and
+    /// what they send again comes back above `base`.
+    pub cursors: BTreeMap<String, u64>,
+    pub at_ms: i64,
+}
+
+impl Manifest {
+    /// The state's SlateDB path (under the store's prefix).
+    pub fn state_path(&self) -> &str {
+        self.state.as_ref().map_or(state::DEFAULT_PATH, |s| s.path.as_str())
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.recovery.as_ref().map_or(0, |r| r.generation)
+    }
+
+    /// Whether a log that ends at `last` may go on at `next` (dense, or
+    /// across a recovery's gap).
+    pub fn continues(&self, last: u64, next: u64) -> bool {
+        // recoveries in a row with nothing committed between leave gaps
+        // that follow each other
+        let mut end = last;
+        while next != end + 1 {
+            match self.gaps.iter().find(|&&(a, _)| a == end) {
+                Some(&(_, u)) => end = u,
+                None => return false,
+            }
+        }
+        true
+    }
 }
 
 fn manifest_path(store: &Store) -> Path {
@@ -345,20 +407,22 @@ impl Leader {
         }
         self.node.flush.s.lock().fences += 1;
         self.node.set_flushed(self.man.flushed, self.man.reserve);
+        self.node.note_manifest(&self.man);
         tracing::info!(epoch = self.epoch, flushed = self.man.flushed, reserve = self.man.reserve, "qlog flush: manifest fenced");
         if self.crash(Step::Fenced) {
             return Ok(());
         }
         // checkpoints of flushes that never committed (this or an older leader's)
         let keep = self.man.state.as_ref().map(|s| s.checkpoint.clone());
-        if let Err(e) = state::delete_checkpoints_except(&self.store, keep.as_deref()).await {
+        let rel = self.man.state_path().to_string();
+        if let Err(e) = state::delete_checkpoints_except(&self.store, &rel, keep.as_deref()).await {
             tracing::warn!("qlog flush: deleting stale checkpoints failed: {e:#}");
         }
         let mut st = loop {
             if self.leading().is_none() {
                 return Ok(());
             }
-            match State::open(&self.store).await {
+            match State::open(&self.store, &rel).await {
                 Ok(s) => break s,
                 Err(e) => {
                     tracing::warn!("qlog flush: opening the state failed: {e:#}");
@@ -430,7 +494,7 @@ impl Leader {
         let segs = match self.put_segments(f).await {
             Ok(Some(s)) => s,
             r => {
-                let _ = state::delete_checkpoint(&self.store, &sref.checkpoint).await;
+                let _ = state::delete_checkpoint(&self.store, &sref).await;
                 return match r {
                     Ok(_) => Ok(Outcome::Retry),
                     Err(e) if e.is::<Crash>() => Ok(Outcome::Stop),
@@ -453,6 +517,8 @@ impl Leader {
             cursors: st.cursors().clone(),
             flushes: self.man.flushes + 1,
             at_ms: chrono::Utc::now().timestamp_millis(),
+            gaps: self.man.gaps.clone(),
+            recovery: self.man.recovery.clone(),
         };
         let etag = match cas_manifest(&self.store, &next, Some(Some(self.etag.clone()))).await {
             Ok(Some(e)) => e,
@@ -465,7 +531,7 @@ impl Leader {
                 {
                     etag.unwrap_or_default()
                 } else {
-                    let _ = state::delete_checkpoint(&self.store, &sref.checkpoint).await;
+                    let _ = state::delete_checkpoint(&self.store, &sref).await;
                     return Err(e.context("manifest CAS"));
                 }
             }
@@ -477,7 +543,7 @@ impl Leader {
         self.etag = etag;
         self.node.set_flushed(self.man.flushed, self.man.reserve);
         if let Some(o) = old.state.filter(|o| o.checkpoint != sref.checkpoint)
-            && let Err(e) = state::delete_checkpoint(&self.store, &o.checkpoint).await
+            && let Err(e) = state::delete_checkpoint(&self.store, &o).await
         {
             tracing::warn!("qlog flush: deleting the previous checkpoint failed: {e:#}");
         }
@@ -511,7 +577,7 @@ impl Leader {
     }
 
     async fn lost_cas(&mut self, sref: &StateRef) -> anyhow::Result<Outcome> {
-        let _ = state::delete_checkpoint(&self.store, &sref.checkpoint).await;
+        let _ = state::delete_checkpoint(&self.store, sref).await;
         match read_manifest(&self.store).await? {
             Some((m, _)) if m.epoch > self.epoch => {
                 tracing::warn!(epoch = self.epoch, newer = m.epoch, "qlog flush: fenced by a newer leader");
@@ -572,6 +638,15 @@ impl Leader {
                 }
                 Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
                     match nodelog::read_head(&self.store, LOG_ID, ord).await? {
+                        // A deposed leader's flush, still running when a
+                        // bucket recovery moved F past it: no manifest names
+                        // an ordinal at or past next_ordinal, and this one
+                        // doesn't continue the log, so it's nobody's.
+                        Head::Segment(h) if (h.first_seq as u64) <= self.man.flushed => {
+                            tracing::warn!(ord, first = h.first_seq, f = self.man.flushed, "qlog flush: deleting a stale segment in the way");
+                            self.store.raw.delete(&path).await?;
+                            continue;
+                        }
                         Head::Segment(h) if h.first_seq as u64 == from => {
                             if h.last_seq as u64 > f {
                                 tracing::info!(ord, last = h.last_seq, f, "qlog flush: an existing segment reaches past F");
@@ -640,6 +715,10 @@ pub(crate) async fn read_bucket(
         return Ok(None);
     }
     let i = (from - first) as usize;
+    // `from` is in a recovery's gap, past this segment's end
+    if i > seg.len() {
+        return Ok(None);
+    }
     let prev_epoch = if i > 0 {
         seg[i - 1].epoch
     } else if from == 1 {
@@ -666,6 +745,11 @@ pub(crate) async fn read_bucket(
 #[derive(Debug)]
 struct Crash;
 
+/// Whether `e` is an injected crash (tests: the step was cut short).
+pub fn is_crash(e: &anyhow::Error) -> bool {
+    e.is::<Crash>()
+}
+
 impl std::fmt::Display for Crash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("crash injected")
@@ -689,6 +773,11 @@ pub struct Verified {
     pub segments: u64,
     /// Segments past the manifest (written by a flush that didn't commit).
     pub orphans: u64,
+    /// Segments past the manifest that a deposed leader wrote below F (the
+    /// next flush deletes them).
+    pub stale: u64,
+    /// Recovery gaps the segments were walked across.
+    pub gaps: u64,
     pub entries: u64,
     pub dids: u64,
     pub hosts: u64,
@@ -732,17 +821,23 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
     let mut hosts: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     let mut last = 0u64;
     let mut ord = 0u64;
+    v.gaps = m.gaps.len() as u64;
     loop {
         let Some(obj) = nodelog::read_object(store, LOG_ID, ord).await? else { break };
         let segment::LogObject::Segment(h, ents) = obj else {
             bad(&mut v, format!("ordinal {ord} is a fence"));
             break;
         };
-        if h.first_seq as u64 != last + 1 {
+        if ord >= m.next_ordinal && (h.first_seq as u64) <= m.flushed {
+            v.stale += 1;
+            ord += 1;
+            continue;
+        }
+        if !m.continues(last, h.first_seq as u64) {
             bad(&mut v, format!("segment {ord} starts at {}, after {last}", h.first_seq));
         }
         for e in ents {
-            if e.seq as u64 != last + 1 {
+            if !m.continues(last, e.seq as u64) {
                 bad(&mut v, format!("segment {ord}: seq {} after {last}", e.seq));
             }
             last = e.seq as u64;
@@ -760,7 +855,9 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
         }
         if ord < m.next_ordinal {
             v.segments += 1;
-            if ord + 1 == m.next_ordinal && last != m.flushed {
+            // after a recovery that salvaged nothing new, the last segment
+            // ends where the gap up to F starts
+            if ord + 1 == m.next_ordinal && !m.continues(last, m.flushed + 1) {
                 bad(&mut v, format!("the manifest's last segment ends at {last}, not F {}", m.flushed));
             }
         } else {
@@ -825,4 +922,214 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
     v.dids = dids.len() as u64;
     v.ok = v.messages.is_empty();
     Ok(v)
+}
+
+/// Where the log stands in the bucket when a quorum is lost.
+#[derive(Debug)]
+pub struct RecoveryPoint {
+    pub manifest: Manifest,
+    pub etag: String,
+    /// Segments past the manifest that continue the log: a flush that died
+    /// before its CAS. Every flush writes committed entries only, so they
+    /// are adopted and move F (their entries carry no host cursors:
+    /// segments don't keep them, so the cursors stay at the manifest's,
+    /// which only costs more re-ingest).
+    pub orphans: Vec<(SegRef, Vec<Entry>)>,
+    /// F': the manifest's F, or the last orphan's end.
+    pub flushed: u64,
+}
+
+/// Reads the manifest and adopts the orphan segments past it. A segment
+/// past it that starts at or below F is a deposed leader's: deleted, so it
+/// can't take an ordinal the recovery writes.
+pub async fn recovery_point(store: &Store) -> anyhow::Result<Option<RecoveryPoint>> {
+    let Some((m, etag)) = read_manifest(store).await? else { return Ok(None) };
+    let mut orphans = Vec::new();
+    let mut last = m.flushed;
+    let mut ord = m.next_ordinal;
+    loop {
+        let Some(segment::LogObject::Segment(h, ents)) = nodelog::read_object(store, LOG_ID, ord).await? else {
+            break;
+        };
+        let first = h.first_seq as u64;
+        if first <= m.flushed {
+            tracing::warn!(ord, first, f = m.flushed, "qlog recovery: deleting a stale segment past the manifest");
+            store.raw.delete(&nodelog::segment_path(store, LOG_ID, ord)).await?;
+            ord += 1;
+            continue;
+        }
+        if first != last + 1 {
+            tracing::warn!(ord, first, last, "qlog recovery: a segment past the manifest doesn't continue the log");
+            break;
+        }
+        let es: Vec<Entry> = ents.into_iter().map(|e| Entry::new(e.epoch, e.seq as u64, e.frame)).collect();
+        let Some(end) = es.last().map(|e| e.seq) else { break };
+        // committed entries never pass R, so neither can a flush of them
+        anyhow::ensure!(end <= m.reserve, "qlog recovery: segment {ord} ends at {end}, past R {}", m.reserve);
+        orphans.push((SegRef { ordinal: ord, first, last: end, bytes: 0 }, es));
+        last = end;
+        ord += 1;
+    }
+    Ok(Some(RecoveryPoint { manifest: m, etag: etag.unwrap_or_default(), orphans, flushed: last }))
+}
+
+/// How long each part of a bucket recovery took.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RecoveryStats {
+    pub generation: u64,
+    pub epoch: u64,
+    /// The old manifest's F, after orphans, after salvage (S), and R.
+    pub manifest_flushed: u64,
+    pub orphans_to: u64,
+    pub after: u64,
+    pub base: u64,
+    pub orphan_segments: u64,
+    pub salvaged: u64,
+    /// Reading the manifest and the orphans (the node measures it).
+    pub read_ms: u64,
+    pub clone_ms: u64,
+    /// Applying orphans and salvage to the clone, the jump and the seal.
+    pub apply_seal_ms: u64,
+    pub segments_ms: u64,
+    pub manifest_ms: u64,
+    pub total_ms: u64,
+}
+
+/// The bucket side of a recovery by `epoch`, the leader of a quorum with
+/// no quorum of intact logs (docs/quorum.md, "Bucket recovery"): the
+/// state cloned from the manifest's checkpoint, the orphans and `salvage`
+/// (committed entries from F' + 1 on, densely, that a reachable node held)
+/// applied to it, the applied point jumped to R, sealed there; `salvage`
+/// uploaded as segments; then the manifest CASed with F = R, the gap
+/// `(S, R]` and the recovery's cursors. Seqs resume at R + 1. A crash or a
+/// lost CAS anywhere before the manifest leaves the old one in charge (the
+/// clone and segments are left for the next attempt or the retention
+/// report).
+pub async fn recover(
+    store: &Store,
+    id: &str,
+    epoch: u64,
+    o: &Options,
+    p: RecoveryPoint,
+    salvage: Vec<Entry>,
+    stats: &mut RecoveryStats,
+) -> anyhow::Result<Manifest> {
+    let t0 = Instant::now();
+    let crash = |step| o.crash.as_ref().is_some_and(|h| h(step));
+    let m = &p.manifest;
+    anyhow::ensure!(m.epoch < epoch, "qlog recovery: the manifest is epoch {}'s, not older than {epoch}", m.epoch);
+    let r = m.reserve;
+    let mut s = p.flushed;
+    for e in &salvage {
+        anyhow::ensure!(e.seq == s + 1, "qlog recovery: salvage isn't dense at {} after {s}", e.seq);
+        s = e.seq;
+    }
+    anyhow::ensure!(s <= r, "qlog recovery: salvage reaches {s}, past R {r}");
+    (stats.manifest_flushed, stats.orphans_to, stats.after, stats.base) = (m.flushed, p.flushed, s, r);
+    (stats.orphan_segments, stats.salvaged, stats.epoch) = (p.orphans.len() as u64, salvage.len() as u64, epoch);
+    let rel = state::recovery_path(epoch);
+    let mut st = State::recover(store, m.state.as_ref(), &rel).await?;
+    stats.clone_ms = t0.elapsed().as_millis() as u64;
+    let t1 = Instant::now();
+    for (_, es) in &p.orphans {
+        for chunk in es.chunks(4096) {
+            st.apply(chunk).await?;
+        }
+    }
+    for chunk in salvage.chunks(4096) {
+        st.apply(chunk).await?;
+    }
+    let cursors = st.cursors().clone();
+    st.jump(r).await?;
+    let sref = st.seal().await?;
+    st.close().await;
+    stats.apply_seal_ms = t1.elapsed().as_millis() as u64;
+    if crash(Step::RecoverSealed) {
+        anyhow::bail!(Crash);
+    }
+    let t2 = Instant::now();
+    let mut segments: Vec<SegRef> = p.orphans.iter().map(|(r, _)| r.clone()).collect();
+    let mut ord = m.next_ordinal + p.orphans.len() as u64;
+    let mut rest = &salvage[..];
+    while !rest.is_empty() {
+        let mut b = SegmentBuilder::for_log(LOG_ID);
+        let mut n = 0;
+        for e in rest {
+            push(&mut b, e);
+            n += 1;
+            if b.len() >= o.segment_bytes {
+                break;
+            }
+        }
+        let (first, last) = (rest[0].seq, rest[n - 1].seq);
+        rest = &rest[n..];
+        let obj = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+            let obj = b.seal(LOG_ID, ord, ord);
+            Ok(segment::compress(&obj, segment::compression_level())?.unwrap_or(obj))
+        })
+        .await??;
+        let bytes = obj.len() as u64;
+        store
+            .raw
+            .put_opts(
+                &nodelog::segment_path(store, LOG_ID, ord),
+                PutPayload::from(obj),
+                PutOptions { mode: PutMode::Create, ..Default::default() },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("qlog recovery: segment {ord}: {e}"))?;
+        segments.push(SegRef { ordinal: ord, first, last, bytes });
+        ord += 1;
+    }
+    stats.segments_ms = t2.elapsed().as_millis() as u64;
+    if crash(Step::RecoverBeforeManifest) {
+        anyhow::bail!(Crash);
+    }
+    let t3 = Instant::now();
+    let mut gaps = m.gaps.clone();
+    if s < r {
+        gaps.push((s, r));
+    }
+    let generation = m.generation() + 1;
+    let now = chrono::Utc::now().timestamp_millis();
+    let next = Manifest {
+        epoch,
+        leader: id.to_string(),
+        flushed: r,
+        reserve: r + o.headroom,
+        next_ordinal: ord,
+        segments,
+        state: Some(sref.clone()),
+        cursors: cursors.clone(),
+        flushes: m.flushes + 1,
+        at_ms: now,
+        gaps,
+        recovery: Some(Recovery { generation, epoch, after: s, base: r, cursors, at_ms: now }),
+    };
+    match cas_manifest(store, &next, Some(Some(p.etag.clone()))).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let _ = state::delete_checkpoint(store, &sref).await;
+            anyhow::bail!("qlog recovery: the manifest moved under it");
+        }
+        Err(e) => {
+            if !matches!(read_manifest(store).await, Ok(Some((x, _))) if x == next) {
+                let _ = state::delete_checkpoint(store, &sref).await;
+                return Err(e.context("qlog recovery: manifest CAS"));
+            }
+        }
+    }
+    stats.manifest_ms = t3.elapsed().as_millis() as u64;
+    stats.generation = generation;
+    if crash(Step::RecoverAfterManifest) {
+        anyhow::bail!(Crash);
+    }
+    // the clone pins what it needs of the old state with its own checkpoint
+    if let Some(old) = &m.state
+        && let Err(e) = state::delete_checkpoint(store, old).await
+    {
+        tracing::warn!("qlog recovery: deleting the old manifest's checkpoint failed: {e:#}");
+    }
+    stats.total_ms = t0.elapsed().as_millis() as u64 + stats.read_ms;
+    Ok(next)
 }

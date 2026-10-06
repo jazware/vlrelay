@@ -57,6 +57,11 @@ pub struct Config {
     /// A follower heard from within this long still holds the leader's disk
     /// trimming back to what it has matched.
     pub laggard_grace: Duration,
+    /// Run a bucket recovery as soon as the promise round proves no quorum
+    /// of intact logs can exist (see `try_takeover`). False: a candidate
+    /// that finds that only logs it and keeps retrying (an operator
+    /// restarts one member with it on).
+    pub auto_recover: bool,
 }
 
 impl Config {
@@ -77,6 +82,7 @@ impl Config {
             max_pending_bytes: 256 << 20,
             flush: None,
             laggard_grace: Duration::from_secs(10),
+            auto_recover: true,
         }
     }
 
@@ -321,6 +327,17 @@ struct Core {
     reserve: u64,
     /// Submitted cursors waiting for an entry to ride on.
     pending_cursors: BTreeMap<String, u64>,
+    /// Bucket recoveries so far, as known (the manifest's generation; also
+    /// learned from appends and promises).
+    generation: u64,
+    /// The cursors the last recovery left each host at, if known, with its
+    /// generation: host owners re-read their hosts from these.
+    recovery_cursors: Option<(u64, Bytes)>,
+    /// Leader: followers whose log is empty (a new or wiped disk, or a
+    /// memory-only restart). They start at the leader's oldest local entry
+    /// rather than replaying the bucket from seq 1: nothing they emitted
+    /// is behind it.
+    fresh: HashSet<String>,
 }
 
 pub struct Stats {
@@ -338,6 +355,10 @@ pub struct Stats {
     pub disk_reads: AtomicU64,
     /// Batches a lagging follower was served from the bucket segments.
     pub bucket_reads: AtomicU64,
+    /// Bucket recoveries this node ran, and the promise rounds that found no
+    /// quorum of intact logs could exist.
+    pub recoveries: AtomicU64,
+    pub lost_quorums: AtomicU64,
 }
 
 impl Default for Stats {
@@ -352,6 +373,8 @@ impl Default for Stats {
             promise_rounds: AtomicU64::new(0),
             disk_reads: AtomicU64::new(0),
             bucket_reads: AtomicU64::new(0),
+            recoveries: AtomicU64::new(0),
+            lost_quorums: AtomicU64::new(0),
         }
     }
 }
@@ -382,6 +405,11 @@ pub struct Status {
     pub flushed: u64,
     pub reserve: u64,
     pub flush: Option<flush::Status>,
+    pub generation: u64,
+    pub recoveries: u64,
+    pub lost_quorums: u64,
+    /// The bucket recoveries this node ran, with their timings.
+    pub recovered: Vec<flush::RecoveryStats>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -420,6 +448,10 @@ pub struct Node {
     pub emit: Arc<Emitter>,
     pub stats: Stats,
     pub flush: flush::Shared,
+    /// Held from reading what to emit until it's handed over, so batches
+    /// reach the firehose in order (a recovery emits outside the emitter).
+    emit_order: Mutex<()>,
+    recovered: Mutex<Vec<flush::RecoveryStats>>,
 }
 
 impl Node {
@@ -437,6 +469,10 @@ impl Node {
         recovered: Option<Recovered>,
     ) -> anyhow::Result<Arc<Node>> {
         let genesis = read_leader(&store).await?.is_none();
+        let manifest = match &cfg.flush {
+            Some(_) => flush::read_manifest(&store).await?.map(|(m, _)| m),
+            None => None,
+        };
         let (mut log, promised, promised_to, whole) = match recovered {
             Some(r) => (r.log, r.promised, r.promised_to, !r.fresh),
             None => (Log::new(), 0, None, false),
@@ -473,9 +509,18 @@ impl Node {
                 waiters: BTreeMap::new(),
                 pending: VecDeque::new(),
                 pending_bytes: 0,
-                flushed: 0,
-                reserve: if cfg.flush.is_some() { 0 } else { u64::MAX },
+                flushed: manifest.as_ref().map_or(0, |m| m.flushed),
+                reserve: match (&cfg.flush, &manifest) {
+                    (None, _) => u64::MAX,
+                    (Some(_), m) => m.as_ref().map_or(0, |m| m.reserve),
+                },
                 pending_cursors: BTreeMap::new(),
+                generation: manifest.as_ref().map_or(0, |m| m.generation()),
+                recovery_cursors: manifest
+                    .as_ref()
+                    .and_then(|m| m.recovery.as_ref())
+                    .map(|r| (r.generation, encode_cursors(&r.cursors))),
+                fresh: HashSet::new(),
             }),
             cfg,
             store,
@@ -487,6 +532,8 @@ impl Node {
             emit,
             stats: Stats::default(),
             flush: flush::Shared::default(),
+            emit_order: Mutex::new(()),
+            recovered: Mutex::new(Vec::new()),
         });
         node.emit.attach(&node);
         tracing::info!(id = %node.cfg.id, genesis, whole, promised, emitted, commit, "qlog: node up");
@@ -529,6 +576,10 @@ impl Node {
             flushed: c.flushed,
             reserve: c.reserve,
             flush: self.cfg.flush.as_ref().map(|_| self.flush.status(reset)),
+            generation: c.generation,
+            recoveries: self.stats.recoveries.load(Ordering::Relaxed),
+            lost_quorums: self.stats.lost_quorums.load(Ordering::Relaxed),
+            recovered: self.recovered.lock().clone(),
         }
     }
 
@@ -572,6 +623,17 @@ impl Node {
         c.flushed = c.flushed.max(flushed);
         c.reserve = c.reserve.max(reserve);
         self.advance_commit(&mut c);
+    }
+
+    /// What a manifest says about recoveries (a new leader's fence read).
+    pub(crate) fn note_manifest(&self, m: &flush::Manifest) {
+        let mut c = self.core.lock();
+        c.generation = c.generation.max(m.generation());
+        if let Some(r) = &m.recovery
+            && c.recovery_cursors.as_ref().is_none_or(|(g, _)| *g < r.generation)
+        {
+            c.recovery_cursors = Some((r.generation, encode_cursors(&r.cursors)));
+        }
     }
 
     pub(crate) fn step_down_from(&self, epoch: u64, why: &str) {
@@ -649,10 +711,10 @@ impl Node {
                 appender = Some(a.leader.clone());
             }
             let resp = match m {
-                Msg::Submit { frames, cursors } => {
+                Msg::Submit { frames, cursors, generation } => {
                     let (n, tx) = (self.clone(), tx.clone());
                     tokio::spawn(async move {
-                        let r = n.submit(frames, cursors).await;
+                        let r = n.submit_from(frames, cursors, generation).await;
                         let _ = tx.send(wire::encode(rid, &r));
                     });
                     continue;
@@ -663,6 +725,15 @@ impl Node {
                     self.on_fetch(epoch, from_seq, max_bytes as usize).await
                 }
                 Msg::Ping { .. } => Msg::Pong,
+                Msg::Cursors => {
+                    let c = self.core.lock();
+                    match &c.recovery_cursors {
+                        Some((g, b)) if *g == c.generation => {
+                            Msg::CursorsResp { generation: *g, known: true, cursors: b.clone() }
+                        }
+                        _ => Msg::CursorsResp { generation: c.generation, known: c.generation == 0, cursors: Bytes::new() },
+                    }
+                }
                 _ => continue,
             };
             if tx.send(wire::encode(rid, &resp)).is_err() {
@@ -682,6 +753,15 @@ impl Node {
     /// quorum holds them (or failed if this node stops leading first; the
     /// sender then resends them to the next leader, under new seqs).
     pub async fn submit(self: &Arc<Self>, frames: Vec<(Bytes, Bytes)>, cursors: Bytes) -> Msg {
+        let g = self.core.lock().generation;
+        self.submit_from(frames, cursors, g).await
+    }
+
+    /// As `submit`, from a submitter that last rewound for recovery
+    /// `generation`: its cursors are dropped if it's behind, since they may
+    /// count events a recovery lost (they'd put the manifest's cursors past
+    /// the log).
+    pub async fn submit_from(self: &Arc<Self>, frames: Vec<(Bytes, Bytes)>, cursors: Bytes, generation: u64) -> Msg {
         // under the submitter's timeout, so a busy leader isn't taken for a dead one
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut commits = self.commit.subscribe();
@@ -703,9 +783,11 @@ impl Node {
             }
             let epoch = c.epoch;
             let first = c.log.last_seq() + 1;
-            merge_cursors(&mut c.pending_cursors, &cursors);
+            if generation >= c.generation {
+                merge_cursors(&mut c.pending_cursors, &cursors);
+            }
             if frames.is_empty() {
-                return Msg::Submitted { first, n: 0 };
+                return Msg::Submitted { first, n: 0, generation: c.generation };
             }
             let mut ride = encode_cursors(&std::mem::take(&mut c.pending_cursors));
             for (p, s) in &frames {
@@ -736,7 +818,7 @@ impl Node {
             }
         }
         match rx.await {
-            Ok(Ok(())) => Msg::Submitted { first, n: last - first + 1 },
+            Ok(Ok(())) => Msg::Submitted { first, n: last - first + 1, generation: self.core.lock().generation },
             Ok(Err(reason)) => Msg::Failed { reason },
             Err(_) => Msg::Failed { reason: "dropped".into() },
         }
@@ -881,13 +963,19 @@ impl Node {
         loop {
             head.borrow_and_update();
             commit.borrow_and_update();
-            let (behind, flushed) = {
+            let (behind, flushed, fresh) = {
                 let c = self.core.lock();
                 let next = c.next.get(&peer).copied().unwrap_or(0);
                 let b = (c.role == Role::Leader && c.epoch == epoch && next <= c.log.base().1)
                     .then(|| (next, c.log.base().1));
-                (b, c.flushed)
+                (b, c.flushed, c.fresh.contains(&peer))
             };
+            // where a fresh follower starts: the oldest entry held here, if
+            // the bucket has everything below it
+            let fresh_start = behind.and_then(|(_, base)| {
+                let t = self.durability.first_readable().unwrap_or(base).min(base);
+                (fresh && t <= flushed).then_some(t)
+            });
             // behind what's in memory: committed entries from the commitlog,
             // from the oldest it still holds if it doesn't reach back to `next`
             // (a reset there, never past what a takeover would flush from)
@@ -895,7 +983,7 @@ impl Node {
                 Some((next, base)) => match self.durability.read(next, base, self.cfg.max_batch_bytes).await {
                     Some(r) => Some((next, r, false)),
                     // behind the disk too: from the bucket, if it's flushed
-                    None if self.cfg.flush.is_some() && next <= flushed => {
+                    None if self.cfg.flush.is_some() && next <= flushed && fresh_start.is_none() => {
                         match flush::read_bucket(
                             &self.store,
                             &mut seg_cache,
@@ -950,6 +1038,7 @@ impl Node {
                         reset,
                         flushed: c.flushed,
                         reserve: c.reserve,
+                        generation: c.generation,
                         entries,
                     })
                 } else if !fresh && last_send.elapsed() < self.cfg.heartbeat {
@@ -971,6 +1060,7 @@ impl Node {
                         reset,
                         flushed: c.flushed,
                         reserve: c.reserve,
+                        generation: c.generation,
                         entries: c.log.entries_from(prev_seq + 1, self.cfg.max_batch_bytes),
                     })
                 }
@@ -1012,6 +1102,11 @@ impl Node {
         }
         c.acked_at.insert(peer.to_string(), Instant::now());
         if r.ok {
+            c.fresh.remove(peer);
+        } else if r.last_seq == 0 {
+            c.fresh.insert(peer.to_string());
+        }
+        if r.ok {
             let m = c.matched.entry(peer.to_string()).or_default();
             *m = (*m).max(r.matched);
             let m = *m;
@@ -1049,6 +1144,7 @@ impl Node {
             c.last_heard = Instant::now();
             c.flushed = c.flushed.max(a.flushed);
             c.reserve = c.reserve.max(a.reserve);
+            c.generation = c.generation.max(a.generation);
             if !c.intact && c.need_upto.is_none() {
                 c.need_upto = Some(a.leader_last);
             }
@@ -1136,6 +1232,7 @@ impl Node {
             base_seq: c.log.base().1,
             commit: c.log.commit(),
             intact: c.intact,
+            generation: c.generation,
         };
         (resp, self.sync(&mut c))
     }
@@ -1386,12 +1483,15 @@ impl Node {
             }
             self.stats.promise_rounds.fetch_add(1, Ordering::Relaxed);
             let mut voters: Vec<(String, u64, u64)> = Vec::new();
+            // every member that promised, with its commit index, intact or not
+            let mut answered: Vec<(String, u64)> = Vec::new();
             {
                 let c = self.core.lock();
                 if c.intact {
                     let (e, s) = c.log.last();
                     voters.push((self.cfg.id.clone(), e, s));
                 }
+                answered.push((self.cfg.id.clone(), c.log.commit()));
             }
             let mut rx = self.broadcast(Msg::Promise { epoch, from: self.cfg.id.clone() });
             while voters.len() < self.cfg.quorum() {
@@ -1404,13 +1504,34 @@ impl Node {
                         self.step_down(&mut c, "a member promised a newer epoch");
                         return Ok(());
                     }
-                    if p.ok && p.intact {
-                        voters.push((id, p.last_epoch, p.last_seq));
+                    if p.ok {
+                        let mut c = self.core.lock();
+                        c.generation = c.generation.max(p.generation);
+                        drop(c);
+                        answered.push((id.clone(), p.commit));
+                        if p.intact {
+                            voters.push((id, p.last_epoch, p.last_seq));
+                        }
                     }
                 }
             }
             if voters.len() < self.cfg.quorum() {
-                tracing::warn!(id = %self.cfg.id, epoch, intact = voters.len(), "qlog: no quorum of intact logs yet, retrying");
+                // A member that didn't promise may hold an intact log; one
+                // that promised this epoch and isn't intact can't become
+                // intact behind our back (it refuses older leaders now).
+                // Only when even counting every silent member as intact
+                // falls short of a quorum has the quorum been lost.
+                let silent = self.cfg.members.len() - answered.len();
+                if voters.len() + silent < self.cfg.quorum() {
+                    self.stats.lost_quorums.fetch_add(1, Ordering::Relaxed);
+                    if self.cfg.flush.is_some() && self.cfg.auto_recover {
+                        tracing::warn!(id = %self.cfg.id, epoch, intact = voters.len(), answered = answered.len(), "qlog: no quorum of intact logs can exist: bucket recovery");
+                        return self.bucket_recover(epoch, answered).await;
+                    }
+                    tracing::warn!(id = %self.cfg.id, epoch, intact = voters.len(), "qlog: the quorum is lost; bucket recovery is off, waiting");
+                } else {
+                    tracing::warn!(id = %self.cfg.id, epoch, intact = voters.len(), "qlog: no quorum of intact logs yet, retrying");
+                }
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }
@@ -1434,6 +1555,150 @@ impl Node {
             self.become_leader(&mut c, epoch);
             return Ok(());
         }
+    }
+
+    /// After a lost quorum (docs/quorum.md, "Bucket recovery"): this
+    /// candidate, holding promises from a quorum of members, takes the log
+    /// from the bucket. Committed entries past the manifest's F (orphan
+    /// segments, then the longest committed prefix a member that promised
+    /// holds) are kept with their seqs; the seqs from there up to R are
+    /// skipped (anything emitted among them is re-ingested from the hosts
+    /// above R); the state is the manifest's checkpoint cloned; and this
+    /// node leads from R + 1.
+    async fn bucket_recover(self: &Arc<Self>, epoch: u64, answered: Vec<(String, u64)>) -> anyhow::Result<()> {
+        let o = self.cfg.flush.clone().expect("checked by the caller");
+        let t0 = Instant::now();
+        let Some(p) = flush::recovery_point(&self.store).await? else {
+            // Nothing was ever fenced, so the reservation was 0: nothing was
+            // ever committed, let alone emitted. Start over at the bottom.
+            let mut c = self.core.lock();
+            if c.role != Role::Candidate || c.epoch != epoch {
+                return Ok(());
+            }
+            anyhow::ensure!(c.log.commit() == 0, "qlog: a commit index with no manifest");
+            c.log.reset(epoch, 0);
+            self.become_leader(&mut c, epoch);
+            return Ok(());
+        };
+        let mut stats = flush::RecoveryStats { read_ms: t0.elapsed().as_millis() as u64, ..Default::default() };
+        let from = p.flushed + 1;
+        let mut salvage = Vec::new();
+        let mut by_commit = answered;
+        by_commit.sort_by(|a, b| b.1.cmp(&a.1));
+        for (id, commit) in by_commit {
+            if commit < from {
+                break;
+            }
+            match self.committed_from(&id, epoch, from, commit).await {
+                Ok(es) if es.first().is_some_and(|e| e.seq == from) => {
+                    tracing::info!(id = %self.cfg.id, from = %id, first = from, last = commit, "qlog recovery: salvaged committed entries");
+                    salvage = es;
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(id = %self.cfg.id, from = %id, "qlog recovery: salvage failed: {e:#}"),
+            }
+        }
+        let m = flush::recover(&self.store, &self.cfg.id, epoch, &o, p, salvage, &mut stats).await?;
+        let rec = m.recovery.clone().expect("a recovery manifest");
+        let (after, base) = (rec.after, rec.base);
+        // This incarnation's live consumers get everything up to S before the
+        // jump; S is in the bucket now. A process that hasn't emitted has no
+        // live consumers (reconnecting ones backfill).
+        let emitted = self.core.lock().emitted;
+        let mut catch_up = Vec::new();
+        if self.emit.firehose().is_some() && emitted < after {
+            let mut cache: flush::SegCache = None;
+            let mut next = emitted + 1;
+            while next <= after {
+                match flush::read_bucket(&self.store, &mut cache, next, after, 8 << 20).await? {
+                    Some((_, es)) if !es.is_empty() => {
+                        next = es.last().expect("non-empty").seq + 1;
+                        catch_up.extend(es);
+                    }
+                    _ => break,
+                }
+            }
+        }
+        let _order = self.emit_order.lock();
+        let mut c = self.core.lock();
+        if c.role != Role::Candidate || c.epoch != epoch {
+            // the manifest is ours and fences older leaders; whoever leads
+            // next reads it
+            return Ok(());
+        }
+        if !catch_up.is_empty() && catch_up[0].seq == c.emitted + 1 {
+            let upto = catch_up.last().expect("non-empty").seq;
+            let ev: Vec<(i64, Bytes)> = catch_up.into_iter().map(|e| (e.seq as i64, e.data)).collect();
+            self.emit.emit(c.emitted, upto, ev);
+            c.emitted = upto;
+        }
+        if c.emitted < base {
+            if self.emit.firehose().is_some() && c.emitted < after {
+                self.stats.emit_gaps.fetch_add(after - c.emitted, Ordering::Relaxed);
+                tracing::warn!(id = %self.cfg.id, from = c.emitted, to = after, "qlog recovery: couldn't emit up to S before the jump");
+            }
+            c.emitted = base;
+        }
+        // the log's base takes this epoch, so a promise round prefers it
+        // over any older log still on a member's disk
+        c.log.reset(epoch, base);
+        c.flushed = c.flushed.max(m.flushed);
+        c.reserve = c.reserve.max(m.reserve);
+        c.generation = c.generation.max(rec.generation);
+        c.recovery_cursors = Some((rec.generation, encode_cursors(&rec.cursors)));
+        self.stats.recoveries.fetch_add(1, Ordering::Relaxed);
+        stats.total_ms = t0.elapsed().as_millis() as u64;
+        tracing::warn!(
+            id = %self.cfg.id, epoch, generation = rec.generation, f = stats.manifest_flushed, after, base,
+            salvaged = stats.salvaged, orphans = stats.orphan_segments, ms = stats.total_ms,
+            "qlog recovery: the bucket's log adopted, resuming above R"
+        );
+        self.recovered.lock().push(stats);
+        self.become_leader(&mut c, epoch);
+        Ok(())
+    }
+
+    /// Committed entries `[from, upto]` as `id` holds them (this node: its
+    /// own log; a member that promised `epoch`: fetched). Fewer if it holds
+    /// fewer; empty if it doesn't reach back to `from`.
+    async fn committed_from(&self, id: &str, epoch: u64, from: u64, upto: u64) -> anyhow::Result<Vec<Entry>> {
+        let mut out: Vec<Entry> = Vec::new();
+        let mut next = from;
+        if id == self.cfg.id {
+            let upto = upto.min(self.core.lock().log.commit());
+            while next <= upto {
+                let es = self.committed_chunk(next, upto, self.cfg.max_batch_bytes).await?;
+                let Some(l) = es.last() else { break };
+                next = l.seq + 1;
+                out.extend(es);
+            }
+            return Ok(out);
+        }
+        let rpc = self.ctl.get(id).ok_or_else(|| anyhow::anyhow!("unknown member {id}"))?;
+        while next <= upto {
+            let m = Msg::Fetch {
+                epoch,
+                from: self.cfg.id.clone(),
+                from_seq: next,
+                max_bytes: self.cfg.max_batch_bytes as u64,
+            };
+            let Msg::FetchResp { ok, base_seq, entries, .. } =
+                rpc.call(&m, self.cfg.rpc_timeout * 4).await.map_err(|e| anyhow::anyhow!("{e:?}"))?
+            else {
+                anyhow::bail!("unexpected reply to fetch");
+            };
+            anyhow::ensure!(ok, "{id} no longer promised to epoch {epoch}");
+            if base_seq >= next {
+                break;
+            }
+            let es: Vec<Entry> = entries.into_iter().take_while(|e| e.seq <= upto).collect();
+            let Some(l) = es.last() else { break };
+            anyhow::ensure!(es[0].seq == next, "{id} sent {} for {next}", es[0].seq);
+            next = l.seq + 1;
+            out.extend(es);
+        }
+        Ok(out)
     }
 
     /// Sends `m` to every peer; replies arrive as they come. Each call runs
@@ -1531,6 +1796,7 @@ impl Node {
                 return;
             }
             loop {
+                let _order = self.emit_order.lock();
                 let (from, upto, events) = {
                     let mut c = self.core.lock();
                     let upto = c.log.commit().min(c.durable);

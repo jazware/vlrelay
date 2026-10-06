@@ -24,6 +24,9 @@ pub struct Append {
     /// flushes from there) and leads under R if it takes over.
     pub flushed: u64,
     pub reserve: u64,
+    /// Bucket recoveries so far (the manifest's generation) as the leader
+    /// knows it: whoever leads next answers host owners with it.
+    pub generation: u64,
     pub entries: Vec<Entry>,
 }
 
@@ -50,6 +53,7 @@ pub struct PromiseResp {
     /// The log holds everything this node ever acked (memory-only: false
     /// after a restart until it has caught up again).
     pub intact: bool,
+    pub generation: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,10 +90,25 @@ pub enum Msg {
         /// each counting only events already acked: they ride on this
         /// submit's first entry (or the next one appended).
         cursors: Bytes,
+        /// The recovery generation the submitter last rewound for: cursors
+        /// from before a recovery it hasn't seen may count lost events, so
+        /// the leader drops them.
+        generation: u64,
     },
     Submitted {
         first: u64,
         n: u64,
+        /// The leader's recovery generation: higher than the submitter's,
+        /// it rewinds its hosts to `Cursors`.
+        generation: u64,
+    },
+    /// A host owner asks where the last bucket recovery left its hosts.
+    Cursors,
+    CursorsResp {
+        generation: u64,
+        /// False: this node doesn't know that recovery's cursors yet.
+        known: bool,
+        cursors: Bytes,
     },
     NotLeader {
         hint: String,
@@ -114,6 +133,8 @@ impl Msg {
             Msg::Submitted { .. } => 10,
             Msg::NotLeader { .. } => 11,
             Msg::Failed { .. } => 12,
+            Msg::Cursors => 13,
+            Msg::CursorsResp { .. } => 14,
         }
     }
 
@@ -143,6 +164,7 @@ pub fn encode(rid: u64, m: &Msg) -> Bytes {
             b.put_u8(a.reset as u8);
             b.put_u64(a.flushed);
             b.put_u64(a.reserve);
+            b.put_u64(a.generation);
             put_entries(&mut b, &a.entries);
         }
         Msg::AppendResp(r) => {
@@ -165,6 +187,7 @@ pub fn encode(rid: u64, m: &Msg) -> Bytes {
             b.put_u64(r.base_seq);
             b.put_u64(r.commit);
             b.put_u8(r.intact as u8);
+            b.put_u64(r.generation);
         }
         Msg::Fetch { epoch, from, from_seq, max_bytes } => {
             b.put_u64(*epoch);
@@ -181,17 +204,25 @@ pub fn encode(rid: u64, m: &Msg) -> Bytes {
         }
         Msg::Ping { from } => put_str(&mut b, from),
         Msg::Pong => {}
-        Msg::Submit { frames, cursors } => {
+        Msg::Submit { frames, cursors, generation } => {
             b.put_u32(frames.len() as u32);
             for (p, s) in frames {
                 put_bytes(&mut b, p);
                 put_bytes(&mut b, s);
             }
             put_bytes(&mut b, cursors);
+            b.put_u64(*generation);
         }
-        Msg::Submitted { first, n } => {
+        Msg::Submitted { first, n, generation } => {
             b.put_u64(*first);
             b.put_u64(*n);
+            b.put_u64(*generation);
+        }
+        Msg::Cursors => {}
+        Msg::CursorsResp { generation, known, cursors } => {
+            b.put_u64(*generation);
+            b.put_u8(*known as u8);
+            put_bytes(&mut b, cursors);
         }
         Msg::NotLeader { hint } => put_str(&mut b, hint),
         Msg::Failed { reason } => put_str(&mut b, reason),
@@ -205,7 +236,7 @@ fn entries_len(m: &Msg) -> usize {
     match m {
         Msg::Append(a) => a.entries.iter().map(|e| e.data.len() + e.cursors.len() + 24).sum(),
         Msg::FetchResp { entries, .. } => entries.iter().map(|e| e.data.len() + e.cursors.len() + 24).sum(),
-        Msg::Submit { frames, cursors } => frames.iter().map(|(p, s)| p.len() + s.len() + 8).sum::<usize>() + cursors.len(),
+        Msg::Submit { frames, cursors, .. } => frames.iter().map(|(p, s)| p.len() + s.len() + 8).sum::<usize>() + cursors.len(),
         _ => 0,
     }
 }
@@ -286,6 +317,7 @@ pub fn decode(body: Bytes) -> R<(u64, Msg)> {
             reset: r.bool()?,
             flushed: r.u64()?,
             reserve: r.u64()?,
+            generation: r.u64()?,
             entries: r.entries()?,
         }),
         2 => Msg::AppendResp(AppendResp {
@@ -305,6 +337,7 @@ pub fn decode(body: Bytes) -> R<(u64, Msg)> {
             base_seq: r.u64()?,
             commit: r.u64()?,
             intact: r.bool()?,
+            generation: r.u64()?,
         }),
         5 => Msg::Fetch { epoch: r.u64()?, from: r.string()?, from_seq: r.u64()?, max_bytes: r.u64()? },
         6 => Msg::FetchResp {
@@ -322,11 +355,13 @@ pub fn decode(body: Bytes) -> R<(u64, Msg)> {
             for _ in 0..n {
                 frames.push((r.bytes()?, r.bytes()?));
             }
-            Msg::Submit { frames, cursors: r.bytes()? }
+            Msg::Submit { frames, cursors: r.bytes()?, generation: r.u64()? }
         }
-        10 => Msg::Submitted { first: r.u64()?, n: r.u64()? },
+        10 => Msg::Submitted { first: r.u64()?, n: r.u64()?, generation: r.u64()? },
         11 => Msg::NotLeader { hint: r.string()? },
         12 => Msg::Failed { reason: r.string()? },
+        13 => Msg::Cursors,
+        14 => Msg::CursorsResp { generation: r.u64()?, known: r.bool()?, cursors: r.bytes()? },
         _ => return Err("unknown message"),
     };
     if r.0.has_remaining() {
@@ -381,6 +416,7 @@ mod tests {
                 reset: true,
                 flushed: 4,
                 reserve: 99,
+                generation: 2,
                 entries: ents.clone(),
             }),
             Msg::AppendResp(AppendResp { ok: true, promised: 3, matched: 10, commit: 7, last_seq: 10, intact: false }),
@@ -393,6 +429,7 @@ mod tests {
                 base_seq: 1,
                 commit: 7,
                 intact: true,
+                generation: 1,
             }),
             Msg::Fetch { epoch: 4, from: "n2".into(), from_seq: 8, max_bytes: 1 << 20 },
             Msg::FetchResp { ok: true, base_epoch: 1, base_seq: 2, last_seq: 10, entries: ents },
@@ -401,8 +438,11 @@ mod tests {
             Msg::Submit {
                 frames: vec![(Bytes::from_static(b"p"), Bytes::from_static(b"s"))],
                 cursors: Bytes::from_static(b"c"),
+                generation: 3,
             },
-            Msg::Submitted { first: 11, n: 2 },
+            Msg::Submitted { first: 11, n: 2, generation: 3 },
+            Msg::Cursors,
+            Msg::CursorsResp { generation: 3, known: true, cursors: Bytes::from_static(b"cc") },
             Msg::NotLeader { hint: "n1".into() },
             Msg::Failed { reason: "x".into() },
         ];
