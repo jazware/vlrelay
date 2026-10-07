@@ -80,8 +80,9 @@ reports why.
 The relay-only defaults are guesses to tune against real traffic. Auto-throttle trips at 50%
 failed frames over a sweep interval with at least 200 frames, and a throttled host recovers after
 an hour without a trip. The spam thresholds are 300 newly created accounts an hour per host, 600
-records a minute per account and 600 failed frames a minute per host. The trusted tier is never
-auto-throttled, since throttling the big PDSes for a buggy minute would stall most of the network.
+records a minute per account and 600 failed frames a minute per host. The trusted tier isn't
+auto-throttled by default (`tiers.trusted.autoThrottle`), since throttling the big PDSes for a buggy
+minute would stall most of the network.
 
 There are two deliberate departures from indigo. Trusted-domain and allow-listed hosts don't spend
 the daily new-host budget (indigo counts everything but admin requests). And a failed counter
@@ -110,8 +111,16 @@ first time they're seen. After that the host record's tier holds.
 The driver processes trips every second and sweeps every host every 30 s, using the counter
 deltas since the previous sweep for the error budget. After a restart the first sweep only takes a
 baseline. A host's policy state (where to recover to, last trip, trip count, operator throttle,
-the last 20 operator actions) lives in its host record, and a domain-rule ban added later
+the last 20 tier actions) lives in its host record, and a domain-rule ban added later
 disconnects a host that's already connected within about a second.
+
+Every tier change the relay makes itself (an auto-throttle, a recovery, a promotion) goes on the
+host's action trail next to the operators', as a `set-tier` by `relay (service)` with its `reason`
+and, for a throttle, the `case` it opened or updated. That case's `autoAction` says `throttled from`
+the old tier. A spam threshold's throttle uses that threshold's case; an error-budget throttle opens
+an `error-budget` case (the failed share of the sweep's frames against the budget). An operator's
+`set-tier` doesn't exempt a host from the next trip: if its tier allows auto-throttling, a host
+still failing its checks goes back to `throttled`, and the trail shows why.
 
 ## Domain rules
 

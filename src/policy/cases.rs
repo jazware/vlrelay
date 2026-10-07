@@ -112,6 +112,14 @@ pub enum Opened {
     Updated(u64),
 }
 
+impl Opened {
+    pub fn id(self) -> u64 {
+        match self {
+            Opened::Created(id) | Opened::Updated(id) => id,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct OpenIndex {
     id: u64,

@@ -698,8 +698,16 @@ async fn driver_throttles_opens_cases_and_sweeps() {
     assert_eq!(farm.tier, Tier::Throttled);
     assert_eq!(e.for_host(&farm).limits.unwrap().events_per_sec, 5.0);
     let c = e.cases.get_case(1).await.unwrap().unwrap();
-    assert_eq!(c.auto_action.as_deref(), Some("throttled"));
+    assert_eq!(c.auto_action.as_deref(), Some("throttled from new"));
     assert_eq!(c.evidence[0].signals["new-accounts"], 300.0);
+    let trail = PolicyAdmin::host_actions(&farm);
+    assert!(
+        matches!(&trail[..], [a] if a.by == tiers::RELAY_ACTOR
+            && matches!(&a.action, HostAction::SetTier { tier } if tier == "throttled")
+            && a.reason.as_deref().is_some_and(|r| r.contains("spam threshold new-accounts"))
+            && a.case == Some(1)),
+        "{trail:?}"
+    );
 
     // first sweep: baselines, and the old new host is promoted
     let r = d.sweep_at(now).await.unwrap();
@@ -716,11 +724,79 @@ async fn driver_throttles_opens_cases_and_sweeps() {
     let r = d.sweep_at(now + 30).await.unwrap();
     assert_eq!(r.moved.len(), 1);
     assert_eq!(r.moved[0].to, Tier::Throttled);
+    assert_eq!(r.cases, vec![Opened::Created(2)]);
+    let c = e.cases.get_case(2).await.unwrap().unwrap();
+    assert_eq!((c.kind.as_str(), c.auto_action.as_deref()), ("error-budget", Some("throttled from default")));
+    assert_eq!((c.observed, c.threshold), (80.0, 50.0));
     // quiet for the recovery period: both throttled hosts come back
     let r = d.sweep_at(now + 30 + 3_600).await.unwrap();
     let mut back: Vec<_> = r.moved.iter().map(|m| (m.host.clone(), m.to)).collect();
     back.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(back, vec![("buggy.example".into(), Tier::Default), ("farm.example".into(), Tier::New)]);
+    let trail = PolicyAdmin::host_actions(&hosts.get_host("buggy.example").await.unwrap().unwrap());
+    let seen: Vec<_> = trail
+        .iter()
+        .map(|a| match &a.action {
+            HostAction::SetTier { tier } => (a.by.as_str(), tier.as_str(), a.case),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(seen, vec![(tiers::RELAY_ACTOR, "throttled", Some(2)), (tiers::RELAY_ACTOR, "default", None)]);
+    assert!(trail[1].reason.as_deref().is_some_and(|r| r.starts_with("recovered to default")), "{trail:?}");
+}
+
+/// What happened to two trusted hosts in prod: an operator set them trusted
+/// with `tiers.trusted.autoThrottle` on, and a sweep full of failed frames
+/// throttled them again. The trail used to end at the operator's set-tier,
+/// and no case said the relay had acted.
+#[tokio::test]
+async fn an_auto_throttle_after_an_operators_set_tier_is_on_the_trail() {
+    let store = Store::memory(None);
+    let e = engine(&store, "a");
+    let mut body = p();
+    body.tiers.trusted.auto_throttle = true;
+    e.save_policy(0, body, "op", "").await.unwrap();
+    let hosts = Arc::new(MemHosts::default());
+    let now = crate::state::now_secs();
+    hosts.put_host(&rec("pds.example.com", Tier::Throttled, now - 30 * DAY)).await.unwrap();
+    let a = PolicyAdmin::new(e.clone(), hosts.clone());
+    a.host_action("pds.example.com", HostAction::SetTier { tier: "trusted".into() }, "admin (token)").await.unwrap();
+    let d = Driver::new(e.clone(), hosts.clone());
+    d.sweep_at(now).await.unwrap();
+    hosts
+        .add_counts(&[("pds.example.com".into(), HostCounts { events: 0, failed_checks: 202, ..Default::default() })])
+        .await
+        .unwrap();
+    let r = d.sweep_at(now + 30).await.unwrap();
+    assert_eq!(r.moved.iter().map(|m| (m.from, m.to)).collect::<Vec<_>>(), vec![(Tier::Trusted, Tier::Throttled)]);
+    let h = hosts.get_host("pds.example.com").await.unwrap().unwrap();
+    assert_eq!(h.tier, Tier::Throttled);
+    let trail = PolicyAdmin::host_actions(&h);
+    let [op, relay] = &trail[..] else { panic!("{trail:?}") };
+    assert_eq!(op.by, "admin (token)");
+    assert_eq!(relay.by, "relay (service)");
+    assert!(relay.at_ms >= op.at_ms);
+    assert!(matches!(&relay.action, HostAction::SetTier { tier } if tier == "throttled"));
+    assert_eq!(
+        relay.reason.as_deref(),
+        Some("auto-throttled from trusted: 100% of 202 frames failed checks (budget 50%)")
+    );
+    let id = relay.case.expect("the case is on the trail");
+    let c = e.cases.get_case(id).await.unwrap().unwrap();
+    assert_eq!((c.kind.as_str(), c.host.as_str()), ("error-budget", "pds.example.com"));
+    assert_eq!(c.to_wire().auto_action.as_deref(), Some("throttled from trusted"));
+    // the wire form leaves both fields out of an operator's entry
+    let v = serde_json::to_value(op).unwrap();
+    assert!(v.get("reason").is_none() && v.get("case").is_none(), "{v}");
+
+    // still failing and already throttled: the trip counts, nothing new on the trail or the case
+    hosts
+        .add_counts(&[("pds.example.com".into(), HostCounts { events: 0, failed_checks: 300, ..Default::default() })])
+        .await
+        .unwrap();
+    let r = d.sweep_at(now + 60).await.unwrap();
+    assert!(r.moved.is_empty() && r.cases.is_empty());
+    assert_eq!(PolicyAdmin::host_actions(&hosts.get_host("pds.example.com").await.unwrap().unwrap()).len(), 2);
 }
 
 #[tokio::test]

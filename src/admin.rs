@@ -361,6 +361,13 @@ pub struct HostActionRecord {
     pub at_ms: i64,
     pub by: String,
     pub action: HostAction,
+    /// Why the relay moved the host on its own (operators' actions carry
+    /// their reason in the action, if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The case the relay opened or updated for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case: Option<u64>,
 }
 
 // ---------------------------------------------------------------- domain rules

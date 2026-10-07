@@ -183,7 +183,7 @@ export type HostDetail = {
   rejectsByReason: Partial<Record<RejectReason, number>>
   recentRejects: RejectSample[]
   series: { sampleSecs: number; t: number[]; events: number[]; rejects: number[] }
-  actions: { atMs: number; by: string; action: HostAction }[]
+  actions: { atMs: number; by: string; action: HostAction; reason?: string; case?: number }[]
   openCases: number[]
 }
 

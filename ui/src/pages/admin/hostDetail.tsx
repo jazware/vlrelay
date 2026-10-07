@@ -76,6 +76,11 @@ const BP_WHY: Record<BackpressureReason | 'unknown', [string, string]> = {
 }
 
 const by = (a: Acted) => `${a.by}, ${ago(a.atMs)}`
+const caseLink = (id: number) => (
+  <button type="button" className="cx-linklike" onClick={() => openPanel('case', String(id))}>
+    case {id}
+  </button>
+)
 const ruleName = (r: DomainRule) => (
   <button type="button" className="cx-linklike" onClick={() => openPanel('rule', String(r.id))}>
     rule {r.id} (<span className="mono">{r.pattern}</span>)
@@ -234,7 +239,11 @@ function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; 
       const set = last('set-tier')
       lines.push(
         set && set.action.action === 'set-tier' && set.action.tier === r.tier ? (
-          <>Tier {r.tier} set by {by(set)}</>
+          <>
+            Tier {r.tier} set by {by(set)}
+            {set.reason ? <>: {set.reason}</> : null}
+            {set.case != null ? <> ({caseLink(set.case)})</> : null}
+          </>
         ) : r.tier === policy?.defaultTier ? (
           <>The {r.tier} tier is the default for a new host: no rule or operator moved it.</>
         ) : (
@@ -573,7 +582,7 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
           )}
         </div>
       </Sec>
-      <Sec title="Operator actions" digest={d.actions.length ? `${d.actions.length}` : 'none'} open={d.actions.length > 0} flush>
+      <Sec title="Actions" digest={d.actions.length ? `${d.actions.length}` : 'none'} open={d.actions.length > 0} flush>
         {d.actions.length ? (
           <div className="cx-tw">
             <table className="cx-t compact">
@@ -582,7 +591,11 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
                   <tr key={i}>
                     <td className="sm muted">{ago(a.atMs)}</td>
                     <td className="sm">{a.by}</td>
-                    <td className="mono sm">{describe(a.action)}</td>
+                    <td className="mono sm">
+                      {describe(a.action)}
+                      {a.reason ? <span className="muted"> · {a.reason}</span> : null}
+                      {a.case != null ? <> · {caseLink(a.case)}</> : null}
+                    </td>
                   </tr>
                 ))}
               </tbody>

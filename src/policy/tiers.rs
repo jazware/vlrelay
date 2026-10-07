@@ -18,6 +18,7 @@
 //! "never tripped".
 
 use super::doc::{PolicyBody, tier_name};
+use crate::admin::{HostAction, HostActionRecord};
 use crate::state::{HostRecord, Tier};
 use serde::{Deserialize, Serialize};
 
@@ -43,12 +44,15 @@ pub struct HostPolicy {
     /// Operator account cap in place of the tier's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_accounts: Option<u64>,
-    /// The last operator actions, newest last.
+    /// The last tier actions, the operators' and the relay's own, newest
+    /// last.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<serde_json::Value>,
 }
 
 pub const ACTIONS_KEPT: usize = 20;
+/// Who the trail says moved a host when the relay did it on its own.
+pub const RELAY_ACTOR: &str = "relay (service)";
 const EXTRA_KEY: &str = "policy";
 
 pub fn host_policy(rec: &HostRecord) -> HostPolicy {
@@ -61,6 +65,42 @@ pub fn set_host_policy(rec: &mut HostRecord, p: &HostPolicy) {
     } else {
         rec.extra.insert(EXTRA_KEY.into(), serde_json::to_value(p).expect("serializable"));
     }
+}
+
+/// Appends `a` to the host's action trail, keeping the newest
+/// [`ACTIONS_KEPT`].
+pub fn record_action(rec: &mut HostRecord, a: &HostActionRecord) {
+    let mut s = host_policy(rec);
+    s.actions.push(serde_json::to_value(a).expect("serializable"));
+    let drop = s.actions.len().saturating_sub(ACTIONS_KEPT);
+    s.actions.drain(..drop);
+    set_host_policy(rec, &s);
+}
+
+/// The trail entry the relay writes for a tier change of its own.
+pub fn relay_action(to: Tier, reason: &str, at_ms: i64) -> HostActionRecord {
+    HostActionRecord {
+        at_ms,
+        by: RELAY_ACTOR.into(),
+        action: HostAction::SetTier { tier: tier_name(to).into() },
+        reason: Some(reason.into()),
+        case: None,
+    }
+}
+
+/// Points the relay's trail entry at `at_ms` to `case`. False if the entry
+/// has left the trail (or never was in it).
+pub fn link_case(rec: &mut HostRecord, at_ms: i64, case: u64) -> bool {
+    let mut s = host_policy(rec);
+    let Some(v) = s.actions.iter_mut().rev().find(|v| {
+        serde_json::from_value::<HostActionRecord>((*v).clone())
+            .is_ok_and(|a| a.at_ms == at_ms && a.by == RELAY_ACTOR && a.case.is_none())
+    }) else {
+        return false;
+    };
+    v["case"] = case.into();
+    set_host_policy(rec, &s);
+    true
 }
 
 /// What happened to a host since its last step.

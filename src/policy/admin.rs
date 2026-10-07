@@ -380,8 +380,7 @@ impl PolicyAdmin {
                 return Err(AdminError::tier_set_by_rule(r.id, &r.pattern, tier_name(w)));
             }
         }
-        let entry = serde_json::to_value(HostActionRecord { at_ms: now_ms(), by: by.to_string(), action })
-            .map_err(anyhow::Error::from)?;
+        let entry = HostActionRecord { at_ms: now_ms(), by: by.to_string(), action, reason: None, case: None };
         let mut outcome: Option<Result<Tier, String>> = None;
         let out = &mut outcome;
         let written = self
@@ -395,11 +394,7 @@ impl PolicyAdmin {
                         *out = Some(Err(e));
                         return None;
                     }
-                    let mut st = tiers::host_policy(&rec);
-                    st.actions.push(entry);
-                    let drop = st.actions.len().saturating_sub(tiers::ACTIONS_KEPT);
-                    st.actions.drain(..drop);
-                    tiers::set_host_policy(&mut rec, &st);
+                    tiers::record_action(&mut rec, &entry);
                     *out = Some(Ok(from));
                     Some(rec)
                 }),

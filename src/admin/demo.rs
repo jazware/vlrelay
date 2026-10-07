@@ -1408,7 +1408,7 @@ impl AdminSource for Demo {
                 h.redial_at = Some(now + 1_500);
             }
         }
-        h.actions.push(HostActionRecord { at_ms: now, by: by.into(), action });
+        h.actions.push(HostActionRecord { at_ms: now, by: by.into(), action, reason: None, case: None });
         self.host_changed(h, now, true);
         let h = &s.hosts[i];
         Ok(s.row(h))
