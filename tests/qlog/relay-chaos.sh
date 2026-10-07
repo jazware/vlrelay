@@ -44,6 +44,9 @@
 # fails unless a whole read of the list finished, whatever the faults did
 # to the leaders reading it.
 #
+# FAKE_FAULT passes fakepds a --fault (badsig:2:rate=0.4 gives one host bad
+# signatures, for the rejects views the end of the run records).
+#
 # PLC_EXPORT=1 runs the PLC export on the leader against the fake PLC's
 # /export: PLC_HOSTS (1000) hosts of --dids accounts in its history,
 # PLC_RATE (4) requests a second, and every PLC_THROTTLE_EVERY'th (6)
@@ -145,6 +148,7 @@ gen_threads=$(( rate > 2000 ? 8 : 2 ))
 "$target/fakepds" run --seed "relayq$B" --port-base "$fake_base" --hosts "$fake_hosts" --dids "$dids" --rate "$rate" \
   --gen-threads "$gen_threads" --plc-port "$fake_plc" --replay-mb 256 --lag-secs 30 \
   --initial-records 20 --target-records 60 --stats-secs 30 \
+  $([ -n "${FAKE_FAULT:-}" ] && echo "--fault $FAKE_FAULT") \
   $([ "${PLC_EXPORT:-}" = 1 ] && echo "--plc-hosts ${PLC_HOSTS:-1000} --plc-throttle-every ${PLC_THROTTLE_EVERY:-6}") \
   $([ "${DISCOVERY:-}" = 1 ] && echo "--list-extra ${LIST_EXTRA:-40} --list-page ${LIST_PAGE:-1} --plc-throttle-every ${PLC_THROTTLE_EVERY:-6}") \
   >"$out/fakepds.log" 2>&1 &
@@ -455,9 +459,12 @@ while [ $(($(date +%s) - load_start + 12)) -lt "$duration" ] && [ "$scenario" !=
 done
 
 while [ $(($(date +%s) - load_start)) -lt "$duration" ]; do sleep 1; done
-# each node's consumers (the checker's sockets) as its admin API reports them
+# each node's consumers (the checker's sockets) as its admin API reports
+# them, and its view of the cluster's worst hosts
 for i in $started; do
   curl -sf --max-time 2 -u admin:relayq "http://127.0.0.1:$(http "$i")/admin/api/consumers" >"$out/consumers-n$i.json" || true
+  curl -sf --max-time 5 -u admin:relayq "http://127.0.0.1:$(http "$i")/admin/api/ops/rejects/top?limit=5" >"$out/rejects-top-n$i.json" || true
+  curl -sf --max-time 5 -u admin:relayq "http://127.0.0.1:$(http "$i")/admin/api/hosts?flag=erroring&source=cli&limit=3" >"$out/hosts-flag-n$i.json" || true
 done
 python3 - "$out" $started <<'PY' || true
 import json, sys
