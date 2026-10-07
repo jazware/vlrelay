@@ -32,16 +32,35 @@ select.cx-inp.dirty {
 }
 
 /* ---------------------------------------------------------------- knobs */
+/* one setting: what it is and why in a column of bounded width, then the control and its default
+   right beside it, so a wide panel doesn't push the control a screen away from its label */
 .cx-knob {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 4px 14px;
+  grid-template-columns: minmax(0, 400px) minmax(0, auto);
+  justify-content: start;
+  gap: 4px 20px;
   padding: 9px 12px;
   border-top: 1px solid var(--rule2);
   align-items: center;
 }
 .cx-knob:first-child {
   border-top: 0;
+}
+/* settings in a full-width panel: two to a row where there's room */
+.cx-knobs {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 620px), 1fr));
+  border-top: 1px solid var(--rule2);
+}
+.cx-knobs:first-child {
+  border-top: 0;
+}
+.cx-knobs > .cx-knob {
+  border-top: 0;
+  border-bottom: 1px solid var(--rule2);
+}
+.cx-knobs + .cx-pn-f {
+  margin-top: -1px;
 }
 .cx-knob .kl {
   font-weight: 600;
@@ -63,7 +82,7 @@ select.cx-inp.dirty {
   display: flex;
   gap: 8px;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
   flex-wrap: wrap;
 }
 .cx-knob .use {
@@ -89,8 +108,19 @@ select.cx-inp.dirty {
   resize: vertical;
 }
 
-/* the tier matrix: one input per cell, a quiet line under it when it's off the default */
-.cx-tiers td.r {
+/* the tier matrix: a fixed column per tier, one input per cell with a quiet line under it when it's
+   off the default, and what each limit does in the spare width */
+.cx-tiers td.lim {
+  width: 1%;
+  padding-right: 18px;
+}
+.cx-tiers th.tier,
+.cx-tiers td.tier {
+  width: 140px;
+  min-width: 140px;
+  text-align: center;
+}
+.cx-tiers td.tier {
   vertical-align: top;
   padding-top: 5px;
   padding-bottom: 5px;
@@ -100,12 +130,37 @@ select.cx-inp.dirty {
   flex-direction: column;
   align-items: flex-end;
   gap: 2px;
+  min-height: 26px;
+  justify-content: center;
+}
+.cx-tiers .th {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
 }
 .cx-tiers th .n {
   font-family: var(--mono);
   font-weight: 400;
   color: var(--ink3);
-  margin-left: 4px;
+  font-size: 10.5px;
+}
+.cx-tiers td.why {
+  white-space: normal;
+  color: var(--ink3);
+  font-size: 11.5px;
+  min-width: 220px;
+  vertical-align: top;
+  padding-top: 9px;
+  padding-left: 18px;
+}
+.cx-tiers th.fill {
+  padding-left: 18px;
+}
+.cx-inp.num.none {
+  color: var(--ink3);
+  font-family: var(--sans, inherit);
+  font-style: italic;
 }
 
 /* ---------------------------------------------------------------- the draft bar and diffs */
@@ -183,7 +238,78 @@ select.cx-inp.dirty {
   align-items: flex-start;
 }
 
+/* ---------------------------------------------------------------- seed relays */
+.cx-seeds td:first-child {
+  padding-right: 24px;
+}
+.cx-addseed .cx-inp {
+  flex: 0 1 440px;
+}
+
 /* ---------------------------------------------------------------- cases */
+/* the cases panel: a summary row per kind, checkboxes, the bulk bar */
+.cx-cases th.ck,
+.cx-cases td.ck {
+  width: 28px;
+  padding-right: 0;
+}
+.cx-cases td.subj {
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cx-cases tr.grp {
+  cursor: pointer;
+}
+.cx-cases tr.grp:hover td {
+  background: var(--hover);
+}
+.cx-cases tr.more td {
+  height: auto;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+.cx-cases tr.more .cx-btn + .cx-btn,
+.cx-cases tr.more .cx-btn + span {
+  margin-left: 8px;
+}
+.cx-grpbtn {
+  all: unset;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 12.5px;
+}
+.cx-grpbtn b {
+  font-weight: 600;
+}
+.cx-grpbtn .t2 b {
+  font-family: var(--mono);
+}
+.cx-grpbtn[aria-expanded='true'] .cx-chev {
+  transform: rotate(90deg);
+}
+.cx-grpbtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.cx-bulk {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--rule2);
+  background: color-mix(in oklab, var(--accent) 8%, var(--sheet));
+  font-size: 12.5px;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+.cx-bulk b {
+  margin-right: 4px;
+}
 .cx-signals {
   display: flex;
   flex-wrap: wrap;

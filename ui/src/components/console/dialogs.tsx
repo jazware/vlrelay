@@ -68,7 +68,8 @@ export type ConfirmSpec = {
   primary?: boolean
   /** The request it sends, shown in the footer: "POST /admin/api/hosts/x/action {…}". */
   call: string | ((values: Record<string, string | boolean>) => string)
-  run: (values: Record<string, string | boolean>) => Promise<unknown>
+  /** `progress` puts a line beside the busy button, for a run that makes many calls. */
+  run: (values: Record<string, string | boolean>, progress: (text: string) => void) => Promise<unknown>
   done?: string | ((result: unknown) => string)
 }
 
@@ -110,6 +111,7 @@ function ConfirmDialog({ spec, onCancel, onDone }: { spec: ConfirmSpec; onCancel
   const [word, setWord] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>()
+  const [prog, setProg] = useState('')
   const first = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null)
   useEffect(() => {
     setTimeout(() => first.current?.focus(), 20)
@@ -123,7 +125,7 @@ function ConfirmDialog({ spec, onCancel, onDone }: { spec: ConfirmSpec; onCancel
     setBusy(true)
     setError(undefined)
     try {
-      const r = await spec.run(vals)
+      const r = await spec.run(vals, setProg)
       const msg = typeof spec.done === 'function' ? spec.done(r) : spec.done
       if (msg) toast(msg)
       onDone()
@@ -213,6 +215,11 @@ function ConfirmDialog({ spec, onCancel, onDone }: { spec: ConfirmSpec; onCancel
         <span className="call" title={callText}>
           {callText}
         </span>
+        {prog && (
+          <span className="sm t2 nowrap" role="status">
+            {prog}
+          </span>
+        )}
         <button type="button" className="cx-btn" onClick={onCancel}>
           Cancel
         </button>

@@ -16,6 +16,8 @@ export type Col<T> = {
   render: (row: T) => ReactNode
   className?: string
   style?: CSSProperties
+  /** Takes the table's spare width (a name or a description), so the other columns keep to their content. */
+  fill?: boolean
 }
 
 export function DataTable<T>({
@@ -30,6 +32,7 @@ export function DataTable<T>({
   dim,
   label,
   serverSort,
+  fit,
 }: {
   rows: T[]
   cols: Col<T>[]
@@ -45,6 +48,8 @@ export function DataTable<T>({
   label?: string
   /** The server sorts (and pages): rows come in order, a header click asks for another order. Columns with `serverSortable` get the click. */
   serverSort?: { id: string; asc: boolean; sortable: string[]; onSort: (s: { id: string; asc: boolean }) => void }
+  /** Few, narrow columns: they keep to their content and an empty last column takes the rest. */
+  fit?: boolean
 }) {
   const [own, setOwn] = useState(initial)
   const sort = serverSort ? { id: serverSort.id, asc: serverSort.asc } : own
@@ -78,7 +83,7 @@ export function DataTable<T>({
               return (
                 <th
                   key={c.id}
-                  className={`${c.r ? 'r ' : ''}${sortable(c) ? 'sortable' : ''}`}
+                  className={`${c.r ? 'r ' : ''}${c.fill ? 'fill ' : ''}${sortable(c) ? 'sortable' : ''}`}
                   title={c.title}
                   aria-sort={on ? (sort?.asc ? 'ascending' : 'descending') : undefined}
                   onClick={sortable(c) ? () => setSort(on ? { id: c.id, asc: !sort?.asc } : { id: c.id, asc: c.id === 'host' }) : undefined}
@@ -88,12 +93,13 @@ export function DataTable<T>({
                 </th>
               )
             })}
+            {fit && <th className="fill" aria-hidden="true" />}
           </tr>
         </thead>
         <tbody>
           {sorted.length === 0 && (
             <tr>
-              <td colSpan={cols.length}>{empty ?? <Empty>Nothing here.</Empty>}</td>
+              <td colSpan={cols.length + (fit ? 1 : 0)}>{empty ?? <Empty>Nothing here.</Empty>}</td>
             </tr>
           )}
           {sorted.map((r, i) => {
@@ -111,10 +117,11 @@ export function DataTable<T>({
                 }}
               >
                 {cols.map((c) => (
-                  <td key={c.id} className={`${c.r ? 'r ' : ''}${c.className ?? ''}`} style={c.style}>
+                  <td key={c.id} className={`${c.r ? 'r ' : ''}${c.fill ? 'fill ' : ''}${c.className ?? ''}`} style={c.style}>
                     {c.render(r)}
                   </td>
                 ))}
+                {fit && <td className="fill" />}
               </tr>
             )
           })}

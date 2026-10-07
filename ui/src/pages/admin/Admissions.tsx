@@ -30,10 +30,10 @@ export function AdmissionTable({ entries, maxHeight }: { entries: CrawlAdmission
               <td>{OUT[a.outcome] ?? <Chip k="idle">{a.outcome}</Chip>}</td>
               <td className="mono sm">{a.host}</td>
               <td>{a.tier && <TierTag t={a.tier} />}</td>
-              <td className="wrap sm t2">{a.reason}</td>
               <td>
                 <SourceTag s={a.source} />
               </td>
+              <td className="fill wrap sm t2">{a.reason}</td>
             </tr>
           ))}
         </tbody>

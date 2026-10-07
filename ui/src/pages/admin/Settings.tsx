@@ -134,7 +134,7 @@ function Flags() {
       }
     >
       <div className="cx-toolbar">
-        <SearchInput mono value={q} placeholder="Filter flags, env, values" onChange={setQ} />
+        <SearchInput mono value={q} placeholder="Filter flags, env, values" onChange={setQ} style={{ flex: '0 1 440px' }} />
         <label className="cx-form-row" style={{ gap: 6, cursor: 'pointer' }}>
           <Toggle on={onlyChanged} onChange={setOnlyChanged} label="Changed from default only" />
           <span className="sm t2" onClick={() => setOnlyChanged(!onlyChanged)}>
@@ -213,6 +213,7 @@ function Plc() {
                         <th>Read to</th>
                         <th className="r">Ops</th>
                         <th>Progress</th>
+                        <th className="fill" />
                       </tr>
                     </thead>
                     <tbody>
@@ -225,6 +226,7 @@ function Plc() {
                           <td className="sm">
                             <Meter v={w.progress} max={1} k={w.done ? 'ok' : 'info'} /> <span className="mono">{w.done ? 'done' : `${Math.round(w.progress * 100)}%`}</span>
                           </td>
+                          <td className="fill" />
                         </tr>
                       ))}
                     </tbody>
@@ -289,31 +291,7 @@ export function Settings() {
         }
       />
       <div className="cx-stack">
-        <div className="cx-tilesbox">
-          <Tiles
-            tiles={[
-              { label: 'From flags', value: fmtNum(count('flag')) },
-              { label: 'From environment', value: fmtNum(count('env')) },
-              { label: 'Changed from default', value: fmtNum(e.filter(changed).length) },
-              { label: 'Defaults', value: fmtNum(count('default')) },
-              { label: 'Unset', value: fmtNum(count('unset')) },
-              { label: 'Secrets set', value: fmtNum(secrets.filter((x) => x.set).length), unit: `of ${secrets.length}`, title: 'Their values never leave the node' },
-            ]}
-          />
-        </div>
-        <Flags />
         <div className="cx-grid2">
-          <Panel title="This build" src={<><Src>settings · binary, version</Src> <Src>/api/public/stats</Src></>}>
-            <KV
-              style={{ padding: '10px 12px' }}
-              rows={[
-                ['Version', <span key="v" className="mono">{s.data ? `${s.data.binary} ${s.data.version}` : '…'}</span>],
-                ['Up', pub ? `${dur(pub.uptimeSecs * 1000)} (since ${dt(pub.timeMs - pub.uptimeSecs * 1000)})` : '…'],
-                ['Nodes', view ? (view.single ? 'one node' : `${plural(view.nodes.length, 'node')}: ${view.nodes.map((n) => n.id).join(', ')}`) : '…'],
-                ['Same build on', view && !view.single ? (new Set(view.nodes.map((n) => n.version).filter(Boolean)).size > 1 ? <Chip key="d" k="warn">mixed versions</Chip> : 'every node') : '—'],
-              ]}
-            />
-          </Panel>
           <Panel
             title="Console"
             foot={
@@ -348,8 +326,34 @@ export function Settings() {
               ]}
             />
           </Panel>
+          <Panel title="This build" src={<><Src>settings · binary, version</Src> <Src>/api/public/stats</Src></>}>
+            <KV
+              style={{ padding: '10px 12px' }}
+              rows={[
+                ['Version', <span key="v" className="mono">{s.data ? `${s.data.binary} ${s.data.version}` : '…'}</span>],
+                ['Up', pub ? `${dur(pub.uptimeSecs * 1000)} (since ${dt(pub.timeMs - pub.uptimeSecs * 1000)})` : '…'],
+                ['Nodes', view ? (view.single ? 'one node' : `${plural(view.nodes.length, 'node')}: ${view.nodes.map((n) => n.id).join(', ')}`) : '…'],
+                ['Same build on', view && !view.single ? (new Set(view.nodes.map((n) => n.version).filter(Boolean)).size > 1 ? <Chip key="d" k="warn">mixed versions</Chip> : 'every node') : '—'],
+              ]}
+            />
+          </Panel>
         </div>
         <Plc />
+        <section className="cx-stack" id="flags" aria-label="Process flags">
+          <div className="cx-tilesbox">
+            <Tiles
+              tiles={[
+                { label: 'From flags', value: fmtNum(count('flag')) },
+                { label: 'From environment', value: fmtNum(count('env')) },
+                { label: 'Changed from default', value: fmtNum(e.filter(changed).length) },
+                { label: 'Defaults', value: fmtNum(count('default')) },
+                { label: 'Unset', value: fmtNum(count('unset')) },
+                { label: 'Secrets set', value: fmtNum(secrets.filter((x) => x.set).length), unit: `of ${secrets.length}`, title: 'Their values never leave the node' },
+              ]}
+            />
+          </div>
+          <Flags />
+        </section>
       </div>
     </>
   )

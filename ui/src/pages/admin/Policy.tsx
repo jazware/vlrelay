@@ -8,7 +8,7 @@ import { toast } from '../../components/console/toast'
 import { Banners, Chip, Empty, ErrorState, KV, Loaded, Meter, PageHead, Panel, Src, TierTag, Updated, type BannerSpec } from '../../components/console/kit'
 import { ApiError, errText, type Case, type PolicyAudit, type PolicyUsage } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
-import { ago, dt, dur, fmtNum, fmtSi, plural } from '../../lib/console/fmt'
+import { ago, dt, dur, fmtNum, plural } from '../../lib/console/fmt'
 import { cached, keys } from '../../lib/console/cache'
 import { readPolicySource, useCapHosts, useConsumers, useHostList, useOpenCases, useOverview, usePolicyAudit, usePolicyDefaults, usePolicySource, usePolicyUsage, useSignals, useTierCounts } from '../../lib/console/queries'
 import * as W from '../../lib/console/writes'
@@ -47,16 +47,16 @@ const tiersOf = (body?: Json) => {
   return [...TIER_ORDER.filter((x) => t.includes(x)), ...t.filter((x) => !TIER_ORDER.includes(x))]
 }
 
-type Row = { k: string; label: string; int?: boolean; bytes?: boolean; zero?: string }
+type Row = { k: string; label: string; unit?: string; why: string; int?: boolean; bytes?: boolean; zero?: string }
 const TIER_ROWS: Row[] = [
-  { k: 'eventsPerSec', label: 'Events/s' },
-  { k: 'eventsPerHour', label: 'Events/h', int: true, zero: 'no hourly cap' },
-  { k: 'eventsPerDay', label: 'Events/day', int: true, zero: 'no daily cap' },
-  { k: 'maxAccounts', label: 'Account cap', int: true },
-  { k: 'newAccountsPerHour', label: 'New accounts/h', int: true, zero: 'no limit' },
-  { k: 'bytesPerSec', label: 'Read rate B/s', int: true, bytes: true },
-  { k: 'identityEventsPerHour', label: 'Identity events/h', int: true, zero: 'no limit' },
-  { k: 'reconnectsPerHour', label: 'Reconnects/h', int: true, zero: 'no limit' },
+  { k: 'eventsPerSec', label: 'Events', unit: '/s', why: 'A host past it is read more slowly; its reader blocks and nothing is dropped.' },
+  { k: 'eventsPerHour', label: 'Events', unit: '/h', int: true, zero: 'no limit', why: 'An hourly bucket on top of the rate.' },
+  { k: 'eventsPerDay', label: 'Events', unit: '/day', int: true, zero: 'no limit', why: 'A daily bucket on top of that.' },
+  { k: 'maxAccounts', label: 'Account cap', int: true, why: 'Accounts on one host. Past it new accounts are created throttled.' },
+  { k: 'newAccountsPerHour', label: 'New accounts', unit: '/h', int: true, zero: 'no limit', why: 'Newly created accounts only; past it their events wait.' },
+  { k: 'bytesPerSec', label: 'Read rate', unit: '/s', int: true, bytes: true, why: "Bytes a second off the host's socket." },
+  { k: 'identityEventsPerHour', label: 'Identity events', unit: '/h', int: true, zero: 'no limit', why: 'Accepted #identity events; past it they’re dropped.' },
+  { k: 'reconnectsPerHour', label: 'Reconnects', unit: '/h', int: true, zero: 'no limit', why: 'How often the relay may reconnect to the host.' },
 ]
 
 export type Signal = { k: string; label: string; per: 'host' | 'account'; kinds: string[] }
@@ -155,34 +155,60 @@ function useErrors(): Map<string, string> {
 
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 
-function NumIn({ path, w = 96, label, ratio }: { path: string; w?: number; label: string; ratio?: boolean }) {
+const UNIT: Record<string, number> = { k: 1e3, m: 1e6, g: 1e9, t: 1e12, ki: 1024, mi: 1024 ** 2, gi: 1024 ** 3, ti: 1024 ** 4 }
+
+/** What an operator types into a number: "50000000", "50,000,000", "50M", "200 MiB", "no limit" (0). NaN when it isn't one. */
+export function parseNum(text: string): number {
+  const t = text.trim().toLowerCase().replace(/[,_\s]/g, '').replace(/%$/, '')
+  if (t === '') return NaN
+  if (t === 'nolimit' || t === 'none') return 0
+  const m = t.match(/^(-?\d*\.?\d+(?:e[+-]?\d+)?)(ki|mi|gi|ti|k|m|g|t)?b?(?:\/s)?$/)
+  if (!m) return NaN
+  return Number(m[1]) * (m[2] ? UNIT[m[2]] : 1)
+}
+
+/** Bytes in the largest binary unit that says them exactly ("200 MiB"), else grouped ("2,100,000 B"). */
+export function exactBytes(n: number): string {
+  if (n === 0) return '0 B'
+  for (const [u, f] of [['TiB', 1024 ** 4], ['GiB', 1024 ** 3], ['MiB', 1024 ** 2], ['KiB', 1024]] as const) if (n >= f && n % f === 0) return `${fmtNum(n / f)} ${u}`
+  return `${fmtNum(n)} B`
+}
+
+/**
+ * A number in the draft. At rest it reads grouped ("50,000,000"), as exact bytes ("200 MiB") or as
+ * "no limit" for a 0 that means none; focused, it shows the raw value. It takes "50M" or "200 MiB" too.
+ */
+function NumIn({ path, w = 96, label, ratio, bytes, zero }: { path: string; w?: number; label: string; ratio?: boolean; bytes?: boolean; zero?: string }) {
   const d = useDraft()
   const errs = useErrors()
   const v = getIn(d.body, path)
-  const show = (x: unknown) => (typeof x === 'number' && Number.isFinite(x) ? String(ratio ? Math.round(x * 10000) / 100 : x) : '')
-  const [text, setText] = useState(show(v))
-  // follow the draft when it moves under the input (discard, a rebase, the JSON editor)
-  useEffect(() => {
-    const n = text.trim() === '' ? NaN : Number(text) / (ratio ? 100 : 1)
-    if (!(Number.isNaN(n) && Number.isNaN(num(v))) && n !== v) setText(show(v))
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [v])
+  const raw = (x: unknown) => (typeof x === 'number' && Number.isFinite(x) ? String(ratio ? Math.round(x * 10000) / 100 : x) : '')
+  const [text, setText] = useState(raw(v))
+  const [focus, setFocus] = useState(false)
+  const n = num(v)
+  const none = !focus && !!zero && n === 0
+  const shown = focus || !Number.isFinite(n) ? text : ratio ? raw(v) : none ? zero : bytes ? exactBytes(n) : fmtNum(n, n % 1 ? 4 : 0)
   const dirty = !same(v, getIn(d.base?.body, path))
   const err = errs.get(path)
   return (
     <input
-      className={`cx-inp num${dirty ? ' dirty' : ''}${err ? ' bad' : ''}`}
+      className={`cx-inp num${dirty ? ' dirty' : ''}${err ? ' bad' : ''}${none ? ' none' : ''}`}
       style={{ width: w }}
-      inputMode="decimal"
+      inputMode={bytes ? 'text' : 'decimal'}
       aria-label={label}
       aria-invalid={!!err}
-      title={err}
-      value={text}
+      title={err ?? (bytes ? 'Bytes: 209715200, 200 MiB or 200M' : zero ? `0 is ${zero}` : 'Takes 50000, 50,000 or 50k')}
+      value={shown}
+      onFocus={() => {
+        setFocus(true)
+        // the draft may have moved under the input (discard, a rebase, the JSON editor)
+        if (Number.isFinite(n)) setText(raw(v))
+      }}
+      onBlur={() => setFocus(false)}
       onChange={(e) => {
         setText(e.target.value)
-        const s = e.target.value.trim()
-        const n = s === '' ? NaN : Number(s)
-        setField(path, Number.isFinite(n) ? (ratio ? n / 100 : n) : NaN)
+        const x = parseNum(e.target.value)
+        setField(path, Number.isFinite(x) ? (ratio ? x / 100 : x) : NaN)
       }}
     />
   )
@@ -244,7 +270,7 @@ function ListIn({ path, label }: { path: string; label: string }) {
 const fmtDef = (v: unknown, unit?: string) => (v === undefined ? '—' : typeof v === 'boolean' ? (v ? 'on' : 'off') : Array.isArray(v) ? (v.length ? v.join(', ') : 'none') : typeof v === 'number' ? `${fmtNum(v, v % 1 ? 2 : 0)}${unit ? ` ${unit}` : ''}` : String(v))
 
 /** The default a fresh relay has, magenta when the draft is off it. */
-function Def({ path, unit, ratio, quiet }: { path: string; unit?: string; ratio?: boolean; quiet?: boolean }) {
+function Def({ path, unit, ratio, quiet, bytes }: { path: string; unit?: string; ratio?: boolean; quiet?: boolean; bytes?: boolean }) {
   const d = useDraft()
   const defs = usePolicyDefaults().data
   if (!defs) return null
@@ -254,7 +280,7 @@ function Def({ path, unit, ratio, quiet }: { path: string; unit?: string; ratio?
   if (quiet && same(v, def)) return null
   return (
     <span className={`cx-kd${same(v, def) ? '' : ' chg'}`} title="What a fresh relay has">
-      default {ratio && typeof def === 'number' ? `${fmtNum(def * 100, 1)}%` : fmtDef(def, unit)}
+      default {ratio && typeof def === 'number' ? `${fmtNum(def * 100, 1)}%` : bytes && typeof def === 'number' ? exactBytes(def) : fmtDef(def, unit)}
     </span>
   )
 }
@@ -327,50 +353,60 @@ function TierMatrix() {
           <tr>
             <th>Limit</th>
             {tiers.map((t) => (
-              <th key={t} className="r">
-                <TierTag t={t} />
-                <span className="n" title="hosts in this tier now">
-                  {n.has(t) ? fmtNum(n.get(t)!) : ''}
+              <th key={t} className="tier">
+                <span className="th">
+                  <TierTag t={t} />
+                  <span className="n" title="hosts in this tier now">
+                    {n.has(t) ? plural(n.get(t)!, 'host') : ''}
+                  </span>
                 </span>
               </th>
             ))}
+            <th className="fill">What it limits</th>
           </tr>
         </thead>
         <tbody>
           {rows.map((r) => (
             <tr key={r.k}>
-              <td>{r.label}</td>
+              <td className="lim">
+                {r.label}
+                {r.unit && <span className="muted"> {r.unit}</span>}
+              </td>
               {tiers.map((t) => {
                 const path = `tiers.${t}.${r.k}`
-                const v = num(getIn(d.body, path))
                 const use = r.k === 'maxAccounts' ? atCap(t) : r.k === 'eventsPerSec' ? nearRate(t) : 0
                 return (
-                  <td key={t} className="r">
+                  <td key={t} className="tier">
                     <span className="cell">
-                      <NumIn path={path} w={110} label={`${t} ${r.label}`} />
-                      {r.bytes && Number.isFinite(v) && <span className="cx-kd">{fmtSi(v)}B/s</span>}
-                      {r.zero && v === 0 && <span className="cx-kd">{r.zero}</span>}
+                      <NumIn path={path} w={118} label={`${t} ${r.label}${r.unit ?? ''}`} bytes={r.bytes} zero={r.zero} />
                       {use > 0 && (
                         <span className="cx-kd" style={{ color: 'var(--warn)' }} title={r.k === 'maxAccounts' ? 'busy hosts at their account cap' : 'busiest hosts within 10% of the rate'}>
                           {r.k === 'maxAccounts' ? `${use} at cap` : `${use} near it`}
                         </span>
                       )}
-                      {!wire && <Def path={path} quiet />}
+                      {!wire && <Def path={path} bytes={r.bytes} quiet />}
                       {errs.has(path) && <span className="cx-kd s-err">{errs.get(path)!.replace(/^tiers\.\S+ /, '')}</span>}
                     </span>
                   </td>
                 )
               })}
+              <td className="fill why">
+                {r.why}
+                {r.zero ? ' 0 is no limit.' : ''}
+              </td>
             </tr>
           ))}
           {tiers.some((t) => typeof getIn(d.body, `tiers.${t}.autoThrottle`) === 'boolean') && (
             <tr>
-              <td title="Off keeps a tier out of the error and spam budgets">Auto-throttle</td>
+              <td className="lim">Auto-throttle</td>
               {tiers.map((t) => (
-                <td key={t} className="r">
-                  <ToggleIn path={`tiers.${t}.autoThrottle`} label={`auto-throttle ${t}`} />
+                <td key={t} className="tier">
+                  <span className="cell">
+                    <ToggleIn path={`tiers.${t}.autoThrottle`} label={`auto-throttle ${t}`} />
+                  </span>
                 </td>
               ))}
+              <td className="fill why">Off keeps a tier out of the error and spam budgets.</td>
             </tr>
           )}
         </tbody>
@@ -585,13 +621,14 @@ export function DiscoveryPolicy() {
   return (
     <>
       <div className="cx-tw">
-        <table className="cx-t compact">
+        <table className="cx-t compact cx-seeds">
           <thead>
             <tr>
               <th>Seed relay</th>
               <th>On</th>
-              <th className="r">Read every</th>
+              <th>Read every</th>
               <th />
+              <th className="fill" />
             </tr>
           </thead>
           <tbody>
@@ -612,7 +649,7 @@ export function DiscoveryPolicy() {
                       onClick={() => setSeed(i, { ...r, enabled: !r.enabled })}
                     />
                   </td>
-                  <td className="r nowrap">
+                  <td className="nowrap">
                     <input
                       className={`cx-inp num${was && was.refreshIntervalSecs !== r.refreshIntervalSecs ? ' dirty' : ''}`}
                       style={{ width: 64 }}
@@ -626,11 +663,12 @@ export function DiscoveryPolicy() {
                     />{' '}
                     <span className="muted sm">h</span>
                   </td>
-                  <td className="r">
+                  <td>
                     <button type="button" className="cx-btn sm quiet" onClick={() => setSeed(i, null)} aria-label={`Remove ${r.url}`}>
                       Remove
                     </button>
                   </td>
+                  <td className="fill" />
                 </tr>
               )
             })}
@@ -642,16 +680,17 @@ export function DiscoveryPolicy() {
                     <s>{b.url}</s> <span className="s-err sm">removed</span>
                   </td>
                   <td colSpan={2} />
-                  <td className="r">
+                  <td>
                     <button type="button" className="cx-btn sm quiet" onClick={() => setField('discovery.seedRelays', [...seeds, b])}>
                       Keep
                     </button>
                   </td>
+                  <td className="fill" />
                 </tr>
               ))}
             {!seeds.length && !base.length && (
               <tr>
-                <td colSpan={4}>
+                <td colSpan={5}>
                   <Empty>No seed relays: only requestCrawl and the hosts given at start find new PDSes.</Empty>
                 </td>
               </tr>
@@ -660,21 +699,23 @@ export function DiscoveryPolicy() {
         </table>
       </div>
       <form
-        className="cx-pn-b cx-form-row"
+        className="cx-pn-b cx-form-row cx-addseed"
         onSubmit={(e) => {
           e.preventDefault()
           if (url.trim() && !bad && addSeedRelay(url)) setUrl('')
         }}
       >
-        <input className={`cx-inp mono${bad ? ' bad' : ''}`} style={{ flex: '1 1 220px' }} placeholder="https://relay.example.com" aria-label="Seed relay URL" spellCheck={false} autoComplete="off" value={url} onChange={(e) => setUrl(e.target.value)} title={bad} />
+        <input className={`cx-inp mono${bad ? ' bad' : ''}`} placeholder="https://relay.example.com" aria-label="Seed relay URL" spellCheck={false} autoComplete="off" value={url} onChange={(e) => setUrl(e.target.value)} title={bad} />
         <button className="cx-btn" disabled={!url.trim() || !!bad}>
           Add seed relay
         </button>
         {(bad || err) && <span className="s-err sm">{bad ?? err}</span>}
       </form>
-      <Knob path="discovery.plc" label="PDS hosts from the PLC export" why="Admit the PDS endpoints the documents the export reader reads name (needs --plc-export)." />
-      <Knob path="discovery.connectsPerMin" label="Discovery connects" why="New hosts discovery may connect a minute, cluster-wide. Its own budget: requestCrawl keeps the daily one." unit="/min" />
-      <Knob path="discovery.requestsPerSec" label="listHosts requests" why="Pages a second to any one seed relay; a 429 or 5xx waits out its Retry-After on top." unit="/s" />
+      <div className="cx-knobs">
+        <Knob path="discovery.plc" label="PDS hosts from the PLC export" why="Admit the PDS endpoints the documents the export reader reads name (needs --plc-export)." />
+        <Knob path="discovery.connectsPerMin" label="Discovery connects" why="New hosts discovery may connect a minute, cluster-wide. Its own budget: requestCrawl keeps the daily one." unit="/min" />
+        <Knob path="discovery.requestsPerSec" label="listHosts requests" why="Pages a second to any one seed relay; a 429 or 5xx waits out its Retry-After on top." unit="/s" />
+      </div>
     </>
   )
 }
@@ -708,7 +749,7 @@ function History() {
       ),
     },
     { id: 'by', label: 'By', render: (x) => <span className="sm">{x.by}</span> },
-    { id: 'note', label: 'Note', className: 'wrap sm', render: (x) => x.note || <span className="muted">—</span> },
+    { id: 'note', label: 'Note', fill: true, className: 'wrap sm', render: (x) => x.note || <span className="muted">—</span> },
     { id: 'ch', label: 'Changed', render: (x) => <span className="mono sm t2 trunc" style={{ display: 'inline-block', maxWidth: 380 }}>{x.changes.join(' · ') || '—'}</span> },
     { id: 'at', label: 'When', r: true, render: (x) => <span className="sm muted" title={dt(x.atMs)}>{ago(x.atMs)}</span> },
   ]
@@ -1026,8 +1067,10 @@ export function Policy() {
                   foot={<span>A threshold of 0 turns a signal off. A per-account signal that throttles throttles the account's host.</span>}
                 >
                   <SpamTable />
-                  <Knob path="spam.trackHosts" label="Hosts tracked per signal" why="Only the heaviest keys are tracked, so memory stays fixed however many hosts are noisy." />
-                  <Knob path="spam.trackAccounts" label="Accounts tracked per signal" why="The same for DIDs." />
+                  <div className="cx-knobs">
+                    <Knob path="spam.trackHosts" label="Hosts tracked per signal" why="Only the heaviest keys are tracked, so memory stays fixed however many hosts are noisy." />
+                    <Knob path="spam.trackAccounts" label="Accounts tracked per signal" why="The same for DIDs." />
+                  </div>
                 </Panel>
               </>
             ) : (

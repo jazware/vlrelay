@@ -281,6 +281,7 @@ export function Consumers() {
                 <th className="r">Consumers</th>
                 <th className="r">Sent/s</th>
                 <th className="r">Behind the commit</th>
+                <th className="fill" />
               </tr>
             </thead>
             <tbody>
@@ -298,12 +299,13 @@ export function Consumers() {
                     <td className="r mono sm" title="Entries the leader has committed that this node hasn't emitted yet">
                       {behind === undefined ? '—' : `${fmtNum(behind)} entries`}
                     </td>
+                    <td className="fill" />
                   </tr>
                 )
               })}
               {!serving.length && (
                 <tr>
-                  <td colSpan={5}>
+                  <td colSpan={6}>
                     <Empty>Loading…</Empty>
                   </td>
                 </tr>

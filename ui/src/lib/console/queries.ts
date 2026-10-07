@@ -60,8 +60,8 @@ export const useCluster = () => useLive<ClusterView>(keys.cluster(), A.cluster, 
 
 // ---------------------------------------------------------------- what the quorum statuses show over time
 
-/** Bucket requests per second over the last minute, summed over the members that answer. */
-export type ReqRates = { windowSecs: number; total: QCounts; byPurpose: Record<string, QCounts>; byComponent: Record<string, QCounts>; byOp: Record<string, number> }
+/** Bucket requests per second over the last minute, summed over the members that answer (`byNode`: each one's own). */
+export type ReqRates = { windowSecs: number; total: QCounts; byNode: Record<string, QCounts>; byPurpose: Record<string, QCounts>; byComponent: Record<string, QCounts>; byOp: Record<string, number> }
 /** An epoch change the console saw (a fallback for one no member's history lists). */
 export type SeenEpoch = { atMs: number; from: number; epoch: number; leader: string | null }
 
@@ -87,7 +87,7 @@ function addRate(into: Record<string, QCounts>, k: string, now: QCounts, then: Q
 }
 
 function observeRequests(q: QuorumView, at: number) {
-  const out: ReqRates = { windowSecs: 0, total: zero(), byPurpose: {}, byComponent: {}, byOp: {} }
+  const out: ReqRates = { windowSecs: 0, total: zero(), byNode: {}, byPurpose: {}, byComponent: {}, byOp: {} }
   let any = false
   for (const n of q.nodes) {
     const r = n.stale ? undefined : n.status?.requests
@@ -109,6 +109,7 @@ function observeRequests(q: QuorumView, at: number) {
     out.total.a += tot.total.a
     out.total.b += tot.total.b
     out.total.free += tot.total.free
+    out.byNode[n.node] = tot.total
     for (const [k, v] of Object.entries(r.by_purpose ?? {})) addRate(out.byPurpose, k, v, first.by_purpose?.[k], secs)
     for (const [k, v] of Object.entries(r.by_component ?? {})) addRate(out.byComponent, k, v, first.by_component?.[k], secs)
     for (const [k, v] of Object.entries(r.by_op ?? {})) out.byOp[k] = (out.byOp[k] ?? 0) + Math.max(0, v - (first.by_op?.[k] ?? 0)) / secs
