@@ -215,29 +215,9 @@ const NAMES: [&str; 24] = [
 ];
 const TLDS: [&str; 10] = ["com", "dev", "social", "net", "org", "xyz", "io", "blue", "cloud", "me"];
 
+/// The real relay's defaults, so the demo's tiers are the relay's.
 fn default_policy() -> Policy {
-    let tier = |eps: f64, hour: u64, day: u64, max: u64, newh: u64| TierLimits {
-        events_per_sec: eps,
-        events_per_hour: hour,
-        events_per_day: day,
-        max_accounts: max,
-        new_accounts_per_hour: newh,
-    };
-    Policy {
-        tiers: BTreeMap::from([
-            ("trusted".to_string(), tier(5_000.0, 15_000_000, 300_000_000, 5_000_000, 50_000)),
-            ("standard".to_string(), tier(50.0, 150_000, 2_000_000, 100_000, 500)),
-            ("probation".to_string(), tier(10.0, 20_000, 200_000, 1_000, 50)),
-        ]),
-        default_tier: "probation".into(),
-        spam: SpamThresholds {
-            new_accounts_per_hour: 300,
-            reject_ratio: 0.2,
-            bad_signatures_per_min: 60,
-            account_events_per_sec: 20.0,
-            auto_throttle: false,
-        },
-    }
+    crate::policy::admin::to_wire(&crate::policy::doc::PolicyBody::default())
 }
 
 impl Sim {
@@ -317,7 +297,7 @@ impl Sim {
                 if hosts.iter().any(|h| h.name == name) { name.replacen('.', &format!("{i}."), 1) } else { name };
             let accounts = (rng.range(7.5, 11.3)).exp() as u64;
             let rate = accounts as f64 * rng.range(0.0006, 0.0018);
-            let tier = if accounts > 20_000 { "trusted" } else { "standard" };
+            let tier = if accounts > 20_000 { "trusted" } else { "default" };
             add(&mut hosts, &mut rng, name, tier, Profile::Community, rate, accounts);
         }
         for (i, name) in
@@ -326,7 +306,7 @@ impl Sim {
                 .enumerate()
         {
             let accounts = 20 + i as u64 * 37;
-            add(&mut hosts, &mut rng, name.to_string(), "standard", Profile::Buggy, 0.8 + i as f64 * 1.1, accounts);
+            add(&mut hosts, &mut rng, name.to_string(), "default", Profile::Buggy, 0.8 + i as f64 * 1.1, accounts);
         }
         let spam: [(&str, Profile, f64, u64); 7] = [
             ("pds-7f3a.fastvps.cloud", Profile::SpamAccounts, 38.0, 14_200),
@@ -338,7 +318,7 @@ impl Sim {
             ("autopost.megabot.io", Profile::Flood, 31.0, 12),
         ];
         for (name, p, rate, accounts) in spam {
-            add(&mut hosts, &mut rng, name.to_string(), "probation", p, rate, accounts);
+            add(&mut hosts, &mut rng, name.to_string(), "new", p, rate, accounts);
         }
         while hosts.len() < 5_000 {
             let name = match rng.below(6) {
@@ -355,7 +335,7 @@ impl Sim {
             // most self-hosted PDSes hold one or two accounts
             let accounts = if rng.chance(0.7) { 1 + rng.below(3) as u64 } else { rng.range(1.0, 7.0).exp() as u64 };
             let rate = accounts as f64 * rng.range(0.0002, 0.004) * rng.jitter(0.8);
-            let tier = if rng.chance(0.3) { "probation" } else { "standard" };
+            let tier = if rng.chance(0.3) { "new" } else { "default" };
             add(&mut hosts, &mut rng, name, tier, Profile::SelfHosted, rate, accounts);
         }
         // the long tail's connection churn
@@ -417,16 +397,16 @@ impl Sim {
     fn seed_policy_history(&mut self, now: i64) {
         let day = 86_400_000;
         let mut p = default_policy();
-        p.tiers.get_mut("standard").unwrap().events_per_sec = 30.0;
+        p.tiers.get_mut("default").unwrap().events_per_sec = 30.0;
         p.spam.new_accounts_per_hour = 500;
         type Step = (i64, &'static str, Box<dyn Fn(&mut Policy)>);
         let steps: [Step; 3] = [
             (now - 21 * day, "initial limits", Box::new(|_| {})),
             (
                 now - 9 * day,
-                "standard tier was clipping small community PDSes at peak",
+                "default tier was clipping small community PDSes at peak",
                 Box::new(|p| {
-                    p.tiers.get_mut("standard").unwrap().events_per_sec = 50.0;
+                    p.tiers.get_mut("default").unwrap().events_per_sec = 51.0;
                 }),
             ),
             (
@@ -461,12 +441,7 @@ impl Sim {
     fn seed_rules(&mut self, now: i64) {
         let rules = [
             ("*.cryptoairdrop.live", RuleEffect::Ban, "forged commits, every subdomain is the same operator", 6),
-            (
-                "*.fastvps.cloud",
-                RuleEffect::Tier { tier: "probation".into() },
-                "cheap VPS range used by account farms",
-                3,
-            ),
+            ("*.fastvps.cloud", RuleEffect::Tier { tier: "new".into() }, "cheap VPS range used by account farms", 3),
             ("*.host.bsky.network", RuleEffect::Tier { tier: "trusted".into() }, "Bluesky's PDS fleet", 30),
             ("*.megabot.io", RuleEffect::Throttle { events_per_sec: 5.0 }, "bot platform, fine at low volume", 1),
         ];
@@ -886,7 +861,7 @@ impl Sim {
             let did = (kind == "account-rate").then(|| fake_did(&name));
             let mut auto_action = None;
             if spam.auto_throttle && severity >= Severity::High {
-                let cap = self.policy.policy.tiers.get("probation").map(|t| t.events_per_sec).unwrap_or(10.0);
+                let cap = self.policy.policy.tiers.get("new").map(|t| t.events_per_sec).unwrap_or(10.0);
                 self.hosts[i].throttle = Some(cap);
                 auto_action = Some(format!("throttled to {cap} events/s"));
             }
@@ -2062,7 +2037,7 @@ mod tests {
         let l = d.hosts(HostQuery { q: Some("fastvps".into()), ..Default::default() }).await.unwrap();
         assert_eq!(l.total, 2);
         let det = d.host("pds-7f3a.fastvps.cloud").await.unwrap();
-        assert_eq!(det.row.tier, "probation");
+        assert_eq!(det.row.tier, "new");
 
         let p = d.policy().await.unwrap();
         let mut np = p.policy.clone();
@@ -2075,7 +2050,7 @@ mod tests {
         let stale =
             d.update_policy(PolicyUpdate { base_version: p.version, policy: np, note: String::new() }, "admin").await;
         assert!(matches!(stale, Err(AdminError::Conflict(_))));
-        assert_eq!(d.policy_audit().await.unwrap()[0].changes, vec!["spam.rejectRatio: 0.2 → 0.3".to_string()]);
+        assert_eq!(d.policy_audit().await.unwrap()[0].changes, vec!["spam.rejectRatio: 0.5 → 0.3".to_string()]);
     }
 
     #[tokio::test]
@@ -2232,6 +2207,16 @@ mod tests {
                 && h["throttledAccounts"].as_u64().unwrap() > 0)
         );
         assert!(hs.windows(2).all(|w| w[0]["throttledAccounts"].as_u64() >= w[1]["throttledAccounts"].as_u64()));
+
+        // the tiers are one set wherever the console reads them
+        let tiers = |v: &serde_json::Value| -> std::collections::BTreeSet<String> {
+            v.as_object().unwrap().keys().cloned().collect()
+        };
+        let pol = json(call("GET", "/admin/api/policy", true).await.unwrap()).await;
+        let full = json(call("GET", "/admin/api/policy/full", true).await.unwrap()).await;
+        assert_eq!(tiers(&pol["policy"]["tiers"]), tiers(&full["policy"]["tiers"]));
+        let names = tiers(&pol["policy"]["tiers"]);
+        assert!(all.hosts.iter().all(|h| names.contains(&h.tier)), "a host in a tier the policy doesn't have");
 
         let p = json(call("GET", "/admin/api/ops/plc", true).await.unwrap()).await;
         assert_eq!(p["enabled"], true);

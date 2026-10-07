@@ -174,10 +174,13 @@ followers send nothing in steady state.
 
 The today-at-30 s row is measured: three nodes, an hour at 350 events/s on a local MinIO, every
 request counted by purpose. It came to 0.48 Class A and 1.66 Class B a second, which the model
-reproduces. An hour on a real R2 bucket counted the same (0.478 A, 1.725 B), and R2 billed none of
-SlateDB's GC deletes (one-key `DeleteObjects`, ~0.15 a second) as Class A, so the model leaves
-them out: 0.33 Class A a second today at 30 s ([quorum.md](quorum.md#real-r2-hour)). The rest is
-modeled from it. Takeovers, membership changes, recovery and retention are
+reproduces. An hour on a real R2 bucket (2026-10-06, the same three nodes and load) counted the
+same: 0.478 Class A and 1.725 Class B a second. Cloudflare's own count for a half hour of it
+matched on Class B exactly (3,280 against 3,277 counted) and came to 626 Class A against 1,006
+counted: R2 bills none of SlateDB's GC deletes (one-key `DeleteObjects`, ~0.15 a second) as Class
+A. So the model leaves them out, and what R2 bills today at 30 s is ~0.33 Class A and ~1.7 Class B
+a second. Reads from a bench box took 51-102 ms at the median and writes 205-410 ms, the round trips
+the recovery and membership estimates assume. The rest is modeled from it. Takeovers, membership changes, recovery and retention are
 a few requests each, and backfill reads one GET per segment.
 
 The knobs, in R2 $/mo before the free tier, to show the slope:

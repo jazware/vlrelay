@@ -810,3 +810,15 @@ async fn policy_admin_maps_the_wire_types() {
     assert!(a.cases(crate::admin::CaseQuery { status: Some(CaseStatus::Open) }).await.unwrap().is_empty());
     assert_eq!(a.case_detail(1).await.unwrap().evidence.len(), 1);
 }
+
+/// `GET policy` (the wire view) and `GET policy/full` (the document) name
+/// the same tiers.
+#[test]
+fn the_wire_policy_and_the_document_name_the_same_tiers() {
+    let body = PolicyBody::default();
+    let wire: std::collections::BTreeSet<String> = crate::policy::admin::to_wire(&body).tiers.keys().cloned().collect();
+    let doc: std::collections::BTreeSet<String> =
+        serde_json::to_value(&body).unwrap()["tiers"].as_object().unwrap().keys().cloned().collect();
+    assert_eq!(wire, doc);
+    assert_eq!(wire, ["default", "new", "throttled", "trusted"].iter().map(|s| s.to_string()).collect());
+}
