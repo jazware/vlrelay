@@ -1,6 +1,6 @@
 # Operator console
 
-The console at `/admin` and the public page at `/` share one look, "exchange": a switchboard at night. Bone and ink-indigo panels, cobalt for action, a magenta carrier lamp for the live stream (seq, commit, emit), Archivo widened for labels and IBM Plex Mono for numbers. The shell is the vlpds console's (`vlpds/ui/CONSOLE.md`): a top bar with the carrier rule, a patch-panel rail of sections, a dense main column and one slide-over for any row. The kit was copied from there and re-skinned, so the two consoles drive the same way.
+The console at `/admin` and the public page at `/` share one look, "exchange": a switchboard at night. Bone and ink-indigo panels, cobalt for action, a magenta carrier lamp for the live stream (seq, commit, emit), Archivo widened for labels and IBM Plex Mono for numbers. The shell is [vlpds's console](https://github.com/jazware/vlpds)'s (its `ui/CONSOLE.md`): a top bar with the carrier rule, a patch-panel rail of sections, a dense main column and one slide-over for any row. The kit was copied from vlpds's console and re-skinned, so the two consoles drive the same way.
 
 ## Where things live
 
@@ -22,7 +22,7 @@ The console at `/admin` and the public page at `/` share one look, "exchange": a
 5. Add entities and verbs to ⌘K with `registerPalette`.
 6. Check it at 390 px and in both themes, against `admin_demo` and a real relay, with the browser console clean.
 
-The kit's parts are documented in the vlpds CONSOLE.md. What differs here:
+The kit's parts are documented in vlpds's `ui/CONSOLE.md` (https://github.com/jazware/vlpds). What differs here:
 
 - `DataTable serverSort={{ id, asc, sortable, onSort }}` for tables the server sorts and pages (Hosts). Duplicate row keys get a suffix instead of breaking React.
 - `useLivePoll(fetch, key, ms, { keep })` is a poll owned by one component (a host's detail, one page of hosts). It pauses with space. `keep` keeps the last rows while a new filter loads.

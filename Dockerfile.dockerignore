@@ -1,0 +1,10 @@
+# Only what the build reads.
+*
+!rust-toolchain.toml
+!Cargo.toml
+!Cargo.lock
+!src
+!ui
+!docs
+ui/node_modules
+ui/dist

@@ -142,8 +142,8 @@ section of the policy document adds two sources, both run by the leader in the b
   `com.atproto.sync.listHosts`, read a page at a time at `discovery.requestsPerSec` (2), waiting
   out a 429 or a 5xx for its `Retry-After`, the whole list again every `refreshIntervalSecs` (6 h).
   This relay only reads: it never asks them to crawl anything. `--bootstrap-relay` fills the list
-  on a first start, while the document has none; the dashboard edits it after that, as every
-  policy field (a versioned save with its base version).
+  on a first start, while the document has none. After that the dashboard edits it like every
+  other policy field (a versioned save with its base version).
 - **The PLC export** (`discovery.plc`, with `--plc-export`): the distinct PDS hosts the documents
   the export reader reads name.
 
@@ -286,7 +286,7 @@ carries the `#account`, so it commits like any event. Every node polls `policy/t
 - Without `--plc-export`, a cold start resolves every account once at the PLC budget, about 31
   hours for 56M accounts at 500/s. With it, the leader reads the directory's export at
   `--plc-export-rate` (2 requests a second, ~14 hours for the history in 2026) and a seed fills
-  a cache miss without a lookup; a forced refresh (an `#identity`, a signature that fails) still
+  a cache miss without a lookup. A forced refresh (an `#identity`, a signature that fails) still
   asks PLC. Every document the leader fetches is kept in the seeds too, so a restart doesn't
   resolve those accounts again.
 - The account cap and the per-host new-account rate are counted on the leader and aren't in the

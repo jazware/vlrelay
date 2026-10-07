@@ -164,8 +164,8 @@ page) with no migration. See [Cluster](cluster.md#changing-the-members) and
   at 2 requests a second takes about 11 hours for today's ~80M ops. Without it, each account is
   resolved once at the PLC budget.
 - The sync API's repo endpoints answer on the leader, and a follower names it.
-- There are no alert rules, Grafana dashboards or Ansible kit for vlRelay yet, and no published
-  image. [Operations](operations/index.md) says what there is.
+- There are no alert rules, Grafana dashboards or Ansible kit for vlRelay yet.
+  [Operations](operations/index.md) says what there is.
 - Compressed or filtered outputs (a zstd-framed stream, Jetstream-style collection filters) and
   public segments for backfill are designed but not built.
 - vlRelay is new and hasn't run in production. It has unit and differential tests, chaos runs on a

@@ -2,6 +2,8 @@
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+import? 'internal/justfile'
+
 target_dir := env_var_or_default("CARGO_TARGET_DIR", "target")
 bin := target_dir / "debug"
 
@@ -91,44 +93,12 @@ qlog-chaos scenario *args:
 relay-chaos scenario *args:
     tests/qlog/relay-chaos.sh {{scenario}} {{args}}
 
-# ---- benchbox (scripts/benchbox.sh) --------------------------------------------
+# ---- images ----------------------------------------------------------------
 
-# Ship the working tree (tracked + uncommitted) to benchbox:~/vlrelay-dev
-benchbox-sync:
-    scripts/benchbox.sh sync
-
-# Sync, then build the bins (dev-release) on benchbox with a target dir kept between runs
-benchbox-build *args:
-    scripts/benchbox.sh build {{args}}
-
-# Run a bin on benchbox under a memory cap (MEM, default 8G): just benchbox-run vlrelay --help
-benchbox-run bin *args:
-    scripts/benchbox.sh run {{bin}} {{args}}
-
-# ---- images (Dockerfile; the build context is packages/) -------------------
-
-# Production image for this machine's platform (tools=1 adds fakepds and e2e_check)
+# Production image for this machine's platform (tools=1 adds fakepds and e2e_check; the context is .. while vlpds is a path dependency)
 docker-build tag="vlrelay:local" tools="":
-    docker buildx build -f Dockerfile --build-arg VLRELAY_TOOLS={{tools}} -t {{tag}} --load ..
-
-# The amd64 image, built on benchbox and loaded here (build/benchbox-image.sh; PUSH=1 also pushes)
-docker-build-benchbox tag="":
-    build/benchbox-image.sh {{tag}}
-
-# Build the production amd64 image from the committed tree and push it, without Docker:
-# zigbuild + crane onto the pinned base (build/oci-image.sh, scripts/oci/README.md). Prints the ref.
-image-push tag=`git rev-parse --short=12 HEAD`:
-    build/oci-image.sh {{tag}}
-
-alias docker-push := image-push
-
-# Rebuild the runtime base (Dockerfile's runtime-base stage) and pin its digest in build/oci-base
-image-base:
-    build/oci-image.sh base
-
-# The same image the old way: docker buildx with build/Dockerfile.cross (build/mac-image.sh; PUSH=0 to only load it)
-docker-push-buildx tag=`git rev-parse --short=12 HEAD`:
-    build/mac-image.sh {{tag}}
+    ctx=.; if grep -q '^vlpds = { path' Cargo.toml; then ctx=..; fi; \
+    docker buildx build -f Dockerfile --build-arg VLRELAY_TOOLS={{tools}} -t {{tag}} --load $ctx
 
 # Regenerate docs/operations/configuration.md from `vlrelay --help` (run after changing a flag)
 config-doc:

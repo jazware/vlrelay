@@ -1,8 +1,8 @@
 # vlRelay docs: style guide
 
 Not published (files starting with `_` are skipped). Read this before writing or editing a page.
-It's vlpds's guide (`vlpds/docs/_style.md`), with vlRelay's sections, tones and
-public/internal split. The renderer is a port of vlpds's, so a page that builds there builds here.
+It's [vlpds's guide](https://github.com/jazware/vlpds/blob/main/docs/_style.md), with vlRelay's
+sections and tones. The renderer is a port of vlpds's, so a page that builds there builds here.
 
 The docs site is built from the Markdown files in this directory and served by the relay at
 `/docs`, with no auth (a node without `--admin-token` still serves it). `docs/foo.md` is
@@ -11,22 +11,24 @@ The docs site is built from the Markdown files in this directory and served by t
 
 ## Public and internal
 
-The site is public. Some of this directory isn't: dev notes, bench logs and design studies that
-name private hosts, paths and people, or that only make sense with the repo open.
+This package is published as its own public repository (github.com/jazware/vlrelay), with its
+history. So everything in it is public, and the site is too.
 
-- `docs/_internal.txt` lists the files the site leaves out. They keep plain Markdown with no
-  front matter, and nothing changes about how they're read in the repo.
-- A published page can't link to an internal one (the check fails with "it is internal"). Say
-  what's needed on the public page, or name the file in code (`docs/chaos.md`) only when an
-  operator would actually go read it. The deny list below catches most of those names anyway.
-- `ui/scripts/docs-deny.txt` holds patterns no published page may contain: private hosts,
-  networks, accounts, paths and the internal notes' names. Use placeholders
-  (`relay.example.com`, `<your-bucket>`, "a 16-core bench box").
-- `docs/design.html` and `docs/quorum-study.html` are standalone pages for the repo and aren't
-  served.
-
-When a page mixes the two (a public mechanism plus the Rust API that wires it), the public part
-stays here and the rest moves to an internal file such as `policy-internals.md`.
+- Every page in `docs/` is published except `index.md`, the repo's reading list.
+  `docs/_internal.txt` lists the pages the site leaves out. A published page can't link to one
+  (the check fails with "it is internal").
+- Working notes, bench logs and raw results that name private hosts, paths or people live in
+  `internal/` at the top of the package. That directory is never exported, so nothing outside it
+  may link to or name a file in it.
+- No private names anywhere in the package, published page or not: no hostnames, IPs, tailnet or
+  account names, home paths or monorepo paths. Use placeholders (`relay.example.com`,
+  `<your-bucket>`, `10.0.0.1`) and describe machines generically ("a 2-vCPU VPS", "a 32-thread
+  bench box", "three hosts over a WireGuard mesh").
+- `check-docs` (`ui/scripts/check-docs-private.mjs`) also runs every published page against a
+  private deny list of those names when the list is present. It isn't exported, so the public
+  repo skips that check. Grep files that aren't published by hand.
+- `docs/quorum-study.html` is a standalone page for the repo and isn't served.
+- vlpds is a separate public project. Link it at https://github.com/jazware/vlpds.
 
 ## How it is built
 
@@ -52,8 +54,8 @@ stays here and the rest moves to an internal file such as `policy-internals.md`.
    ```yaml
    ---
    title: Cluster                  # sidebar and page title
-   section: vlRelay                # "vlRelay" or "Reference" for docs/*.md, "Operations" for docs/operations/*.md
-   order: 5                        # position in its section (vlRelay 1-99, Operations 100+, Reference 300+); unique
+   section: vlRelay                # "vlRelay", "Testing" or "Reference" for docs/*.md, "Operations" for docs/operations/*.md
+   order: 5                        # position in its section (vlRelay 1-99, Operations 100+, Testing 200+, Reference 300+); unique
    status: ready                   # stub (an outline; grey dot in the nav) | draft | ready (default)
    summary: "One sentence under the title. Quote it if it contains ': '."
    ---
@@ -192,7 +194,7 @@ Diagram rules:
   the bucket names it. If you simplify (three nodes stand for N), say so in the caption.
 - **One idea per diagram.** If a diagram needs a legend, split it.
 - **Arrows are data or control flow, in the direction it moves**, labeled with the verb or the
-  payload (`append, then ack`, `lease CAS`). Dashed = background or optional.
+  payload (`append, then ack`, `flush`). Dashed = background or optional.
 - **Don't let lines cross boxes.** Pin sides (`n3.b15 -> appview.t`) and leave a grid unit or two
   between rows for routes. Check the result in both themes (the theme toggle is in the top bar).
 - **Short labels.** A box label is a noun of one to three words; details go in `sub` or the text.
@@ -236,15 +238,15 @@ touch end to end. Tones mean the same as in diagrams.
 
 - **Operator- and consumer-focused.** Write for someone running a relay or reading its firehose:
   what it does, what it costs, what to watch, what to do. Bench logs, design history and rejected
-  alternatives stay in the internal notes (`perf-log.md`, `docs/design.html`).
+  alternatives go on the deep pages (`quorum.md`, `chaos.md`), not the operator pages.
 - **Concise.** Short sentences, plain words, active voice. Lead with the point. [Voice](#voice)
   below spells out what that means sentence by sentence.
 - **Round numbers** with their basis: "~60k commits/s per 16-core node (measured)", "~$1.7k/mo on S3".
   Say whether a number is measured, modeled or a design target. Link the benchmark directory
   (`bench/results/…`) in a note or sentence rather than copying tables.
-- **Defaults with their flag**: "a 10 s lease (`--lease-ttl-ms`)". Name metrics exactly
+- **Defaults with their flag**: "a 30 s flush (`--qlog-flush-ms`)". Name metrics exactly
   (`vlrelay_time_to_firehose_seconds`).
-- **Code paths sparingly**, as inline code (`src/nodelog.rs`), when an operator would actually go
+- **Code paths sparingly**, as inline code (`src/qlog/flush.rs`), when an operator would actually go
   read it. Not as links.
 - **Say what isn't built.** If something is design only (backups, planet scale), say so plainly.
 - Callouts: `> [!NOTE]`, `> [!TIP]`, `> [!WARNING]`, `> [!DANGER]` as the first line of a
@@ -252,11 +254,10 @@ touch end to end. Tones mean the same as in diagrams.
 
 ## Voice
 
-The docs should read like Jaz explaining the system to another engineer: the voice of the
-[example.com](https://example.com) posts and the [Practical Observability](https://book.someone.me)
-book, tightened for reference docs. A reader said the earlier drafts were "a little flowery" and
+The docs should read like the author explaining the system to another engineer: the voice of
+the author's blog posts and book, tightened for reference docs. A reader said the earlier drafts were "a little flowery" and
 took a while to get into. Most of that came from a handful of habits that a language model reaches
-for and Jaz doesn't. This section lists them so they can be checked for.
+for and the author doesn't. This section lists them so they can be checked for.
 
 ### What the voice is
 
@@ -283,12 +284,12 @@ for and Jaz doesn't. This section lists them so they can be checked for.
   hedges. One "about" or "~" per number is enough.
 - **Paragraphs of 1-4 sentences.** Short is good. What's banned is a short paragraph whose only
   job is to land a line for effect (see the list below).
-- **Parentheses for asides**, not dashes or semicolons: "(the default)", "(`--lease-ttl-ms`)",
+- **Parentheses for asides**, not dashes or semicolons: "(the default)", "(`--qlog-flush-ms`)",
   "(i.e. the node's own log)". Keep them short and useful: a flag, a default, a basis, an example.
 - **A little humour is fine, and rare.** The blog has the odd "Not quite…" or "problem solved,
   right?". In the docs, at most one light aside on a page, and never in the operations pages or
   the runbook. Don't invent jokes to hit a quota.
-- **Words Jaz uses:** keep up with, get by on, a bit, pretty, just (sparingly), cheap, plenty,
+- **Words the voice uses:** keep up with, get by on, a bit, pretty, just (sparingly), cheap, plenty,
   hold up, spread out, so, since, that's, around, something like.
 
 ### Banned patterns
@@ -336,7 +337,7 @@ edit. Don't touch `hero` or `diagram` blocks (see below).
 9. Make the actor the subject: "is acknowledged by the node" → "the node acknowledges".
 10. Delete sentences that describe the page or section instead of the system.
 11. Turn lists of three into lists of what's needed.
-12. Read the paragraph aloud. If Jaz wouldn't say it to a coworker, rewrite it.
+12. Read the paragraph aloud. If you wouldn't say it to a coworker, rewrite it.
 
 Length usually comes out about the same. Splitting crammed sentences and adding connectives costs a
 few words, and cutting flourish wins them back. The goal is faster reading, not a lower word count.
@@ -413,7 +414,7 @@ A voice pass changes wording only. Check each of these before committing:
   the code. The docs only describe what exists. If something reads wrong, flag it instead of fixing
   it in prose.
 - **Headings.** `check-docs` checks every link and anchor. Leave headings as they are. If one must
-  change, update every link to it in `docs/`, `README.md` and `ops/` in the same commit.
+  change, update every link to it in `docs/` and `README.md` in the same commit.
 - **Links.** Every link stays and points to the same target.
 - **Front matter.** `title`, `section`, `order`, `status` stay. `summary` may be reworded for voice
   (keep it quoted if it contains `: `).
@@ -427,10 +428,10 @@ Run `just docs-check` after every page.
 
 ## Avoiding duplication
 
-- The internal notes (`perf-log.md`, `quorum.md`, `policy-internals.md`, `chaos.md`,
-  `shadow.md`, `reference-notes.md`, `PLAN.md`) remain the deep log: every iteration, measurement
-  and rejected alternative. The docs are the curated, current view: what's true now and what an
-  operator or consumer needs.
+- The deep pages (`quorum.md`, `policy-internals.md`, `chaos.md`, `shadow.md`,
+  `reference-notes.md`) are the log: every iteration, measurement and rejected alternative. The
+  other pages are the curated, current view: what's true now and what an operator or consumer
+  needs.
 - `operations/configuration.md` is generated by `just config-doc` (`build/config_doc.py`). Edit
   the script's header and section notes, not the page.
 - Each fact has one home page. Other pages state it in a clause and link there.
