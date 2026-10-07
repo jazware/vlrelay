@@ -11,7 +11,7 @@ publish = false
 # crypto, MST, CAR and DID resolution. Factored into shared crates once the
 # relay settles which pieces it needs.
 # the public vlpds at the commit this one was exported against
-vlpds = { git = "https://github.com/jazware/vlpds", rev = "80c1c645bc83c714e95f15be0b9ab9513f597d17" }
+vlpds = { git = "https://github.com/jazware/vlpds", rev = "d46cdd65a82dd75183862f66ed1da24e21307c9b" }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws", "macros", "http2"] }
@@ -80,8 +80,8 @@ shrike = { version = "=0.7.0", default-features = false, features = ["syntax", "
 
 # the fork rev vlpds pins (vlpds/Cargo.toml lists its patches)
 [patch.crates-io]
-slatedb = { git = "https://github.com/jazware/slatedb", rev = "cec4b86fad717081fca9e9522c498c0269087cf8" }
-slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "cec4b86fad717081fca9e9522c498c0269087cf8" }
+slatedb = { git = "https://github.com/jazware/slatedb", rev = "11b27b89caeff4b6fd788fab4919aa835fe04f03" }
+slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "11b27b89caeff4b6fd788fab4919aa835fe04f03" }
 
 [profile.release]
 opt-level = 3
