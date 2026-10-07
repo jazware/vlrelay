@@ -209,7 +209,7 @@ function inboxItems(view: RelayView | undefined): PalItem[] {
     view,
     events,
     throttled: throttledPoll.get().data?.hosts,
-    capped: capPoll.get().data?.hosts,
+    capped: capPoll.get().data,
     consumers: consumersPoll.get().data,
     slowCutMs: slowLagMs(policyFullPoll.get().data),
     cases: openCasesPoll.get().data,

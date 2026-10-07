@@ -162,8 +162,8 @@ export const storePoll = createPoller<StoreView>(A.store, 5000, {
 })
 /** Throttled hosts (they fall behind instead of dropping), for the banners. */
 export const throttledPoll = createPoller<HostList>(() => A.hosts({ status: 'throttled', sort: 'lag', desc: true, limit: 200 }), 5000)
-/** The busiest hosts with their caps, for the "at the account cap" banner. */
-export const capPoll = createPoller<HostList>(() => A.hosts({ sort: 'accounts', desc: true, limit: 400 }), 30_000)
+/** The hosts at their account cap (all of them counted, the busiest 400 listed), for the "at the account cap" banner. */
+export const capPoll = createPoller<HostList>(() => A.hosts({ flag: 'atCap', sort: 'accounts', desc: true, limit: 400 }), 30_000)
 
 /** The slow-consumer cutoff from the full policy (consumers.slowConsumerLagSecs), else 120 s. */
 export function slowLagMs(p?: FullPolicyDoc): number {

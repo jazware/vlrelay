@@ -3,7 +3,7 @@ import { Chip, Swatch, type BannerSpec, type Tone } from '../../components/conso
 import { openPanel } from '../../components/console/nav'
 import { hostActionDialog } from '../../components/console/hostActions'
 import { REASON_LABEL } from '../../components/relay'
-import type { Case, Consumer, HostRow, RejectReason } from '../../lib/api'
+import type { Case, Consumer, HostList, HostRow, RejectReason } from '../../lib/api'
 import { ago, fmtMs, fmtNum, plural } from '../../lib/console/fmt'
 import { isSlow } from '../../lib/console/polls'
 import type { RelayView } from '../../lib/console/relay'
@@ -27,6 +27,13 @@ export const REASON_WHAT: Record<RejectReason, string> = {
 }
 export const reasonLabel = (r: string) => REASON_LABEL[r as RejectReason] ?? r
 
+/** The hosts at their cap that still create accounts (banned and suspended ones don't), and how many there are past the listed 400. */
+function capHosts(l: HostList | undefined) {
+  const rows = l?.hosts ?? []
+  const atCap = rows.filter((h) => h.status !== 'banned' && h.status !== 'suspended')
+  return { atCap, atCapN: (l?.total ?? 0) - (rows.length - atCap.length) }
+}
+
 export function NodeTag({ view, id }: { view?: RelayView; id: string }) {
   if (!id) return <span className="muted">—</span>
   const n = view?.byId.get(id)
@@ -48,7 +55,7 @@ const hostLink = (h: string) => (
 export function relayBanners(o: {
   view?: RelayView
   throttled?: HostRow[]
-  capped?: HostRow[]
+  capped?: HostList
   consumers?: Consumer[]
   slowCutMs: number
   scope: 'overview' | 'hosts'
@@ -128,13 +135,13 @@ export function relayBanners(o: {
     })
   }
 
-  const atCap = (o.capped ?? []).filter((h) => h.maxAccounts > 0 && h.accounts >= h.maxAccounts && h.status !== 'banned' && h.status !== 'suspended')
-  if (atCap.length)
+  const { atCap, atCapN } = capHosts(o.capped)
+  if (atCapN > 0)
     out.push({
       id: 'cap',
       tone: 'warn',
-      title: `${plural(atCap.length, 'host')} at the account cap`,
-      desc: atCap.slice(0, 3).map((h) => h.host).join(', ') + (atCap.length > 3 ? '…' : ''),
+      title: `${plural(atCapN, 'host')} at the account cap`,
+      desc: atCap.slice(0, 3).map((h) => h.host).join(', ') + (atCapN > 3 ? '…' : ''),
       right: 'policy',
       body: (
         <>
@@ -192,7 +199,7 @@ export function attention(o: {
   view?: RelayView
   events: EpochEvent[]
   throttled?: HostRow[]
-  capped?: HostRow[]
+  capped?: HostList
   consumers?: Consumer[]
   slowCutMs: number
   cases?: Case[]
@@ -220,8 +227,8 @@ export function attention(o: {
       desc: behind.length === 1 ? 'throttled' : `worst ${behind[0].host}, ${fmtMs(behind[0].lagMs)}`,
       run: () => openPanel('host', behind[0].host),
     })
-  const atCap = (o.capped ?? []).filter((h) => h.maxAccounts > 0 && h.accounts >= h.maxAccounts && h.status !== 'banned' && h.status !== 'suspended')
-  if (atCap.length) out.push({ id: 'cap', tone: 'warn', title: `${plural(atCap.length, 'host')} at the account cap`, desc: 'Hosts · at cap', run: () => navigate('/admin/hosts?flag=cap') })
+  const { atCapN } = capHosts(o.capped)
+  if (atCapN > 0) out.push({ id: 'cap', tone: 'warn', title: `${plural(atCapN, 'host')} at the account cap`, desc: 'Hosts · at cap', run: () => navigate('/admin/hosts?flag=cap') })
   const slow = (o.consumers ?? []).filter((c) => isSlow(c, o.slowCutMs)).sort((a, b) => b.lagMs - a.lagMs)
   if (slow.length)
     out.push({

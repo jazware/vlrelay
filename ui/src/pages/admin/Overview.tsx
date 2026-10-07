@@ -197,7 +197,7 @@ export function Overview() {
   const crit = cases.data?.filter((c) => c.severity === 'critical').length ?? 0
   const slow = subs.data?.filter((c) => isSlow(c, cut)).length ?? 0
   const consumers = subs.data ? { n: subs.data.length, slow, backfill: subs.data.filter((c) => c.backfilling).length } : undefined
-  const banners = relayBanners({ view, throttled: thr.data?.hosts, capped: cap.data?.hosts, consumers: subs.data, slowCutMs: cut, scope: 'overview' })
+  const banners = relayBanners({ view, throttled: thr.data?.hosts, capped: cap.data, consumers: subs.data, slowCutMs: cut, scope: 'overview' })
   const changed = q && q.health !== 'down' ? recentLeaderChange(events) : undefined
   // after the quorum's own banner (held or degraded), before the rest
   if (changed) banners.splice(banners[0]?.id === 'degraded' ? 1 : 0, 0, leaderBanner(changed))
