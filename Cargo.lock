@@ -3852,7 +3852,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slate-metrics"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlpds?rev=13a558a690ea646104c9641fcb2d363ae86cc7a1#13a558a690ea646104c9641fcb2d363ae86cc7a1"
+source = "git+https://github.com/jazware/vlpds?rev=838d36fa85767b6f316bc260429e4d3968d43b2c#838d36fa85767b6f316bc260429e4d3968d43b2c"
 dependencies = [
  "parking_lot",
  "prometheus",
@@ -4645,7 +4645,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vlpds"
 version = "1.0.0"
-source = "git+https://github.com/jazware/vlpds?rev=13a558a690ea646104c9641fcb2d363ae86cc7a1#13a558a690ea646104c9641fcb2d363ae86cc7a1"
+source = "git+https://github.com/jazware/vlpds?rev=838d36fa85767b6f316bc260429e4d3968d43b2c#838d36fa85767b6f316bc260429e4d3968d43b2c"
 dependencies = [
  "anyhow",
  "argon2",

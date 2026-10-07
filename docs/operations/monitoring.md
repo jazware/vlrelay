@@ -125,8 +125,10 @@ series go when it closes. `GET /admin/api/store` shows the same databases as `db
 | `slatedb_db_l0_stall_count_total{type}`, `slatedb_db_backpressure_count_total` | counter | Writes held back by too many L0 SSTs, or by the memtable limit |
 | `slatedb_cache_entries{cache="node"}` | gauge | Entries in the node's shared block and metadata cache (`--slatedb-cache-mb`) |
 
-SlateDB also exports its request counts, flushes and object store calls (`slatedb_db_*`,
-`slatedb_object_store_*`). The `slatedb_lsm_*` series are read from each database's manifest in
+SlateDB's other `slatedb_db_*`, `slatedb_compactor_*`, `slatedb_wal_*` and
+`slatedb_memtable_flush_*` series carry `db` too. Its object store calls, GC and the SST filter
+counts (`slatedb_object_store_*`, `slatedb_gc_*`, `slatedb_db_sst_filter_*`) are node-wide,
+summed over the databases, without `db`. The `slatedb_lsm_*` series are read from each database's manifest in
 memory when `/metrics` is scraped, so they cover readers too; nothing polls in between.
 
 ## The quorum log
