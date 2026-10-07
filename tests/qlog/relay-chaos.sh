@@ -110,7 +110,7 @@ out=${OUT:-$crate/dev/state-relayq-$B/$scenario}
 rm -rf "$out"
 mkdir -p "$out"
 prefix="relayq-$scenario-$(date +%s)"
-ms() { date +%s%3N; }
+. "$here/ms.sh"
 log() { echo "$(ms) $*" | tee -a "$out/events.log"; }
 nodepid() { pgrep -f "^$bin --node-id n$1 " | head -1; }
 

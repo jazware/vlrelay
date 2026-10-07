@@ -131,8 +131,7 @@ echo "$prefix" >"$out/prefix"
 ps -o pgid= $$ | tr -d ' ' >"$out/pgid"
 s3_endpoint=${S3_ENDPOINT:-http://127.0.0.1:$minio}
 s3_flags=(--s3-endpoint "$s3_endpoint" --s3-bucket "${S3_BUCKET:-vlrelay}")
-# uutils date (Ubuntu 26.04) ignores %3N
-ms() { local n; n=$(date +%s%N); echo $((n / 1000000)); }
+. "$here/ms.sh"
 log() { echo "$(ms) $*" | tee -a "$out/events.log"; }
 
 pids=()

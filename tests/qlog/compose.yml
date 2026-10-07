@@ -3,6 +3,9 @@
 # compress to almost nothing), on tmpfs.
 services:
   minio:
+    build:
+      context: ../../../vlpds/build
+      dockerfile: Dockerfile.minio
     image: vlpds-minio:local
     command: server /data
     environment:

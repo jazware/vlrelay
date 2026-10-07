@@ -345,7 +345,6 @@ export function Consumers() {
             <KV
               style={{ padding: '10px 12px', margin: 0 }}
               rows={[
-                ['Connections per IP', <span className="mono">{fmtNum(P.connectionsPerIp)}</span>],
                 ['Consumers per node', <span className="mono">{fmtNum(P.consumersPerNode)}</span>],
                 ['Slow consumer cutoff', <span className="mono">{fmtMs(cut)}</span>],
                 ['Max backfill', <span className="mono">{P.maxBackfillSecs ? dur(P.maxBackfillSecs * 1000) : '—'}</span>],

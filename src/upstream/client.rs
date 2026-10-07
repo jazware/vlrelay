@@ -234,7 +234,9 @@ impl HostTask {
                             // desynchronize those accounts, so it replays its
                             // new sequence from the start: commits it re-sends
                             // are caught by rev, and the rest by the restart
-                            // dedupe (docs/chaos.md, issue 1).
+                            // dedupe. Resyncing the touched accounts instead
+                            // would need the very events we missed to know
+                            // which they are.
                             self.entry.count_error(|c| c.future_cursor += 1);
                             if cursor.is_some_and(|c| c <= 0) {
                                 // can't be ahead of anything: a broken host
@@ -509,9 +511,9 @@ pub(crate) mod tests {
         m.shutdown().await.unwrap();
     }
 
-    /// Issue 1 in docs/chaos.md: a host whose sequence restarted answers our
-    /// cursor with FutureCursor. Resuming live lost everything it emitted
-    /// since the restart; it must replay its new sequence from 0.
+    /// A host whose sequence restarted answers our cursor with FutureCursor.
+    /// Resuming live would lose everything it emitted since the restart, so
+    /// it must replay its new sequence from 0.
     #[tokio::test]
     async fn future_cursor_replays_the_new_sequence_from_zero() {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
