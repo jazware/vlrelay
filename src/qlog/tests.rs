@@ -1604,10 +1604,11 @@ async fn recovery_adopts_orphan_segments() {
 async fn the_recovered_state_equals_replaying_the_bucket() {
     use flush::Step;
     let armed: Arc<Mutex<Vec<Step>>> = Arc::default();
-    let a = armed.clone();
+    let stop_at_fence = Arc::new(AtomicBool::new(false));
+    let (a, stop) = (armed.clone(), stop_at_fence.clone());
     let mut c = flushing(
         move |_| {
-            let a = a.clone();
+            let (a, stop) = (a.clone(), stop.clone());
             flush::Options {
                 crash: Some(Arc::new(move |s| {
                     let mut g = a.lock();
@@ -1615,7 +1616,7 @@ async fn the_recovered_state_equals_replaying_the_bucket() {
                         g.remove(0);
                         return true;
                     }
-                    false
+                    s == Step::Fenced && g.is_empty() && stop.load(Ordering::SeqCst)
                 })),
                 headroom: 5_000,
                 ..flush_opts()
@@ -1628,9 +1629,14 @@ async fn the_recovered_state_equals_replaying_the_bucket() {
     let load = HostLoad::start(&c, 4, 10, Duration::from_millis(2));
     wait_flushed(&c, 1, Duration::from_secs(5)).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    // three attempts die (one at each step), the fourth leads and stops
-    // its flush at the fence, so the recovery manifest stays current
-    *armed.lock() = vec![Step::RecoverSealed, Step::RecoverBeforeManifest, Step::RecoverAfterManifest, Step::Fenced];
+    // Three attempts die (one at each step). Every leader after them stops
+    // its flush at the fence, so the last recovery manifest stays current.
+    // That needn't be the fourth attempt's: under load another member's
+    // election can depose the recovered leader before any wiped follower
+    // has caught up from it, and with no quorum of intact logs that's one
+    // more recovery.
+    *armed.lock() = vec![Step::RecoverSealed, Step::RecoverBeforeManifest, Step::RecoverAfterManifest];
+    stop_at_fence.store(true, Ordering::SeqCst);
     for id in c.ids.clone() {
         c.wipe(&id);
     }
@@ -1642,28 +1648,45 @@ async fn the_recovered_state_equals_replaying_the_bucket() {
         assert!(t.elapsed() < Duration::from_secs(20), "steps left {:?}: {}", armed.lock(), status_line(&c));
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let l = c.wait_leader(Duration::from_secs(10)).await;
+    // with every log intact no recovery follows
+    let t = Instant::now();
+    loop {
+        c.wait_leader(Duration::from_secs(10)).await;
+        if c.nodes.values().all(|r| r.node.status().intact) {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "not every log is intact: {}", status_line(&c));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let m = flush::read_manifest(&c.store).await.unwrap().unwrap().0;
     let rec = m.recovery.clone().unwrap();
     // the attempt that died after its manifest CAS did recover (it may
     // have led and committed above its R for all anyone can tell), so the
     // next one jumped again
-    assert_eq!((rec.generation, m.flushed, m.state.as_ref().unwrap().seq), (2, rec.base, rec.base), "{m:?}");
+    assert!(rec.generation >= 2, "{m:?}");
+    assert_eq!((m.flushed, m.state.as_ref().unwrap().seq), (rec.base, rec.base), "{m:?}");
     assert_ne!(m.state_path(), super::state::DEFAULT_PATH);
     let v = verify(&c).await;
-    assert!(v.ok && v.gaps == 2 && v.flushed == rec.base, "{v:#?}");
+    assert!(v.ok && v.gaps == rec.generation && v.flushed == rec.base, "{v:#?}");
     let applied = super::state::read_checkpoint(&c.store, m.state.as_ref().unwrap()).await.unwrap().0;
     assert_eq!(
         applied.get(super::state::applied_key()).map(|b| u64::from_be_bytes(b[..8].try_into().unwrap())),
         Some(rec.base)
     );
-    // flushing again from here (a takeover fences and flushes as usual)
-    c.kill(&l);
-    c.start(&l).await;
+    // flushing again from here (a takeover fences and flushes as usual);
+    // every node restarts, since leadership may have moved since the check
+    // to another whose flush stopped at its fence
+    stop_at_fence.store(false, Ordering::SeqCst);
+    for id in c.ids.clone() {
+        c.kill(&id);
+    }
+    for id in c.ids.clone() {
+        c.start(&id).await;
+    }
     c.wait_leader(Duration::from_secs(10)).await;
     let (v, r, m) = settle_recovered(&c, load).await;
     eprintln!("{v:?}\n{r:?}\n{m:?}");
-    assert_eq!(m.generation(), 2, "{m:?}");
+    assert_eq!(m.generation(), rec.generation, "{m:?}");
     c.shutdown();
 }
 
