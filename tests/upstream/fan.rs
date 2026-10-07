@@ -29,11 +29,27 @@ pub struct HostSpec {
     pub max_seq: Option<i64>,
     /// Lowest seq still held; an older cursor gets OutdatedCursor first.
     pub min_seq: Option<i64>,
+    /// The `time` each frame carries.
+    pub stamp: Stamp,
+}
+
+/// What a frame's `time` says.
+#[derive(Clone, Copy, Debug)]
+pub enum Stamp {
+    /// The same instant on every frame, long past.
+    Fixed,
+    /// When it was sent, give or take `skew_secs` (negative: behind).
+    Sent { skew_secs: f64 },
+    /// An hour-long backlog, or any `secs`: the events the host sent at
+    /// `rate`/s over the `secs` before the socket opened, as fast as the
+    /// socket takes them, then live at `rate`. (The spec's own `rate` is
+    /// ignored.)
+    Backlog { secs: f64, rate: f64 },
 }
 
 impl HostSpec {
     pub fn rate(rate: f64, size: usize) -> HostSpec {
-        HostSpec { rate, size, deaf: false, max_seq: None, min_seq: None }
+        HostSpec { rate, size, deaf: false, max_seq: None, min_seq: None, stamp: Stamp::Fixed }
     }
 }
 
@@ -130,13 +146,17 @@ pub fn now_ns() -> i64 {
 }
 
 pub fn frame(name: &str, seq: i64, size: usize) -> Vec<u8> {
+    frame_at(name, seq, size, "2026-10-04T00:00:00.000Z")
+}
+
+pub fn frame_at(name: &str, seq: i64, size: usize, time: &str) -> Vec<u8> {
     encode_message(
         "#commit",
         &[
             ("seq", Value::Int(seq)),
             ("repo", Value::Text(format!("did:plc:{name}"))),
             ("rev", Value::Text("3l3qo2vutsw2b".into())),
-            ("time", Value::Text("2026-10-04T00:00:00.000Z".into())),
+            ("time", Value::Text(time.into())),
             ("blocks", Value::Bytes(vec![0x5a; size])),
             ("sentNs", Value::Int(now_ns())),
         ],
@@ -183,13 +203,39 @@ async fn serve(sock: WebSocket, name: String, spec: HostSpec, host: Arc<FanHost>
         }
         seq = min - 1;
     }
+    let rfc = |ns: i64| chrono::DateTime::from_timestamp_nanos(ns).to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    if let Stamp::Backlog { secs, rate } = spec.stamp {
+        let start = now_ns() - (secs * 1e9) as i64;
+        for i in 0i64.. {
+            let at = start + (i as f64 * 1e9 / rate) as i64;
+            let wait = at - now_ns();
+            if wait > 0 {
+                if tx.flush().await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_nanos(wait as u64)).await;
+            }
+            seq += 1;
+            host.head.fetch_max(seq as u64, Ordering::Relaxed);
+            if tx.feed(Message::Binary(frame_at(&name, seq, spec.size, &rfc(at)).into())).await.is_err() {
+                return;
+            }
+            if i % 64 == 63 && tx.flush().await.is_err() {
+                return;
+            }
+        }
+    }
     if spec.rate <= 0.0 {
         std::future::pending::<()>().await;
     }
     let emit = |seq: &mut i64| {
         *seq += 1;
         host.head.fetch_max(*seq as u64, Ordering::Relaxed);
-        Message::Binary(frame(&name, *seq, spec.size).into())
+        let f = match spec.stamp {
+            Stamp::Sent { skew_secs } => frame_at(&name, *seq, spec.size, &rfc(now_ns() + (skew_secs * 1e9) as i64)),
+            _ => frame(&name, *seq, spec.size),
+        };
+        Message::Binary(f.into())
     };
     if spec.rate.is_infinite() {
         loop {

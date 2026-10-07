@@ -263,7 +263,13 @@ pub fn run_emitter(
                 e.host.starved.fetch_add((want - buf.len()) as u64, Ordering::Relaxed);
                 e.tokens = 0.0;
             }
-            e.host.publish(&buf, &now);
+            match f.lag {
+                Some(secs) => {
+                    let late = chrono::Utc::now() - chrono::Duration::milliseconds((secs * 1000.0) as i64);
+                    e.host.publish(&buf, &late.to_rfc3339_opts(chrono::SecondsFormat::Micros, true));
+                }
+                None => e.host.publish(&buf, &now),
+            }
         }
     }
 }

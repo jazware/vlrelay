@@ -10,6 +10,7 @@
 //! downstream sees each event at least once and never a gap.
 
 pub(crate) mod client;
+pub mod clock;
 pub mod crawl;
 pub mod fair;
 pub mod flow;
@@ -72,7 +73,14 @@ pub struct UpstreamConfig {
     /// Frames read and not yet done, per host and in all; a host at a cap
     /// isn't read.
     pub inflight: flow::FlowLimits,
+    /// How far back a host's event times count on its own timeline
+    /// (`clock`); older ones count at this horizon.
+    pub event_horizon: Duration,
 }
+
+/// [`UpstreamConfig::event_horizon`]'s default: a relay down for a day still
+/// replays that day at the cost it had.
+pub const EVENT_HORIZON: Duration = Duration::from_secs(24 * 3_600);
 
 impl UpstreamConfig {
     pub fn new(dev_mode: bool) -> UpstreamConfig {
@@ -93,6 +101,7 @@ impl UpstreamConfig {
             max_frame_bytes: 5 << 20,
             read_buffer_bytes: 16 * 1024,
             inflight: flow::FlowLimits::default(),
+            event_horizon: EVENT_HORIZON,
         }
     }
 }
@@ -446,6 +455,11 @@ impl Manager {
     /// Frames in flight over every host.
     pub fn inflight(&self) -> usize {
         self.flow.events()
+    }
+
+    /// How full the node's in-flight caps are, 0-1.
+    pub fn inflight_fill(&self) -> f64 {
+        self.flow.fill()
     }
 
     pub fn running(&self) -> usize {

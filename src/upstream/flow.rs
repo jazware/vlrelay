@@ -103,6 +103,14 @@ impl Flow {
         self.counts.events.load(Ordering::Relaxed)
     }
 
+    /// How full the node's caps are, 0-1 (the fuller of events and bytes).
+    pub fn fill(&self) -> f64 {
+        let l = self.limits();
+        let e = self.counts.events.load(Ordering::Relaxed) as f64 / l.events.max(1) as f64;
+        let b = self.counts.bytes.load(Ordering::Relaxed) as f64 / l.bytes.max(1) as f64;
+        e.max(b).min(1.0)
+    }
+
     /// Which cap `h` is at, if any.
     fn full(&self, h: &HostFlow) -> Option<&'static str> {
         let l = self.limits();

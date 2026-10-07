@@ -40,6 +40,7 @@ pub mod acks;
 pub mod adapters;
 pub mod admin;
 pub mod forward;
+pub mod lag;
 pub mod metrics;
 pub mod policy;
 pub mod quorum;
@@ -65,9 +66,8 @@ use vlpds::store::Store;
 
 pub type State = StateStore<VerifyChain>;
 
-/// A host reader this far behind opens a case ([`Node::lag_cases`]).
-pub const LAG_CASE_MS: i64 = 10 * 60_000;
-const LAG_CASE_EVERY: Duration = Duration::from_secs(300);
+/// How often the node looks for read-lag cases it can close.
+const LAG_SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -101,6 +101,11 @@ pub struct NodeConfig {
     pub policy: Option<policy::PolicyEngine>,
     /// The tier a `--host` upstream starts at the first time it's seen.
     pub cli_host_tier: Tier,
+    /// When a host's read lag opens a case, and when the case closes.
+    pub lag_cases: lag::LagCaseConfig,
+    /// How far back a host's event times count on its own timeline
+    /// (`upstream::clock`).
+    pub event_horizon: Duration,
 }
 
 impl NodeConfig {
@@ -122,6 +127,8 @@ impl NodeConfig {
             inflight: upstream::flow::FlowLimits::default(),
             policy: None,
             cli_host_tier: Tier::Trusted,
+            lag_cases: lag::LagCaseConfig::default(),
+            event_horizon: upstream::EVENT_HORIZON,
         }
     }
 
@@ -257,6 +264,7 @@ pub struct Node {
     /// The quorum log half (docs/quorum.md): the log node, its client, the
     /// leader's hooks and the host table.
     pub quorum: Arc<quorum::Glue>,
+    lag: Mutex<lag::LagWatch>,
 }
 
 /// Scheme for each `--host` given as a URL, so a dev upstream on
@@ -345,6 +353,7 @@ impl Node {
             ingest: ingest_handle.clone(),
             started_ms: upstream::host::now_ms() as i64,
             quorum,
+            lag: Mutex::new(lag::LagWatch::new(cfg.lag_cases)),
         });
         let weak = Arc::downgrade(&node);
         manager.on_connect(Arc::new(move |host: &Host, epoch, cursor, restarted| {
@@ -358,6 +367,7 @@ impl Node {
         ingest_handle.spawn(node.clone().dispatch(rx));
         tokio::spawn(node.clone().tap());
         tokio::spawn(node.clone().sampler());
+        tokio::spawn(node.clone().lag_sweeper());
 
         Ok(node)
     }
@@ -513,7 +523,7 @@ impl Node {
             }
             event::Event::Identity(i) => {
                 if let Some(p) = &self.policy
-                    && !p.take_identity_event(&f.host.0)
+                    && !p.take_identity_event(&f.host.0, f.clock_ms)
                 {
                     let detail = "over the host's identityEventsPerHour".to_string();
                     return Err((i.did.clone(), Rejection { reason: policy::IDENTITY_RATE, detail }));
@@ -634,37 +644,58 @@ impl Node {
         }
     }
 
-    /// Opens (or adds to) a case for each host whose reader is more than
-    /// [`LAG_CASE_MS`] behind, at most every [`LAG_CASE_EVERY`] per host. A
-    /// host held to its limits that long is losing ground, and the PDS will
-    /// cut the socket with `ConsumerTooSlow` once it's past its own outbox.
-    fn lag_cases(&self, lags: &[(&str, i64)], last: &mut HashMap<String, Instant>) {
+    /// How full this node's in-flight caps and busiest lane are.
+    fn pressure(&self) -> lag::Pressure {
+        let lanes =
+            self.lanes.iter().map(|l| 1.0 - l.capacity() as f64 / l.max_capacity().max(1) as f64).fold(0.0, f64::max);
+        lag::Pressure { inflight: self.manager.inflight_fill(), lanes }
+    }
+
+    /// Opens (or adds to) a read-lag case for each host [`lag::LagWatch`]
+    /// says fell behind on its own. A host held to its limits that long is
+    /// losing ground, and the PDS will cut the socket with `ConsumerTooSlow`
+    /// once it's past its own outbox.
+    fn lag_cases(&self, hosts: &[upstream::HostView]) {
         let Some(p) = self.policy.clone() else { return };
-        last.retain(|_, at| at.elapsed() < LAG_CASE_EVERY);
-        for &(host, lag) in lags {
-            if lag < LAG_CASE_MS || last.contains_key(host) {
-                continue;
-            }
-            last.insert(host.to_string(), Instant::now());
-            let (host, node, engine) = (host.to_string(), self.cfg.node_id.clone(), p.engine.clone());
+        let now = upstream::host::now_ms() as i64;
+        let pressure = self.pressure();
+        let samples: Vec<lag::Sample<'_>> = hosts
+            .iter()
+            .map(|h| lag::Sample {
+                host: h.record.hostname.as_str(),
+                lag_ms: h.host_lag_ms,
+                held_at_ms: h.backpressure_at_ms,
+            })
+            .collect();
+        let (trips, threshold) = {
+            let mut w = self.lag.lock();
+            (w.observe(now, pressure, &samples), w.config().threshold.as_secs_f64())
+        };
+        for (host, trip) in trips {
+            let (node, engine) = (self.cfg.node_id.clone(), p.engine.clone());
             tokio::spawn(async move {
+                let observed = trip.lag_ms as f64 / 1000.0;
+                let signals = [("inflightFill", trip.pressure.inflight), ("laneFill", trip.pressure.lanes)]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), (v * 100.0).round() / 100.0))
+                    .collect();
                 let o = crate::policy::cases::CaseOpen {
                     kind: "read-lag".into(),
                     host: host.clone(),
                     did: None,
                     severity: crate::admin::Severity::High,
-                    summary: format!("{host}: reader {} min behind the host's stream", lag / 60_000),
-                    observed: lag as f64 / 1000.0,
-                    threshold: LAG_CASE_MS as f64 / 1000.0,
+                    summary: format!("{host}: reader {} min behind the host's stream", trip.lag_ms / 60_000),
+                    observed,
+                    threshold,
                     auto_action: None,
                     evidence: crate::policy::cases::Evidence {
                         at_ms: upstream::host::now_ms() as i64,
-                        observed: lag as f64 / 1000.0,
-                        threshold: LAG_CASE_MS as f64 / 1000.0,
+                        observed,
+                        threshold,
                         window_secs: 0,
                         node,
                         detail: Some("raise the host's limits or tier, or it will fall out of the PDS's outbox".into()),
-                        signals: Default::default(),
+                        signals,
                     },
                 };
                 if let Err(e) = engine.cases.open_or_update(o).await {
@@ -672,6 +703,46 @@ impl Node {
                 }
             });
         }
+    }
+
+    /// Closes the open read-lag cases of hosts this node reads once their
+    /// lag has recovered ([`lag`]), cases from before this process
+    /// included.
+    async fn lag_sweeper(self: Arc<Self>) {
+        let Some(p) = self.policy.clone() else { return };
+        let mut tick = tokio::time::interval(LAG_SWEEP_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(e) = self.sweep_lag_cases(&p.engine).await {
+                tracing::warn!("read-lag sweep: {e:#}");
+            }
+        }
+    }
+
+    /// One pass of [`Self::lag_sweeper`]; returns the cases it closed.
+    pub async fn sweep_lag_cases(&self, engine: &crate::policy::Engine) -> anyhow::Result<Vec<u64>> {
+        let now = upstream::host::now_ms() as i64;
+        let open: Vec<_> = engine
+            .cases
+            .list(None)
+            .await?
+            .into_iter()
+            .filter(|c| c.is_open() && c.kind == "read-lag")
+            .filter(|c| self.manager.is_running(&Host(c.host.clone())) && self.lag.lock().recovered(&c.host, now))
+            .collect();
+        let by = crate::admin::Actor::Service("relay".into()).label();
+        let mut closed = Vec::new();
+        for c in open {
+            let Some(done) = engine.cases.resolve_open(c.id, lag::RESOLVED_NOTE, &by).await? else { continue };
+            tracing::info!(host = %done.host, case = done.id, "read-lag case resolved: lag recovered");
+            if let Some(f) = self.quorum.hooks.changes.get() {
+                let hint = serde_json::json!({ "status": done.status });
+                f.touch(crate::admin::changes::ChangeKind::Case, done.id.to_string(), Some(hint), true);
+            }
+            closed.push(done.id);
+        }
+        Ok(closed)
     }
 
     /// One sample per second for the dashboard and the gauges.
@@ -684,7 +755,6 @@ impl Node {
         let mut prev_bytes_out = 0u64;
         let mut prev_rejects: HashMap<&'static str, u64> = HashMap::new();
         let mut prev_lat = (0u64, 0u64);
-        let mut lag_cased: HashMap<String, Instant> = HashMap::new();
         let mut first = true;
         loop {
             tick.tick().await;
@@ -726,11 +796,10 @@ impl Node {
                 metrics::IDENTITY_LOOKUPS.with_label_values(&[k]).set(v.load(Ordering::Relaxed) as i64);
             }
             metrics::IDENTITY_CACHE.set(self.identity.len() as i64);
-            let lags: Vec<(&str, i64)> =
-                hosts.iter().filter_map(|h| Some((h.record.hostname.as_str(), h.read_lag_ms?))).collect();
-            metrics::HOST_READ_LAG_MAX.set(lags.iter().map(|l| l.1 / 1000).max().unwrap_or(0));
-            metrics::HOSTS_LAGGING.set(lags.iter().filter(|l| l.1 > 60_000).count() as i64);
-            self.lag_cases(&lags, &mut lag_cased);
+            let lags: Vec<i64> = hosts.iter().filter_map(|h| h.read_lag_ms).collect();
+            metrics::HOST_READ_LAG_MAX.set(lags.iter().map(|l| l / 1000).max().unwrap_or(0));
+            metrics::HOSTS_LAGGING.set(lags.iter().filter(|&&l| l > 60_000).count() as i64);
+            self.lag_cases(&hosts);
             let mut by_status: HashMap<&'static str, i64> = HashMap::new();
             for h in &hosts {
                 *by_status.entry(admin::host_status_label(h)).or_default() += 1;

@@ -552,7 +552,7 @@ fn topk_stays_bounded_with_10k_hosts() {
             k.hash(&mut s);
             s.finish()
         };
-        let a = t.add(&k, h, "h", 1, None, 0.0, 30);
+        let a = t.add(&k, h, "h", 1.0, None, 0.0, 30);
         assert!(a.lower <= truth[&k] as f64);
         assert!(t.len() <= 64);
     }
@@ -586,6 +586,24 @@ fn signals_window_slides() {
     assert_eq!(rec(500, t0 + 125_000).len(), 1);
     // records without a DID don't count for per-account rules
     assert!(s.record(&Signal::new(SignalKind::Record, "pds.example", None), t0).is_empty());
+}
+
+#[test]
+fn a_catching_up_hosts_events_weigh_what_their_own_time_did() {
+    let mut spam = super::doc::Spam::default();
+    spam.account_records.limit = 100.0; // per 60 s
+    let s = Signals::new(&spam);
+    let t0: i64 = 6_000_000 * 60 * 1000;
+    let rec = |n: u32, weight: f64| {
+        let mut sig = Signal::new(SignalKind::Record, "pds.example", Some("did:plc:busy"));
+        sig.count = n;
+        sig.weight = weight;
+        s.record(&sig, t0)
+    };
+    // ten minutes of 80/min, replayed at 10× its pace inside one window
+    assert!(rec(800, 0.1).is_empty());
+    // and the same at arrival time is a burst
+    assert_eq!(rec(800, 1.0).len(), 1);
 }
 
 // ---------------------------------------------------------------- cases
@@ -831,7 +849,12 @@ async fn policy_admin_maps_the_wire_types() {
         .await
         .unwrap();
     assert_eq!(c.status, CaseStatus::Dismissed);
-    assert!(a.cases(crate::admin::CaseQuery { status: Some(CaseStatus::Open) }).await.unwrap().is_empty());
+    assert!(
+        a.cases(crate::admin::CaseQuery { status: Some(CaseStatus::Open), ..Default::default() })
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(a.case_detail(1).await.unwrap().evidence.len(), 1);
 }
 

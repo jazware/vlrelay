@@ -83,6 +83,7 @@ Each account belongs to one generator thread (account index mod threads), so per
 | `stall` | `secs` (10), `every` (60) | stops writing to every socket (no frames, no pings) and then delivers the backlog | a quiet host that comes back |
 | `disconnect` | `every` (30), `down` (5) | closes every socket and answers new connections with 503 for `down` seconds | reconnects with backoff and cursor resume |
 | `replay` | `every` (20), `count` (100) | re-sends its last `count` frames with their old seqs | seq regressions and rev-order rejects |
+| `lag` | `secs` (900) | stamps every event's `time` `secs` in the past, a PDS whose stream runs late however fast it's read | the host's read lag at `secs`, and a `read-lag` case once it holds past the relay's threshold |
 
 A local run with one of each on 8 hosts, checked by `consume --verify`, counted 143 signature, 89 chain, 133 foreign and 100 rev-order failures and 100 seq regressions (two replays of 50), and nothing else.
 

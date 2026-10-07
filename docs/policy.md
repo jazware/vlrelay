@@ -177,6 +177,39 @@ relay's own trouble (`stale`, `desynchronized`, `rate_limited`, `identity_unavai
 `not_owner` and so on) doesn't. Accepted `#identity` events spend the host's
 `identityEventsPerHour` (0 is unlimited), and past it they're dropped as `identity_rate`.
 
+### Counted on the host's own timeline
+
+A relay that restarts, a host that reconnects after an outage, or a cursor resumed from minutes
+back all read a backlog: an hour of a host's normal traffic arriving in a few minutes. Counted when
+the relay reads them, those events look like a flood, and the host is throttled and tripped right
+when it's only catching up. So per-host limits and spam signals count each event at the `time` the
+host stamped on it (`src/upstream/clock.rs`), and a replay costs what the original traffic did.
+
+The host's clock is the newest event time seen, clamped:
+
+- never past now, so a future-dated event buys no room;
+- never back, so a host can't spend the same stretch twice (the clock outlives its sockets);
+- never further back than `--event-horizon-secs` (a day), so a stale or bogus `time` counts at
+  the horizon;
+- forward by any limiter pause it sat out, so debt is paid in real time.
+
+Over any stretch the clock moves at most as far as the wall clock plus how far behind it started:
+a horizon's worth the first time a process sees the host, and the real time it was away after
+that. A genuine burst, whose events are stamped as they're sent, meets the limits exactly as
+before.
+
+| Limit or signal | Counted by | Why |
+|---|---|---|
+| events/s, bytes/s, events/h, events/day | the host's clock | the token buckets run on it |
+| `identityEventsPerHour` | the host's clock | the event's own clock as its reader saw it |
+| Spam signals except new accounts, and so the auto-throttle they trigger | the host's pace | each event weighs 1/pace, where pace is host seconds per wall second (1 live, 60 for an hour read in a minute), so a window holds about what the host sent in that much of its own time |
+| New accounts: `newAccountsPerHour`, `newAccountsPerMin`, the new-accounts signal, the account cap | the wall clock | a farm replayed is still a farm |
+| Fresh DID fetches per host, the PLC budget, in-flight caps, other cluster budgets | the wall clock | they guard what the relay spends now |
+| Reconnects per hour | the wall clock | dials happen now |
+| The error budget | neither | it's a ratio of failed to accepted frames |
+
+The host's pace shows on host detail ("catching up at ×N") and as `catchUpPace` on its row.
+
 ## New accounts and the account cap
 
 The account gate tells a newly created account from one that's only first seen. A relay that
@@ -231,9 +264,32 @@ PDS no longer holds is gone. In the same run, eurosky.social was auto-throttled 
 2,500 an hour while it sent ~6/s. It was ~50 minutes behind after an hour and was cut off.
 
 Each host's lag is the newest frame's age when it was read, plus the time since while the reader
-is held back. It's on the Hosts page, in `vlrelay_host_read_lag_max_seconds` and
-`vlrelay_hosts_lagging`, and a reader more than 10 minutes behind opens a `read-lag` case. PDS
-clocks are in the number, so it's good to seconds.
+is held back. A reader that has waited 10 s on an empty socket has everything the host sent, so a
+quiet host reads 0, not the age of its last frame. It's on the Hosts page, in
+`vlrelay_host_read_lag_max_seconds` and `vlrelay_hosts_lagging`. PDS clocks are in the number, so
+it's good to seconds.
+
+### Read-lag cases
+
+A `read-lag` case says the host fell behind on its own, so the lag it looks at leaves out what the
+relay did (`src/node/lag.rs`): time the reader sat in `backpressure` doesn't count, and neither
+does a frame read soon after, since it's old because the relay held it. A case opens when a
+host's lag is over `--lag-case-minutes` (10) and:
+
+- the host hasn't been in `backpressure` for `--lag-case-grace-secs` (180);
+- this node's in-flight caps and busiest lane have stayed under `--lag-case-pressure-pct` (50%)
+  for the same grace;
+- the lag has stayed over the line for `--lag-case-sustain-secs` (120) without the reader
+  catching up on it faster than a tenth of real time.
+
+Each trip notes the node's in-flight and lane fill in its evidence (`inflightFill`, `laneFill`).
+
+The node that reads a host resolves its open (or acknowledged) read-lag cases once the host's lag
+has been under the line for `--lag-case-resolve-secs` (600): status `resolved`, the note "resolved:
+lag recovered" by `relay (service)`, and a `case` change event. It looks every minute, cases from
+before it started included. Only that node knows the host's lag; cases are shared objects written
+by CAS, so a host changing owners at worst has two nodes try and the second find it closed. A
+case an operator resolved or dismissed is never touched.
 
 | Option | Keeps | Costs |
 |---|---|---|

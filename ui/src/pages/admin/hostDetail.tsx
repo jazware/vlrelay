@@ -273,6 +273,12 @@ function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; 
       )
     outs.push(...ruleOut)
   }
+  if (r.catchUpPace)
+    lines.push(
+      <>
+        Catching up at ×{fmtNum(r.catchUpPace)} its own pace: its limits and spam signals count by event time, so the backlog costs what its traffic did.
+      </>,
+    )
   return (
     <div className={`cx-banner ${tone} cx-why`} role="note" aria-label="Why it's held">
       <div className="bh">
@@ -334,7 +340,7 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
           ['events/s', live ? fmtSi(r.eventsPerSec) : '—'],
           ['rejected', fmtRatio(r.errorRate)],
           ['accounts / cap', `${fmtSi(r.accounts)} / ${cap ? fmtSi(cap) : '—'}`],
-          ['read lag', live && r.lagMs ? fmtMs(r.lagMs) : '—'],
+          ['read lag', live && r.lagMs ? `${fmtMs(r.lagMs)}${r.catchUpPace ? ` · catching up ×${fmtNum(r.catchUpPace)}` : ''}` : '—'],
           ['upstream seq', fmtNum(r.lastUpstreamSeq)],
         ]}
       />

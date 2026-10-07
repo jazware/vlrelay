@@ -203,8 +203,15 @@ pub struct HostRow {
     pub last_upstream_seq: i64,
     pub connected_since_ms: Option<i64>,
     /// How far the reader is behind the host's stream: the newest frame's
-    /// read time minus its event time, plus the time since while held back.
+    /// read time minus its event time, plus the time since while held back;
+    /// 0 once the reader waits on an empty socket.
     pub lag_ms: f64,
+    /// Set while the host's events are read faster than it sent them (a
+    /// backlog after a restart, a reconnect or a cursor resume): host
+    /// seconds per wall second. Its limits and spam signals count on its
+    /// own timeline meanwhile, so the backlog costs what the traffic did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up_pace: Option<f64>,
     /// Operator throttle (events/s) on top of the tier, if any.
     pub throttle: Option<f64>,
     /// The domain rule that applies to this host, if any.
@@ -660,6 +667,17 @@ pub enum CaseStatus {
     Dismissed,
 }
 
+impl CaseStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CaseStatus::Open => "open",
+            CaseStatus::Acknowledged => "acknowledged",
+            CaseStatus::Resolved => "resolved",
+            CaseStatus::Dismissed => "dismissed",
+        }
+    }
+}
+
 /// One trip folded into a case: what was measured and every signal's
 /// count for the same host (and DID) at that moment.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -718,6 +736,54 @@ pub struct CaseNote {
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct CaseQuery {
     pub status: Option<CaseStatus>,
+    /// `GET cases` only (an [`AdminSource`] filters by status alone).
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+/// `GET cases`: a page of the cases matching every filter, worst severity
+/// first, how many match, and facet counts for the filter tabs.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaseList {
+    pub cases: Vec<Case>,
+    pub total: usize,
+    pub counts: CaseCounts,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaseCounts {
+    /// Every filter but `status`.
+    pub by_status: BTreeMap<String, usize>,
+    /// Every filter but `kind`.
+    pub by_kind: BTreeMap<String, usize>,
+}
+
+/// [`CaseList`] out of every case (sorted as [`AdminSource::cases`] sorts).
+pub fn case_page(all: Vec<Case>, q: &CaseQuery) -> CaseList {
+    let kind = |c: &Case| q.kind.as_ref().is_none_or(|k| *k == c.kind);
+    let status = |c: &Case| q.status.is_none_or(|s| s == c.status);
+    let host = |c: &Case| q.host.as_ref().is_none_or(|h| h.eq_ignore_ascii_case(&c.host));
+    let mut counts = CaseCounts::default();
+    for c in all.iter().filter(|c| host(c)) {
+        if kind(c) {
+            *counts.by_status.entry(c.status.as_str().to_string()).or_default() += 1;
+        }
+        if status(c) {
+            *counts.by_kind.entry(c.kind.clone()).or_default() += 1;
+        }
+    }
+    let matching: Vec<Case> = all.into_iter().filter(|c| host(c) && kind(c) && status(c)).collect();
+    let total = matching.len();
+    let cases = matching.into_iter().skip(q.offset.unwrap_or(0)).take(q.limit.unwrap_or(usize::MAX)).collect();
+    CaseList { cases, total, counts }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -726,6 +792,69 @@ pub struct CaseUpdate {
     pub status: Option<CaseStatus>,
     #[serde(default)]
     pub note: String,
+}
+
+/// Which cases a bulk update takes: every field given has to match.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaseFilter {
+    pub kind: Option<String>,
+    pub status: Option<CaseStatus>,
+    pub host: Option<String>,
+}
+
+/// `POST cases/bulk`: the cases in `ids`, or matching `filter` (both:
+/// those in `ids` that match), get `status` and `note`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaseBulkUpdate {
+    #[serde(default)]
+    pub ids: Option<Vec<u64>>,
+    #[serde(default)]
+    pub filter: Option<CaseFilter>,
+    pub status: Option<CaseStatus>,
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaseBulkResult {
+    pub updated: usize,
+    pub ids: Vec<u64>,
+}
+
+/// At most this many cases change in one bulk update.
+pub const CASE_BULK_MAX: usize = 5_000;
+
+/// The cases `b` takes out of `all`, and the per-case update each gets. A
+/// bulk update with nothing to scope it, or nothing to change, is refused;
+/// one without a note gets one, so every case's trail says who did it.
+pub fn bulk_targets(all: &[Case], b: &CaseBulkUpdate) -> AdminResult<(Vec<u64>, CaseUpdate)> {
+    if b.ids.is_none() && b.filter.is_none() {
+        return Err(AdminError::BadRequest("give ids, a filter or both".into()));
+    }
+    if b.status.is_none() && b.note.trim().is_empty() {
+        return Err(AdminError::BadRequest("give a status, a note or both".into()));
+    }
+    let ids: Option<std::collections::HashSet<u64>> = b.ids.as_ref().map(|v| v.iter().copied().collect());
+    let f = b.filter.clone().unwrap_or_default();
+    let out: Vec<u64> = all
+        .iter()
+        .filter(|c| ids.as_ref().is_none_or(|i| i.contains(&c.id)))
+        .filter(|c| f.kind.as_ref().is_none_or(|k| *k == c.kind))
+        .filter(|c| f.status.is_none_or(|s| s == c.status))
+        .filter(|c| f.host.as_ref().is_none_or(|h| h.eq_ignore_ascii_case(&c.host)))
+        .map(|c| c.id)
+        .collect();
+    if out.len() > CASE_BULK_MAX {
+        return Err(AdminError::BadRequest(format!("{} cases match; at most {CASE_BULK_MAX} at once", out.len())));
+    }
+    let note = match (b.note.trim(), b.status) {
+        ("", Some(s)) => format!("bulk: {}", s.as_str()),
+        (n, _) => n.to_string(),
+    };
+    Ok((out, CaseUpdate { status: b.status, note }))
 }
 
 // ---------------------------------------------------------------- operations
@@ -1308,6 +1437,13 @@ pub trait AdminSource: Send + Sync + 'static {
         }
     }
     fn update_case(&self, id: u64, update: CaseUpdate, by: &str) -> impl Future<Output = AdminResult<Case>> + Send;
+    /// [`bulk_targets`], each updated as [`Self::update_case`] would, its
+    /// change events coalesced.
+    fn bulk_update_cases(
+        &self,
+        update: CaseBulkUpdate,
+        by: &str,
+    ) -> impl Future<Output = AdminResult<CaseBulkResult>> + Send;
 }
 
 // ---------------------------------------------------------------- router
@@ -1361,6 +1497,7 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
         .route("/admin/api/accounts/{did}/takedown", post(takedown::<S>))
         .route("/admin/api/accounts/{did}/untakedown", post(untakedown::<S>))
         .route("/admin/api/cases", get(cases::<S>))
+        .route("/admin/api/cases/bulk", post(bulk_cases::<S>))
         .route("/admin/api/cases/{id}", get(case::<S>).post(update_case::<S>))
         .route("/admin/api/cases/{id}/evidence", get(case_detail::<S>))
         .route_layer(middleware::from_fn_with_state(ctx.clone(), auth::<S>))
@@ -1408,6 +1545,8 @@ pub enum Actor {
     Token,
     /// A login the admin listener's proxy named.
     Operator(Arc<str>),
+    /// The relay itself, acting on its own (closing a case it opened).
+    Service(Arc<str>),
 }
 
 impl Actor {
@@ -1416,6 +1555,7 @@ impl Actor {
         match self {
             Actor::Token => "token",
             Actor::Operator(_) => "proxy",
+            Actor::Service(_) => "service",
         }
     }
 
@@ -1425,6 +1565,7 @@ impl Actor {
         match self {
             Actor::Token => "admin (token)".into(),
             Actor::Operator(login) => format!("{login} (proxy)"),
+            Actor::Service(name) => format!("{name} (service)"),
         }
     }
 }
@@ -1436,6 +1577,7 @@ async fn session(Extension(a): Extension<Actor>) -> Json<serde_json::Value> {
     Json(match &a {
         Actor::Token => serde_json::json!({ "auth": "token" }),
         Actor::Operator(login) => serde_json::json!({ "auth": "proxy", "operator": login.as_ref() }),
+        Actor::Service(name) => serde_json::json!({ "auth": "service", "operator": name.as_ref() }),
     })
 }
 
@@ -1669,11 +1811,19 @@ async fn untakedown<S: AdminSource>(
 ) -> AdminResult<Json<Account>> {
     Ok(Json(c.src.untakedown(&did, &a.label()).await?))
 }
-async fn cases<S: AdminSource>(State(c): Ax<S>, Query(q): Query<CaseQuery>) -> AdminResult<Json<Vec<Case>>> {
-    Ok(Json(c.src.cases(q).await?))
+async fn cases<S: AdminSource>(State(c): Ax<S>, Query(q): Query<CaseQuery>) -> AdminResult<Json<CaseList>> {
+    let all = c.src.cases(CaseQuery::default()).await?;
+    Ok(Json(case_page(all, &q)))
 }
 async fn case<S: AdminSource>(State(c): Ax<S>, Path(id): Path<u64>) -> AdminResult<Json<Case>> {
     Ok(Json(c.src.case(id).await?))
+}
+async fn bulk_cases<S: AdminSource>(
+    State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
+    Json(u): Json<CaseBulkUpdate>,
+) -> AdminResult<Json<CaseBulkResult>> {
+    Ok(Json(c.src.bulk_update_cases(u, &a.label()).await?))
 }
 async fn update_case<S: AdminSource>(
     State(c): Ax<S>,

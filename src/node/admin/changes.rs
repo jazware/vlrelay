@@ -385,6 +385,16 @@ mod tests {
         store: vlpds::store::Store,
         settle: Duration,
     ) -> Arc<NodeAdmin> {
+        relay_with(id, addrs, store, settle, |_| {}).await
+    }
+
+    async fn relay_with(
+        id: &str,
+        addrs: &HashMap<String, String>,
+        store: vlpds::store::Store,
+        settle: Duration,
+        tweak: impl FnOnce(&mut NodeConfig),
+    ) -> Arc<NodeAdmin> {
         let mut cfg = NodeConfig::new("http://127.0.0.1:9");
         cfg.node_id = id.into();
         cfg.dev_mode = true;
@@ -400,6 +410,7 @@ mod tests {
         q.election_timeout = Duration::from_millis(600);
         q.flush = Duration::from_millis(300);
         q.retain_horizon = None;
+        tweak(&mut cfg);
         let node = Node::start(store, cfg, q).await.unwrap();
         let a = Arc::new(NodeAdmin::new(node.clone(), node.policy.clone().unwrap()).with_settle(settle));
         let _ = node.quorum.hooks.answers.set(a.clone());
@@ -648,5 +659,92 @@ mod tests {
         let r = listed(&a, &host).unwrap();
         assert_eq!((r.tier.as_str(), r.pending), ("trusted", false));
         assert!(serde_json::to_value(&r).unwrap().get("pending").is_none(), "only an action's answer carries it");
+    }
+
+    /// A PDS at `127.0.0.1:{port}` whose frames (DID-less, so the relay
+    /// skips them at once) carry a `time` `late` ms in the past.
+    async fn late_pds(late: Arc<std::sync::atomic::AtomicI64>) -> u16 {
+        use axum::extract::ws::{Message, WebSocketUpgrade};
+        let app = axum::Router::new().route(
+            "/xrpc/com.atproto.sync.subscribeRepos",
+            axum::routing::get(move |ws: WebSocketUpgrade| {
+                let late = late.clone();
+                async move {
+                    ws.on_upgrade(move |mut sock| async move {
+                        for seq in 1i64.. {
+                            let ms = crate::upstream::host::now_ms() as i64
+                                - late.load(std::sync::atomic::Ordering::Relaxed);
+                            let time = chrono::DateTime::from_timestamp_millis(ms)
+                                .unwrap()
+                                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+                            let f = crate::upstream::frame::encode_message(
+                                "#commit",
+                                &[("seq", vlpds::cbor::Value::Int(seq)), ("time", vlpds::cbor::Value::Text(time))],
+                            );
+                            if sock.send(Message::Binary(f.into())).await.is_err() {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    })
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(l, app).await });
+        port
+    }
+
+    /// A host whose stream runs late while the relay has room opens a
+    /// read-lag case; once it has caught up, the node that reads it closes
+    /// the case itself, with a note naming it and a `case` event.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_host_opens_a_read_lag_case_and_its_recovery_closes_it() {
+        use crate::node::lag::{LagCaseConfig, RESOLVED_NOTE};
+        let store = vlpds::store::Store::memory(None);
+        let addrs: HashMap<String, String> =
+            [("n1".to_string(), format!("127.0.0.1:{}", crate::qlog::tests::free_port()))].into();
+        let a = relay_with("n1", &addrs, store, crate::node::admin::HOST_ACTION_SETTLE, |cfg| {
+            cfg.lag_cases = LagCaseConfig {
+                threshold: Duration::from_secs(3),
+                sustain: Duration::from_secs(1),
+                grace: Duration::from_secs(1),
+                pressure: 0.5,
+                resolve_after: Duration::from_secs(2),
+            };
+        })
+        .await;
+        let _sub = a.feed().subscribe(None).unwrap();
+        until("a leader", || a.node.quorum.qnode.status().leader).await;
+        let late = Arc::new(std::sync::atomic::AtomicI64::new(10_000));
+        let host = format!("127.0.0.1:{}", late_pds(late.clone()).await);
+        a.node.manager.admit(&Host(host.clone()), crate::upstream::Tier::Trusted).await.unwrap();
+        let engine = a.policy.engine.clone();
+
+        let t = Instant::now();
+        let id = loop {
+            let open = engine.cases.list(None).await.unwrap();
+            if let Some(c) = open.iter().find(|c| c.kind == "read-lag" && c.host == host && c.is_open()) {
+                break c.id;
+            }
+            assert!(t.elapsed() < Duration::from_secs(20), "no read-lag case");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        // still behind: nothing to close
+        assert!(a.node.sweep_lag_cases(&engine).await.unwrap().is_empty());
+
+        late.store(0, std::sync::atomic::Ordering::Relaxed);
+        let t = Instant::now();
+        while !a.node.sweep_lag_cases(&engine).await.unwrap().contains(&id) {
+            assert!(t.elapsed() < Duration::from_secs(20), "case {id} never closed");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let c = engine.cases.get_case(id).await.unwrap().unwrap();
+        assert_eq!(c.status, admin::CaseStatus::Resolved);
+        let note = c.notes.last().unwrap();
+        assert_eq!((note.text.as_str(), note.by.as_str()), (RESOLVED_NOTE, "relay (service)"));
+        assert!(a.node.sweep_lag_cases(&engine).await.unwrap().is_empty(), "closed twice");
+        until("the case event", || find(&a, |ch| ch.kind == ChangeKind::Case && ch.id == id.to_string())).await;
     }
 }

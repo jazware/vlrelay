@@ -5,7 +5,7 @@ mod fan;
 mod pds;
 mod scale;
 
-use fan::{Fan, HostSpec};
+use fan::{Fan, HostSpec, Stamp};
 use pds::Pds;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -303,6 +303,71 @@ async fn rate_limit_pauses_reads() {
     m.shutdown().await.unwrap();
 }
 
+fn limited(events_per_sec: f64) -> TierLimits {
+    TierLimits {
+        events_per_sec,
+        bytes_per_sec: f64::INFINITY,
+        burst_secs: 1.0,
+        weight: 1,
+        events_per_hour: events_per_sec * 3_600.0,
+        events_per_day: 0.0,
+        reconnects_per_hour: 0.0,
+    }
+}
+
+/// `spec` at 30 events/s (and 108k/h); frames delivered in `d`, and whether
+/// the host ever showed throttled.
+async fn under_limit(name: &str, spec: HostSpec, d: Duration, want: usize) -> (usize, bool) {
+    let fan = Fan::spawn().await;
+    fan.set(name, spec);
+    let mut cfg = fan_config(&fan);
+    cfg.limits.new = limited(30.0);
+    let (m, mut rx) = Manager::new(cfg, Arc::new(MemHostStore::default()), None);
+    m.start().await.unwrap();
+    let h = Host(format!("{name}.fan.test"));
+    m.admit(&h, Tier::New).await.unwrap();
+    let t = Instant::now();
+    let (mut n, mut throttled) = (0, false);
+    while t.elapsed() < d && n < want {
+        if let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+            n += 1;
+        }
+        throttled |= m.host(&h).unwrap().record.status == HostStatus::Throttled;
+    }
+    m.shutdown().await.unwrap();
+    (n, throttled)
+}
+
+/// An hour the host sent at 20/s, under its 30/s, replayed as fast as the
+/// socket goes: counted on the host's own timeline it costs what the
+/// traffic did, so nothing holds it (on the wall clock it would take 40 min).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backlog_replays_at_the_cost_the_traffic_had() {
+    let spec = HostSpec { stamp: Stamp::Backlog { secs: 3_600.0, rate: 20.0 }, ..HostSpec::rate(0.0, 50) };
+    let (n, throttled) = under_limit("behind", spec, Duration::from_secs(60), 72_000).await;
+    assert!(n >= 72_000, "replayed {n} of 72000");
+    assert!(!throttled, "a backlog within its limits was throttled");
+}
+
+/// The same frames stamped as they're sent are a burst, and the limit holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_stamped_as_sent_is_held_to_the_limit() {
+    let spec = HostSpec { stamp: Stamp::Sent { skew_secs: 0.0 }, ..HostSpec::rate(f64::INFINITY, 50) };
+    let (n, throttled) = under_limit("burst", spec, Duration::from_secs(2), usize::MAX).await;
+    // 30/s for 2 s, the 30-frame burst, and what the queue took before it emptied
+    assert!(n <= 400, "delivered {n}");
+    assert!(throttled);
+}
+
+/// Stamping its events an hour ahead buys a host nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn future_dated_events_dont_evade_the_limit() {
+    let spec = HostSpec { stamp: Stamp::Sent { skew_secs: 3_600.0 }, ..HostSpec::rate(f64::INFINITY, 50) };
+    let (n, throttled) = under_limit("ahead", spec, Duration::from_secs(2), usize::MAX).await;
+    assert!(n <= 400, "delivered {n}");
+    assert!(throttled);
+}
+
 /// Nobody takes frames, so the relay pauses the host itself: `backpressure`
 /// naming what's full, never `throttled` (its limits are unlimited here).
 /// Once frames are taken again the status clears.
@@ -364,6 +429,61 @@ async fn full_lane_queue_is_backpressure() {
         Backpressure::QueueFull,
     )
     .await;
+}
+
+/// Read-lag cases (`vlrelay::node::lag`) against real readers: a host
+/// whose stream runs 10 s late trips once the relay has room for it, and
+/// the same host behind a relay that isn't taking frames doesn't.
+async fn lag_trips(drained: bool) -> (usize, bool) {
+    use vlrelay::node::lag::{LagCaseConfig, LagWatch, Pressure, Sample};
+    let fan = Fan::spawn().await;
+    fan.set("late", HostSpec { stamp: Stamp::Sent { skew_secs: -10.0 }, ..HostSpec::rate(200.0, 50) });
+    let mut cfg = fan_config(&fan);
+    cfg.limits = Limits::unlimited();
+    if !drained {
+        cfg.output_capacity = 1;
+        cfg.host_queue_frames = 4;
+    }
+    let (m, mut rx) = Manager::new(cfg, Arc::new(MemHostStore::default()), None);
+    m.start().await.unwrap();
+    let h = Host("late.fan.test".into());
+    m.admit(&h, Tier::Default).await.unwrap();
+    let drain = drained.then(|| tokio::spawn(async move { while rx.recv().await.is_some() {} }));
+    let mut w = LagWatch::new(LagCaseConfig {
+        threshold: Duration::from_secs(5),
+        sustain: Duration::from_secs(1),
+        grace: Duration::from_secs(2),
+        ..LagCaseConfig::default()
+    });
+    let (mut trips, mut held) = (0, false);
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(6) {
+        let v = m.host(&h).unwrap();
+        held |= v.record.status == HostStatus::Backpressure;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let s = Sample { host: &v.record.hostname, lag_ms: v.host_lag_ms, held_at_ms: v.backpressure_at_ms };
+        trips += w.observe(now, Pressure::default(), &[s]).len();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    m.shutdown().await.unwrap();
+    if let Some(d) = drain {
+        d.abort();
+    }
+    (trips, held)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_host_with_room_trips_read_lag() {
+    let (trips, held) = lag_trips(true).await;
+    assert_eq!(trips, 1);
+    assert!(!held);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_host_the_relay_holds_doesnt_trip() {
+    let (trips, held) = lag_trips(false).await;
+    assert!(held, "never in backpressure");
+    assert_eq!(trips, 0);
 }
 
 /// One host at 50x the rate of 20 others, a consumer that can't keep up
