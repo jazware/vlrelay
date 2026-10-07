@@ -212,7 +212,7 @@ impl PolicyAdmin {
         }
     }
 
-    fn rule_view(r: &Rule, matches: &BTreeMap<u64, u32>) -> wire::DomainRule {
+    fn rule_view(r: &Rule, matches: &BTreeMap<u64, u32>, version: u64) -> wire::DomainRule {
         wire::DomainRule {
             id: r.id,
             pattern: r.pattern.clone(),
@@ -221,13 +221,14 @@ impl PolicyAdmin {
             created_at_ms: r.created_at_ms,
             created_by: r.created_by.clone(),
             matches: matches.get(&r.id).copied().unwrap_or(0),
+            version,
         }
     }
 
     pub async fn domain_rules(&self) -> AdminResult<Vec<wire::DomainRule>> {
-        let (_, set) = self.engine.rules();
+        let (version, set) = self.engine.rules();
         let m = self.match_counts(&set).await?;
-        Ok(set.rules.iter().map(|r| Self::rule_view(r, &m)).collect())
+        Ok(set.rules.iter().map(|r| Self::rule_view(r, &m, version)).collect())
     }
 
     async fn edit_rules(
@@ -235,21 +236,21 @@ impl PolicyAdmin {
         by: &str,
         note: &str,
         f: impl FnOnce(&mut RuleSet) -> AdminResult<u64>,
-    ) -> AdminResult<(RuleSet, u64)> {
+    ) -> AdminResult<(RuleSet, u64, u64)> {
         if let Err(e) = self.engine.refresh().await {
             tracing::warn!("rules refresh before save: {e:#}");
         }
         let (version, mut set) = self.engine.rules();
         let id = f(&mut set)?;
         let d = self.engine.save_rules(version, set, by, note).await.map_err(save_err)?;
-        Ok((d.body, id))
+        Ok((d.body, id, d.version))
     }
 
     pub async fn create_domain_rule(&self, input: DomainRuleInput, by: &str) -> AdminResult<wire::DomainRule> {
         let pattern = rules::normalize_pattern(&input.pattern).map_err(AdminError::BadRequest)?;
         let effect = effect_from_wire(&input.effect)?;
         let note = format!("create {pattern}");
-        let (set, id) = self
+        let (set, id, version) = self
             .edit_rules(by, &note, |set| {
                 if set.rules.iter().any(|r| r.pattern == pattern) {
                     return Err(AdminError::Conflict(format!("a rule for {pattern} already exists")));
@@ -269,14 +270,14 @@ impl PolicyAdmin {
             .await?;
         let m = self.match_counts(&set).await?;
         let r = set.rules.iter().find(|r| r.id == id).expect("just added");
-        Ok(Self::rule_view(r, &m))
+        Ok(Self::rule_view(r, &m, version))
     }
 
     pub async fn update_domain_rule(&self, id: u64, input: DomainRuleInput, by: &str) -> AdminResult<wire::DomainRule> {
         let pattern = rules::normalize_pattern(&input.pattern).map_err(AdminError::BadRequest)?;
         let effect = effect_from_wire(&input.effect)?;
         let note = format!("update rule {id} ({pattern})");
-        let (set, _) = self
+        let (set, _, version) = self
             .edit_rules(by, &note, |set| {
                 if set.rules.iter().any(|r| r.pattern == pattern && r.id != id) {
                     return Err(AdminError::Conflict(format!("a rule for {pattern} already exists")));
@@ -294,7 +295,7 @@ impl PolicyAdmin {
             .await?;
         let m = self.match_counts(&set).await?;
         let r = set.rules.iter().find(|r| r.id == id).expect("exists");
-        Ok(Self::rule_view(r, &m))
+        Ok(Self::rule_view(r, &m, version))
     }
 
     pub async fn delete_domain_rule(&self, id: u64, by: &str) -> AdminResult<()> {

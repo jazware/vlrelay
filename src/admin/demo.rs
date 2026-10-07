@@ -23,6 +23,7 @@ const EVENT_BYTES: f64 = 4_600.0;
 
 pub struct Demo {
     sim: Mutex<Sim>,
+    feed: Arc<changes::ChangeFeed>,
     /// Always locked after `sim` when both are held.
     extra: Mutex<extra::Extra>,
 }
@@ -38,19 +39,126 @@ impl Demo {
         }
         sim.tick(start);
         let extra = extra::Extra::new(start, sim.last_seq);
-        let demo = Arc::new(Demo { sim: Mutex::new(sim), extra: Mutex::new(extra) });
+        let feed = changes::ChangeFeed::new(NODES[0]);
+        feed.spawn_flusher();
+        let demo = Arc::new(Demo { sim: Mutex::new(sim), feed, extra: Mutex::new(extra) });
         let weak = Arc::downgrade(&demo);
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_secs(1));
             iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut n: u64 = 0;
             loop {
                 iv.tick().await;
                 let Some(d) = weak.upgrade() else { break };
-                d.sim.lock().tick(now_ms());
+                d.step(now_ms(), n);
+                n += 1;
             }
         });
         demo
     }
+
+    /// One tick of the simulation, and the change events it makes.
+    fn step(&self, now: i64, n: u64) {
+        let mut g = self.sim.lock();
+        let s = &mut *g;
+        let before: Vec<HostSig> = s.hosts.iter().map(sig).collect();
+        let cases = s.cases.iter().map(|c| (c.id, c.updated_at_ms)).collect::<HashMap<_, _>>();
+        s.tick(now);
+        // a host flapping in and out of backpressure every few seconds
+        if n % 3 == 0 {
+            let i = s.rng.below(s.hosts.len().min(400));
+            let reason = *s.rng.pick(&[
+                BackpressureReason::InflightFull,
+                BackpressureReason::NodeInflightFull,
+                BackpressureReason::QueueFull,
+            ]);
+            let h = &mut s.hosts[i];
+            match h.status {
+                HostStatus::Connected => {
+                    h.status = HostStatus::Backpressure;
+                    h.backpressure = Some(reason);
+                }
+                HostStatus::Backpressure => {
+                    h.status = HostStatus::Connected;
+                    h.backpressure = None;
+                }
+                _ => {}
+            }
+        }
+        // a consumer leaving and another arriving
+        if n % 10 == 7 && s.consumers.len() > 1 {
+            let i = 1 + s.rng.below(s.consumers.len() - 1);
+            let gone = s.consumers.remove(i);
+            self.consumer_change(&gone, "disconnect");
+            let mut c = gone.clone();
+            c.id = s.next_consumer;
+            s.next_consumer += 1;
+            c.connected_since_ms = now;
+            c.node = NODES[s.rng.below(NODES.len())].into();
+            self.consumer_change(&c, "connect");
+            s.consumers.push(c);
+        }
+        if n % 5 == 2 {
+            let hint = serde_json::json!({ "inProgress": n % 20 < 10 });
+            self.feed.touch_as(NODES[0], changes::ChangeKind::Discovery, "plc", Some(hint), true);
+        }
+        if n % 4 == 1 {
+            let hint = serde_json::json!({ "caughtUp": n % 40 >= 20 });
+            self.feed.touch_as(NODES[0], changes::ChangeKind::Plc, "export", Some(hint), true);
+        }
+        for i in 0..s.hosts.len() {
+            if sig(&s.hosts[i]) != before[i] {
+                self.host_changed(&mut s.hosts[i], now, false);
+            }
+        }
+        let opened: Vec<(u64, CaseStatus)> =
+            s.cases.iter().filter(|c| cases.get(&c.id) != Some(&c.updated_at_ms)).map(|c| (c.id, c.status)).collect();
+        for (id, st) in opened {
+            self.feed.touch(changes::ChangeKind::Case, id.to_string(), Some(serde_json::json!({ "status": st })), true);
+        }
+    }
+
+    /// The row's new version, made now (an action) or at the next flush.
+    fn host_changed(&self, h: &mut SimHost, now: i64, at_once: bool) {
+        let hint = serde_json::json!({
+            "status": h.status,
+            "backpressureReason": h.backpressure.filter(|_| h.status == HostStatus::Backpressure),
+            "tier": h.tier,
+        });
+        let kind = changes::ChangeKind::Host;
+        h.version = Some(match at_once {
+            true => self.feed.emit(kind, h.name.clone(), Some(hint), true),
+            false => self.feed.touch(kind, h.name.clone(), Some(hint), true),
+        });
+        h.updated_at = Some(now);
+    }
+
+    fn consumer_change(&self, c: &Consumer, event: &str) {
+        let id = format!("{}/{}", c.node, c.id);
+        let hint = serde_json::json!({ "event": event });
+        self.feed.touch_as(&c.node, changes::ChangeKind::Consumer, id, Some(hint), true);
+    }
+
+    fn rules_changed(&self, s: &mut Sim) {
+        s.rules_version += 1;
+        self.feed.publish_versioned(changes::ChangeKind::Rules, "rules", s.rules_version.to_string(), None, true);
+    }
+
+    fn policy_changed(&self, version: u64) {
+        self.feed.publish_versioned(changes::ChangeKind::Policy, "policy", version.to_string(), None, true);
+    }
+
+    /// A takedown or a lift committed at the simulated log's next seq.
+    fn logged(&self, s: &mut Sim, kind: changes::ChangeKind, id: &str, hint: serde_json::Value) {
+        s.last_seq += 1;
+        self.feed.publish_versioned(kind, id, s.last_seq.to_string(), Some(hint), false);
+    }
+}
+
+type HostSig = (HostStatus, String, Option<u64>, Option<BackpressureReason>);
+
+fn sig(h: &SimHost) -> HostSig {
+    (h.status, h.tier.clone(), h.throttle.map(f64::to_bits), h.backpressure)
 }
 
 fn now_ms() -> i64 {
@@ -142,6 +250,8 @@ struct SimHost {
     by_reason: BTreeMap<RejectReason, u64>,
     actions: Vec<HostActionRecord>,
     shard: usize,
+    version: Option<String>,
+    updated_at: Option<i64>,
 }
 
 struct Sample {
@@ -169,6 +279,7 @@ struct Sim {
     audit: Vec<PolicyAudit>,
     rules: Vec<DomainRule>,
     next_rule: u64,
+    rules_version: u64,
     cases: Vec<Case>,
     next_case: u64,
     accounts: Vec<Account>,
@@ -247,6 +358,8 @@ impl Sim {
             let since = now - (rng.range(60.0, 86_400.0 * 9.0) * 1000.0) as i64;
             hosts.push(SimHost {
                 shard: (hash(&name) % HOST_SHARDS as u64) as usize,
+                version: None,
+                updated_at: None,
                 name,
                 tier: tier.into(),
                 status: HostStatus::Connected,
@@ -381,6 +494,7 @@ impl Sim {
             audit: Vec::new(),
             rules: Vec::new(),
             next_rule: 1,
+            rules_version: 1,
             cases: Vec::new(),
             next_case: 1,
             accounts: Vec::new(),
@@ -459,6 +573,7 @@ impl Sim {
                 created_at_ms: now - days * 86_400_000,
                 created_by: "admin".into(),
                 matches: 0,
+                version: 0,
             });
             self.apply_rule_effect(pattern, &effect);
         }
@@ -712,7 +827,10 @@ impl Sim {
                     HostStatus::Throttled
                 } else if h.backpressure.is_some() {
                     HostStatus::Backpressure
-                } else if rate < 0.002 && h.profile == Profile::SelfHosted {
+                } else if h.profile == Profile::SelfHosted
+                    // a band, so a host near the line doesn't flap every tick
+                    && (rate < 0.002 || (h.status == HostStatus::Idle && rate < 0.01))
+                {
                     HostStatus::Idle
                 } else {
                     HostStatus::Connected
@@ -933,6 +1051,8 @@ impl Sim {
             }),
             rule: self.rule_for(&h.name).map(|r| r.id),
             node: self.host_shards[h.shard].clone().unwrap_or_default(),
+            version: h.version.clone(),
+            updated_at_ms: h.updated_at,
         }
     }
 
@@ -954,6 +1074,7 @@ impl Sim {
     fn rule_view(&self, r: &DomainRule) -> DomainRule {
         DomainRule {
             matches: self.hosts.iter().filter(|h| rule_matches(&r.pattern, &h.name)).count() as u32,
+            version: self.rules_version,
             ..r.clone()
         }
     }
@@ -1066,6 +1187,10 @@ fn validate_pattern(p: &str) -> AdminResult<String> {
 // ---------------------------------------------------------------- AdminSource
 
 impl AdminSource for Demo {
+    fn changes(&self) -> Option<Arc<changes::ChangeFeed>> {
+        Some(self.feed.clone())
+    }
+
     async fn overview(&self) -> AdminResult<Overview> {
         let s = self.sim.lock();
         let last = s.history.back().expect("seeded");
@@ -1265,6 +1390,7 @@ impl AdminSource for Demo {
             }
         }
         h.actions.push(HostActionRecord { at_ms: now, by: by.into(), action });
+        self.host_changed(h, now, true);
         let h = &s.hosts[i];
         Ok(s.row(h))
     }
@@ -1291,9 +1417,11 @@ impl AdminSource for Demo {
             created_at_ms: s.now_ms,
             created_by: by.into(),
             matches: 0,
+            version: 0,
         };
         s.apply_rule_effect(&pattern, &rule.effect);
         s.rules.push(r.clone());
+        self.rules_changed(&mut s);
         Ok(s.rule_view(&r))
     }
 
@@ -1309,6 +1437,7 @@ impl AdminSource for Demo {
         s.rules[i].effect = rule.effect.clone();
         s.rules[i].note = rule.note;
         s.apply_rule_effect(&pattern, &rule.effect);
+        self.rules_changed(&mut s);
         let r = s.rules[i].clone();
         Ok(s.rule_view(&r))
     }
@@ -1317,6 +1446,7 @@ impl AdminSource for Demo {
         let mut s = self.sim.lock();
         let i = s.rules.iter().position(|r| r.id == id).ok_or_else(|| AdminError::NotFound(format!("no rule {id}")))?;
         s.rules.remove(i);
+        self.rules_changed(&mut s);
         Ok(())
     }
 
@@ -1344,6 +1474,7 @@ impl AdminSource for Demo {
             PolicyDoc { version: s.policy.version + 1, policy: u.policy, updated_at_ms: now, updated_by: by.into() };
         let version = s.policy.version;
         s.audit.push(PolicyAudit { version, at_ms: now, by: by.into(), note: u.note, changes });
+        self.policy_changed(version);
         Ok(s.policy.clone())
     }
 
@@ -1373,7 +1504,8 @@ impl AdminSource for Demo {
             .iter()
             .position(|c| c.id == id && node.is_none_or(|n| c.node == n))
             .ok_or_else(|| AdminError::NotFound(format!("no consumer {id}")))?;
-        s.consumers.remove(i);
+        let gone = s.consumers.remove(i);
+        self.consumer_change(&gone, "disconnect");
         Ok(())
     }
 
@@ -1501,8 +1633,12 @@ impl AdminSource for Demo {
     }
 
     async fn change_quorum_members(&self, req: QuorumMembersChange, _by: &str) -> AdminResult<serde_json::Value> {
-        let s = self.sim.lock();
-        self.extra.lock().change(req, s.last_seq, s.now_ms)
+        let mut s = self.sim.lock();
+        let out = self.extra.lock().change(req, s.last_seq, s.now_ms)?;
+        let (leader, epoch, _, _) = self.extra.lock().roles();
+        let hint = serde_json::json!({ "epoch": epoch, "leader": leader });
+        self.logged(&mut s, changes::ChangeKind::Cluster, "quorum", hint);
+        Ok(out)
     }
 
     async fn settings(&self) -> AdminResult<SettingsView> {
@@ -1548,6 +1684,7 @@ impl AdminSource for Demo {
         x.full_at_ms = now;
         x.full_by = by.into();
         x.full_note = u.note;
+        self.policy_changed(version);
         Ok(FullPolicyDoc {
             version,
             updated_at_ms: now,
@@ -1688,7 +1825,7 @@ impl AdminSource for Demo {
     }
 
     async fn release_throttled(&self, host: &str, _by: &str) -> AdminResult<Released> {
-        let s = self.sim.lock();
+        let mut s = self.sim.lock();
         let i = s
             .hosts
             .iter()
@@ -1696,6 +1833,12 @@ impl AdminSource for Demo {
             .ok_or_else(|| AdminError::NotFound(format!("no host {host}")))?;
         let h = &s.hosts[i];
         let released = if h.accounts > 100 { (h.accounts - 100).min(400) } else { 0 };
+        let (name, now) = (h.name.clone(), s.now_ms);
+        for k in 0..released.min(3) {
+            let did = fake_did(&format!("{name}/{k}"));
+            self.logged(&mut s, changes::ChangeKind::Account, &did, serde_json::json!({ "host": name }));
+        }
+        self.host_changed(&mut s.hosts[i], now, true);
         Ok(Released { released })
     }
 
@@ -2043,6 +2186,7 @@ impl AdminSource for Demo {
         let i = s.find_account(did)?;
         let now = s.now_ms;
         s.takedowns.insert(did.to_string(), Takedown { at_ms: now, by: by.into(), reason });
+        self.logged(&mut s, changes::ChangeKind::Takedown, did, serde_json::json!({ "takedown": true }));
         Ok(s.account_view(&s.accounts[i]))
     }
 
@@ -2050,6 +2194,7 @@ impl AdminSource for Demo {
         let mut s = self.sim.lock();
         let i = s.find_account(did)?;
         s.takedowns.remove(did);
+        self.logged(&mut s, changes::ChangeKind::Takedown, did, serde_json::json!({ "takedown": false }));
         Ok(s.account_view(&s.accounts[i]))
     }
 
@@ -2076,6 +2221,8 @@ impl AdminSource for Demo {
             c.notes.push(CaseNote { at_ms: now, by: by.into(), text: u.note });
         }
         c.updated_at_ms = now;
+        let hint = serde_json::json!({ "status": c.status });
+        self.feed.emit(changes::ChangeKind::Case, id.to_string(), Some(hint), true);
         Ok(c.clone())
     }
 }
@@ -2399,5 +2546,102 @@ mod tests {
 
         let s = d.settings().await.unwrap();
         assert!(s.entries.iter().filter(|e| e.secret).all(|e| e.value.is_none()));
+    }
+
+    /// SSE frames off a response body as (event, id, data).
+    pub(crate) async fn sse_frames(
+        body: axum::body::Body,
+        want: impl Fn(&[(String, Option<String>, serde_json::Value)]) -> bool,
+    ) -> Vec<(String, Option<String>, serde_json::Value)> {
+        use futures::StreamExt;
+        let mut stream = body.into_data_stream();
+        let mut buf = String::new();
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !want(&out) {
+            let chunk = tokio::time::timeout_at(deadline, stream.next()).await.expect("events in time");
+            buf.push_str(std::str::from_utf8(&chunk.expect("open").expect("chunk")).unwrap());
+            while let Some(end) = buf.find("\n\n") {
+                let frame: String = buf.drain(..end + 2).collect();
+                let (mut ev, mut id, mut data) = ("message".to_string(), None, String::new());
+                for line in frame.lines() {
+                    if let Some(v) = line.strip_prefix("event: ") {
+                        ev = v.into();
+                    } else if let Some(v) = line.strip_prefix("id: ") {
+                        id = Some(v.to_string());
+                    } else if let Some(v) = line.strip_prefix("data: ") {
+                        data.push_str(v);
+                    }
+                }
+                if !data.is_empty() {
+                    out.push((ev, id, serde_json::from_str(&data).unwrap()));
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn the_change_feed_names_what_the_actions_changed() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        let d = Demo::start(7);
+        let app = crate::admin::api_routes(d.clone(), "t".into());
+        let auth = "Basic YWRtaW46dA==";
+        let open = |since: Option<String>| {
+            let mut b = Request::get("/admin/api/changes").header("authorization", auth);
+            if let Some(s) = since {
+                b = b.header("last-event-id", s);
+            }
+            app.clone().oneshot(b.body(Body::empty()).unwrap())
+        };
+        let r = app.clone().oneshot(Request::get("/admin/api/changes").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let r = open(None).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()["content-type"], "text/event-stream");
+
+        let host = d.hosts(HostQuery::default()).await.unwrap().hosts[0].host.clone();
+        let row = d.host_action(&host, HostAction::Throttle { events_per_sec: Some(5.0) }, "t").await.unwrap();
+        let did = d.sim.lock().accounts[0].did.clone();
+        d.takedown(&did, "spam".into(), "t").await.unwrap();
+        let p = d.policy().await.unwrap();
+        let mut pol = p.policy.clone();
+        pol.spam.reject_ratio = (pol.spam.reject_ratio * 0.5).max(0.01);
+        let u = PolicyUpdate { base_version: p.version, policy: pol, note: String::new() };
+        let p2 = d.update_policy(u, "t").await.unwrap();
+        let c = d.consumers().await.unwrap()[0].clone();
+        d.kick_consumer_on(Some(&c.node), c.id, "t").await.unwrap();
+
+        let has = |fs: &[(String, Option<String>, serde_json::Value)], kind: &str, id: &str| {
+            fs.iter().any(|(e, _, v)| e == "change" && v["kind"] == kind && v["id"] == id)
+        };
+        let cid = format!("{}/{}", c.node, c.id);
+        let frames = sse_frames(r.into_body(), |fs| {
+            has(fs, "host", &host)
+                && has(fs, "takedown", &did)
+                && has(fs, "policy", "policy")
+                && has(fs, "consumer", &cid)
+        })
+        .await;
+        assert_eq!(frames[0].0, "hello");
+        assert_eq!(frames[0].2["resumed"], false);
+        let find = |kind: &str| frames.iter().find(|(e, _, v)| e == "change" && v["kind"] == kind).unwrap();
+        let h = find("host");
+        assert_eq!(h.2["version"].as_str(), row.version.as_deref(), "the row carries the event's version");
+        assert_eq!(h.2["hint"]["status"], serde_json::to_value(row.status).unwrap());
+        assert_eq!(find("policy").2["version"], p2.version.to_string());
+        assert_eq!(find("takedown").2["hint"]["takedown"], true);
+
+        // resuming after the host event replays what followed it
+        let after = h.1.clone().unwrap();
+        let r = open(Some(after)).await.unwrap();
+        let again = sse_frames(r.into_body(), |fs| has(fs, "policy", "policy")).await;
+        assert_eq!(again[0].2["resumed"], true);
+        assert!(!has(&again, "host", &host));
+        let r = open(Some("nope.1".into())).await.unwrap();
+        let again = sse_frames(r.into_body(), |fs| fs.len() >= 2).await;
+        assert_eq!((again[1].0.as_str(), &again[1].2["reason"]), ("resync", &serde_json::json!("unknown-cursor")));
     }
 }

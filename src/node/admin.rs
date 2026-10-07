@@ -256,6 +256,8 @@ impl NodeAdmin {
             throttled_accounts: self.node.quorum.hosts.throttled(&h.record.hostname),
             source: self.node.quorum.hosts.source(&h.record.hostname),
             top_reason: rejects.and_then(top_reason),
+            version: None,
+            updated_at_ms: None,
         }
     }
 
@@ -1523,6 +1525,8 @@ mod tests {
             throttled_accounts: 0,
             source: None,
             top_reason: None,
+            version: None,
+            updated_at_ms: None,
         }
     }
 

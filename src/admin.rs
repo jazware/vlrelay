@@ -5,6 +5,7 @@
 //! so the relay can implement it over its real state while [`demo::Demo`]
 //! simulates a busy relay for UI work.
 
+pub mod changes;
 pub mod demo;
 mod diff;
 pub mod fleet;
@@ -230,6 +231,12 @@ pub struct HostRow {
     /// five minutes), if any.
     #[serde(default)]
     pub top_reason: Option<RejectReason>,
+    /// The node-scoped version of the row's last change as the answering
+    /// node reads it (docs/admin-api.md, "Versions"); None until it sees one.
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub updated_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -348,6 +355,9 @@ pub struct DomainRule {
     pub created_by: String,
     /// Known hosts the pattern matches right now.
     pub matches: u32,
+    /// The rule set's version when it was read.
+    #[serde(default)]
+    pub version: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1237,6 +1247,10 @@ pub trait AdminSource: Send + Sync + 'static {
         async { Err(AdminError::NotFound("pipeline numbers aren't available on this relay".into())) }
     }
 
+    /// The change feed this source serves (`GET changes`); None: a 404.
+    fn changes(&self) -> Option<Arc<changes::ChangeFeed>> {
+        None
+    }
     fn cluster(&self) -> impl Future<Output = AdminResult<ClusterView>> + Send;
     fn quorum(&self) -> impl Future<Output = AdminResult<QuorumView>> + Send {
         async { Err(AdminError::NotFound("this relay doesn't run the quorum log".into())) }
@@ -1292,6 +1306,7 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
     let ctx = Arc::new(Ctx { src, token: admin_token });
     Router::new()
         .route("/admin/api/session", get(session))
+        .route("/admin/api/changes", get(change_feed::<S>))
         .route("/admin/api/overview", get(overview::<S>))
         .route("/admin/api/hosts", get(hosts::<S>))
         .route("/admin/api/hosts/{host}", get(host::<S>))
@@ -1407,6 +1422,34 @@ async fn session(Extension(a): Extension<Actor>) -> Json<serde_json::Value> {
 }
 
 type Ax<S> = State<Arc<Ctx<S>>>;
+
+#[derive(Deserialize)]
+struct ChangesQuery {
+    since: Option<String>,
+}
+
+async fn change_feed<S: AdminSource>(
+    State(c): Ax<S>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<ChangesQuery>,
+) -> Response {
+    let Some(feed) = c.src.changes() else {
+        return AdminError::NotFound("this relay serves no change feed".into()).into_response();
+    };
+    let since = headers.get("last-event-id").and_then(|v| v.to_str().ok()).map(str::to_string).or(q.since);
+    match feed.sse(since.as_deref()) {
+        // a buffering proxy (nginx) would hold events back
+        Ok(sse) => ([(header::HeaderName::from_static("x-accel-buffering"), "no")], sse).into_response(),
+        Err(changes::TooManyFeeds) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "TooManyFeeds",
+                "message": format!("{} change feeds are open on this node", changes::MAX_FEEDS),
+            })),
+        )
+            .into_response(),
+    }
+}
 
 async fn overview<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Overview>> {
     Ok(Json(c.src.overview().await?))
