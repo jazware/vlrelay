@@ -195,6 +195,7 @@ function Plc() {
                 ['ops read', fmtSi(p.ops)],
                 ['ops/s', fmtNum(p.opsPerSec, 1)],
                 ['seeds written', fmtSi(p.written)],
+                ['lookups kept', fmtSi(p.learned)],
                 ['requests', fmtSi(p.requests)],
                 ['throttled (429)', fmtNum(p.throttled)],
                 ['errors', fmtNum(p.errors)],

@@ -707,6 +707,10 @@ pub struct PlcView {
     /// The stored checkpoint's windows (written every 10 s).
     pub windows: Vec<PlcWindow>,
     pub checkpoint_ms: i64,
+    /// Fetched DID documents written to the seeds (every leader since its
+    /// start), and dropped.
+    pub learned: u64,
+    pub learned_dropped: u64,
     pub nodes: Vec<PlcNode>,
 }
 

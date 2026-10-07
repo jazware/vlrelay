@@ -83,7 +83,7 @@ mod tests {
     async fn every_database_shares_the_one_cache() {
         let store = vlpds::store::Store::memory(None);
         let st = crate::qlog::state::State::open(&store, "qlog/state-cachetest").await.unwrap();
-        let w = crate::plc_seed::SeedWriter::open(&store, std::time::Duration::from_secs(60)).await.unwrap();
+        let w = crate::plc_seed::SeedWriter::open(&store).await.unwrap();
         w.flush().await.unwrap();
         let r = crate::plc_seed::SeedReader::new(store.clone());
         let _ = r.get("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").await;

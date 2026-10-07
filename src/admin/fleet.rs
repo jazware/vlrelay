@@ -60,6 +60,12 @@ pub struct PlcReport {
     /// The stored checkpoint, read by the leader.
     pub windows: Vec<PlcWindow>,
     pub checkpoint_ms: i64,
+    /// Fetched DID documents this node wrote to the seeds since it started,
+    /// and dropped.
+    #[serde(default)]
+    pub learned: u64,
+    #[serde(default)]
+    pub learned_dropped: u64,
 }
 
 impl NodeReport {
@@ -250,6 +256,8 @@ pub fn plc_view(members: &[Member]) -> PlcView {
         v.throttled += p.throttled;
         v.errors += p.errors;
         v.restarts += p.restarts;
+        v.learned += p.learned;
+        v.learned_dropped += p.learned_dropped;
         if p.checkpoint_ms >= v.checkpoint_ms && !p.windows.is_empty() {
             v.checkpoint_ms = p.checkpoint_ms;
             v.windows = p.windows.clone();

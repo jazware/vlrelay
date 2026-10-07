@@ -84,6 +84,9 @@ pub struct NodeConfig {
     pub lanes: usize,
     /// Threads of the runtime the lanes run on.
     pub ingest_threads: usize,
+    /// DID document lookups started ahead of the lanes at once
+    /// (`IdentityCache::prefetch`); 0 leaves them to the lanes.
+    pub lookup_prefetch: usize,
     /// Threads serving subscribeRepos.
     pub serve_threads: usize,
     /// Upstreams from the command line: a URL (`http://` means plain
@@ -111,6 +114,7 @@ impl NodeConfig {
             max_lag_bytes: None,
             lanes: 64,
             ingest_threads: cores.clamp(2, 16),
+            lookup_prefetch: 256,
             serve_threads: 4,
             hosts: Vec::new(),
             identity: crate::identity::Options::default(),
@@ -247,6 +251,7 @@ pub struct Node {
     /// Per host: sockets below this epoch are fenced (`forward::Fence`).
     fences: Mutex<crate::types::FastMap<Host, Arc<AtomicU64>>>,
     lanes: Vec<mpsc::Sender<Job>>,
+    prefetch: Arc<tokio::sync::Semaphore>,
     pub ingest: tokio::runtime::Handle,
     pub started_ms: i64,
     /// The quorum log half (docs/quorum.md): the log node, its client, the
@@ -336,6 +341,7 @@ impl Node {
             policy: hooks.clone(),
             fences: Mutex::new(Default::default()),
             lanes: lane_tx,
+            prefetch: Arc::new(tokio::sync::Semaphore::new(cfg.lookup_prefetch)),
             ingest: ingest_handle.clone(),
             started_ms: upstream::host::now_ms() as i64,
             quorum,
@@ -380,6 +386,9 @@ impl Node {
                     continue;
                 }
             };
+            if matches!(r.kind, Kind::Commit | Kind::Sync) && self.cfg.lookup_prefetch > 0 {
+                self.identity.prefetch(did, &self.prefetch, &self.ingest);
+            }
             let lane = &self.lanes[lane_of(did, self.lanes.len())];
             let fence = self.fence(&f.host, f.epoch);
             metrics::LANE_QUEUED.inc();
@@ -707,7 +716,13 @@ impl Node {
             let consumers = vlpds::metrics::FIREHOSE_SUBSCRIBERS.get();
             metrics::CONSUMERS.set(consumers);
             let st = &self.identity.stats;
-            for (k, v) in [("hit", &st.hits), ("seeded", &st.seeded), ("fetched", &st.fetches)] {
+            for (k, v) in [
+                ("hit", &st.hits),
+                ("seeded", &st.seeded),
+                ("fetched", &st.fetches),
+                ("prefetched", &st.prefetched),
+                ("prefetch_full", &st.prefetch_full),
+            ] {
                 metrics::IDENTITY_LOOKUPS.with_label_values(&[k]).set(v.load(Ordering::Relaxed) as i64);
             }
             metrics::IDENTITY_CACHE.set(self.identity.len() as i64);

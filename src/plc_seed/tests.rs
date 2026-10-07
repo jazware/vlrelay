@@ -90,6 +90,7 @@ fn choose_weighs_the_record_against_the_seed() {
         key: Some(k.clone()),
         pds: Some("pds.test".into()),
         pds_http: false,
+        lookup: false,
     };
     let rec = |fetched: u32, k: &Bytes| {
         let mut r = Record::new(HostKey::of("pds.test"), now - 100_000);
@@ -159,7 +160,7 @@ struct Writes(Arc<SeedWriter>);
 #[async_trait::async_trait]
 impl Sink for Writes {
     async fn apply(&self, ops: Vec<(String, Seed)>) -> anyhow::Result<usize> {
-        Ok(self.0.apply(ops).await?.written)
+        self.0.apply(ops).await
     }
     async fn flush(&self) -> anyhow::Result<()> {
         self.0.flush().await
@@ -174,18 +175,43 @@ async fn wait(mut f: impl FnMut() -> bool, what: &str) {
     }
 }
 
-#[tokio::test]
-async fn an_op_no_newer_than_the_stored_one_writes_nothing() {
+/// Newest-wins holds without reads: in one batch, across batches, across
+/// flushed L0s and compactions, and on a member's reader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_op_never_replaces_a_newer_one() {
     let store = Store::memory(None);
-    let w = SeedWriter::open(&store, Duration::from_secs(3600)).await.unwrap();
+    let w = SeedWriter::open(&store).await.unwrap();
     let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
-    let seed =
-        |ms: u64| Seed { created_ms: ms, tombstone: false, key: None, pds: Some("pds.test".into()), pds_http: false };
-    assert_eq!(w.apply(vec![(did.into(), seed(2_000))]).await.unwrap().written, 1);
-    for ms in [1_000, 2_000] {
-        assert_eq!(w.apply(vec![(did.into(), seed(ms))]).await.unwrap().written, 0);
+    let seed = |ms: u64, pds: &str| Seed {
+        created_ms: ms,
+        tombstone: false,
+        key: None,
+        pds: Some(pds.into()),
+        pds_http: false,
+        lookup: false,
+    };
+    w.apply(vec![(did.into(), seed(2_000, "b.test")), (did.into(), seed(1_000, "a.test"))]).await.unwrap();
+    assert_eq!(w.get(did).await.unwrap().unwrap().pds.as_deref(), Some("b.test"));
+    w.flush().await.unwrap();
+    for (ms, pds) in [(1_500, "c.test"), (2_000, "a.test")] {
+        w.apply(vec![(did.into(), seed(ms, pds))]).await.unwrap();
+        w.flush().await.unwrap();
     }
-    assert_eq!(w.get(did).await.unwrap().unwrap().created_ms, 2_000);
+    // the same instant: the encodings decide, the same way everywhere
+    assert_eq!(w.get(did).await.unwrap().unwrap().pds.as_deref(), Some("b.test"));
+    w.apply(vec![(did.into(), seed(3_000, "d.test"))]).await.unwrap();
+    w.flush().await.unwrap();
+    w.apply(vec![(did.into(), seed(500, "e.test"))]).await.unwrap();
+    w.flush().await.unwrap();
+    // the test compactor polls every 5 s
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    assert_eq!(w.get(did).await.unwrap().unwrap().pds.as_deref(), Some("d.test"));
+    let r = SeedReader::new(store.clone());
+    assert_eq!(r.get(did).await.unwrap().pds.as_deref(), Some("d.test"));
+    w.close().await;
+    let w = SeedWriter::open(&store).await.unwrap();
+    assert_eq!(w.get(did).await.unwrap().unwrap().pds.as_deref(), Some("d.test"));
+    w.close().await;
 }
 
 /// A takeover mid-export: the old leader stops between checkpoints (its
@@ -202,7 +228,7 @@ async fn a_new_leader_resumes_the_export_from_the_checkpoint() {
     let store = Store::memory(None);
     let total = f.plc.op_count() as u64;
 
-    let wa = Arc::new(SeedWriter::open(&store, Duration::from_secs(3600)).await.unwrap());
+    let wa = Arc::new(SeedWriter::open(&store).await.unwrap());
     let a = Ingester::new(f.cfg(2), store.clone(), Arc::new(Writes(wa.clone())));
     let stats = a.stats.clone();
     let run = tokio::spawn(a.clone().supervise(Arc::new(move || stats.pages.load(Relaxed) < 9)));
@@ -214,8 +240,8 @@ async fn a_new_leader_resumes_the_export_from_the_checkpoint() {
     let asked_before = f.plc.afters.lock().len();
 
     // the new leader's open fences the old writer
-    let wb = Arc::new(SeedWriter::open(&store, Duration::from_secs(3600)).await.unwrap());
-    let late = Seed { created_ms: u64::MAX / 2, tombstone: true, key: None, pds: None, pds_http: false };
+    let wb = Arc::new(SeedWriter::open(&store).await.unwrap());
+    let late = Seed { created_ms: u64::MAX / 2, tombstone: true, key: None, pds: None, pds_http: false, lookup: false };
     let fenced = match wa.apply(vec![("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(), late)]).await {
         Err(_) => true,
         Ok(_) => wa.flush().await.is_err(),
@@ -306,7 +332,12 @@ async fn the_leaders_job_survives_a_takeover_mid_export() {
         crate::state::ApplyConfig::default(),
     ));
     let cache = cache(&f.url);
-    cache.set_seeder(Arc::new(Seeder { seeds: jobs[follower].seeds.clone(), state, ttl: Duration::from_secs(3600) }));
+    cache.set_seeder(Arc::new(Seeder {
+        seeds: jobs[follower].seeds.clone(),
+        state,
+        ttl: Duration::from_secs(3600),
+        web_ttl: Duration::from_secs(3600),
+    }));
     let fetched = f.plc.doc_fetches.load(Relaxed);
     for i in (0..DIDS).step_by(53) {
         let did = f.plc.layout.did(i % HOSTS, i);
@@ -319,4 +350,350 @@ async fn the_leaders_job_survives_a_takeover_mid_export() {
         j.stop();
     }
     c.shutdown();
+}
+
+fn env_or<T: std::str::FromStr>(k: &str, d: T) -> T {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+/// `qlog_plc` requests so far: (writes, the rest).
+fn plc_requests() -> (u64, u64) {
+    use prometheus::core::Collector;
+    let (mut w, mut r) = (0, 0);
+    for mf in vlpds::metrics::OBJ_REQUESTS.collect() {
+        for m in mf.get_metric() {
+            let label = |k: &str| m.get_label().iter().find(|l| l.name() == k).map(|l| l.value().to_string());
+            if label("client").as_deref() != Some("qlog_plc") {
+                continue;
+            }
+            let n = m.get_counter().get_value() as u64;
+            if label("op").is_some_and(|o| o.starts_with("put") || o.starts_with("mpu") || o == "copy") {
+                w += n;
+            } else {
+                r += n;
+            }
+        }
+    }
+    (w, r)
+}
+
+/// The export's fill rate against the fake with plc.directory's page
+/// latency and a bucket with R2's (`VLPDS_INJECT_QLOG_PLC_MS`, set by
+/// the runner), reported per phase. `just`-free:
+/// `VLPDS_INJECT_QLOG_PLC_MS=30,80 BENCH_SECS=60 cargo test --release
+/// export_fill_bench -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn export_fill_bench() {
+    // prod's cache holds a fraction of a 3 GB database, so most reads of a
+    // stored row go to the bucket
+    crate::qlog::cache::configure(env_or("BENCH_CACHE_MB", 8));
+    let hosts = 8;
+    let dids: u32 = env_or("BENCH_DIDS", 100_000);
+    let f = fake(hosts, dids).await;
+    f.plc.export_delay_ms.store(env_or("BENCH_EXPORT_MS", 300), Relaxed);
+    // a second op for every DID (a handle change, a PDS move), as most of
+    // plc.directory's history has: those writes find a stored row
+    if env_or("BENCH_REPEAT", 1) > 0 {
+        let at = export::now_ms() - 1_800_000;
+        for i in 0..dids {
+            for g in 0..hosts {
+                f.plc.append(g, i, 1, at + (i * hosts + g) as u64 / 4);
+            }
+        }
+    }
+    let store = crate::qlog::bucket::counted(&Store::memory(None), "plc");
+    let w = Arc::new(SeedWriter::open(&store).await.unwrap());
+    let mut cfg = f.cfg(env_or("BENCH_STREAMS", 2));
+    cfg.rate = env_or("BENCH_RATE", 1.0);
+    cfg.apply_every = Duration::from_secs(2);
+    cfg.checkpoint_every = Duration::from_secs(10);
+    let ing = Ingester::new(cfg, store.clone(), Arc::new(Writes(w.clone())));
+    let secs: u64 = env_or("BENCH_SECS", 60);
+    // the cache's fetches, kept as the leader keeps them
+    let learn: u64 = env_or("BENCH_LEARN_PER_SEC", 0);
+    let seeds = SeedReader::new(store.clone());
+    *seeds.writer.write() = Some(w.clone());
+    let learner = {
+        let seeds = seeds.clone();
+        tokio::spawn(async move {
+            if learn == 0 {
+                return;
+            }
+            let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / learn as f64));
+            let mut i = 0u64;
+            loop {
+                tick.tick().await;
+                i += 1;
+                let now = crate::policy::store::now_ms() as u64;
+                seeds.learn(&format!("did:plc:{i:z>24}"), Seed::from_lookup(None, now));
+            }
+        })
+    };
+    let writer = {
+        let (seeds, w) = (seeds.clone(), w.clone());
+        let t0 = Instant::now();
+        tokio::spawn(async move {
+            seeds.write_learned(&w, &move || t0.elapsed() < Duration::from_secs(secs)).await;
+        })
+    };
+    let req0 = plc_requests();
+    let t0 = Instant::now();
+    let stats = ing.stats.clone();
+    let run = tokio::spawn(
+        ing.clone()
+            .supervise(Arc::new(move || t0.elapsed() < Duration::from_secs(secs) && !stats.caught_up.load(Relaxed))),
+    );
+    let _ = run.await;
+    let el = t0.elapsed().as_secs_f64();
+    learner.abort();
+    let _ = writer.await;
+    let req1 = plc_requests();
+    let s = &ing.stats;
+    let reqs = s.requests.load(Relaxed);
+    eprintln!(
+        "BENCH ops={} ops/s={:.0} requests={} req/s={:.2} s/request={:.2} written={} learned={} bucket_writes={} bucket_reads={} phases_ms={:?}",
+        s.ops.load(Relaxed),
+        s.ops.load(Relaxed) as f64 / el,
+        reqs,
+        reqs as f64 / el,
+        el / reqs.max(1) as f64,
+        s.written.load(Relaxed),
+        seeds.learned_written.load(Relaxed),
+        req1.0 - req0.0,
+        req1.1 - req0.1,
+        s.phases.snapshot().map(|(k, us)| (k, us / 1000)),
+    );
+    w.close().await;
+}
+
+fn member_state() -> Arc<crate::node::State> {
+    Arc::new(crate::state::StateStore::new(
+        crate::node::adapters::VerifyChain,
+        crate::state::tests::MapIdentity::new(),
+        crate::state::ApplyConfig::default(),
+    ))
+}
+
+fn seeder(seeds: &Arc<SeedReader>, web_ttl: Duration) -> Arc<Seeder> {
+    Arc::new(Seeder { seeds: seeds.clone(), state: member_state(), ttl: Duration::from_secs(3600), web_ttl })
+}
+
+/// The leader's seeds with their writer and the lookups' writer loop, as
+/// a term of the job sets them up.
+struct Leader {
+    w: Arc<SeedWriter>,
+    seeds: Arc<SeedReader>,
+    keep: Arc<std::sync::atomic::AtomicBool>,
+    loop_: tokio::task::JoinHandle<()>,
+}
+
+async fn leader(store: &Store) -> Leader {
+    let w = Arc::new(SeedWriter::open(store).await.unwrap());
+    let seeds = SeedReader::new(store.clone());
+    *seeds.writer.write() = Some(w.clone());
+    let keep = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let loop_ = {
+        let (seeds, w, keep) = (seeds.clone(), w.clone(), keep.clone());
+        tokio::spawn(async move { seeds.write_learned(&w, &move || keep.load(Relaxed)).await })
+    };
+    Leader { w, seeds, keep, loop_ }
+}
+
+impl Leader {
+    /// Ends the term as the job does: a last batch, a flush, the close.
+    async fn end(self) {
+        self.keep.store(false, Relaxed);
+        *self.seeds.writer.write() = None;
+        self.loop_.await.unwrap();
+        self.w.flush().await.unwrap();
+        self.w.close().await;
+    }
+}
+
+/// What the cache fetched on the leader is in the seeds after a restart:
+/// the new process's cache fills from them without asking PLC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_keeps_the_documents_it_looked_up() {
+    let f = fake(2, 40).await;
+    let store = Store::memory(None);
+    let l = leader(&store).await;
+    let c = cache(&f.url);
+    c.set_seeder(seeder(&l.seeds, Duration::from_secs(3600)));
+    let dids: Vec<String> = (0..40).map(|i| f.plc.layout.did(i % 2, i)).collect();
+    for d in &dids {
+        c.lookup_paced(d, false).await.unwrap();
+    }
+    let fetched = f.plc.doc_fetches.load(Relaxed);
+    assert_eq!(fetched, 40);
+    l.end().await;
+
+    let seeds = SeedReader::new(store.clone());
+    let c = cache(&f.url);
+    c.set_seeder(seeder(&seeds, Duration::from_secs(3600)));
+    for (i, d) in dids.iter().enumerate() {
+        let id = c.lookup_paced(d, false).await.unwrap();
+        let want = f.plc.key(i as u32 % 2, i as u32, 0).public_multibase();
+        assert_eq!(id.signing_key_multibase.as_deref(), Some(want.as_str()));
+        assert_eq!(
+            id.pds_host.as_ref().map(|h| h.0.clone()),
+            identity::normalize_host(&f.plc.layout.host_url(i as u32 % 2)).map(|h| h.0)
+        );
+    }
+    assert_eq!(f.plc.doc_fetches.load(Relaxed), fetched, "the restarted cache asked PLC");
+    assert_eq!(c.stats.seeded.load(Relaxed), 40);
+}
+
+/// A fetched document is stamped with when it was fetched: an export op
+/// created after that replaces it, an older one doesn't, and a forced
+/// refresh (an #identity) replaces both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_export_op_newer_than_the_fetch_wins() {
+    let f = fake(1, 4).await;
+    let store = Store::memory(None);
+    let l = leader(&store).await;
+    let c = cache(&f.url);
+    c.set_seeder(seeder(&l.seeds, Duration::from_secs(3600)));
+    let did = f.plc.layout.did(0, 1);
+    c.lookup_paced(&did, false).await.unwrap();
+    tokio::time::sleep(LEARN_EVERY * 2).await;
+    let row = l.w.get(&did).await.unwrap().expect("the fetched document's row");
+    assert!(row.lookup && !row.tombstone && row.key.is_some());
+    let now = crate::policy::store::now_ms() as u64;
+    assert!(row.created_ms <= now - LOOKUP_SKEW.as_millis() as u64);
+
+    let op = |ms: u64, pds: &str| Seed {
+        created_ms: ms,
+        tombstone: false,
+        key: row.key.clone(),
+        pds: Some(pds.into()),
+        pds_http: false,
+        lookup: false,
+    };
+    // the history window reaching an older op
+    l.w.apply(vec![(did.clone(), op(now - 86_400_000, "old.test"))]).await.unwrap();
+    assert_eq!(l.w.get(&did).await.unwrap().unwrap(), row);
+    // the tail reading a move made after the fetch's stamp: it wins, and
+    // the cached copy goes
+    let moved = op(row.created_ms + 1_000, "moved.test");
+    invalidate_if_stale(&c, &did, &moved);
+    assert!(c.cached(&did).is_none(), "the cached document outlived a newer op");
+    l.w.apply(vec![(did.clone(), moved.clone())]).await.unwrap();
+    assert_eq!(l.w.get(&did).await.unwrap().unwrap(), moved);
+    let id = c.lookup_paced(&did, false).await.unwrap();
+    assert_eq!(id.pds_host.as_ref().map(|h| h.0.as_str()), Some("moved.test"));
+    // an op from before the cached fetch leaves the cache alone
+    invalidate_if_stale(&c, &did, &op(now - 86_400_000, "old.test"));
+    assert!(c.cached(&did).is_some());
+
+    // an #identity: the forced fetch finds a rotated key and replaces the row
+    f.plc.rotate_hidden(0, 1, 3);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let id = c.refresh(&did).await.unwrap();
+    let want = f.plc.key(0, 1, 3).public_multibase();
+    assert_eq!(id.signing_key_multibase.as_deref(), Some(want.as_str()));
+    tokio::time::sleep(LEARN_EVERY * 2).await;
+    let row = l.w.get(&did).await.unwrap().unwrap();
+    assert!(row.lookup);
+    let mb = format!("z{}", bs58::encode(row.key.as_ref().unwrap()).into_string());
+    assert_eq!(mb, want);
+    l.end().await;
+}
+
+/// A did:web document from the seeds is used for `web_ttl`, then fetched
+/// again; a did:plc one has no such bound (the export's tail and #identity
+/// keep it current).
+#[tokio::test]
+async fn a_did_web_row_expires() {
+    use crate::identity::Seeder as _;
+    let store = Store::memory(None);
+    let l = leader(&store).await;
+    let s = seeder(&l.seeds, Duration::from_secs(600));
+    let key = format!("did:key:{}", Signer::new(crate::verify::synth::Curve::K256, 1).multibase());
+    let doc = |did: &str| {
+        let l =
+            op_line("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "2025-01-02T03:04:05.678Z", &key, "https://pds.test", false);
+        let seed = parse_line(l.as_bytes()).unwrap().seed;
+        seed.identity(did).unwrap()
+    };
+    let now = crate::policy::store::now_ms() as u64;
+    let (web, plc) = ("did:web:alice.test", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb");
+    let old = now - 3_600_000;
+    s.learned(web, Ok(&doc(web)), old);
+    s.learned(plc, Ok(&doc(plc)), old);
+    s.learned("did:web:bob.test", Ok(&doc("did:web:bob.test")), now);
+    tokio::time::sleep(LEARN_EVERY * 2).await;
+    assert!(s.seed(web).await.is_none(), "a did:web row past its TTL was used");
+    assert!(s.seed("did:web:bob.test").await.is_some());
+    assert!(s.seed(plc).await.is_some());
+    l.end().await;
+}
+
+/// Lookups reach the seeds in batches, into the memtable: no bucket
+/// writes of their own, and one batch per `LEARN_BATCH` documents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lookups_are_written_in_batches() {
+    use futures::TryStreamExt;
+    let store = Store::memory(None);
+    let l = leader(&store).await;
+    let objects = || async { store.raw.list(None).try_collect::<Vec<_>>().await.unwrap().len() };
+    let before = objects().await;
+    let batches0 = l.seeds.learned_batches.load(Relaxed);
+    let n = 3 * LEARN_BATCH + 10;
+    let now = crate::policy::store::now_ms() as u64;
+    for i in 0..n {
+        let did = format!("did:plc:{i:0>24}");
+        l.seeds.learn(&did, Seed::from_lookup(None, now));
+    }
+    tokio::time::sleep(LEARN_EVERY * 3).await;
+    let batches = l.seeds.learned_batches.load(Relaxed) - batches0;
+    assert!((1..=5).contains(&batches), "{batches} batches for {n} documents");
+    assert_eq!(l.seeds.learned_written.load(Relaxed), n as u64);
+    // at a cold start's pace, 100 lookups a second: about a batch a second
+    let batches0 = l.seeds.learned_batches.load(Relaxed);
+    for i in 0..200 {
+        l.seeds.learn(&format!("did:plc:{:a>24}", i), Seed::from_lookup(None, now));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(LEARN_EVERY * 2).await;
+    let batches = l.seeds.learned_batches.load(Relaxed) - batches0;
+    assert!((1..=5).contains(&batches), "{batches} batches for 200 paced lookups");
+    assert_eq!(l.seeds.learned_written.load(Relaxed), n as u64 + 200);
+    assert_eq!(objects().await, before, "learning wrote to the bucket");
+    // a follower keeps nothing
+    let follower = SeedReader::new(store.clone());
+    follower.learn("did:plc:cccccccccccccccccccccccc", Seed::from_lookup(None, now));
+    assert!(follower.learned.lock().is_empty());
+    l.end().await;
+}
+
+/// The export's readers aren't held up by the sink: with plc.directory's
+/// page latency, more windows read more pages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn export_throughput_scales_with_streams() {
+    let layout = Layout::new("plc-seed-streams", "http://127.0.0.1", 41000);
+    // ops up to now, so every window has its share
+    let plc = FakePlc::new(layout, 4, 20_000, export::now_ms(), 10);
+    plc.export_delay_ms.store(150, Relaxed);
+    let lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", lis.local_addr().unwrap());
+    tokio::spawn(axum::serve(lis, plc.router(None)).into_future());
+    let first = plc.export(None, 1);
+    let f = Fake { plc, url, start_ms: parse_line(first.trim().as_bytes()).unwrap().seed.created_ms };
+    let mut rates = Vec::new();
+    for streams in [1, 4] {
+        let store = Store::memory(None);
+        let w = Arc::new(SeedWriter::open(&store).await.unwrap());
+        let mut cfg = f.cfg(streams);
+        cfg.checkpoint_every = Duration::from_secs(1);
+        let ing = Ingester::new(cfg, store.clone(), Arc::new(Writes(w.clone())));
+        let t0 = Instant::now();
+        let run = tokio::spawn(ing.clone().supervise(Arc::new(move || t0.elapsed() < Duration::from_secs(4))));
+        run.await.unwrap();
+        let pages = ing.stats.pages.load(Relaxed) as f64 / t0.elapsed().as_secs_f64();
+        eprintln!("{streams} streams: {pages:.1} pages/s, phases {:?}", ing.stats.phases.snapshot());
+        rates.push(pages);
+        w.close().await;
+    }
+    assert!(rates[1] > rates[0] * 2.5, "pages/s with 1 and 4 streams: {rates:?}");
 }

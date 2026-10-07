@@ -89,6 +89,8 @@ Without `--memory`, the four `--s3-*` values are required (the keys directly or 
 | `--bootstrap-relay <BOOTSTRAP_RELAYS>` | `VLRELAY_BOOTSTRAP_RELAYS` |  | A relay whose com.atproto.sync.listHosts seeds host discovery (read only; repeatable): added to the policy's discovery.seedRelays when it has none yet. The dashboard edits the list after that |
 | `--dev-mode` |  |  | Allows plain ws://, IPs, localhost and ports for upstreams and DID documents. Implied by an http:// --host or a loopback --plc-url |
 | `--did-lookups-per-sec <DID_LOOKUPS_PER_SEC>` |  | `50` | DID document fetches per second, all DIDs together |
+| `--did-lookup-prefetch <DID_LOOKUP_PREFETCH>` |  | `256` | DID document lookups started ahead of the lanes at once, for events waiting behind others in their lane (0: only the lanes look up, at most --lanes at once). The lookup budget still paces the fetches |
+| `--did-web-seed-ttl-secs <DID_WEB_SEED_TTL_SECS>` |  | `86400` | With --plc-export: how long a fetched did:web document kept in the seeds is used before it's fetched again (fetched did:plc documents are kept current by the export's tail and #identity) |
 
 ## Pipeline and serving
 

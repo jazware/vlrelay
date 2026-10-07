@@ -162,6 +162,16 @@ struct Args {
     /// DID document fetches per second, all DIDs together.
     #[arg(long, default_value_t = 50.0)]
     did_lookups_per_sec: f64,
+    /// DID document lookups started ahead of the lanes at once, for events
+    /// waiting behind others in their lane (0: only the lanes look up, at
+    /// most --lanes at once). The lookup budget still paces the fetches.
+    #[arg(long, default_value_t = 256)]
+    did_lookup_prefetch: usize,
+    /// With --plc-export: how long a fetched did:web document kept in the
+    /// seeds is used before it's fetched again (fetched did:plc documents
+    /// are kept current by the export's tail and #identity).
+    #[arg(long, default_value_t = 86_400)]
+    did_web_seed_ttl_secs: u64,
     /// The member's name in the quorum log.
     #[arg(long, default_value = "relay", env = "VLRELAY_NODE_ID")]
     node_id: String,
@@ -417,6 +427,8 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
         Some(vlrelay::node::policy::PolicyEngine(vlrelay::policy::Engine::new(store.clone(), &a.node_id, live)));
     cfg.identity.lookups_per_sec = a.did_lookups_per_sec;
     cfg.identity.burst = (a.did_lookups_per_sec * 2.0).max(1.0);
+    cfg.identity.web_seed_ttl = Duration::from_secs(a.did_web_seed_ttl_secs);
+    cfg.lookup_prefetch = a.did_lookup_prefetch;
     if dev_mode {
         // every DID in a dev network is new, and PLC is local
         cfg.identity.lookups_per_sec = cfg.identity.lookups_per_sec.max(1000.0);

@@ -2147,6 +2147,7 @@ impl Node {
                 seeds: seeds.clone(),
                 state: state.clone(),
                 ttl: cfg.identity.ttl,
+                web_ttl: cfg.identity.web_seed_ttl,
             }));
             crate::plc_seed::job::PlcJob::new(c, st, seeds, identity.clone())
         });

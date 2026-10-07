@@ -531,6 +531,7 @@ lead = [v for v in views.values() if v.get("leader")]
 v = lead[0] if lead else {}
 print(f"plc export: leader {v.get('leader')} caught up {v.get('caughtUp')} ops {v.get('ops')} written {v.get('written')} "
       f"requests {v.get('requests')} throttled {v.get('throttled')} restarts {v.get('restarts')} "
+      f"learned {v.get('learned')} dropped {v.get('learnedDropped')} "
       f"windows {[(w['ops'], w['done']) for w in v.get('windows', [])]}")
 if not v.get("caughtUp"):
     print("relay chaos: the PLC export never caught up", file=sys.stderr)

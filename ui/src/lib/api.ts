@@ -279,6 +279,8 @@ export type PlcView = {
   newestMs: number
   windows: PlcWindow[]
   checkpointMs: number
+  learned: number
+  learnedDropped: number
   nodes: { node: string; stale: boolean; leader: boolean; ops: number; opsPerSec: number; throttled: number; errors: number }[]
 }
 

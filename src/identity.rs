@@ -196,6 +196,9 @@ pub struct Options {
     /// one's result. 30 s is the state step's re-resolve interval for a
     /// host mismatch, so it opens no window that path doesn't have already.
     pub min_refresh: Duration,
+    /// With the seeds: how long a fetched did:web document is used from
+    /// them before it's fetched again (`crate::plc_seed::Seeder`).
+    pub web_seed_ttl: Duration,
 }
 
 impl Default for Options {
@@ -209,6 +212,7 @@ impl Default for Options {
             max_budget_wait: Duration::from_secs(2),
             sweep_every: Duration::from_secs(60),
             min_refresh: Duration::from_secs(30),
+            web_seed_ttl: Duration::from_secs(24 * 3600),
         }
     }
 }
@@ -243,6 +247,10 @@ pub struct Stats {
     pub refresh_coalesced: AtomicU64,
     /// Misses the seeder filled, with no fetch.
     pub seeded: AtomicU64,
+    /// Lookups started ahead of their lane ([`IdentityCache::prefetch`]).
+    pub prefetched: AtomicU64,
+    /// Prefetches skipped with every slot taken.
+    pub prefetch_full: AtomicU64,
 }
 
 pub struct IdentityCache<F: Fetch = HttpFetch> {
@@ -266,6 +274,15 @@ pub type BudgetGate = Arc<dyn Fn() -> bool + Send + Sync>;
 /// a fetch. None: fetch it. Not asked on a forced refresh.
 pub trait Seeder: Send + Sync {
     fn seed<'a>(&'a self, did: &'a str) -> futures::future::BoxFuture<'a, Option<Identity>>;
+
+    /// What a fetch that started at `fetched_ms` (unix ms) found: a
+    /// document, or [`LookupError::NotFound`]. Called on the lookup's path,
+    /// so it must not block.
+    fn learned(&self, _did: &str, _outcome: Result<&Identity, &LookupError>, _fetched_ms: u64) {}
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 impl<F: Fetch> IdentityCache<F> {
@@ -356,8 +373,42 @@ impl<F: Fetch> IdentityCache<F> {
         }
     }
 
+    /// Starts resolving `did` on `rt` when it isn't cached and a slot of
+    /// `slots` is free, so that a lane's lookup later joins it or finds it
+    /// cached. The lanes alone only wait on as many lookups at once as
+    /// there are lanes, each behind its own seed read and fetch: on a cold
+    /// cache that, not the lookup budget, bounds lookups per second. The
+    /// budget still paces the fetches, and a spent one leaves the lookup to
+    /// the lane.
+    pub fn prefetch(self: &Arc<Self>, did: &str, slots: &Arc<tokio::sync::Semaphore>, rt: &tokio::runtime::Handle) {
+        if self.cached(did).is_some() || self.inflight.lock().contains_key(did) {
+            return;
+        }
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            self.stats.prefetch_full.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        self.stats.prefetched.fetch_add(1, Ordering::Relaxed);
+        let (me, did) = (self.clone(), did.to_string());
+        rt.spawn(async move {
+            let _permit = permit;
+            let _ = me.lookup(&did, false).await;
+        });
+    }
+
     pub fn invalidate(&self, did: &str) {
         self.entries.lock().remove(did);
+    }
+
+    /// Drops `did`'s entry when `stale(stored at, unix ms; the document, or
+    /// None for a cached failure)` says so.
+    pub fn invalidate_if(&self, did: &str, stale: impl FnOnce(u64, Option<&Identity>) -> bool) {
+        let mut m = self.entries.lock();
+        let Some(e) = m.get(did) else { return };
+        let at_ms = now_ms().saturating_sub(e.at.elapsed().as_millis() as u64);
+        if stale(at_ms, e.v.as_ref().ok().map(|i| &**i)) {
+            m.remove(did);
+        }
     }
 
     /// Seeds the cache, e.g. from the DID owner's stored state.
@@ -422,9 +473,15 @@ impl<F: Fetch> IdentityCache<F> {
                     self.store(did, r.clone(), false);
                     return r;
                 }
+                let started_ms = now_ms();
                 let r = self.fetch_now(did).await;
                 if !matches!(r, Err(LookupError::OverBudget)) {
                     self.store(did, r.clone(), force);
+                }
+                if matches!(r, Ok(_) | Err(LookupError::NotFound))
+                    && let Some(s) = self.seeder.read().clone()
+                {
+                    s.learned(did, r.as_deref(), started_ms);
                 }
                 r
             })

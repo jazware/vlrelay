@@ -141,6 +141,9 @@ pub struct Stats {
     pub errors: AtomicU64,
     pub checkpoints: AtomicU64,
     pub restarts: AtomicU64,
+    /// Time spent per phase, microseconds summed over every reader
+    /// ([`Phases`]).
+    pub phases: Phases,
     /// Every window but the last is done and the last one read a short page.
     pub caught_up: AtomicBool,
     /// The newest `createdAt` read, unix ms.
@@ -167,6 +170,38 @@ impl Stats {
             }
         }
     }
+}
+
+#[derive(Default, Debug)]
+pub struct Phases {
+    /// Readers waiting on the request pace.
+    pub pace_us: AtomicU64,
+    /// Request sent to body read.
+    pub fetch_us: AtomicU64,
+    pub parse_us: AtomicU64,
+    /// Readers waiting for the coordinator to take their page.
+    pub handoff_us: AtomicU64,
+    /// The coordinator in `Sink::apply`.
+    pub apply_us: AtomicU64,
+    /// The coordinator in `Sink::flush` and the checkpoint's PUT.
+    pub checkpoint_us: AtomicU64,
+}
+
+impl Phases {
+    pub fn snapshot(&self) -> [(&'static str, u64); 6] {
+        [
+            ("pace", self.pace_us.load(Relaxed)),
+            ("fetch", self.fetch_us.load(Relaxed)),
+            ("parse", self.parse_us.load(Relaxed)),
+            ("handoff", self.handoff_us.load(Relaxed)),
+            ("apply", self.apply_us.load(Relaxed)),
+            ("checkpoint", self.checkpoint_us.load(Relaxed)),
+        ]
+    }
+}
+
+fn add_us(c: &AtomicU64, since: Instant) {
+    c.fetch_add(since.elapsed().as_micros() as u64, Relaxed);
 }
 
 /// The checkpoint's windows as the admin API shows them: each one's span
@@ -341,7 +376,9 @@ impl Ingester {
             let apply = acc.len() >= self.cfg.batch
                 || (!acc.is_empty() && (caught_up || last_apply.elapsed() >= self.cfg.apply_every));
             if apply {
+                let t = Instant::now();
                 let n = self.sink.apply(acc.drain().collect()).await?;
+                add_us(&self.stats.phases.apply_us, t);
                 self.stats.written.fetch_add(n as u64, Relaxed);
                 last_apply = Instant::now();
             }
@@ -358,6 +395,7 @@ impl Ingester {
                     newest = %format_ms(self.stats.newest_ms.load(Relaxed)),
                     windows_left = ck.windows.iter().filter(|w| !w.done).count(),
                     throttled = self.stats.throttled.load(Relaxed),
+                    phases_ms = ?self.stats.phases.snapshot().map(|(k, us)| (k, us / 1000)),
                     "PLC export ingest"
                 );
                 last_log = (Instant::now(), ops);
@@ -378,12 +416,16 @@ impl Ingester {
 
     async fn checkpoint(&self, acc: &mut HashMap<String, Seed>, ck: &mut Checkpoint) -> anyhow::Result<()> {
         if !acc.is_empty() {
+            let t = Instant::now();
             let n = self.sink.apply(acc.drain().collect()).await?;
+            add_us(&self.stats.phases.apply_us, t);
             self.stats.written.fetch_add(n as u64, Relaxed);
         }
+        let t = Instant::now();
         self.sink.flush().await?;
         ck.updated_ms = crate::policy::store::now_ms();
         ck.save(&self.store).await?;
+        add_us(&self.stats.phases.checkpoint_us, t);
         self.stats.checkpoints.fetch_add(1, Relaxed);
         Ok(())
     }
@@ -421,8 +463,13 @@ impl Reader {
     async fn run(mut self, tx: mpsc::Sender<anyhow::Result<Page>>) {
         let mut backoff = Duration::from_secs(1);
         loop {
+            let t = Instant::now();
             self.pace.take().await;
-            let body = match self.fetch().await {
+            add_us(&self.stats.phases.pace_us, t);
+            let t = Instant::now();
+            let fetched = self.fetch().await;
+            add_us(&self.stats.phases.fetch_us, t);
+            let body = match fetched {
                 Ok(Fetched::Body(b)) => {
                     backoff = Duration::from_secs(1);
                     b
@@ -441,11 +488,15 @@ impl Reader {
                     continue;
                 }
             };
+            let t = Instant::now();
             let page = self.page(&body);
+            add_us(&self.stats.phases.parse_us, t);
             let (done, short) = (page.done, page.short);
+            let t = Instant::now();
             if tx.send(Ok(page)).await.is_err() {
                 return;
             }
+            add_us(&self.stats.phases.handoff_us, t);
             if done {
                 return;
             }

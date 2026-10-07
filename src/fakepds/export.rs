@@ -44,6 +44,9 @@ pub struct FakePlc {
     /// plc.directory's rate limit answers (0: never).
     pub throttle_every: AtomicU64,
     pub throttled: AtomicU64,
+    /// Each `/export` answer waits this long first (plc.directory's is
+    /// 0.2-0.6 s for a full page).
+    pub export_delay_ms: AtomicU64,
     /// `listHosts`, as a relay would serve it: the fleet's hosts and this
     /// many more that don't answer, `list_page` a page at most.
     pub list_extra: AtomicU64,
@@ -94,6 +97,7 @@ impl FakePlc {
             fail_next: AtomicU64::new(0),
             throttle_every: AtomicU64::new(0),
             throttled: AtomicU64::new(0),
+            export_delay_ms: AtomicU64::new(0),
             list_extra: AtomicU64::new(0),
             list_page: AtomicU64::new(100),
             list_requests: AtomicU64::new(0),
@@ -259,6 +263,10 @@ async fn export(State((p, _, _)): S, Query(q): Query<ExportQuery>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "0")]).into_response();
     }
     p.afters.lock().push(q.after.clone().unwrap_or_default());
+    let delay = p.export_delay_ms.load(Relaxed);
+    if delay > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
     let body = p.export(q.after.as_deref(), q.count.unwrap_or(10));
     ([("content-type", "application/jsonlines")], body).into_response()
 }

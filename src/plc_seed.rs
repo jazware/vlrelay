@@ -17,6 +17,14 @@
 //! carry 3 GB of documents, and losing the last seconds of them at a
 //! takeover only costs a few PLC lookups.
 //!
+//! Rows are written as merges: the database's merge operator ([`NewestWins`])
+//! keeps each DID's newest, so writing a page reads nothing first.
+//!
+//! The leader also keeps every document its cache fetches ([`Seeder`]'s
+//! `learned`, batched by [`SeedReader::write_learned`]), stamped with when
+//! it was fetched, so a restart doesn't resolve those accounts again and an
+//! export op created after the fetch still wins.
+//!
 //! Every member reads the database ([`SeedReader`]). On a DID document cache
 //! miss the seed fills the cache without spending the PLC lookup budget;
 //! the leader also weighs it against the account's record ([`choose`]). A
@@ -69,6 +77,9 @@ pub struct Seed {
     /// The endpoint is `http://`: the host alone would read back as https,
     /// and a local PDS (the dev network's) serves plain http only.
     pub pds_http: bool,
+    /// A document this relay fetched, not an export op: `created_ms` is
+    /// when it was fetched, less [`LOOKUP_SKEW`].
+    pub lookup: bool,
 }
 
 const VERSION: u8 = 1;
@@ -76,6 +87,7 @@ const F_TOMBSTONE: u8 = 1;
 const F_KEY: u8 = 2;
 const F_PDS: u8 = 4;
 const F_PDS_HTTP: u8 = 8;
+const F_LOOKUP: u8 = 16;
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("corrupt seed row")]
@@ -96,6 +108,9 @@ impl Seed {
         }
         if self.pds_http {
             flags |= F_PDS_HTTP;
+        }
+        if self.lookup {
+            flags |= F_LOOKUP;
         }
         b.push(VERSION);
         b.push(flags);
@@ -132,7 +147,14 @@ impl Seed {
         } else {
             None
         };
-        Ok(Seed { created_ms, tombstone: flags & F_TOMBSTONE != 0, key, pds, pds_http: flags & F_PDS_HTTP != 0 })
+        Ok(Seed {
+            created_ms,
+            tombstone: flags & F_TOMBSTONE != 0,
+            key,
+            pds,
+            pds_http: flags & F_PDS_HTTP != 0,
+            lookup: flags & F_LOOKUP != 0,
+        })
     }
 
     fn usable(&self) -> bool {
@@ -156,14 +178,75 @@ impl Seed {
         })
     }
 
-    /// Whether a cached document made from `self` would differ from one
-    /// made from `other`.
-    fn differs(&self, other: &Seed) -> bool {
-        self.tombstone != other.tombstone
-            || self.key != other.key
-            || self.pds != other.pds
-            || self.pds_http != other.pds_http
+    /// Whether `id` (a cached document) says something else than `self`.
+    fn differs_from(&self, id: &Identity) -> bool {
+        if self.tombstone {
+            return true;
+        }
+        let key = id.signing_key_multibase.as_deref().and_then(multikey_bytes);
+        key != self.key
+            || id.pds_host.as_ref().map(|h| h.0.as_str()) != self.pds.as_deref()
+            || id.pds.as_deref().is_some_and(is_http) != self.pds_http
     }
+
+    /// A fetched document as a row, stamped with when it was fetched.
+    pub fn from_lookup(id: Option<&Identity>, fetched_ms: u64) -> Seed {
+        let created_ms = fetched_ms.saturating_sub(LOOKUP_SKEW.as_millis() as u64);
+        match id {
+            Some(id) => Seed {
+                created_ms,
+                tombstone: false,
+                key: id.signing_key_multibase.as_deref().and_then(multikey_bytes),
+                pds: id.pds_host.as_ref().map(|h| h.0.clone()),
+                pds_http: id.pds.as_deref().is_some_and(is_http),
+                lookup: true,
+            },
+            None => Seed { created_ms, tombstone: true, key: None, pds: None, pds_http: false, lookup: true },
+        }
+    }
+
+    /// Whether row `a` wins over row `b`: the newer op, with the encodings
+    /// breaking a tie, so every member and every compaction picks the same
+    /// one. A row that doesn't decode loses.
+    fn wins(a: &[u8], b: &[u8]) -> bool {
+        let at = |r: &[u8]| Seed::decode(r).ok().map(|s| s.created_ms);
+        at(a).cmp(&at(b)).then_with(|| a.cmp(b)).is_ge()
+    }
+}
+
+/// How far a lookup's stamp is set back. PLC stamps an op's `createdAt`
+/// itself, so a document fetched at T reflects every op before T by its
+/// clock; ours may run ahead of it. Setting the stamp back keeps an op
+/// made just after the fetch from looking older than it: an op inside the
+/// margin replaces the fetched document, which costs nothing when it was
+/// already in it.
+pub const LOOKUP_SKEW: Duration = Duration::from_secs(60);
+
+fn is_http(url: &str) -> bool {
+    url.trim().get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://"))
+}
+
+/// A `publicKeyMultibase` as the multicodec bytes a row keeps.
+fn multikey_bytes(mb: &str) -> Option<Bytes> {
+    let raw = bs58::decode(mb.strip_prefix('z')?).into_vec().ok()?;
+    (raw.len() <= crate::state::record::MAX_KEY_LEN).then(|| Bytes::from(raw))
+}
+
+/// The seed database's merge: a DID's newest row wins, so the export's
+/// windows and the lookups write without reading what's there.
+pub struct NewestWins;
+
+impl slatedb::MergeOperator for NewestWins {
+    fn merge(&self, _key: &Bytes, existing: Option<Bytes>, value: Bytes) -> Result<Bytes, slatedb::MergeOperatorError> {
+        Ok(match existing {
+            Some(old) if Seed::wins(&old, &value) => old,
+            _ => value,
+        })
+    }
+}
+
+fn merge_operator() -> Arc<dyn slatedb::MergeOperator + Send + Sync> {
+    Arc::new(NewestWins)
 }
 
 /// One line of the export, parsed.
@@ -199,7 +282,9 @@ pub fn parse_line(line: &[u8]) -> Result<ExportOp, LineError> {
     let op = v.get("operation").ok_or(LineError::Op)?;
     let ty = vlpds::plc::op_type(op, true).map_err(|_| LineError::Op)?;
     let seed = match ty {
-        vlpds::plc::OpType::Tombstone => Seed { created_ms, tombstone: true, key: None, pds: None, pds_http: false },
+        vlpds::plc::OpType::Tombstone => {
+            Seed { created_ms, tombstone: true, key: None, pds: None, pds_http: false, lookup: false }
+        }
         vlpds::plc::OpType::Operation | vlpds::plc::OpType::LegacyCreate => {
             let (key, pds) = if ty == vlpds::plc::OpType::LegacyCreate {
                 (op.get("signingKey"), op.get("service"))
@@ -217,7 +302,8 @@ pub fn parse_line(line: &[u8]) -> Result<ExportOp, LineError> {
                 tombstone: false,
                 key: key.and_then(J::as_str).and_then(did_key_bytes),
                 pds: pds.and_then(identity::normalize_host).map(|h| h.0),
-                pds_http: pds.is_some_and(|p| p.trim().get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://"))),
+                pds_http: pds.is_some_and(is_http),
+                lookup: false,
             }
         }
     };
@@ -288,24 +374,14 @@ fn db_path(store: &Store) -> object_store::path::Path {
     object_store::path::Path::from(format!("{}/{SEEDS_PATH}", store.prefix))
 }
 
-#[derive(Default, Debug)]
-pub struct Applied {
-    pub written: usize,
-    /// DIDs whose cached documents may now be stale.
-    pub changed: Vec<String>,
-}
-
 /// The leader's handle on the seed database: the only writer, fenced by
 /// the next leader's open.
 pub struct SeedWriter {
     db: slatedb::Db,
-    /// Ops created after this (unix ms) may postdate a cached document of a
-    /// DID that had no seed yet, so writing them drops the cached copy.
-    recent_after_ms: u64,
 }
 
 impl SeedWriter {
-    pub async fn open(store: &Store, ttl: Duration) -> anyhow::Result<SeedWriter> {
+    pub async fn open(store: &Store) -> anyhow::Result<SeedWriter> {
         // a few seconds of the tail fit one memtable; the backfill seals
         // 64 MiB L0s as it goes
         let path = db_path(store);
@@ -313,10 +389,10 @@ impl SeedWriter {
         let db = slatedb::Db::builder(path, store.raw.clone())
             .with_settings(crate::qlog::state::settings(64 << 20))
             .with_db_cache(cache, id)
+            .with_merge_operator(merge_operator())
             .build()
             .await?;
-        let recent_after_ms = crate::policy::store::now_ms().saturating_sub(ttl.as_millis() as i64) as u64;
-        Ok(SeedWriter { db, recent_after_ms })
+        Ok(SeedWriter { db })
     }
 
     pub async fn get(&self, did: &str) -> anyhow::Result<Option<Seed>> {
@@ -326,35 +402,20 @@ impl SeedWriter {
         }
     }
 
-    /// Writes the entries newer than what each DID has, to the memtable:
+    /// Merges the rows into the memtable, each DID keeping its newest
+    /// ([`NewestWins`]): no reads, so a page costs no bucket requests.
     /// [`Self::flush`] makes them durable.
-    pub async fn apply(&self, ops: Vec<(String, Seed)>) -> anyhow::Result<Applied> {
-        let mut out = Applied::default();
-        let mut wb = slatedb::WriteBatch::new();
-        for (did, seed) in &ops {
-            let k = seed_key(did);
-            let prev = match self.db.get(&k).await? {
-                Some(b) => Seed::decode(&b).ok(),
-                None => None,
-            };
-            if prev.as_ref().is_some_and(|p| p.created_ms >= seed.created_ms) {
-                continue;
-            }
-            let changed = match &prev {
-                Some(p) => p.differs(seed),
-                None => seed.created_ms > self.recent_after_ms,
-            };
-            if changed {
-                out.changed.push(did.clone());
-            }
-            wb.put(k, seed.encode());
-            out.written += 1;
-        }
+    pub async fn apply(&self, rows: Vec<(String, Seed)>) -> anyhow::Result<usize> {
         // SlateDB refuses an empty batch
-        if out.written > 0 {
-            self.db.write(wb).await?;
+        if rows.is_empty() {
+            return Ok(0);
         }
-        Ok(out)
+        let mut wb = slatedb::WriteBatch::new();
+        for (did, seed) in &rows {
+            wb.merge(seed_key(did), seed.encode());
+        }
+        self.db.write(wb).await?;
+        Ok(rows.len())
     }
 
     /// Makes every applied entry durable (the database runs without a WAL).
@@ -381,7 +442,22 @@ pub struct SeedReader {
     tried: parking_lot::Mutex<Option<Instant>>,
     /// The leader's writer, for its own fresh rows.
     pub writer: parking_lot::RwLock<Option<Arc<SeedWriter>>>,
+    /// Fetched documents waiting for the leader's next write batch
+    /// ([`SeedReader::write_learned`]).
+    learned: parking_lot::Mutex<Vec<(String, Seed)>>,
+    learned_full: tokio::sync::Notify,
+    pub learned_written: std::sync::atomic::AtomicU64,
+    pub learned_batches: std::sync::atomic::AtomicU64,
+    pub learned_dropped: std::sync::atomic::AtomicU64,
 }
+
+/// Fetched documents buffered before a write batch is due anyway.
+pub const LEARN_BATCH: usize = 1024;
+/// How often the buffer is written when it doesn't fill.
+pub const LEARN_EVERY: Duration = Duration::from_secs(1);
+/// What the buffer holds at most (a writer stuck on the bucket): past it a
+/// document is only in memory.
+const LEARN_MAX: usize = 64 * LEARN_BATCH;
 
 /// How often a member retries opening the database before it exists, and
 /// how often an open reader looks for the writer's new manifests.
@@ -394,7 +470,67 @@ impl SeedReader {
             reader: Default::default(),
             tried: Default::default(),
             writer: Default::default(),
+            learned: Default::default(),
+            learned_full: Default::default(),
+            learned_written: Default::default(),
+            learned_batches: Default::default(),
+            learned_dropped: Default::default(),
         })
+    }
+
+    /// Keeps a fetched document for the seed database. Only the leader
+    /// writes it, so on any other member this is a no-op: its own lookups
+    /// stay in its memory, and the leader resolves every account it applies
+    /// anyway.
+    pub fn learn(&self, did: &str, seed: Seed) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.writer.read().is_none() {
+            return;
+        }
+        let mut l = self.learned.lock();
+        if l.len() >= LEARN_MAX {
+            self.learned_dropped.fetch_add(1, Relaxed);
+            return;
+        }
+        l.push((did.to_string(), seed));
+        if l.len() >= LEARN_BATCH {
+            self.learned_full.notify_one();
+        }
+    }
+
+    /// The leader's loop writing [`Self::learn`]'s buffer, one batch per
+    /// [`LEARN_BATCH`] documents or [`LEARN_EVERY`], into the memtable: the
+    /// export's checkpoints flush it, so persisting lookups adds no bucket
+    /// writes of its own. Returns when `keep` turns false, after a last
+    /// batch.
+    pub async fn write_learned(&self, w: &SeedWriter, keep: &(dyn Fn() -> bool + Send + Sync)) {
+        use std::sync::atomic::Ordering::Relaxed;
+        loop {
+            let going = keep();
+            if going {
+                tokio::select! {
+                    _ = self.learned_full.notified() => {}
+                    _ = tokio::time::sleep(LEARN_EVERY) => {}
+                }
+            }
+            let rows = std::mem::take(&mut *self.learned.lock());
+            if !rows.is_empty() {
+                let n = rows.len() as u64;
+                match w.apply(rows).await {
+                    Ok(_) => {
+                        self.learned_written.fetch_add(n, Relaxed);
+                        self.learned_batches.fetch_add(1, Relaxed);
+                    }
+                    Err(e) => {
+                        self.learned_dropped.fetch_add(n, Relaxed);
+                        tracing::debug!("writing fetched DID documents to the seeds: {e:#}");
+                    }
+                }
+            }
+            if !going {
+                return;
+            }
+        }
     }
 
     async fn reader(&self) -> Option<Arc<slatedb::DbReader>> {
@@ -421,6 +557,7 @@ impl SeedReader {
         let (cache, id) = crate::qlog::cache::for_db(path.as_ref());
         match slatedb::DbReader::builder(path, self.store.raw.clone())
             .with_db_cache(cache, id)
+            .with_merge_operator(merge_operator())
             .with_options(opts)
             .with_reader_mode(slatedb::DbReaderMode::FollowLatest)
             .build()
@@ -456,18 +593,32 @@ impl SeedReader {
 }
 
 /// The identity cache's seeder on every member: the seed, weighed against
-/// the account's record where this node holds it (the leader).
+/// the account's record where this node holds it (the leader). It also
+/// hands what the cache fetches to the seeds ([`SeedReader::learn`]).
 pub struct Seeder {
     pub seeds: Arc<SeedReader>,
     pub state: Arc<crate::node::State>,
     pub ttl: Duration,
+    /// A did:web row older than this is fetched again: no export follows
+    /// did:web, so nothing else would replace it.
+    pub web_ttl: Duration,
 }
 
 impl identity::Seeder for Seeder {
     fn seed<'a>(&'a self, did: &'a str) -> futures::future::BoxFuture<'a, Option<Identity>> {
         Box::pin(async move {
-            let seed = self.seeds.get(did).await?;
-            let rec = self.state.get(did).await.ok().flatten();
+            // both are bucket reads when cold: side by side, a miss costs one
+            // round trip before the fetch instead of two
+            let (seed, rec) = tokio::join!(self.seeds.get(did), self.state.get(did));
+            let seed = seed?;
+            let now_ms = crate::policy::store::now_ms() as u64;
+            if seed.lookup
+                && !did.starts_with("did:plc:")
+                && now_ms.saturating_sub(seed.created_ms) >= self.web_ttl.as_millis() as u64
+            {
+                return None;
+            }
+            let rec = rec.ok().flatten();
             let now = crate::state::now_secs();
             match choose(rec.as_deref(), Some(&seed), now, self.ttl.as_secs() as u32) {
                 Pick::Seed => seed.identity(did),
@@ -475,6 +626,24 @@ impl identity::Seeder for Seeder {
             }
         })
     }
+
+    fn learned(&self, did: &str, outcome: Result<&Identity, &identity::LookupError>, fetched_ms: u64) {
+        let seed = match outcome {
+            Ok(id) => Seed::from_lookup(Some(id), fetched_ms),
+            Err(identity::LookupError::NotFound) => Seed::from_lookup(None, fetched_ms),
+            Err(_) => return,
+        };
+        self.seeds.learn(did, seed);
+    }
+}
+
+/// Drops `did`'s cached document when an op created after it was fetched
+/// says something else.
+pub fn invalidate_if_stale<F: identity::Fetch>(cache: &identity::IdentityCache<F>, did: &str, seed: &Seed) {
+    let skew = LOOKUP_SKEW.as_millis() as u64;
+    cache.invalidate_if(did, |fetched_ms, cached| {
+        seed.created_ms + skew > fetched_ms && cached.is_none_or(|id| seed.differs_from(id))
+    });
 }
 
 #[cfg(test)]

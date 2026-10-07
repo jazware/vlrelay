@@ -1781,6 +1781,8 @@ impl AdminSource for Demo {
             newest_ms: now - 1_200,
             windows,
             checkpoint_ms: now - (now % 10_000),
+            learned: 48_000 + (now / 1000 % 600) as u64,
+            learned_dropped: 0,
             nodes: vec![PlcNode {
                 node: leader,
                 stale: false,

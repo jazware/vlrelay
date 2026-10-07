@@ -32,11 +32,10 @@ impl Sink for WriterSink {
                 }
             }
         }
-        let a = self.w.apply(ops).await?;
-        for d in &a.changed {
-            self.cache.invalidate(d);
+        for (did, seed) in &ops {
+            super::invalidate_if_stale(&self.cache, did, seed);
         }
-        Ok(a.written)
+        self.w.apply(ops).await
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
@@ -127,7 +126,7 @@ impl PlcJob {
             if !keep() {
                 return Ok(());
             }
-            match SeedWriter::open(&self.store, self.cache_ttl()).await {
+            match SeedWriter::open(&self.store).await {
                 Ok(w) => break Arc::new(w),
                 Err(e) => {
                     tracing::warn!(epoch, "PLC export: opening the seed database: {e:#}");
@@ -140,16 +139,21 @@ impl PlcJob {
         let sink = Arc::new(WriterSink { w: w.clone(), cache: self.cache.clone(), feed: self.feed.lock().clone() });
         let ing = Ingester::new(self.cfg.clone(), self.store.clone(), sink);
         *self.term.lock() = Some((epoch, ing.stats.clone()));
+        let learned = {
+            let (seeds, w, keep) = (self.seeds.clone(), w.clone(), keep.clone());
+            tokio::spawn(async move { seeds.write_learned(&w, &*keep).await })
+        };
         ing.supervise(keep).await;
-        *self.term.lock() = None;
         *self.seeds.writer.write() = None;
+        let _ = learned.await;
+        // the export's last checkpoint ran before the last lookups' batch
+        if let Err(e) = w.flush().await {
+            tracing::debug!(epoch, "PLC export: flushing the last fetched documents: {e:#}");
+        }
+        *self.term.lock() = None;
         w.close().await;
         tracing::info!(epoch, "PLC export: the term ended");
         Ok(())
-    }
-
-    fn cache_ttl(&self) -> Duration {
-        crate::identity::Options::default().ttl
     }
 
     async fn stored_checkpoint(&self) -> Option<Checkpoint> {
@@ -186,6 +190,8 @@ impl PlcJob {
             newest_ms: s.newest_ms.load(Relaxed) as i64,
             windows,
             checkpoint_ms,
+            learned: self.seeds.learned_written.load(Relaxed),
+            learned_dropped: self.seeds.learned_dropped.load(Relaxed),
         })
     }
 }
