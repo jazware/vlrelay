@@ -4,7 +4,7 @@ import { Banners, Chip, Empty, HostName, KV, LiveVal, Loaded, NeedsVersion, Page
 import { LogRail, type RailData } from '../../components/console/LogRail'
 import { openPanel } from '../../components/console/nav'
 import { confirmAction } from '../../components/console/dialogs'
-import { errText, type ClusterView, type HostRow, type QStatus } from '../../lib/api'
+import { errText, type ClusterView, type HostRow, type QStatus, type QuorumView } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, clock, dt, dur, fmtBytes, fmtMs, fmtNum, fmtSi, fmtUs, plural, seqS } from '../../lib/console/fmt'
 import { useLivePoll } from '../../lib/console/live'
@@ -24,13 +24,19 @@ const setting = (s: ReturnType<typeof settingsPoll.use>['data'], flag: string) =
 export function Quorum() {
   const qp = quorumPoll.use()
   const cp = clusterPoll.use()
-  const sp = settingsPoll.use()
-  const ov = overviewPoll.use()
   const { view } = useRelay()
   const q = qp.data
   if (q && !q.supported) return <NoQuorum c={cp.data} view={view} />
   if (!q) return <Loaded load={qp}>{() => null}</Loaded>
-  const qv = q.data
+  return <QuorumLog qv={q.data} at={qp.at} c={cp.data} view={view} />
+}
+
+// Its own component so its hooks (the history poll among them) run only once the log answered:
+// called after Quorum's early returns, they'd throw on a cold load.
+function QuorumLog({ qv, at, c, view }: { qv: QuorumView; at?: number; c?: ClusterView; view?: RelayView }) {
+  const sp = settingsPoll.use()
+  const ov = overviewPoll.use()
+  const hist = historyPoll.use()
   const rows = memberRows(qv, view)
   const ref = refStatus(qv)
   const lead = rows.find((r) => r.kind === 'leader')?.s ?? undefined
@@ -41,7 +47,6 @@ export function Quorum() {
   const on = membershipOn(sp.data)
   const flushMs = Number(setting(sp.data, '--qlog-flush-ms')?.value ?? '') || undefined
   const stream = ov.data ? (ov.data.streamEventsPerSec ?? ov.data.eventsOutPerSec) : 0
-  const hist = historyPoll.use()
   const events = epochEvents(qv, hist.data?.events ?? [], seenEpochs())
   const known = [...new Set([...rows.map((r) => r.id), ...(view?.nodes.map((n) => n.id) ?? [])])]
   const change = () => membersDialog({ current: members, leader: lead?.id ?? null, known, on })
@@ -91,7 +96,7 @@ export function Quorum() {
     commit: lead?.commit ?? ref?.commit ?? 0,
     held: info?.health === 'down',
     rate: stream,
-    at: qp.at ?? Date.now(),
+    at: at ?? Date.now(),
   }
 
   return (
@@ -154,7 +159,7 @@ export function Quorum() {
       </Panel>
       <div className="cx-grid2 cx-mt">
         <FlushPanel lead={lead} flushMs={flushMs} on={on} />
-        <ShardPanel c={cp.data} view={view} />
+        <ShardPanel c={c} view={view} />
       </div>
       <div className="cx-grid2 cx-mt">
         <Counters rows={rows} />
