@@ -46,6 +46,9 @@ pub struct Config {
     /// History starts here (the first op on plc.directory is from
     /// 2022-11-17).
     pub start_ms: u64,
+    /// The leader stops its term of the export (and its seed reads) while
+    /// the process has more than this allocated, MiB; 0: no limit.
+    pub mem_budget_mb: u64,
 }
 
 impl Config {
@@ -60,6 +63,7 @@ impl Config {
             batch: 50_000,
             checkpoint_every: Duration::from_secs(10),
             start_ms: 1_668_643_200_000,
+            mem_budget_mb: 0,
         }
     }
 }

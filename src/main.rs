@@ -72,6 +72,12 @@ struct Args {
     /// Time windows of the export read side by side on a fresh start.
     #[arg(long, default_value_t = 4)]
     plc_export_streams: usize,
+    /// The leader pauses the PLC export (and its seed reads) while the
+    /// process has more than this many MiB allocated, and resumes below 85%
+    /// of it; 0: no limit. Size it under the container's limit with room
+    /// for the kernel's socket buffers and the allocator's slack.
+    #[arg(long, env = "VLRELAY_PLC_EXPORT_MEM_MB", default_value_t = 0)]
+    plc_export_mem_mb: u64,
     /// Memory bounds of the PLC seeds' SlateDB on the leader, as
     /// `key=value,...`: compactions at once, subcompactions each,
     /// fetch-tasks and fetch-kb of read-ahead per input SST, sst-mb per
@@ -80,6 +86,11 @@ struct Args {
     /// fetch-kb, plus its output's upload buffers.
     #[arg(long, env = "VLRELAY_PLC_SEEDS_SLATEDB", default_value_t = vlrelay::qlog::state::Bounds::SEEDS.to_string())]
     plc_seeds_slatedb: String,
+    /// PLC seed reads in flight at once (the identity cache's misses; the
+    /// rest wait). Each can load megabytes of the seeds' filters and indexes
+    /// from the bucket once they outgrow the metadata cache.
+    #[arg(long, env = "VLRELAY_PLC_SEED_READS", default_value_t = vlrelay::plc_seed::DEFAULT_READ_SLOTS)]
+    plc_seed_reads: usize,
     /// A relay whose com.atproto.sync.listHosts seeds host discovery (read
     /// only; repeatable): added to the policy's discovery.seedRelays when
     /// it has none yet. The dashboard edits the list after that.
@@ -487,11 +498,13 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
     let mut q = quorum_setup(&a.quorum, &a.node_id)?;
     let bounds = vlrelay::qlog::state::Bounds::SEEDS.parse(&a.plc_seeds_slatedb);
     vlrelay::qlog::state::set_seed_bounds(bounds.map_err(|e| anyhow::anyhow!("--plc-seeds-slatedb: {e}"))?);
+    vlrelay::plc_seed::set_read_slots(a.plc_seed_reads);
     if a.plc_export {
         let mut pc = vlrelay::plc_seed::ingest::Config::new(a.plc_export_url.as_deref().unwrap_or(&a.plc_url));
         anyhow::ensure!(a.plc_export_rate > 0.0, "--plc-export-rate must be above 0");
         pc.rate = a.plc_export_rate;
         pc.streams = a.plc_export_streams.max(1);
+        pc.mem_budget_mb = a.plc_export_mem_mb;
         q.plc_export = Some(pc);
     }
     let node = Node::start(store, cfg, q).await?;

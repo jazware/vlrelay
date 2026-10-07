@@ -4744,6 +4744,7 @@ dependencies = [
  "slatedb",
  "tempfile",
  "thiserror 2.0.21",
+ "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
  "tokio-tungstenite",
