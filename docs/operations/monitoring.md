@@ -72,11 +72,11 @@ it reads, the events it submits and its own consumers.
 | `vlrelay_stage_busy_us_total` | counter | `stage` | Microseconds spent in a stage, summed over events |
 | `vlrelay_durable_lag_ms` | gauge | | Mean time from submitting an event to the leader to its commit, over the last second |
 | `vlrelay_hosts` | gauge | `status` | Upstream hosts by status: `connected`, `idle`, `backoff`, `throttled` (held at its own limits), `backpressure` (paused because the relay is behind), `suspended`, `banned` |
-| `vlrelay_host_read_lag_max_seconds` | gauge | | The furthest any host reader on this node is behind its host's stream: the newest frame's age when it was read (read time minus the event's `time`; 0 once the reader has waited 10 s on an empty socket), plus the time since while the reader is held back (by its limits or the relay) |
+| `vlrelay_host_read_lag_max_seconds` | gauge | | The furthest any host reader on this node is behind its host's stream: the newest frame's age when it was read (read time minus the event's `time`, or 0 once the reader has waited 10 s on an empty socket), plus the time since while the reader is held back (by its limits or the relay) |
 | `vlrelay_hosts_lagging` | gauge | | Hosts whose reader is more than a minute behind. Hosts and host detail on the dashboard show each host's lag |
 | `vlrelay_consumers` | gauge | | Connected `subscribeRepos` consumers |
 | `vlrelay_identity_cache_entries` | gauge | | DID documents in the identity cache |
-| `vlrelay_identity_lookups` | gauge | `outcome` | DID document lookups since start: `hit`, `seeded`, `fetched` |
+| `vlrelay_identity_lookups` | gauge | `outcome` | DID document lookups since start: `hit`, `seeded`, `fetched`, and `prefetched` or `prefetch_full` for lookups started ahead of the lanes or skipped with every prefetch slot taken (`--did-lookup-prefetch`) |
 | `vlrelay_forced_lookups_refused_total` | counter | | Fresh DID document fetches an event asked for that its host's budget refused (the cached document was used) |
 | `vlrelay_lane_queued` | gauge | | Events queued in front of the pipeline lanes |
 | `vlrelay_upstream_inflight_events` | gauge | | Upstream frames read and not yet done, all hosts |
@@ -84,6 +84,7 @@ it reads, the events it submits and its own consumers.
 | `vlrelay_upstream_host_inflight_events_max` | gauge | | The most frames any one host has in flight |
 | `vlrelay_upstream_paused_hosts` | gauge | | Hosts whose socket isn't read because of an in-flight cap (`--host-inflight-events`, `--inflight-events`) |
 | `vlrelay_upstream_pauses_total` | counter | `cap` | Socket reads paused at an in-flight cap |
+| `vlrelay_new_accounts_total` | counter | | Newly created accounts the account gate admitted (what `cluster.newAccountsPerMin` budgets) |
 | `vlrelay_accounts_throttled_total` | counter | `why` | New accounts created throttled by policy (`host_cap`) |
 | `vlrelay_accounts_deferred_total` | counter | `why` | Events of new accounts dropped while a new-account budget was spent (`host_rate`, `cluster_budget`) |
 
@@ -116,6 +117,7 @@ Of vlpds's series, the firehose ones apply as they are: `vlpds_firehose_subscrib
 | `flushed`, `reserve` | F, the last seq in the bucket, and R, the highest seq the log may commit before the next flush |
 | `commit_us` | append to quorum commit on the leader, as `p50`, `p99` and `max` in microseconds |
 | `disk` | the commitlog's `fsync_us`, group-commit sizes and bytes on disk (null without `--qlog-dir`) |
+| `durability` | the mode (`fsync`, `page-cache` or `memory`), and in `page-cache` mode the bytes written but not yet fdatasync'd and the time since the last one |
 | `flush` | on the leader: flushes, `failed`, `duration_us` (seal to manifest) and `last_at_ms` |
 | `takeovers`, `lost_quorums`, `recoveries` | counters since start. A rising `recoveries` means the log resumed from the bucket |
 
@@ -127,12 +129,13 @@ never resets it.
 `vlrelay_lane_queued` and `vlrelay_upstream_inflight_events` are the backlog between reading an
 event and the leader's answer. When they climb and keep climbing, the node is behind, and the
 in-flight caps start pausing host sockets (`vlrelay_upstream_paused_hosts`). Those hosts, and
-any whose lane queue is full, count as `vlrelay_hosts{status="backpressure"}`, not `throttled`:
-the relay is behind, not the hosts.
+any whose lane queue is full, count as `vlrelay_hosts{status="backpressure"}`. That status means
+the relay is behind, so those hosts don't show as `throttled`.
 
 Time to firehose is the pipeline, the submit to the leader, the quorum commit and the emit. The
-commit waits until two of the three nodes hold the event on disk, so fsync time sets much of it.
-`disk.fsync_us` in `/qlog/status` shows each node's.
+commit waits until two of the three nodes hold the event. In `page-cache` mode (the default with
+three members) that's a write to the commitlog, and in `fsync` mode (a single node) it's the
+fsync, so `disk.fsync_us` in `/qlog/status` sets much of it there.
 
 `vlrelay_stage_busy_us_total` divided by `vlrelay_events_in_total` is CPU per event in each
 stage. About a third of a node's CPU per event is signature verification

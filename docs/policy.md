@@ -117,7 +117,7 @@ disconnects a host that's already connected within about a second.
 Every tier change the relay makes itself (an auto-throttle, a recovery, a promotion) goes on the
 host's action trail next to the operators', as a `set-tier` by `relay (service)` with its `reason`
 and, for a throttle, the `case` it opened or updated. That case's `autoAction` says `throttled from`
-the old tier. A spam threshold's throttle uses that threshold's case; an error-budget throttle opens
+the old tier. A spam threshold's throttle uses that threshold's case. An error-budget throttle opens
 an `error-budget` case (the failed share of the sweep's frames against the budget). An operator's
 `set-tier` doesn't exempt a host from the next trip: if its tier allows auto-throttling, a host
 still failing its checks goes back to `throttled`, and the trail shows why.
@@ -156,8 +156,8 @@ section of the policy document adds two sources, both run by the leader in the b
   `com.atproto.sync.listHosts`, read a page at a time at `discovery.requestsPerSec` (2), waiting
   out a 429 or a 5xx for its `Retry-After`, the whole list again every `refreshIntervalSecs` (6 h).
   This relay only reads: it never asks them to crawl anything. `--bootstrap-relay` fills the list
-  on a first start, while the document has none; the dashboard edits it after that, as every
-  policy field (a versioned save with its base version).
+  on a first start, while the document has none. After that the dashboard edits it like every
+  other policy field (a versioned save with its base version).
 - **The PLC export** (`discovery.plc`, with `--plc-export`): the distinct PDS hosts the documents
   the export reader reads name.
 
@@ -196,11 +196,11 @@ host stamped on it (`src/upstream/clock.rs`), and a replay costs what the origin
 
 The host's clock is the newest event time seen, clamped:
 
-- never past now, so a future-dated event buys no room;
-- never back, so a host can't spend the same stretch twice (the clock outlives its sockets);
+- never past now, so a future-dated event buys no room
+- never back, so a host can't spend the same stretch twice (the clock outlives its sockets)
 - never further back than `--event-horizon-secs` (a day), so a stale or bogus `time` counts at
-  the horizon;
-- forward by any limiter pause it sat out, so debt is paid in real time.
+  the horizon
+- forward by any limiter pause it sat out, so debt is paid in real time
 
 Over any stretch the clock moves at most as far as the wall clock plus how far behind it started:
 a horizon's worth the first time a process sees the host, and the real time it was away after
@@ -285,18 +285,18 @@ relay did (`src/node/lag.rs`): time the reader sat in `backpressure` doesn't cou
 does a frame read soon after, since it's old because the relay held it. A case opens when a
 host's lag is over `--lag-case-minutes` (10) and:
 
-- the host hasn't been in `backpressure` for `--lag-case-grace-secs` (180);
+- the host hasn't been in `backpressure` for `--lag-case-grace-secs` (180)
 - this node's in-flight caps and busiest lane have stayed under `--lag-case-pressure-pct` (50%)
-  for the same grace;
+  for the same grace
 - the lag has stayed over the line for `--lag-case-sustain-secs` (120) without the reader
-  catching up on it faster than a tenth of real time.
+  catching up on it faster than a tenth of real time
 
 Each trip notes the node's in-flight and lane fill in its evidence (`inflightFill`, `laneFill`).
 
 The node that reads a host resolves its open (or acknowledged) read-lag cases once the host's lag
 has been under the line for `--lag-case-resolve-secs` (600): status `resolved`, the note "resolved:
 lag recovered" by `relay (service)`, and a `case` change event. It looks every minute, cases from
-before it started included. Only that node knows the host's lag; cases are shared objects written
+before it started included. Only that node knows the host's lag. Cases are shared objects written
 by CAS, so a host changing owners at worst has two nodes try and the second find it closed. A
 case an operator resolved or dismissed is never touched.
 
@@ -358,7 +358,7 @@ carries the `#account`, so it commits like any event. Every node polls `policy/t
 - Without `--plc-export`, a cold start resolves every account once at the PLC budget, about 31
   hours for 56M accounts at 500/s. With it, the leader reads the directory's export at
   `--plc-export-rate` (2 requests a second, ~14 hours for the history in 2026) and a seed fills
-  a cache miss without a lookup; a forced refresh (an `#identity`, a signature that fails) still
+  a cache miss without a lookup. A forced refresh (an `#identity`, a signature that fails) still
   asks PLC. Every document the leader fetches is kept in the seeds too, so a restart doesn't
   resolve those accounts again.
 - The account cap and the per-host new-account rate are counted on the leader and aren't in the

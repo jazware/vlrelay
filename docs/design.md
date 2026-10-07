@@ -201,6 +201,3 @@ host ([Cost](cost.md)).
 | A spam wave from new hosts | New-host quotas cap each one, domain rules catch them as a group, and the cluster-wide new-account budget caps the total. |
 | PLC is slow or down | Cached keys keep known accounts flowing. Lookups wait for the budget instead of dropping events, and the backpressure reaches the host's socket. |
 | A slow consumer | It falls back to reading the local log and then segments, and gets `ConsumerTooSlow` once it's too far behind. |
-
-The original design-session document is in the repository next to these pages, with the cost
-estimates and open questions as they stood before the build.

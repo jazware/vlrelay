@@ -1,7 +1,11 @@
-# One vlRelay node on a local MinIO (docs/operations/deploy.md).
+# One vlRelay node on a local MinIO (docs/operations/deploy.md, "One node").
 #
 #   cd deploy/single
 #   UPSTREAM=morel.us-east.host.bsky.network VLRELAY_ADMIN_TOKEN=$(openssl rand -hex 16) docker compose up -d --build
+#
+# That builds the relay from the repository root. To run the published image
+# instead, set VLRELAY_IMAGE=ghcr.io/jazware/vlrelay:main, run
+# `docker compose pull vlrelay`, and leave out --build.
 #
 # The firehose is ws://127.0.0.1:2980/xrpc/com.atproto.sync.subscribeRepos and
 # the dashboard is http://127.0.0.1:2980/admin (user admin, the token).
@@ -11,12 +15,20 @@ name: vlrelay-single
 
 services:
   minio:
-    # MinIO no longer publishes images, so this builds the server from source
-    # (shared with vlpds's dev setup)
+    # MinIO no longer publishes container images, so this builds the server
+    # and mc from source.
     build:
-      context: ../../../vlpds/build
-      dockerfile: Dockerfile.minio
-    image: vlpds-minio:local
+      dockerfile_inline: |
+        FROM golang:1.26.8-bookworm AS build
+        ENV CGO_ENABLED=0
+        RUN go install github.com/minio/minio@latest && go install github.com/minio/mc@latest
+
+        FROM debian:bookworm-slim
+        RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
+        COPY --from=build /go/bin/minio /go/bin/mc /usr/local/bin/
+        EXPOSE 9000 9001
+        ENTRYPOINT ["minio"]
+    image: vlrelay-minio:local
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
@@ -31,7 +43,7 @@ services:
       retries: 30
 
   minio-init:
-    image: vlpds-minio:local
+    image: vlrelay-minio:local
     depends_on:
       minio:
         condition: service_healthy
@@ -43,9 +55,10 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
 
   vlrelay:
+    # the repository root, where the Dockerfile is
     build:
-      context: ../../..
-      dockerfile: vlrelay/Dockerfile
+      context: ../..
+      dockerfile: Dockerfile
     image: ${VLRELAY_IMAGE:-vlrelay:local}
     depends_on:
       minio-init:

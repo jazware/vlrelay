@@ -13,7 +13,8 @@ SECTIONS = [
     (
         "Bucket",
         "Without `--memory`, the four `--s3-*` values are required (the keys directly or from their files). "
-        "Every node of a cluster uses the same bucket and `--prefix`.",
+        "Every node of a cluster uses the same bucket and `--prefix`. [Deploy](deploy.md#the-bucket) has the setup "
+        "for S3, R2 and MinIO.",
         ["memory", "s3-endpoint", "s3-bucket", "s3-access-key", "s3-access-key-file", "s3-secret-key", "s3-secret-key-file", "s3-region", "s3-unsigned-payload", "prefix"],
     ),
     (

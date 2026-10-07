@@ -2,7 +2,7 @@
 title: Deploy
 section: Operations
 order: 101
-summary: "Building the image, one node on Docker Compose, a three-node quorum cluster, the bucket's layout, the proxy in front and rolling upgrades."
+summary: "The image, the bucket, one node on Docker Compose, a three-node quorum cluster, the proxy and tokens in front, and rolling upgrades."
 ---
 
 ```hero
@@ -39,18 +39,22 @@ a member of a quorum log. One node alone is a one-member log, and three nodes co
 two of them hold it. Every flag is in [Configuration](configuration.md), and
 [Cluster](../cluster.md) has the mechanism.
 
+The usual order is a bucket and its credentials, then one node on Docker Compose to look around,
+then a cluster on three machines with a proxy in front.
+
 ## The image
 
-The repository doesn't publish an image yet, so you build it. The crate depends on vlpds by path,
-so the build context is the directory holding both crates, and `Dockerfile.dockerignore` keeps the
-context to the two of them.
+Images are published to `ghcr.io/jazware/vlrelay`. `main` follows the main branch, `sha-<7>`
+pins one commit, and releases get semver tags. To build one yourself, run this from the root of a
+clone of [the repository](https://github.com/jazware/vlrelay):
 
 ```bash
-just docker-build                    # this machine's platform, tagged vlrelay:local
-just docker-build vlrelay:dev 1      # with fakepds and e2e_check in the image too
+docker build -t vlrelay:local .
+docker build -t vlrelay:dev --build-arg VLRELAY_TOOLS=1 .   # with fakepds and e2e_check too
 ```
 
-The image has three stages. A node stage builds the dashboard and the docs into
+The crate pulls vlpds as a git dependency, so the repository root is the whole build context. The
+image has three stages. A node stage builds the dashboard and the docs into
 `/usr/share/vlrelay/ui`. A Rust stage builds the release binary (fat LTO and no
 `target-cpu=native`). The runtime is `debian:bookworm-slim` running as uid 10001 under `tini`. The
 UI is the last layer, so a UI-only or docs-only change rebuilds in seconds.
@@ -60,9 +64,9 @@ flags as its command. `VLRELAY_LISTEN` defaults to `0.0.0.0:2980` in the image, 
 check is `GET /xrpc/_health`.
 
 ```bash
-docker run --rm vlrelay:local --help
-docker run --rm -p 2980:2980 vlrelay:local --memory --dev-mode     # nothing kept, for a look around
-docker run --rm -p 2980:2980 vlrelay:local \
+docker run --rm ghcr.io/jazware/vlrelay:main --help
+docker run --rm -p 2980:2980 ghcr.io/jazware/vlrelay:main --memory --dev-mode     # nothing kept, for a look around
+docker run --rm -p 2980:2980 ghcr.io/jazware/vlrelay:main \
   --memory --host morel.us-east.host.bsky.network --admin-token dev  # one of Bluesky's PDSes
 ```
 
@@ -74,9 +78,27 @@ leader record and the policy use. S3, R2, GCS, Tigris and MinIO all qualify. vlp
 [object store page](https://github.com/jazware/vlpds/blob/main/docs/operations/object-store.md)
 covers choosing one, and its `vlpds-bucket-probe` checks a bucket before you trust it.
 
-One relay lives under one `--prefix` (default `vlrelay`). Every node of a cluster uses the same
-bucket and prefix, and two relays can share a bucket with different prefixes. The log's part of
-the prefix is written by the leader:
+To set one up:
+
+1. Create a bucket. It needs no lifecycle rules, since the leader deletes old segments itself
+   (below).
+2. Create an access key that can read, write, list and delete objects in that bucket only.
+3. Pick a `--prefix` (default `vlrelay`). One relay lives under one prefix. Every node of a
+   cluster uses the same bucket and prefix, and two relays can share a bucket with different
+   prefixes.
+4. Give the node the endpoint, the bucket and the key:
+
+| Provider | `--s3-endpoint` | `--s3-region` |
+|---|---|---|
+| AWS S3 | `https://s3.<region>.amazonaws.com` | the bucket's region |
+| Cloudflare R2 | `https://<account-id>.r2.cloudflarestorage.com` | `auto` (the default) |
+| MinIO | `http://<host>:9000` | `auto` |
+
+The same values go in `VLRELAY_S3_ENDPOINT`, `VLRELAY_S3_BUCKET`, `VLRELAY_S3_ACCESS_KEY` and
+`VLRELAY_S3_SECRET_KEY`. The keys can come from files instead (`--s3-access-key-file`,
+`--s3-secret-key-file`), which keeps them out of the container's env.
+
+The log's part of the prefix is written by the leader:
 
 | Path | What | Written |
 |---|---|---|
@@ -87,7 +109,9 @@ the prefix is written by the leader:
 | `retain/qlog` | what retention deleted | every retention pass |
 
 The policy, domain rules, takedowns (`policy/`) and cases (`cases/`) sit next to them, written by
-whichever node an operator or the policy engine changes them on.
+whichever node an operator or the policy engine changes them on. Host discovery keeps its progress
+in `discovery/state.json`, and `--plc-export` adds `plc/seeds` and `plc/export-checkpoint.json`
+([Policy](../policy.md#discovering-hosts)).
 
 The leader deletes segments older than `--qlog-retain-hours` (72) every
 `--qlog-retain-every-secs` (600). At Bluesky's average of ~330 events/s, 72 hours is ~390 GB of
@@ -107,7 +131,8 @@ vlrelay --node-id n1 --qlog-dir /var/lib/vlrelay/qlog \
 Without `--qlog-dir` the log is in memory only. A restart then resumes from the bucket's last
 flush, with a jump in the seqs, and the PDSes send the rest again.
 
-`deploy/single/docker-compose.yml` runs a node on a local MinIO:
+`deploy/single/docker-compose.yml` runs a node on a local MinIO. It builds MinIO from source (MinIO
+no longer publishes images) and the relay from the repository root:
 
 ```bash
 cd deploy/single
@@ -115,13 +140,16 @@ UPSTREAM=morel.us-east.host.bsky.network VLRELAY_ADMIN_TOKEN=$(openssl rand -hex
   docker compose up -d --build
 ```
 
+To run the published image instead, set `VLRELAY_IMAGE=ghcr.io/jazware/vlrelay:main`, run
+`docker compose pull vlrelay`, and leave out `--build`.
+
 - `UPSTREAM` is a PDS to subscribe to (`--host`). A bare hostname means `wss://`. Add more with
   more `--host` flags, or let PDSes ask with `requestCrawl` (`--crawl`, which the example turns
   on). `--host` upstreams start in the `trusted` tier (`--host-tier`), and crawled ones go through
   the policy's admission rules ([Policy](../policy.md#admission)).
 - The firehose is `ws://127.0.0.1:2980/xrpc/com.atproto.sync.subscribeRepos`, the dashboard is
   `http://127.0.0.1:2980/admin` (user `admin`, password the token) and these docs are at
-  `http://127.0.0.1:2980/docs`.
+  `http://127.0.0.1:2980/docs`. The MinIO console is on `http://127.0.0.1:9001`.
 - The example passes no `--qlog-dir`, so its log is in memory. `docker compose down` and `up`
   again resumes from the last flush in MinIO, with a seq jump. `down -v` deletes the MinIO volume
   and the relay with it.
@@ -151,7 +179,7 @@ vlrelay --node-id n1 --listen 0.0.0.0:2980 \
 | Node id | `--node-id` / `VLRELAY_NODE_ID` | Unique per node. It's the member's name in `qlog/leader` |
 | Peer port | `--qlog-listen` / `VLRELAY_QLOG_LISTEN` | Replication and submits. On the private network only |
 | Peers | `--qlog-peer id=host:port` / `VLRELAY_QLOG_PEERS` | Each other node's `--qlog-listen`, repeatable or comma-separated |
-| Commitlog | `--qlog-dir` / `VLRELAY_QLOG_DIR` | A local NVMe disk. Commits wait on its fsync |
+| Commitlog | `--qlog-dir` / `VLRELAY_QLOG_DIR` | A local NVMe disk. With three members an entry counts once it's written there and fdatasync runs every 100 ms (`--durability page-cache`). A single node waits for the fsync |
 | Membership token | `--qlog-admin-token` / `QLOG_ADMIN_TOKEN` | The same on every node. Without it membership changes are refused |
 | Admin token | `--admin-token` / `VLRELAY_ADMIN_TOKEN` | The dashboard's password, the same on every node |
 
@@ -168,10 +196,13 @@ docker run -d --name vlrelay --restart unless-stopped --stop-timeout 30 \
   -v /var/lib/vlrelay/qlog:/var/lib/vlrelay/qlog \
   -e VLRELAY_S3_ENDPOINT -e VLRELAY_S3_BUCKET -e VLRELAY_S3_ACCESS_KEY -e VLRELAY_S3_SECRET_KEY \
   -e VLRELAY_ADMIN_TOKEN -e QLOG_ADMIN_TOKEN \
-  vlrelay:local --node-id n1 --qlog-listen 0.0.0.0:2978 \
+  ghcr.io/jazware/vlrelay:main --node-id n1 --qlog-listen 0.0.0.0:2978 \
   --qlog-peer n2=10.0.0.2:2978 --qlog-peer n3=10.0.0.3:2978 \
   --qlog-dir /var/lib/vlrelay/qlog --prefix relay1 --host pds.example.com --crawl
 ```
+
+The host directory must be writable by uid 10001 (`chown 10001:10001 /var/lib/vlrelay/qlog`).
+Pin a `sha-<7>` or release tag in production so every node runs the same build.
 
 Every node reads the PDSes the leader's host table gives it, and every node serves the whole
 stream with the same seqs. So a consumer can connect to any node (or a load balancer over all
@@ -200,7 +231,21 @@ node's `/qlog/status` and retries across a leader change. Details:
 ## In front of it
 
 vlRelay serves plain HTTP. Put a TLS proxy (Caddy, nginx, a cloud load balancer) in front of
-`--listen` so consumers get `wss://` and PDSes can reach `requestCrawl` over `https://`.
+`--listen` so consumers get `wss://` and PDSes can reach `requestCrawl` over `https://`. A
+minimal Caddyfile for a node on the same machine:
+
+```caddyfile
+relay.example.com {
+	@private path /metrics /qlog/*
+	respond @private 404
+	reverse_proxy 127.0.0.1:2980 {
+		flush_interval -1
+	}
+}
+```
+
+Run that node with `--listen 127.0.0.1:2980 --trusted-proxy 127.0.0.1/32`. The rules for any
+proxy:
 
 - `/metrics` and `/qlog/status` have no auth. Keep them off the public side of the proxy and
   scrape them on the private address.
@@ -218,6 +263,19 @@ vlRelay serves plain HTTP. Put a TLS proxy (Caddy, nginx, a cloud load balancer)
   proxy, and only for requests whose peer is one. Without the flag every consumer behind the
   proxy counts as the proxy's address, and they share one per-IP cap. Don't list addresses that
   clients can connect from directly, since their `X-Forwarded-For` would be believed.
+
+## Tokens
+
+A relay has two secrets besides the bucket keys. Generate each with `openssl rand -hex 32` and
+use the same value on every node.
+
+| Token | Flag / env | Gates |
+|---|---|---|
+| Admin token | `--admin-token` / `VLRELAY_ADMIN_TOKEN` | `/admin` and its API, as HTTP basic with user `admin`. Without it `/admin` is off (404), and `/`, its stats and `/docs` are still served |
+| Membership token | `--qlog-admin-token` / `QLOG_ADMIN_TOKEN` | `POST /qlog/members`, membership changes from the dashboard, and kicking a consumer on another member |
+
+Each has a `-file` twin (`--admin-token-file`, `--qlog-admin-token-file`) that reads it from a
+file once at start, less one trailing newline. A file keeps it out of `docker inspect`.
 
 ## Shutting down and upgrading
 

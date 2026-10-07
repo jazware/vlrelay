@@ -80,7 +80,7 @@ What the numbers say, in order of size:
 | A flush's bucket work | a manifest CAS, its segments (64 MiB raw, cut per flush), ~8 Class A and ~12 Class B for the state's share | measured over an hour at 350/s, on MinIO and on R2 |
 | SlateDB polls | ~1.26 GET/s for the leader's one SlateDB | measured, same run |
 | Per-DID state | 121.8 B a DID in SSTs (243.6 B right after an update, before compaction) | measured on 1M DIDs in an in-memory bucket (2026-10-04) |
-| Network today | 56M repos, ~24B records, 89.9M PLC DIDs | vlpds cost model's queries |
+| Network today | 56M repos, ~24B records, 89.9M PLC DIDs | [vlpds](https://github.com/jazware/vlpds)'s cost model's queries |
 | Hosts on the network | 6,260 listed, 1,956 active, 89 bsky.network PDSes with 23.4M of 24.0M accounts | `listHosts` |
 | RAM baseline | 2 GB a node plus the firehose ring | assumed (1.1 GB measured at 60 events/s) |
 | fsync | 0.03-0.1 ms datacenter NVMe, 0.5-2 ms VPS, 2.7 ms p50 consumer NVMe | assumed, the last measured |
@@ -308,8 +308,8 @@ consumers are in the same region.
 
 ### Public segments on R2 (design option, not built)
 
-The design leaves open publishing flushed segments in a public R2 bucket (design "Backfill"). Then
-backfill gets nearly free for the relay. A consumer replaying 24 h at 100x pulls ~10 TB of
+The design leaves publishing flushed segments in a public R2 bucket for later
+([Design](design.md#decisions)). It would make backfill nearly free for the relay. A consumer replaying 24 h at 100x pulls ~10 TB of
 compressed segments. From the relay that's ~11 hours of an OVH 3 Gb/s port or ~$920 of AWS egress.
 From public R2 it's $0 of egress and well under a dollar of GETs, since a segment holds up to
 64 MiB of frames. The cost is that the segment format and naming become a public API.
@@ -332,8 +332,8 @@ relay's is the whole stream once per consumer, which is why bandwidth decides wh
 ## Caveats
 
 - The bucket's request rate is measured on a local MinIO, over an hour at today's rate and for 15
-  minutes at 10x. Real R2 hasn't been measured, and whether R2 bills SlateDB's one-key
-  `DeleteObjects` as Class A is open (if it doesn't, Class A drops by about a third).
+  minutes at 10x, and on a real R2 bucket for an hour at today's rate. 10x and 100x haven't been
+  measured on R2, so those rows are modeled.
 - The VPS prices assume the smallest NVMe VPS keeps up. Their fsync latency (assumed 0.5-2 ms) and
   how often two members land on one physical disk haven't been measured.
 - The per-event CPU numbers come from one 16-core box on loopback. AWS cores are Graviton, and
@@ -354,7 +354,7 @@ At 1000x (350k events/s) no host in the model fits, and none of this is built:
 - Parallel segment PUTs in the flush, and datacenter NVMe for the commitlogs. At 100x a node
   already writes ~16 TB a day and needs ~185 MB/s fsynced.
 - Fan-out tiers that aren't full-firehose websockets: a compressed stream extension (~3x less per
-  consumer, design "Scale target"), filtered outputs, and public segments behind a CDN for anyone
+  consumer, [Design](design.md#scale)), filtered outputs, and public segments behind a CDN for anyone
   who can read segments directly. At 14.8 Gb/s per raw consumer, 1,000 consumers is 14.8 Tb/s, and
   no host bill fixes that.
 - Host placement by load, since verify cost follows hosts and a few big PDSes carry most events.
@@ -391,5 +391,5 @@ python3 scripts/cost_model.py --quorum --json   # the per-load, per-flush number
 python3 scripts/cost_model.py                   # the consumer egress tables
 ```
 
-The next measurement worth making is an hour against a real R2 bucket, to confirm the request
-table and the ~200 ms round trips that takeover and recovery estimates assume.
+The hour on R2 confirmed the request table at today's rate. The next measurement worth making is
+the request rate on R2 at 10x and 100x.

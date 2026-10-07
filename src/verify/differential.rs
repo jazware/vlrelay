@@ -214,7 +214,7 @@ fn real_commits_and_mutations_agree() {
         let j: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
         j.as_object().unwrap().iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()
     };
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../vlpds/testdata/shrike/firehose_commits");
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/shrike/firehose_commits");
     let mut diffs = Vec::new();
     for e in std::fs::read_dir(dir).unwrap() {
         let p = e.unwrap().path();

@@ -38,23 +38,85 @@ facts:
 
 A quorum cluster is three nodes (or one, or five) that keep the recent log in each other instead
 of the bucket. One node leads. Every node reads its share of the PDSes and verifies their events,
-as a lone relay does, then hands each one to the leader. The leader checks it against the
-account's record, gives it the next seq and replicates it, and the event reaches consumers on
-every node once two of the three hold it. The bucket gets everything up to one seq every 30
-seconds: the log as segments, the accounts' records, the host table and the PDS cursors, with one
-manifest written last. A consumer can connect to any node and resume on another with its cursor.
+then hands each one to the leader. The leader checks it against the account's record, gives it the
+next seq and replicates it, and the event reaches consumers on every node once two of the three
+hold it. The bucket gets everything up to one seq every 30 seconds: the log as segments, the
+accounts' records, the host table and the PDS cursors, with one manifest written last. A consumer
+can connect to any node and resume on another with its cursor.
 
 One node is the same thing with one member: its commitlog is the write-ahead log, it flushes to
 the bucket on the same schedule, and adding members later is a membership change.
 
 ## Running one
 
+You need three hosts, each with a local NVMe disk, a private network between them, and one bucket.
+
+### The bucket
+
+Any S3-compatible store with strongly consistent conditional writes (`If-None-Match: *` and
+`If-Match`) works: S3, R2, GCS, Tigris and MinIO all do. Create a bucket and an access key that
+can read, write, list and delete in it. Every node uses the same bucket and the same `--prefix`,
+and two relays can share a bucket under different prefixes.
+
+| Flag | Env | What |
+|---|---|---|
+| `--s3-endpoint URL` | `VLRELAY_S3_ENDPOINT` | `https://<account-id>.r2.cloudflarestorage.com`, `https://s3.<region>.amazonaws.com`, `http://minio:9000` |
+| `--s3-bucket NAME` | `VLRELAY_S3_BUCKET` | The bucket |
+| `--s3-access-key`, `--s3-secret-key` | `VLRELAY_S3_ACCESS_KEY`, `VLRELAY_S3_SECRET_KEY` | The key. `--s3-access-key-file` and `--s3-secret-key-file` read them from files |
+| `--s3-region` | `VLRELAY_S3_REGION` | `auto` (the default) for R2, the bucket's region for S3 |
+| `--prefix` | `VLRELAY_PREFIX` | The relay's key prefix, `vlrelay` by default |
+
+Put the shared settings in one env file and copy it to every host (mode 600):
+
 ```bash
-vlrelay --node-id n1 --listen :2980 \
-        --qlog-listen 10.0.0.1:2978 --qlog-peer n2=10.0.0.2:2978 --qlog-peer n3=10.0.0.3:2978 \
-        --qlog-dir /var/lib/vlrelay/qlog --qlog-admin-token "$QLOG_TOKEN" \
-        --s3-endpoint ... --prefix relay1 --host pds.example.com --crawl
+# /etc/vlrelay/env
+VLRELAY_S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+VLRELAY_S3_BUCKET=<your-bucket>
+VLRELAY_S3_ACCESS_KEY=<access key id>
+VLRELAY_S3_SECRET_KEY=<secret access key>
+VLRELAY_PREFIX=relay1
+# the dashboard's password
+VLRELAY_ADMIN_TOKEN=<openssl rand -hex 16>
+# what a membership change must carry
+QLOG_ADMIN_TOKEN=<openssl rand -hex 16>
 ```
+
+### The peer network
+
+The nodes replicate to each other on the peer port (`--qlog-listen`, 2978). It has no TLS or
+auth of its own, so it belongs on a private network: a LAN, a VPC, or a WireGuard mesh such as
+Tailscale between hosts at different providers. The examples use `10.0.0.1`, `10.0.0.2` and
+`10.0.0.3` for the three hosts' private addresses. Every node needs to reach the other two on
+2978, and nothing else should.
+
+### Starting the nodes
+
+On the first host (`10.0.0.1`), give the commitlog a directory the image's user (uid 10001) can
+write, then start the node with the other two as peers:
+
+```bash
+sudo install -d -o 10001 -g 10001 /var/lib/vlrelay/qlog
+docker run -d --name vlrelay --restart unless-stopped --stop-timeout 30 \
+  --env-file /etc/vlrelay/env \
+  -p 10.0.0.1:2980:2980 -p 10.0.0.1:2978:2978 \
+  -v /var/lib/vlrelay/qlog:/var/lib/vlrelay/qlog \
+  ghcr.io/jazware/vlrelay \
+  --node-id n1 --qlog-listen 0.0.0.0:2978 \
+  --qlog-peer n2=10.0.0.2:2978 --qlog-peer n3=10.0.0.3:2978 \
+  --qlog-dir /var/lib/vlrelay/qlog --host pds.example.com --crawl
+```
+
+Do the same on the other two with `--node-id n2` and `n3`, their own addresses in `-p`, and the
+other two nodes as `--qlog-peer`s. The nodes elect a leader once two of them are up, and the first
+start writes the member set to `qlog/leader` in the bucket. After that the bucket's record wins
+over the flags.
+
+`--host` and `--crawl` work on any node: a PDS admitted anywhere goes into the leader's host
+table, and the leader gives it to a node. Each node's `/qlog/status` says who leads, and the
+dashboard's Quorum page (`/admin/quorum`) shows all three members. Port 2980 serves the firehose,
+the sync API, `/admin` and `/docs`, but also `/metrics` and `/qlog/status` with no auth, so put a
+TLS proxy in front of it that passes everything except `/qlog/` and `/metrics`.
+[Deploy](operations/deploy.md) covers the proxy and rolling upgrades.
 
 | Flag | Default | What |
 |---|---|---|
@@ -70,13 +132,12 @@ vlrelay --node-id n1 --listen :2980 \
 | `--durability MODE` | `page-cache` (three or more), `fsync` (one) | When an entry counts on a node: once in the commitlog's page cache (fdatasync'd every `--durability-sync-ms`, 100), after its fdatasync, or in `memory` only. A single node runs `fsync`. |
 | `--bootstrap-relay URL` | | A relay whose `listHosts` seeds host discovery on a first start ([Policy](policy.md#discovering-hosts)). |
 
-Every node points at the same bucket and `--prefix`. `--host` and `--crawl` work on any node: a
-PDS admitted anywhere goes into the leader's host table, and the leader gives it to a node.
+Every flag is in [Configuration](operations/configuration.md).
 
 ## The path of an event
 
 1. A node reads a PDS the leader gave it, parses the event and checks its signature and its MST
-   proof, as a lone relay does. Verifying is most of the CPU, so it stays spread out.
+   proof. Verifying is most of the CPU, so it stays spread out.
 2. It sends the event to the leader in a batch, with the account's events always in one batch
    stream, so they arrive in order.
 3. The leader checks the event against the account's record: the PDS is the one the DID document
@@ -93,11 +154,11 @@ so two sockets on one PDS can't mix up an account's order.
 
 | What happens | What it costs |
 |---|---|
-| The leader's process dies | another node takes over in 50-120 ms (kill -9 at 10x); nothing committed is lost |
+| The leader's process dies | another node takes over in 50-120 ms (kill -9 at 10x), and nothing committed is lost |
 | The leader hangs or is cut off | the others take over after 1 s of silence |
-| A follower dies | nothing for consumers; its PDSes move to the others after 2 s and resume from their cursors |
-| Every process dies at once | a takeover once they're back; nothing is lost in any mode but `memory` (the page cache outlives a process) |
-| Two nodes lose power within ~100 ms (`page-cache`), or two disks are lost | the log resumes from the bucket's last flush, with a jump in the seqs; the PDSes send the rest again |
+| A follower dies | nothing for consumers. Its PDSes move to the others after 2 s and resume from their cursors |
+| Every process dies at once | a takeover once they're back. Nothing is lost in any mode but `memory` (the page cache outlives a process) |
+| Two nodes lose power within ~100 ms (`page-cache`), or two disks are lost | the log resumes from the bucket's last flush, with a jump in the seqs, and the PDSes send the rest again |
 
 The new leader opens the account records at the last flush and replays its own log from there
 before it takes events, which takes tens of milliseconds. A node that comes back catches up from
@@ -105,9 +166,19 @@ the leader and serves its consumers from its own log again.
 
 ## Changing the members
 
-`qlog member replace n3 n4`, or the dashboard's Quorum page, sends a change to the leader with the
-admin token. The new node joins as a learner, copies the leader's log, and the switch happens at a
-flush: commits pause for about 10 ms. A removed node stops getting events and its PDSes move.
+Replacing a machine, or growing from one node to three, is a membership change. Start the new node
+first, with the others as `--qlog-peer`s, then send the change to the leader from the dashboard's
+Quorum page. `POST /admin/api/cluster/quorum/members` ([Admin API](admin-api.md#endpoints)) does
+the same, and so does the `qlog` tool in this repository, which finds the leader and retries
+across a leader change:
+
+```bash
+QLOG_ADMIN_TOKEN=... cargo run --release --bin qlog -- member \
+  --node n1=10.0.0.1:2980 --node n2=10.0.0.2:2980 replace n3 n4
+```
+
+The new node joins as a learner, copies the leader's log, and the switch happens at a flush:
+commits pause for about 10 ms. A removed node stops getting events and its PDSes move.
 
 ## What's in the bucket
 

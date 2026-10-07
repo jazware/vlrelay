@@ -20,25 +20,25 @@ MIB = 1 << 20
 
 # ---------------------------------------------------------------- inputs
 FRAME_B = 5_300            # mean frame, reference-notes.md "Frame sizes and rates" (5,283-5,323 B)
-ZSTD_RATIO = 1.56          # zstd -1 on production frames, perf-log.md iteration 5
-FWD_EXTRA_B = 90           # forward hop adds DID, host, seq, meta: perf-log.md iteration 6
-RATE_AVG = 350             # events/s, 7-day average, reference-notes.md (ClickHouse repo_records)
+ZSTD_RATIO = 1.56          # zstd -1 on production frames, perf.md "Compression"
+FWD_EXTRA_B = 90           # forward hop adds DID, host, seq, meta: the removed lease cluster's bench
+RATE_AVG = 350             # events/s, 7-day average of the network's records, reference-notes.md
 RATE_PEAK_HOUR = 480
 RATE_LOW_HOUR = 180
 BURST = 2.0                # minute bursts over the peak hour (assumed, as in vlpds's model)
 CPU_TARGET = 0.7           # size so a peak-hour minute burst runs at <=70% CPU
 
 # CPU per event (perf.md). Thread = hardware thread (SMT sibling counts), core = physical core.
-US_SINGLE_CORE = 70        # one node, 8 physical cores, iteration 5 (65-70)
-US_SINGLE_THREAD = 90      # one node on 3 cores + SMT, iteration 6 (89-94)
-US_CLUSTER_THREAD = 150    # 3-node cluster, all nodes' CPU per event, iteration 6 (142-156)
-US_CLUSTER_CORE = 117      # the same scaled to physical cores, iteration 6 extrapolation
-# Iteration 6's split of the cluster's extra ~60 us/event (thread seconds), used to scale with N.
+US_SINGLE_CORE = 70        # one node, 8 physical cores, perf.md "One node" (65-70)
+US_SINGLE_THREAD = 90      # one node on 3 cores + SMT, perf.md "One node" (89-94)
+US_CLUSTER_THREAD = 150    # 3-node lease cluster (removed), all nodes' CPU per event (142-156)
+US_CLUSTER_CORE = 117      # the same scaled to physical cores, that bench's extrapolation
+# The lease cluster bench's split of its extra ~60 us/event (thread seconds), used to scale with N.
 US_FWD = 15                # per forwarded event: send + receive + HTTP/2 + TLS
 US_LOG_COPY = 8.25         # per event per peer copy of a log stream (serve + receive): 16.5 us at 2 peers
 US_MERGE_NODE = 1.2        # per event per node merging it: 3.5 us at 3 nodes
 US_CLUSTER_OTHER = 30      # the rest of the +60 (SlateDB writes, apply_did, hash maps, clock)
-US_ARCHIVE = 130           # archival apply, tree reopened each commit (69 when kept), archival.md
+US_ARCHIVE = 130           # archival apply, tree reopened each commit (69 when kept), the removed archival mode
 
 LINGER_S = 0.025           # --linger-ms default
 SEAL_OVERHEAD_S = 0.0028   # vlpds measured seal-to-next-open overhead (cost-model-2026-10-02)
@@ -65,7 +65,7 @@ REPLAY_H_PER_CONSUMER_DAY = 1.0  # backfill read from the bucket per consumer pe
 RING_B = 512 * MIB         # ServeConfig::ring_bytes
 REPLICA_POLL_S, REPLICA_WINDOW, GET_LATENCY_S = 0.020, 2, 0.025  # cluster/follow.rs; latency assumed
 NIC_UTIL = 0.7             # usable share of a NIC or a guaranteed port
-CONSUMER_CORES_PER_GBPS = 0.025 / 1.6  # perf.md "Fan-out at 33k": 0.025 cores per 1.6 Gb/s consumer
+CONSUMER_CORES_PER_GBPS = 0.025 / 1.6  # perf.md "Fan-out": 0.025 cores per 1.6 Gb/s consumer
 
 LOADS = [("today", 1), ("10x", 10), ("100x", 100), ("1000x", 1000)]
 SIZED = [(n, m, True) for n, m in LOADS] + [("1000x, merge tier (sketch)", 1000, False)]
@@ -417,8 +417,8 @@ Q_EDGE_OPTS = {"ovh": ["ovh-adv2", "ovh-adv2-5g", "ovh-scale-10g", "ovh-scale-25
 Q_FSYNC_MS = {"dc": (0.03, 0.1), "vps": (0.5, 2.0), "consumer": (1.0, 5.0)}
 Q_DEV_NAME = {"dc": "datacenter NVMe with power-loss protection (AX42, ADVANCE-2, EC2 instance store)",
               "vps": "VPS virtual NVMe (OVH VPS, Hetzner Cloud)", "consumer": "consumer NVMe without power-loss protection"}
-Q_RTT_MS = {"one DC": 0.2, "one metro (FSN-NBG, RBX-GRA)": 3.0, "cross-region (Vint Hill-Us-west)": 65.0}  # assumed
-R2_PUT_P50_MS = 200         # measured: vlpds bench/results/spaces-r2-2026-10-05.md, from benchbox
+Q_RTT_MS = {"one DC": 0.2, "one metro (FSN-NBG, RBX-GRA)": 3.0, "cross-region (US East-US West)": 65.0}  # assumed
+R2_PUT_P50_MS = 200         # measured: vlpds bench/results/spaces-r2-2026-10-05.md, from a bench box
 
 
 def q_bucket(mult, flush_s, store, *, seg_b=Q_SEG_B, shards=Q_DID_SHARDS, ctl="peers", bucket="full",
@@ -605,7 +605,7 @@ def quorum_main():
                  f"host {money(t['hosts'])}, bucket {money(t['bucket'])}"])
     t = q_total(1, 60, "ovh-vps2", "r2", ha=False, bucket="none")
     rows.append(["Single node, OVH VPS-2, NVMe only", "", money(t["total"]), "no bucket: losing the disk loses the cursors"])
-    rows.append(["Benchmark: a non-archival sync 1.1 relay on one node", "", "$10-15", "Jaz's figure"])
+    rows.append(["Benchmark: a non-archival sync 1.1 relay on one node", "", "$10-15", "estimate"])
     table(["setup", "flush", "$/mo", "where it goes"], rows)
 
     print("## Quorum HA: bucket requests and storage per flush interval (3 nodes, peers for liveness)\n")

@@ -7,9 +7,20 @@ name: vlrelay-dev
 
 services:
   minio:
+    # vlpds's build/Dockerfile.minio, inline so it builds without a vlpds
+    # checkout (MinIO no longer publishes container images). Same image name,
+    # so the qlog harnesses and vlpds's benches share it.
     build:
-      context: ../../vlpds/build
-      dockerfile: Dockerfile.minio
+      dockerfile_inline: |
+        FROM golang:1.26.8-bookworm AS build
+        ENV CGO_ENABLED=0
+        RUN go install github.com/minio/minio@latest && go install github.com/minio/mc@latest
+
+        FROM debian:bookworm-slim
+        RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
+        COPY --from=build /go/bin/minio /go/bin/mc /usr/local/bin/
+        EXPOSE 9000 9001
+        ENTRYPOINT ["minio"]
     image: vlpds-minio:local
     command: server /data --console-address ":9001"
     environment:

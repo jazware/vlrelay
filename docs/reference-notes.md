@@ -1,6 +1,38 @@
-# vlRelay: reference notes
+---
+title: Reference notes
+section: Reference
+order: 306
+summary: "How indigo's relay and the production firehose actually behave: every check per event type, account and host states, limits, cursors, measured frame sizes and latency, and where vlRelay matches or differs."
+---
 
-What the production relay (indigo `cmd/relay`) and shrike actually do, what the production firehose looks like on the wire, and what vlRelay has to match. Read this before changing anything in `verify`, `upstream`, `serve` or `sync_api`.
+```hero
+diagram:
+  caption: "indigo's relay, as `bsky.network` runs it. One goroutine reads each host, a per-host scheduler hands events to workers keyed by DID, and every failed check is logged and the event dropped. An event that passes gets its seq and is written to disk before any subscriber sees it. Production runs the strict sync 1.1 checks in lenient mode, so they only log."
+  nodes:
+    - { id: pds, label: PDSes, sub: "~1,950 active hosts", at: [0, 4], size: [8, 3], tone: muted, stack: true }
+    - { id: read, label: host reader, sub: "decode · seq > lastSeq", at: [12, 4], size: [9, 3] }
+    - { id: sched, label: per-DID workers, sub: "rate limits block", at: [25, 4], size: [9, 3] }
+    - { id: proc, label: processRepoEvent, sub: "account · rev · sig", at: [38, 4], size: [10, 3] }
+    - { id: disk, label: disk log, sub: "seq · 100 ms batches", at: [52, 4], size: [9, 3], shape: store, tone: amber }
+    - { id: cons, label: Consumers, sub: through rainbow, at: [52, 10], size: [9, 3], tone: blue }
+  edges:
+    - "pds -> read: ws"
+    - "read -> sched"
+    - "sched -> proc"
+    - "proc -> disk: persist"
+    - "disk -> cons: broadcast"
+facts:
+  - { value: "~90", unit: ms, label: PDS to consumer p50, note: "~590 ms p99, measured through production", tone: blue }
+  - { value: "~5.3 KB", label: mean frame, note: "99.6% one-op commits, most of it the MST proof", tone: amber }
+  - { value: "lenient", label: sync 1.1 checks, note: "MST inversion and prevData only log", tone: rust }
+  - { value: "0", label: commits missed, note: "17,000 matched across three PDSes", tone: accent }
+```
+
+What the production relay (indigo `cmd/relay`) and shrike actually do, what the production
+firehose looks like on the wire, and what a relay has to match to be a drop-in replacement. vlRelay
+was built against these notes, and they're the reference for its `verify`, `upstream`, `serve` and
+`sync_api` modules. [Subscribe to the firehose](subscribing.md) has how vlRelay itself behaves for
+a consumer.
 
 Sources, pinned:
 
@@ -318,7 +350,7 @@ cd tools/refdiff && cargo build --release
   --secs 780 --out run.json
 ```
 
-We ran it twice from benchbox on 2026-10-04, 09:10 and 09:28 UTC (a Sunday, ~2 am Pacific, so near the daily low), for 16 and 13 minutes. amanita is a Bluesky mushroom with ~213k accounts. eurosky.social (~35k accounts, in Europe) and blacksky.app (~42k accounts, its own PDS implementation) are the biggest independent hosts by account count in `listHosts`. Raw output is in `tools/refdiff/results/`.
+We ran it twice from a bench box in the US on 2026-10-04, 09:10 and 09:28 UTC (a Sunday, ~2 am Pacific, so near the daily low), for 16 and 13 minutes. amanita is a Bluesky mushroom with ~213k accounts. eurosky.social (~35k accounts, in Europe) and blacksky.app (~42k accounts, its own PDS implementation) are the biggest independent hosts by account count in `listHosts`. Raw output is in `tools/refdiff/results/`.
 
 ### Frame sizes and rates
 
@@ -339,7 +371,7 @@ We ran it twice from benchbox on 2026-10-04, 09:10 and 09:28 UTC (a Sunday, ~2 a
 
 Almost every frame is a one-op commit, and about 90% of its bytes are the CAR blocks. A record is a few hundred bytes, so most of the ~4.8 KB is the MST proof path that sync 1.1 requires. That's why frames got bigger than the ~4.5 KB the design assumed.
 
-Our indexer's ClickHouse archive puts the rate in context (`default.repo_records`, record ops per hour over the last 7 days). The average is ~350 ops/s, the busiest hour ~480/s and the quietest ~180/s. So we sampled close to the bottom of the day, and the peak is about 2.3× what we saw.
+An indexer's archive of the network's record ops (ops per hour over the 7 days before) puts the rate in context. The average is ~350 ops/s, the busiest hour ~480/s and the quietest ~180/s. So we sampled close to the bottom of the day, and the peak is about 2.3× what we saw.
 
 For the capacity math, that means:
 
@@ -361,7 +393,7 @@ The delay is the time between our socket getting an event from the PDS and our s
 
 Run 1 agrees (n = 10,228, p50 102 ms, p90 192 ms, p99 734 ms, p99.9 2.5 s). Its percentiles leave out the ~8% of events that reached us from the relay first, so they read a bit high.
 
-Some of the deltas are negative, down to -880 ms. That's when the PDS's stream to us was slower than the PDS→relay→us path. TCP connects from benchbox take ~30 ms to the relay's edge, ~60 ms to amanita and ~160 ms to eurosky, so the paths aren't equal. The PDS streams also arrive in bursts (amanita's own commit-to-socket time has a p99 of 2.6 s). So p50 is the trustworthy number and the tails carry PDS noise. Part of indigo's p50 is built in: it writes events to disk every 100 ms (or 400 events) before broadcasting, and rainbow adds a hop.
+Some of the deltas are negative, down to -880 ms. That's when the PDS's stream to us was slower than the PDS→relay→us path. TCP connects from the bench box take ~30 ms to the relay's edge, ~60 ms to amanita and ~160 ms to eurosky, so the paths aren't equal. The PDS streams also arrive in bursts (amanita's own commit-to-socket time has a p99 of 2.6 s). So p50 is the trustworthy number and the tails carry PDS noise. Part of indigo's p50 is built in: it writes events to disk every 100 ms (or 400 events) before broadcasting, and rainbow adds a hop.
 
 The baseline vlRelay has to beat is ~90 ms p50 and ~600 ms p99 from PDS to consumer, measured this way.
 
@@ -371,7 +403,7 @@ Across both runs, 17,000 commits matched with no misses, no CID mismatches, no d
 
 Three `#sync` events from eurosky never showed up at the relay. All three DIDs had just migrated to eurosky from Bluesky mushrooms (morel, scalycap and shiitake), and each `#sync` reached us a second or two after the PLC operation that moved the account (`did:plc:2x3ipl2td62fs4ubqwqoe273` at 09:14:09.66Z, for example). The likely cause is indigo resolving the DID before PLC (or its cache) had the new PDS and dropping the event as coming from the wrong host. The accounts' later commits went through, and `getRepoStatus` at the relay showed the right rev afterwards. (The [shadow run](shadow.md#sync-identity-and-account-events-against-production) found a likelier cause: eurosky's post-migration `#sync` carries a `rev` its signed commit doesn't have, so indigo's rev check drops it, and vlRelay's does too.)
 
-This matters for PLAN decision 3. vlRelay will drop events from a host that the DID document doesn't name yet, so it'll hit the same race. A DID owner should hold events from a non-matching host for a few seconds and re-resolve once more before dropping them, and the `#sync` that follows a migration is the event most likely to be in that window.
+This matters for vlRelay's design, which drops events from a host that the DID document doesn't name yet, so it'll hit the same race. The relay should hold events from a non-matching host for a few seconds and re-resolve once more before dropping them, and the `#sync` that follows a migration is the event most likely to be in that window.
 
 The two "relay-only" commits in run 2 are an artifact of how refdiff picks DIDs. They came from the account's old PDS (shiitake) before it moved to eurosky later in the run.
 
@@ -379,58 +411,99 @@ The two "relay-only" commits in run 2 are an artifact of how refdiff picks DIDs.
 
 None of the 230 `#identity` events from the relay in run 2 carried a handle. Five of the seven eurosky `#identity` events that matched had one at the PDS, and the relay stripped all five. That's the `SkipHandleVerification` quirk from [`#identity`](#identity) showing up in production.
 
-## What vlRelay must match
+## What a relay must match
+
+What a relay needs to do for consumers and PDSes that were written against indigo's:
 
 Wire format and stream:
 
-- [ ] Re-emit `#commit` and `#sync` with every lexicon field as received except `seq`, including the deprecated ones (`tooBig: false`, `rebase: false`, `blobs: []`). indigo decodes into cbor-gen structs and re-encodes, so unknown fields are dropped on the way through.
-- [ ] Emit only `#commit`, `#sync`, `#identity` and `#account` downstream. Drop upstream `#info` and `#labels`.
-- [ ] Seqs strictly increasing, 1 to 2^53, never reset across restarts or failovers.
-- [ ] `cursor` replays `seq > cursor`. `cursor=0` replays the whole window. No cursor means live.
-- [ ] Ping idle subscribers every 30 s. Answer slow consumers with `ConsumerTooSlow` (op -1) before closing.
-- [ ] Frames up to 5 MB from upstream.
+- Re-emit `#commit` and `#sync` with every lexicon field as received except `seq`, including the
+  deprecated ones (`tooBig: false`, `rebase: false`, `blobs: []`). indigo decodes into cbor-gen
+  structs and re-encodes, so unknown fields are dropped on the way through.
+- Emit only `#commit`, `#sync`, `#identity` and `#account` downstream. Drop upstream `#info` and
+  `#labels`.
+- Seqs strictly increasing, 1 to 2^53, never reset across restarts or failovers.
+- `cursor` replays `seq > cursor`. `cursor=0` replays the whole window. No cursor means live.
+- Ping idle subscribers every 30 s. Answer slow consumers with `ConsumerTooSlow` (op -1) before
+  closing.
+- Frames up to 5 MB from upstream.
 
 Checks, in this order of cost:
 
-- [ ] Drop frames over 5 MB, `#commit` with more than 2,000,000 bytes of blocks or more than 200 ops, and `#sync` over the same blocks limit.
-- [ ] Commit CAR v1, root block present, `version == 3`, DID and rev syntax, rev at most 5 minutes in the future.
-- [ ] `evt.repo == commit.did` and `evt.rev == commit.rev`.
-- [ ] Signature against the `#atproto` key.
-- [ ] Drop a `#commit` whose rev isn't newer than the stored rev, even when we're lenient about everything else.
-- [ ] Only accept repo events from the host the DID document names. On a mismatch, purge and re-resolve once before dropping.
-- [ ] Drop `#commit` and `#sync` for inactive accounts, but re-check `getRepoStatus` at the PDS first when only the upstream status says inactive (indigo#1161).
-- [ ] Pass `#identity` from any host, purging our identity cache for the DID.
+- Drop frames over 5 MB, `#commit` with more than 2,000,000 bytes of blocks or more than 200 ops,
+  and `#sync` over the same blocks limit.
+- Commit CAR v1, root block present, `version == 3`, DID and rev syntax, rev at most 5 minutes in
+  the future.
+- `evt.repo == commit.did` and `evt.rev == commit.rev`.
+- Signature against the `#atproto` key.
+- Drop a `#commit` whose rev isn't newer than the stored rev, even when lenient about everything
+  else.
+- Only accept repo events from the host the DID document names. On a mismatch, purge and
+  re-resolve once before dropping.
+- Drop `#commit` and `#sync` for inactive accounts, but re-check `getRepoStatus` at the PDS first
+  when only the upstream status says inactive (indigo#1161).
+- Pass `#identity` from any host, purging the identity cache for the DID.
 
 State and endpoints:
 
-- [ ] Account status combines a local and an upstream status, with `takendown` (and other local states) winning.
-- [ ] `listRepos`, `getRepoStatus`, `getLatestCommit`, `listHosts`, `getHostStatus` with indigo's fields, errors, limits and defaults (tables above).
-- [ ] requestCrawl hostname rules: https/wss only, no port except `localhost`, handle syntax, domain bans on every parent, `describeServer` must answer.
-- [ ] New host starts at the live head. Persist each host's cursor every few seconds and resume from it.
-- [ ] Per-host account limit (default 100) with a trusted-domain list (default `*.host.bsky.network`). Over-limit accounts are throttled, and raising the limit releases them oldest first with an `#account` each.
-- [ ] Per-host event limits that block the reader instead of dropping.
-- [ ] Refuse to subscribe to another relay (`Server` header contains `atproto-relay`), and send `Server: … (atproto-relay)` ourselves.
-- [ ] Admin: takedown and reverse with `#account`, host block and unblock, domain bans, account limit changes, crawl switch and per-day limit.
+- Account status combines a local and an upstream status, with `takendown` (and other local
+  states) winning.
+- `listRepos`, `getRepoStatus`, `getLatestCommit`, `listHosts`, `getHostStatus` with indigo's
+  fields, errors, limits and defaults (tables above).
+- requestCrawl hostname rules: https/wss only, no port except `localhost`, handle syntax, domain
+  bans on every parent, `describeServer` must answer.
+- A new host starts at the live head. Persist each host's cursor every few seconds and resume from
+  it.
+- Per-host account limit (default 100) with a trusted-domain list (default `*.host.bsky.network`).
+  Over-limit accounts are throttled, and raising the limit releases them oldest first with an
+  `#account` each.
+- Per-host event limits that block the reader instead of dropping.
+- Refuse to subscribe to another relay (`Server` header contains `atproto-relay`), and send
+  `Server: … (atproto-relay)` ourselves.
+- Admin: takedown and reverse with `#account`, host block and unblock, domain bans, account limit
+  changes, crawl switch and per-day limit.
 
 ## Where vlRelay differs on purpose
 
-Decided in the design doc:
+These were decided in the [design](design.md):
 
-- Sync 1.1 is enforced. A failed `prevData` or inversion check drops the event and marks the account `desynchronized` until a `#sync` resets it (archival mode's `getRepo` reset went with archival mode). indigo only logs these.
-- Takedowns filter the replay window as well as the live stream, through the takedown list in the bucket (`policy/takedowns/current/`). Every node leaves a taken-down account's `#commit` and `#sync` frames out of the ring and segment backfill, without renumbering, and lets its `#account` and `#identity` through. Lifting the takedown lets the frames replay again, which is what indigo always serves. See [policy-internals.md, State and the node](policy-internals.md#state-and-the-node).
-- A slow consumer falls back to reading segments, so catch-up doesn't trip `ConsumerTooSlow` before it reaches live.
-- The relay seq is the merge key of the node logs, so seqs are time-ordered ids with gaps instead of a dense counter. The spec allows gaps. (Superseded: seqs became dense for `@atproto/sync`, and on the quorum log the leader assigns them at commit.)
-- Account migrations: the DID owner only accepts events from the host its fresh DID document names, and re-resolves when that changes (PLAN decision 3). That's what indigo does too, but per DID owner instead of per host. (On the quorum log the leader makes this check.)
+- Sync 1.1 is enforced. A failed `prevData` or inversion check drops the event and marks the
+  account `desynchronized` until a `#sync` resets it. indigo only logs these.
+- Takedowns filter the replay window as well as the live stream, through the takedown list in the
+  bucket (`policy/takedowns/current/`). Every node leaves a taken-down account's `#commit` and
+  `#sync` frames out of the ring and segment backfill, without renumbering, and lets its
+  `#account` and `#identity` through. Lifting the takedown lets the frames replay again, which is
+  what indigo always serves. See
+  [Policy internals](policy-internals.md#state-and-the-node).
+- A slow consumer falls back to reading segments, so catch-up doesn't trip `ConsumerTooSlow` before
+  it reaches live.
+- Seqs are dense. The quorum log's leader gives each event the next seq when it appends it, and
+  every node emits it under that seq. They only jump forward after a recovery from the bucket.
+- Account migrations: the leader only accepts events from the host the DID's fresh document names,
+  and re-resolves when that changes. That's what indigo does too.
 
-Proposed here, for the lead to confirm:
+This study also proposed the following. Three of them are built: the `OutdatedCursor` and
+`FutureCursor` frames, the CAR root check, and keeping `#identity` handles that match
+`alsoKnownAs` (the [shadow run](shadow.md) saw it against production). The rest are proposals as
+of this study. [Subscribe to the firehose](subscribing.md) and [Policy](policy.md) have what
+vlRelay does today.
 
-- Events from a host the DID document doesn't name yet wait a few seconds for one more re-resolve before they're dropped, so the `#sync` right after a migration isn't lost (see [Missing, extra and out-of-order events](#missing-extra-and-out-of-order-events)).
+- Events from a host the DID document doesn't name yet wait a few seconds for one more re-resolve
+  before they're dropped, so the `#sync` right after a migration isn't lost (see
+  [Missing, extra and out-of-order events](#missing-extra-and-out-of-order-events)).
 - `#sync` rev ordering is checked like `#commit`, so a `#sync` can't roll an account back.
-- `#info OutdatedCursor` for cursors older than the window, and `FutureCursor` (then close) for cursors past the head, per the event-stream spec.
-- The CAR root must equal `evt.commit`, and blocks are re-hashed as they're used (vlpds's CAR reader already does).
-- If DID resolution fails, the event waits on the host's identity budget instead of skipping the signature check.
-- `#identity` keeps the handle if it matches the DID document's `alsoKnownAs`. indigo strips almost all of them by accident, and consumers have learned not to trust the field, so this is cheap to get right.
-- Hosts get `idle` after a quiet period, automatic retry for `offline` with real backoff, and `throttled` as a live state set by policy. The cursor flush never overwrites a status.
+- `#info OutdatedCursor` for cursors older than the window, and `FutureCursor` (then close) for
+  cursors past the head, per the event-stream spec.
+- The CAR root must equal `evt.commit`, and blocks are re-hashed as they're used (vlpds's CAR
+  reader already does).
+- If DID resolution fails, the event waits on the host's identity budget instead of skipping the
+  signature check.
+- `#identity` keeps the handle if it matches the DID document's `alsoKnownAs`. indigo strips almost
+  all of them by accident, and consumers have learned not to trust the field, so this is cheap to
+  get right.
+- Hosts get `idle` after a quiet period, automatic retry for `offline` with real backoff, and
+  `throttled` as a live state set by policy. The cursor flush never overwrites a status.
 - `getHostStatus` gets the last upstream error as an extension field (indigo#1423).
-- `throttled` and `desynchronized` accounts are reported `active: true` with their status, per the account spec. Check what the AppView does with them before shipping this.
-- `getRepo` respects takedowns.
+- `throttled` and `desynchronized` accounts are reported `active: true` with their status, per the
+  account spec. Check what the AppView does with them first.
+- `getRepo` respects takedowns. (vlRelay doesn't serve `getRepo` at all today.)

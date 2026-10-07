@@ -57,7 +57,7 @@ entrypoint ([Deploy](deploy.md#the-image)).
 
 ## Bucket
 
-Without `--memory`, the four `--s3-*` values are required (the keys directly or from their files). Every node of a cluster uses the same bucket and `--prefix`.
+Without `--memory`, the four `--s3-*` values are required (the keys directly or from their files). Every node of a cluster uses the same bucket and `--prefix`. [Deploy](deploy.md#the-bucket) has the setup for S3, R2 and MinIO.
 
 | Flag | Env | Default | What |
 |---|---|---|---|

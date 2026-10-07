@@ -32,9 +32,11 @@ facts:
 ```
 
 These pages are for whoever runs a vlRelay, from one node in memory to a three-node quorum
-cluster. Read [Deploy](deploy.md) first. [Configuration](configuration.md) lists every flag, and
-[Monitoring](monitoring.md) says what to watch. The [Overview](../overview.md) explains the design
-in one screen, and [Cluster](../cluster.md) explains the quorum log.
+cluster. Read [Deploy](deploy.md) first. It covers the image (`ghcr.io/jazware/vlrelay`, or
+[built from the repository](deploy.md#the-image)), the bucket and the proxy.
+[Configuration](configuration.md) lists every flag, and [Monitoring](monitoring.md) says what to
+watch. The [Overview](../overview.md) explains the design in one screen, and
+[Cluster](../cluster.md) explains the quorum log.
 
 ```pages
 {}
@@ -42,10 +44,10 @@ in one screen, and [Cluster](../cluster.md) explains the quorum log.
 
 ## What there isn't yet
 
-- A published image. You build it from the repository ([Deploy](deploy.md#the-image)).
 - Alert rules, a runbook and Grafana dashboards. The dashboard at `/admin` covers the live view,
   and [Monitoring](monitoring.md) lists the series to alert on.
-- An Ansible kit. vlpds's kit is the model for one, and most of it (base hardening, Caddy, Alloy,
-  secrets as files) would carry over unchanged.
+- An Ansible kit. [vlpds's kit](https://github.com/jazware/vlpds/tree/main/deploy/ansible) is
+  the model for one, and most of it (base hardening, Caddy, Alloy, secrets as files) would carry
+  over unchanged.
 - Feature levels for upgrades. Nothing stops a new version from writing something an old one can't
   read, so roll one node at a time and don't roll back across a format change.
