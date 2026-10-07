@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 import { Chip, Empty, KV, Loaded, PageHead, Panel, Spark, Src, Tiles, Updated, type TileSpec } from '../../components/console/kit'
-import type { QCounts, QuorumView, SettingsView, StoreLatency } from '../../lib/api'
+import type { DbShape, QCounts, QuorumView, SettingsView, StoreLatency } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, dur, fmtBytes, fmtMs, fmtNum, fmtSi, plural, seqS } from '../../lib/console/fmt'
 import { requestRates, seriesOf, useQuorum, useSettings, useStore, type ReqRates } from '../../lib/console/queries'
@@ -10,8 +10,8 @@ import { memberRows } from './quorumUi'
 import { NodeTag } from './relayUi'
 
 // The bucket the quorum log writes. GET store is the answering node's: its requests by purpose
-// and R2 class with their rates and bytes, request latency by op, and the leader's last retention
-// pass. The members' statuses add every member's requests, by member and by key component.
+// and R2 class with their rates and bytes, request latency by op, the leader's last retention
+// pass, and the shape of each SlateDB database the node has open. The members' statuses add every member's requests, by member and by key component.
 // Counts and rates only: no prices.
 
 const PURPOSE: Record<string, { label: string; what: string }> = {
@@ -242,6 +242,7 @@ export function Store() {
         <Latency node={v.node} rows={latency} />
         <Retention ret={ret} />
       </div>
+      <Databases node={v.node} dbs={v.dbs ?? []} />
       <Members qv={qv} mt={mt} rr={rr} />
     </>
   )
@@ -484,6 +485,101 @@ function Members({ qv, mt, rr }: { qv?: QuorumView; mt: ReturnType<typeof member
               </tr>
             </tbody>
           )}
+        </table>
+      </div>
+    </Panel>
+  )
+}
+
+// ---------------------------------------------------------------- SlateDB
+
+const DB: Record<string, string> = {
+  qlog_state: "the quorum log's state: cursors, hosts, accounts",
+  qlog_state_checkpoint: 'a checkpoint of the state, read whole during a recovery',
+  plc_seeds: "the PLC export's DID document seeds (the leader writes them)",
+  plc_seeds_reader: "a member's read-only view of the seeds",
+}
+
+function hitRate(d: DbShape) {
+  const hits = d.cache.reduce((s, c) => s + c.hits, 0)
+  const all = hits + d.cache.reduce((s, c) => s + c.misses, 0)
+  return all ? `${((hits / all) * 100).toFixed(1)}%` : '—'
+}
+
+function Databases({ node, dbs }: { node: string; dbs: DbShape[] }) {
+  return (
+    <Panel
+      className="cx-mt"
+      title="SlateDB databases"
+      src={<Src>store · dbs</Src>}
+      right={<span className="muted sm">{node} · as slatedb_*{'{db=…}'} exports them</span>}
+      foot={
+        <span>
+          From each handle's manifest in memory: L0 SSTs wait for the compactor, and every read checks each of them. Bytes are SlateDB's estimates. The memtable holds unflushed writes (mutable and
+          immutable); cache hits and stalls are since the handle opened.
+        </span>
+      }
+    >
+      <div className="cx-tw">
+        <table className="cx-t compact">
+          <thead>
+            <tr>
+              <th>Database</th>
+              <th className="r" title="L0 SSTs, and their bytes">
+                L0
+              </th>
+              <th className="r" title="Sorted runs, newest first, with each one's SST count">
+                Sorted runs
+              </th>
+              <th className="r">SSTs</th>
+              <th className="r">Size</th>
+              <th className="r" title="Mutable and immutable memtables">
+                Memtable
+              </th>
+              <th className="r" title="Block and metadata cache hits over lookups">
+                Cache hits
+              </th>
+              <th className="r" title="Compactions running, and the bytes they're compacting">
+                Compacting
+              </th>
+              <th className="r" title="Writes that waited on too many L0 SSTs, and on the memtable limit">
+                Stalls
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {dbs.map((d) => (
+              <tr key={d.db}>
+                <td title={DB[d.db]}>
+                  <Named label={<>{d.db.replace(/_/g, ' ')} {d.role === 'reader' && <Chip k="plain" glyph={false}>reader</Chip>}</>} raw={`manifest ${fmtNum(d.manifestId)}`} />
+                </td>
+                <td className={`r mono sm${d.l0Ssts >= 8 ? ' s-warn' : ''}`}>
+                  {fmtNum(d.l0Ssts)} <span className="muted">· {fmtBytes(d.l0Bytes)}</span>
+                </td>
+                <td className="r mono sm" title={d.sortedRuns.map((r) => `run ${r.id}: ${plural(r.ssts, 'SST')}, ${fmtBytes(r.bytes)}`).join('\n')}>
+                  {fmtNum(d.sortedRuns.length)}
+                  {d.sortedRuns.length > 0 && <span className="muted"> · {d.sortedRuns.slice(0, 4).map((r) => r.ssts).join('/')}{d.sortedRuns.length > 4 ? '/…' : ''}</span>}
+                </td>
+                <td className="r mono sm">{fmtNum(d.sstCount)}</td>
+                <td className="r mono sm">{fmtBytes(d.totalBytes)}</td>
+                <td className="r mono sm">{d.memtableBytes == null ? '—' : fmtBytes(d.memtableBytes)}</td>
+                <td className="r mono sm">{hitRate(d)}</td>
+                <td className="r mono sm" title={d.compaction.lastAtSecs ? `last finished ${ago(d.compaction.lastAtSecs * 1000)}` : undefined}>
+                  {d.compaction.running == null ? '—' : d.compaction.running > 0 ? `${d.compaction.running} · ${fmtBytes(d.compaction.bytesInFlight ?? 0)}` : 'idle'}
+                </td>
+                <td className={`r mono sm${d.stalls.l0Stalls > 0 ? ' s-warn' : ''}`}>
+                  {fmtNum(d.stalls.l0Stalls)} <span className="muted">· {fmtNum(d.stalls.backpressure)}</span>
+                </td>
+              </tr>
+            ))}
+            {!dbs.length && (
+              <tr>
+                <td colSpan={9}>
+                  <Empty>{node} has no SlateDB database open.</Empty>
+                </td>
+              </tr>
+            )}
+          </tbody>
         </table>
       </div>
     </Panel>

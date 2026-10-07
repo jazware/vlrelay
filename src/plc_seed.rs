@@ -374,6 +374,10 @@ fn db_path(store: &Store) -> object_store::path::Path {
     object_store::path::Path::from(format!("{}/{SEEDS_PATH}", store.prefix))
 }
 
+/// The `db` labels of the seed database's SlateDB series and shapes.
+pub const WRITER_LABEL: &str = "plc_seeds";
+pub const READER_LABEL: &str = "plc_seeds_reader";
+
 /// The leader's handle on the seed database: the only writer, fenced by
 /// the next leader's open.
 pub struct SeedWriter {
@@ -390,8 +394,10 @@ impl SeedWriter {
             .with_settings(crate::qlog::state::settings(64 << 20, crate::qlog::state::seed_bounds()))
             .with_db_cache(cache, id)
             .with_merge_operator(merge_operator())
+            .with_metrics_recorder(slate_metrics::recorder(WRITER_LABEL))
             .build()
             .await?;
+        slate_metrics::register(WRITER_LABEL, &db);
         Ok(SeedWriter { db })
     }
 
@@ -560,10 +566,12 @@ impl SeedReader {
             .with_merge_operator(merge_operator())
             .with_options(opts)
             .with_reader_mode(slatedb::DbReaderMode::FollowLatest)
+            .with_metrics_recorder(slate_metrics::recorder(READER_LABEL))
             .build()
             .await
         {
             Ok(r) => {
+                slate_metrics::register_reader(READER_LABEL, &r);
                 let r = Arc::new(r);
                 *w = Some(r.clone());
                 Some(r)

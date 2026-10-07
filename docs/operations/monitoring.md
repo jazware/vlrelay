@@ -104,6 +104,31 @@ Of vlpds's series, the firehose ones apply as they are: `vlpds_firehose_subscrib
 `vlpds_firehose_backfill_events_total` for consumers reading old cursors from the bucket, and
 `vlpds_object_store_requests_total` for every bucket request by `op` and `result`.
 
+### SlateDB
+
+Every SlateDB database a node opens exports SlateDB's own metrics as `slatedb_*`, each with a
+`db` label: `qlog_state` (the quorum log's state, on the leader), `plc_seeds` (the PLC seeds'
+writer, on the leader), `plc_seeds_reader` (the other members' view of them) and
+`qlog_state_checkpoint` (a checkpoint a recovery reads whole, while it runs). A database's
+series go when it closes. `GET /admin/api/store` shows the same databases as `dbs`.
+
+| Series | Type | What |
+|---|---|---|
+| `slatedb_lsm_ssts{tier}`, `slatedb_lsm_sst_bytes{tier}` | gauge | SSTs and their estimated bytes in the manifest, `tier` `l0` or `compacted`. A growing L0 means the compactor is behind, and every read checks each L0 SST |
+| `slatedb_lsm_sorted_runs`, `slatedb_lsm_largest_run_bytes` | gauge | Sorted runs, and the biggest one's bytes |
+| `slatedb_lsm_checkpoints`, `slatedb_lsm_manifest_id` | gauge | Checkpoints pinning SSTs, and the manifest version the handle last saw |
+| `slatedb_db_total_mem_size_bytes` | gauge | Mutable and immutable memtables: writes held in memory until an L0 upload |
+| `slatedb_wal_wal_buffer_estimated_bytes` | gauge | WAL buffered and not yet uploaded |
+| `slatedb_db_cache_access_count_total{entry_kind,result}` | counter | Block and metadata cache lookups, `hit` or `miss` |
+| `slatedb_compactor_running_compactions`, `slatedb_compactor_total_bytes_being_compacted` | gauge | Compactions in progress and their input bytes |
+| `slatedb_compactor_bytes_compacted_total` | counter | Bytes the compactor wrote |
+| `slatedb_db_l0_stall_count_total{type}`, `slatedb_db_backpressure_count_total` | counter | Writes held back by too many L0 SSTs, or by the memtable limit |
+| `slatedb_cache_entries{cache="node"}` | gauge | Entries in the node's shared block and metadata cache (`--slatedb-cache-mb`) |
+
+SlateDB also exports its request counts, flushes and object store calls (`slatedb_db_*`,
+`slatedb_object_store_*`). The `slatedb_lsm_*` series are read from each database's manifest in
+memory when `/metrics` is scraped, so they cover readers too; nothing polls in between.
+
 ## The quorum log
 
 `GET /qlog/status` is one JSON object per node. The fields worth watching:

@@ -1139,6 +1139,78 @@ fn fake_did(seed: &str) -> String {
     s
 }
 
+/// The leader's two databases, as a node shows them a few minutes into a
+/// PLC backfill: the seeds' L0 filling faster than the compactor drains it.
+fn demo_dbs(up: f64) -> Vec<slate_metrics::DbShape> {
+    use slate_metrics::{CacheAccess, CompactionShape, DbShape, RunShape, StallShape};
+    let mb = |x: f64| (x * 1048576.0) as u64;
+    let cache = |hit: f64, miss: f64| {
+        ["data_block", "filter", "index", "stats"]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| CacheAccess {
+                kind: (*k).into(),
+                hits: (hit * up / (i as f64 + 1.0)) as u64,
+                misses: (miss * up / (i as f64 + 1.0)) as u64,
+            })
+            .collect()
+    };
+    let state_runs = vec![
+        RunShape { id: 7, ssts: 3, bytes: mb(190.0) },
+        RunShape { id: 6, ssts: 6, bytes: mb(410.0) },
+        RunShape { id: 3, ssts: 34, bytes: mb(2_300.0) },
+    ];
+    let seed_runs = vec![RunShape { id: 2, ssts: 11, bytes: mb(700.0) }];
+    let shape = |db: &str, l0: u64, l0_mb: f64, runs: Vec<RunShape>| {
+        let l0_bytes = mb(l0_mb);
+        DbShape {
+            db: db.into(),
+            role: "writer".into(),
+            sst_count: l0 + runs.iter().map(|r| r.ssts).sum::<u64>(),
+            total_bytes: l0_bytes + runs.iter().map(|r| r.bytes).sum::<u64>(),
+            l0_ssts: l0,
+            l0_bytes,
+            sorted_runs: runs,
+            ..Default::default()
+        }
+    };
+    vec![
+        DbShape {
+            manifest_id: 18_204,
+            durable_seq: 912_000_000,
+            checkpoints: 2,
+            external_dbs: 1,
+            memtable_bytes: Some(mb(41.0) as i64),
+            wal_buffer_bytes: Some(0),
+            cache: cache(52.0, 1.3),
+            compaction: CompactionShape {
+                running: Some(0),
+                bytes_in_flight: Some(0),
+                bytes_compacted: (mb(1.8) as f64 * up) as u64,
+                last_at_secs: Some(1_791_331_200),
+            },
+            stalls: StallShape::default(),
+            ..shape("qlog_state", 3, 180.0, state_runs)
+        },
+        DbShape {
+            manifest_id: 2_311,
+            durable_seq: 48_000_000,
+            checkpoints: 0,
+            memtable_bytes: Some(mb(118.0) as i64),
+            wal_buffer_bytes: Some(0),
+            cache: cache(3.0, 0.9),
+            compaction: CompactionShape {
+                running: Some(1),
+                bytes_in_flight: Some(mb(512.0) as i64),
+                bytes_compacted: (mb(6.0) as f64 * up) as u64,
+                last_at_secs: Some(1_791_331_140),
+            },
+            stalls: StallShape { backpressure: 3, l0_stalls: 41 },
+            ..shape("plc_seeds", 14, 900.0, seed_runs)
+        },
+    ]
+}
+
 fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
@@ -1952,6 +2024,7 @@ impl AdminSource for Demo {
                 lat("list", 0.05, 40.0, 50.0, 100.0),
             ],
             retention: Some(retention),
+            dbs: demo_dbs(up),
         })
     }
 
@@ -2512,6 +2585,9 @@ mod tests {
         assert!(st["purposes"].as_array().unwrap().iter().any(|p| p["purpose"] == "flush"));
         assert!(!st["latency"].as_array().unwrap().is_empty());
         assert!(st["retention"]["plan"]["segment_bytes"].as_u64().unwrap() > 0);
+        let dbs = st["dbs"].as_array().unwrap();
+        assert_eq!(dbs.iter().map(|d| d["db"].as_str().unwrap()).collect::<Vec<_>>(), ["qlog_state", "plc_seeds"]);
+        assert!(dbs.iter().all(|d| d["l0Ssts"].is_u64() && d["sortedRuns"].is_array() && d["memtableBytes"].is_i64()));
         assert!(st.to_string().find('$').is_none());
 
         let c = json(call("GET", "/admin/api/cluster", true).await.unwrap()).await;
