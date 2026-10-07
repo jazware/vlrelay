@@ -1,0 +1,7 @@
+Vendored from shrike (https://github.com/jcalabro/shrike), crates.io shrike 0.7.0
+(commit 359f0d2, "Bump version to 0.7.0"), dual-licensed MIT OR Apache-2.0
+(LICENSE-MIT here; Apache-2.0 at https://github.com/jcalabro/shrike/blob/main/LICENSE-APACHE).
+Copyright (c) Jim Calabro. The same copy vlpds vendors (its testdata/shrike/).
+Used by src/verify/tests.rs and src/verify/differential.rs.
+
+  firehose_commits/*.json        testdata/repo_proofs/firehose_commits/ (real bsky.network #commits)

@@ -370,7 +370,7 @@ fn multikeys() {
 // real bsky.network #commits (sync 1.0 era: no prevData)
 
 fn fixture_frames() -> Vec<(String, Bytes)> {
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../vlpds/testdata/shrike/firehose_commits");
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/shrike/firehose_commits");
     let mut out = Vec::new();
     for e in std::fs::read_dir(dir).expect("fixtures") {
         let p = e.unwrap().path();
