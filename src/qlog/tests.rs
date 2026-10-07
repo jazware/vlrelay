@@ -1604,10 +1604,11 @@ async fn recovery_adopts_orphan_segments() {
 async fn the_recovered_state_equals_replaying_the_bucket() {
     use flush::Step;
     let armed: Arc<Mutex<Vec<Step>>> = Arc::default();
-    let a = armed.clone();
+    let stop_at_fence = Arc::new(AtomicBool::new(false));
+    let (a, stop) = (armed.clone(), stop_at_fence.clone());
     let mut c = flushing(
         move |_| {
-            let a = a.clone();
+            let (a, stop) = (a.clone(), stop.clone());
             flush::Options {
                 crash: Some(Arc::new(move |s| {
                     let mut g = a.lock();
@@ -1615,7 +1616,7 @@ async fn the_recovered_state_equals_replaying_the_bucket() {
                         g.remove(0);
                         return true;
                     }
-                    false
+                    s == Step::Fenced && g.is_empty() && stop.load(Ordering::SeqCst)
                 })),
                 headroom: 5_000,
                 ..flush_opts()
@@ -1628,9 +1629,14 @@ async fn the_recovered_state_equals_replaying_the_bucket() {
     let load = HostLoad::start(&c, 4, 10, Duration::from_millis(2));
     wait_flushed(&c, 1, Duration::from_secs(5)).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    // three attempts die (one at each step), the fourth leads and stops
-    // its flush at the fence, so the recovery manifest stays current
-    *armed.lock() = vec![Step::RecoverSealed, Step::RecoverBeforeManifest, Step::RecoverAfterManifest, Step::Fenced];
+    // Three attempts die (one at each step). Every leader after them stops
+    // its flush at the fence, so the last recovery manifest stays current.
+    // That needn't be the fourth attempt's: under load another member's
+    // election can depose the recovered leader before any wiped follower
+    // has caught up from it, and with no quorum of intact logs that's one
+    // more recovery.
+    *armed.lock() = vec![Step::RecoverSealed, Step::RecoverBeforeManifest, Step::RecoverAfterManifest];
+    stop_at_fence.store(true, Ordering::SeqCst);
     for id in c.ids.clone() {
         c.wipe(&id);
     }
@@ -1642,28 +1648,45 @@ async fn the_recovered_state_equals_replaying_the_bucket() {
         assert!(t.elapsed() < Duration::from_secs(20), "steps left {:?}: {}", armed.lock(), status_line(&c));
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let l = c.wait_leader(Duration::from_secs(10)).await;
+    // with every log intact no recovery follows
+    let t = Instant::now();
+    loop {
+        c.wait_leader(Duration::from_secs(10)).await;
+        if c.nodes.values().all(|r| r.node.status().intact) {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "not every log is intact: {}", status_line(&c));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let m = flush::read_manifest(&c.store).await.unwrap().unwrap().0;
     let rec = m.recovery.clone().unwrap();
     // the attempt that died after its manifest CAS did recover (it may
     // have led and committed above its R for all anyone can tell), so the
     // next one jumped again
-    assert_eq!((rec.generation, m.flushed, m.state.as_ref().unwrap().seq), (2, rec.base, rec.base), "{m:?}");
+    assert!(rec.generation >= 2, "{m:?}");
+    assert_eq!((m.flushed, m.state.as_ref().unwrap().seq), (rec.base, rec.base), "{m:?}");
     assert_ne!(m.state_path(), super::state::DEFAULT_PATH);
     let v = verify(&c).await;
-    assert!(v.ok && v.gaps == 2 && v.flushed == rec.base, "{v:#?}");
+    assert!(v.ok && v.gaps == rec.generation && v.flushed == rec.base, "{v:#?}");
     let applied = super::state::read_checkpoint(&c.store, m.state.as_ref().unwrap()).await.unwrap().0;
     assert_eq!(
         applied.get(super::state::applied_key()).map(|b| u64::from_be_bytes(b[..8].try_into().unwrap())),
         Some(rec.base)
     );
-    // flushing again from here (a takeover fences and flushes as usual)
-    c.kill(&l);
-    c.start(&l).await;
+    // flushing again from here (a takeover fences and flushes as usual);
+    // every node restarts, since leadership may have moved since the check
+    // to another whose flush stopped at its fence
+    stop_at_fence.store(false, Ordering::SeqCst);
+    for id in c.ids.clone() {
+        c.kill(&id);
+    }
+    for id in c.ids.clone() {
+        c.start(&id).await;
+    }
     c.wait_leader(Duration::from_secs(10)).await;
     let (v, r, m) = settle_recovered(&c, load).await;
     eprintln!("{v:?}\n{r:?}\n{m:?}");
-    assert_eq!(m.generation(), 2, "{m:?}");
+    assert_eq!(m.generation(), rec.generation, "{m:?}");
     c.shutdown();
 }
 
@@ -2420,5 +2443,101 @@ async fn trusting_a_short_log_after_a_power_loss_is_caught() {
         !r.ok || r.acked_missing > 0 || r.events_lost > 0 || r.holes > 0,
         "trusting short logs after power losses went unnoticed: {r:?}"
     );
+    c.shutdown();
+}
+
+/// A follower cut off behind the bucket's F, the only node left
+/// running: nothing flushes over the bucket the test then plays recoveries
+/// into. Returns it, what it emitted and the manifest.
+async fn a_lone_follower_behind_the_bucket() -> (Cluster, String, u64, flush::Manifest) {
+    let mut c = flushing(|_| flush_opts(), 64 << 20).await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let f = c.ids.iter().find(|id| **id != l).unwrap().clone();
+    c.isolate(&f);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let behind = c.nodes[&f].node.status().emitted;
+    assert!(behind > 0, "{f} emitted nothing before it was cut off");
+    load.stop().await;
+    let top = c.nodes[&l].node.status().commit;
+    let m = wait_flushed(&c, top, Duration::from_secs(10)).await;
+    for id in c.ids.clone() {
+        if id != f {
+            c.kill(&id);
+        }
+    }
+    (c, f, behind, m)
+}
+
+/// Plays a recovery's leader resetting `f` to `to` and waits for its
+/// stream to get there. Returns the seqs it emitted past `behind`.
+async fn reset_and_emit(c: &Cluster, f: &str, behind: u64, to: u64, m: &flush::Manifest) -> Vec<u64> {
+    let st = c.nodes[f].node.status();
+    let rpc = super::node::Rpc::new(f, &c.addrs[f], Arc::new(Faults::default()));
+    let reset = wire::Append {
+        epoch: st.promised,
+        leader: "test".into(),
+        prev_epoch: st.promised,
+        prev_seq: to,
+        commit: to,
+        leader_last: to,
+        reset: true,
+        flushed: m.flushed,
+        reserve: m.reserve,
+        generation: st.generation,
+        entries: Vec::new(),
+    };
+    match rpc.call(&wire::Msg::Append(reset), Duration::from_secs(2)).await {
+        Ok(wire::Msg::AppendResp(r)) => assert!(r.ok, "{r:?}"),
+        r => panic!("{r:?}"),
+    }
+    let t = Instant::now();
+    while c.nodes[f].node.status().emitted != to {
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", c.nodes[f].node.status());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stream = format!("{f}#{}", c.incarnations[f]);
+    c.emitted.lock().iter().filter(|(s, q, _)| *s == stream && *q > behind).map(|e| e.1).collect()
+}
+
+/// A deposed leader's flush, still running when a recovery moved F past
+/// it, can leave a segment at the recovery's next ordinal holding seqs from
+/// S + 1 until the new leader's first flush replaces it. A follower that
+/// emitted up to S, reset past R, crosses the gap without emitting them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_reset_across_a_gap_never_emits_a_deposed_leaders_segment() {
+    let (c, f, behind, m) = a_lone_follower_behind_the_bucket().await;
+    let (s, r) = (m.flushed, m.flushed + 1000);
+    let mut m2 = m.clone();
+    m2.gaps.push((s, r));
+    (m2.flushed, m2.reserve) = (r, r + 5000);
+    flush::put_test_manifest(&c.store, &m2).await;
+    let stale: Vec<super::log::Entry> =
+        (s + 1..=s + 5).map(|q| super::log::Entry::new(1, q, Bytes::from(format!("stale{q}")))).collect();
+    flush::put_test_segment(&c.store, m.next_ordinal, &stale).await;
+    let got = reset_and_emit(&c, &f, behind, r + 10, &m2).await;
+    assert_eq!(got, (behind + 1..=s).collect::<Vec<_>>(), "emitted seqs in the gap ({s}, {r}]");
+    c.shutdown();
+}
+
+/// A follower whose stream is still behind one recovery's gap when a
+/// second recovery's leader resets it hands its consumers the log on both
+/// sides of the first gap, up to the second's S: (e, S1] and (R1, S2].
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_reset_across_two_gaps_emits_the_log_between_them() {
+    let (c, f, behind, m) = a_lone_follower_behind_the_bucket().await;
+    let (s1, r1) = (m.flushed, m.flushed + 1000);
+    let (s2, r2) = (r1 + 100, r1 + 2000);
+    let between: Vec<super::log::Entry> =
+        (r1 + 1..=s2).map(|q| super::log::Entry::new(2, q, Bytes::from(format!("between{q}")))).collect();
+    flush::put_test_segment(&c.store, m.next_ordinal, &between).await;
+    let mut m2 = m.clone();
+    m2.gaps.extend([(s1, r1), (s2, r2)]);
+    (m2.flushed, m2.reserve, m2.next_ordinal) = (r2, r2 + 5000, m.next_ordinal + 1);
+    flush::put_test_manifest(&c.store, &m2).await;
+    let got = reset_and_emit(&c, &f, behind, r2 + 10, &m2).await;
+    assert_eq!(got, (behind + 1..=s1).chain(r1 + 1..=s2).collect::<Vec<_>>());
+    assert_eq!(c.nodes[&f].node.status().emit_gaps, (r1 - s1) + (r2 - s2) + 10);
     c.shutdown();
 }

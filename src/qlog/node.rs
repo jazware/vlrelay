@@ -2239,13 +2239,18 @@ impl Node {
             let mut cache: flush::SegCache = None;
             let mut next = m.past_gaps(emitted) + 1;
             while next <= after {
-                match flush::read_bucket_entries(&self.bucket.backfill, &mut cache, next, after, 8 << 20).await? {
-                    Some(es) if !es.is_empty() => {
-                        next = es.last().expect("non-empty").seq + 1;
+                match flush::read_bucket_entries(&self.bucket.backfill, &mut cache, next, after, 8 << 20).await {
+                    Ok(Some(es)) if !es.is_empty() => {
+                        next = m.past_gaps(es.last().expect("non-empty").seq) + 1;
                         catch_up.extend(es);
                     }
-                    _ if m.past_gaps(next - 1) >= next => next = m.past_gaps(next - 1) + 1,
-                    _ => break,
+                    Ok(_) => break,
+                    // the manifest is ours already: a failed read costs this
+                    // stream a gap, not the recovery
+                    Err(e) => {
+                        tracing::warn!(id = %self.cfg.id, next, "qlog recovery: reading the bucket up to S failed: {e:#}");
+                        break;
+                    }
                 }
             }
         }
@@ -2266,8 +2271,8 @@ impl Node {
             c.emitted = upto;
         }
         if c.emitted < base {
-            if self.emit.firehose().is_some() && c.emitted < after {
-                self.stats.emit_gaps.fetch_add(after - c.emitted, Ordering::Relaxed);
+            if self.emit.firehose().is_some() && m.past_gaps(c.emitted) < after {
+                self.stats.emit_gaps.fetch_add(after - m.past_gaps(c.emitted), Ordering::Relaxed);
                 tracing::warn!(id = %self.cfg.id, from = c.emitted, to = after, "qlog recovery: couldn't emit up to S before the jump");
             }
             c.emitted = base;
@@ -2814,6 +2819,10 @@ impl Node {
     /// jumps there (past a recovery's gap, which no segment holds).
     async fn emit_jump(&self) {
         let mut cache: flush::SegCache = None;
+        // Gaps are only ever added, so an older manifest's still hold. A
+        // reset past a newer recovery's gap raises `to`, and that recovery's
+        // manifest was written before any log resumed above it.
+        let (mut man, mut man_to) = (None::<flush::Manifest>, 0);
         loop {
             let (from, to) = {
                 let mut c = self.core.lock();
@@ -2825,19 +2834,39 @@ impl Node {
                     }
                 }
             };
-            let read = flush::read_bucket_entries(&self.bucket.backfill, &mut cache, from + 1, to, 8 << 20).await;
-            let held = matches!(&read, Ok(Some(es)) if es.first().is_some_and(|e| e.seq == from + 1));
-            // Two resets before the bucket is read (recoveries in a row) leave
-            // `to` past a second gap, with real seqs between the two: cross
-            // only the gap `from` is in, then read on.
-            let gap_end = if held || read.is_err() {
-                None
-            } else {
+            let mut man_err = None;
+            if to > man_to {
                 match flush::read_manifest(&self.bucket.flush).await {
-                    Ok(Some((m, _))) => Some(m.past_gaps(from)).filter(|&u| u > from && u < to),
-                    _ => None,
+                    Ok(m) => {
+                        man = m.map(|(m, _)| m).or(man);
+                        man_to = to;
+                    }
+                    Err(e) => man_err = Some(e),
+                }
+            }
+            // A gap is crossed before the bucket is read there: a deposed
+            // leader's flush can leave a segment at the recovery's next
+            // ordinal holding seqs from the gap's start (never committed by
+            // the new log) until the new leader's first flush replaces it.
+            let in_gap = |m: &flush::Manifest| Some(m.past_gaps(from)).filter(|&u| u > from);
+            let mut gap = man.as_ref().and_then(in_gap);
+            let read = match (gap, man_err) {
+                (Some(_), _) => Ok(None),
+                (None, Some(e)) => Err(e),
+                (None, None) => {
+                    flush::read_bucket_entries(&self.bucket.backfill, &mut cache, from + 1, to, 8 << 20).await
                 }
             };
+            let held = matches!(&read, Ok(Some(es)) if es.first().is_some_and(|e| e.seq == from + 1));
+            if !held
+                && gap.is_none()
+                && read.is_ok()
+                && let Ok(Some((m, _))) = flush::read_manifest(&self.bucket.flush).await
+            {
+                gap = in_gap(&m);
+                man = Some(m);
+            }
+            let gap_end = gap.filter(|&u| u < to);
             let _order = self.emit_order.lock();
             let mut c = self.core.lock();
             if c.emitted != from {
@@ -2857,8 +2886,11 @@ impl Node {
                     self.stats.emit_gaps.fetch_add(u - from, Ordering::Relaxed);
                     c.emitted = u;
                 }
+                // a reset past a further gap came in meanwhile: there may be
+                // real seqs between the two
+                _ if c.jump_to.is_some_and(|j| j > to) => {}
                 r => {
-                    let to = c.jump_to.take().unwrap_or(to).max(to);
+                    c.jump_to = None;
                     if let Err(e) = &r {
                         tracing::warn!(id = %self.cfg.id, from, "qlog: reading the skipped seqs from the bucket failed: {e:#}");
                     }

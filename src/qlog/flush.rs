@@ -883,8 +883,9 @@ async fn locate(
         return Ok(None);
     }
     let i = (from - first) as usize;
-    // `from` is in a recovery's gap, past this segment's end
-    if i > seg.len() {
+    // segments are dense, but one that isn't (or `from` in a gap past its
+    // end) must not hand out other seqs as `from`'s
+    if seg.get(i).is_none_or(|e| e.seq != from) {
         return Ok(None);
     }
     Ok(Some((ord, seg, i)))
@@ -1417,4 +1418,124 @@ async fn put_recovery_segment(
         .await
         .map_err(|e| anyhow::anyhow!("qlog recovery: segment {ord}: {e}"))?;
     Ok(SegRef { ordinal: ord, first, last, bytes })
+}
+
+#[cfg(test)]
+pub(crate) async fn put_test_segment(store: &Store, ord: u64, es: &[Entry]) {
+    let mut b = SegmentBuilder::for_log(LOG_ID);
+    for e in es {
+        push(&mut b, e);
+    }
+    put_recovery_segment(store, b, ord, es[0].seq, es.last().expect("non-empty").seq).await.unwrap();
+}
+
+#[cfg(test)]
+pub(crate) async fn put_test_manifest(store: &Store, m: &Manifest) {
+    use object_store::ObjectStoreExt;
+    store.raw.put(&manifest_path(store), PutPayload::from(serde_json::to_vec(m).unwrap())).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_gaps(gaps: &[(u64, u64)]) -> Manifest {
+        Manifest { gaps: gaps.to_vec(), ..Default::default() }
+    }
+
+    #[test]
+    fn past_gaps_edges() {
+        for gaps in [vec![(10, 20), (20, 30), (50, 60)], vec![(50, 60), (20, 30), (10, 20)]] {
+            let m = with_gaps(&gaps);
+            for (at, want) in [
+                (0, 0),
+                (9, 9),
+                (10, 30),
+                (11, 30),
+                (19, 30),
+                (20, 30),
+                (29, 30),
+                (30, 30),
+                (31, 31),
+                (49, 49),
+                (50, 60),
+                (59, 60),
+                (60, 60),
+                (61, 61),
+            ] {
+                assert_eq!(m.past_gaps(at), want, "at {at} gaps {gaps:?}");
+            }
+        }
+        // never written, but must still end past both
+        assert_eq!(with_gaps(&[(10, 20), (15, 30)]).past_gaps(12), 30);
+        // a recovery before anything was flushed
+        assert_eq!(with_gaps(&[(0, 100)]).past_gaps(0), 100);
+        assert_eq!(with_gaps(&[]).past_gaps(7), 7);
+        let m = with_gaps(&[(10, 20), (20, 30), (50, 60)]);
+        for last in 0..70 {
+            let inside = (11..30).contains(&last) || (51..60).contains(&last);
+            assert!(inside || m.continues(last, m.past_gaps(last) + 1), "last {last}");
+        }
+    }
+
+    async fn put(store: &Store, ord: u64, seqs: std::ops::RangeInclusive<u64>, epoch: u64) {
+        let es: Vec<Entry> = seqs.map(|s| Entry::new(epoch, s, bytes::Bytes::from(format!("e{epoch}s{s}")))).collect();
+        put_test_segment(store, ord, &es).await;
+    }
+
+    fn seqs(es: &[Entry]) -> Vec<u64> {
+        es.iter().map(|e| e.seq).collect()
+    }
+
+    #[tokio::test]
+    async fn read_bucket_entries_across_gaps() {
+        let store = Store::memory(None);
+        // 1..=10, gap (10, 20], 21..=30, gaps (30, 40] and (40, 50], 51..=55
+        put(&store, 0, 1..=10, 1).await;
+        put(&store, 1, 21..=30, 2).await;
+        put(&store, 2, 51..=55, 3).await;
+        let mut c = None;
+        // there's no epoch for the seq before a gap's end
+        assert!(read_bucket(&store, &mut c, 21, 30, 1 << 20).await.unwrap().is_none());
+        let es = read_bucket_entries(&store, &mut c, 21, 30, 1 << 20).await.unwrap().unwrap();
+        assert_eq!(seqs(&es), (21..=30).collect::<Vec<_>>());
+        let es = read_bucket_entries(&store, &mut c, 51, 100, 1 << 20).await.unwrap().unwrap();
+        assert_eq!(seqs(&es), (51..=55).collect::<Vec<_>>());
+        for s in [11, 15, 20, 31, 40, 45, 50] {
+            let r = read_bucket_entries(&store, &mut c, s, 100, 1 << 20).await.unwrap();
+            assert!(r.is_none(), "seq {s}: {:?}", r.map(|es| seqs(&es)));
+        }
+        // an emitter's walk from behind the first gap, crossing each gap
+        // before reading
+        let m = with_gaps(&[(10, 20), (30, 40), (40, 50)]);
+        let (mut next, upto, mut got) = (6, 55, Vec::new());
+        loop {
+            next = m.past_gaps(next - 1) + 1;
+            if next > upto {
+                break;
+            }
+            let es = read_bucket_entries(&store, &mut c, next, upto, 16).await.unwrap().unwrap();
+            assert_eq!(es[0].seq, next);
+            next = es.last().unwrap().seq + 1;
+            got.extend(seqs(&es));
+        }
+        assert_eq!(got, (6..=10).chain(21..=30).chain(51..=55).collect::<Vec<_>>());
+    }
+
+    /// Why an emitter crosses a gap before reading the bucket: a deposed
+    /// leader's flush can put a segment at the recovery's next ordinal,
+    /// holding seqs from the gap's start, and nothing in the bucket read
+    /// tells it apart.
+    #[tokio::test]
+    async fn a_stale_segment_in_a_gap_is_readable_at_its_start() {
+        let store = Store::memory(None);
+        put(&store, 0, 1..=10, 1).await;
+        put(&store, 1, 11..=15, 1).await;
+        let m = Manifest { flushed: 100, reserve: 200, next_ordinal: 1, gaps: vec![(10, 100)], ..Default::default() };
+        let mut c = None;
+        let es = read_bucket_entries(&store, &mut c, 11, 150, 1 << 20).await.unwrap().unwrap();
+        assert_eq!(seqs(&es), (11..=15).collect::<Vec<_>>());
+        assert!(read_bucket(&store, &mut c, 11, 150, 1 << 20).await.unwrap().is_some());
+        assert_eq!(m.past_gaps(10), 100);
+    }
 }
