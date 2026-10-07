@@ -99,7 +99,6 @@ export function leaderBanner(e: EpochEvent): BannerSpec {
 
 const REJECTS_TO = '/admin/hosts?sort=errors'
 type Busy = 'events' | 'rejects'
-const topReason = (r: Partial<Record<RejectReason, number>>) => (Object.entries(r) as [RejectReason, number][]).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1])[0]?.[0]
 
 function healthCells(o: O, view: RelayView | undefined, cases: number, crit: number, throttled: number, consumers: { n: number; slow: number; backfill: number } | undefined, leadSince?: number): HealthCell[] {
   const q = view?.quorum
@@ -167,14 +166,6 @@ export function Overview() {
   const [busy, setBusy] = useState<Busy>('events')
   const rej = useLivePoll(() => (busy === 'rejects' ? A.hosts({ sort: 'errors', desc: true, limit: 8 }).then((r) => r.hosts) : Promise.resolve([] as HostRow[])), `busy:${busy}`, 5000)
   const rejNames = (rej.data ?? []).filter((h) => h.errorRate > 0).map((h) => h.host)
-  // the top reason is in each host's detail: asked only while the rejects view is on
-  const reasonsOf = useLivePoll(
-    () => Promise.all(rejNames.map((h) => A.host(h).then((d) => [h, topReason(d.rejectsByReason)] as const, () => [h, undefined] as const))),
-    `busy-reasons:${rejNames.join(',')}`,
-    10_000,
-    { keep: true },
-  )
-  const reasonOf = new Map(reasonsOf.data ?? [])
 
   const sub = (
     <>
@@ -287,7 +278,7 @@ export function Overview() {
             <Panel
               title="Busiest hosts"
               to={busy === 'rejects' ? REJECTS_TO : '/admin/hosts'}
-              src={<Src>{busy === 'rejects' ? 'hosts?sort=errors&limit=8 · hosts/{host}' : 'overview.topHosts'}</Src>}
+              src={<Src>{busy === 'rejects' ? 'hosts?sort=errors&limit=8 · topReason' : 'overview.topHosts'}</Src>}
               right={<Seg<Busy> label="Busiest by" value={busy} options={[{ v: 'events', label: 'events' }, { v: 'rejects', label: 'rejects' }]} onChange={setBusy} />}
             >
               {busy === 'rejects' ? (
@@ -309,7 +300,7 @@ export function Overview() {
                         {rej.data
                           .filter((h) => h.errorRate > 0)
                           .map((r, i) => {
-                            const why = reasonOf.get(r.host)
+                            const why = r.topReason
                             return (
                               <tr key={`${r.host}#${i}`} data-open={`host:${r.host}`} onClick={() => openPanel('host', r.host)}>
                                 <td className="trunc" style={{ maxWidth: 190 }}>
