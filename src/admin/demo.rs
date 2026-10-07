@@ -436,6 +436,20 @@ impl Sim {
         for (name, p, rate, accounts) in spam {
             add(&mut hosts, &mut rng, name.to_string(), "new", p, rate, accounts);
         }
+        // a shared PDS host's customers, and its own PDS, which an exact rule lifts out of the
+        // wildcard's tier
+        for (i, name) in ["demo", "pds-1", "pds-2", "pds-3", "eu.pds-4"].iter().enumerate() {
+            let accounts = 40 + i as u64 * 130;
+            add(
+                &mut hosts,
+                &mut rng,
+                format!("{name}.example.social"),
+                "default",
+                Profile::Community,
+                accounts as f64 * 0.001,
+                accounts,
+            );
+        }
         while hosts.len() < 5_000 {
             let name = match rng.below(6) {
                 0 => format!("pds.{}{}.{}", rng.pick(&NAMES), rng.pick(&WORDS), rng.pick(&TLDS)),
@@ -561,6 +575,8 @@ impl Sim {
             ("*.fastvps.cloud", RuleEffect::Tier { tier: "new".into() }, "cheap VPS range used by account farms", 3),
             ("*.host.bsky.network", RuleEffect::Tier { tier: "trusted".into() }, "Bluesky's PDS fleet", 30),
             ("*.megabot.io", RuleEffect::Throttle { events_per_sec: 5.0 }, "bot platform, fine at low volume", 1),
+            ("*.example.social", RuleEffect::Tier { tier: "new".into() }, "shared PDS host: customers start new", 2),
+            ("demo.example.social", RuleEffect::Tier { tier: "trusted".into() }, "the host's own PDS", 1),
         ];
         for (pattern, effect, note, days) in rules {
             let id = self.next_rule;
@@ -740,12 +756,12 @@ impl Sim {
         }
     }
 
+    /// Applies to the hosts the rule decides, not those a more specific rule takes.
     fn apply_rule_effect(&mut self, pattern: &str, effect: &RuleEffect) -> u32 {
         let mut n = 0;
-        for h in self.hosts.iter_mut() {
-            if !rule_matches(pattern, &h.name) {
-                continue;
-            }
+        let decides: Vec<bool> =
+            self.hosts.iter().map(|h| self.rule_for(&h.name).is_some_and(|r| r.pattern == pattern)).collect();
+        for (h, _) in self.hosts.iter_mut().zip(decides).filter(|(_, d)| *d) {
             n += 1;
             match effect {
                 RuleEffect::Ban => {
@@ -1075,7 +1091,7 @@ impl Sim {
 
     fn rule_view(&self, r: &DomainRule) -> DomainRule {
         DomainRule {
-            matches: self.hosts.iter().filter(|h| rule_matches(&r.pattern, &h.name)).count() as u32,
+            matches: self.hosts.iter().filter(|h| self.rule_for(&h.name).is_some_and(|w| w.id == r.id)).count() as u32,
             version: self.rules_version,
             ..r.clone()
         }
@@ -1421,8 +1437,8 @@ impl AdminSource for Demo {
             matches: 0,
             version: 0,
         };
-        s.apply_rule_effect(&pattern, &rule.effect);
         s.rules.push(r.clone());
+        s.apply_rule_effect(&pattern, &rule.effect);
         self.rules_changed(&mut s);
         Ok(s.rule_view(&r))
     }
@@ -2279,6 +2295,27 @@ mod tests {
             d.update_policy(PolicyUpdate { base_version: p.version, policy: np, note: String::new() }, "admin").await;
         assert!(matches!(stale, Err(AdminError::Conflict(_))));
         assert_eq!(d.policy_audit().await.unwrap()[0].changes, vec!["spam.rejectRatio: 0.5 → 0.3".to_string()]);
+    }
+
+    /// A rule's `matches` and `hosts?rule=` count the hosts it decides: an exact rule takes its
+    /// host from the wildcard above it, as the relay's lookup does.
+    #[tokio::test]
+    async fn an_exact_rule_overrides_its_wildcard() {
+        let d = Demo::start(7);
+        let rules = d.domain_rules().await.unwrap();
+        let rule = |p: &str| rules.iter().find(|r| r.pattern == p).unwrap().clone();
+        let (wild, exact) = (rule("*.example.social"), rule("demo.example.social"));
+        assert_eq!((wild.matches, exact.matches), (4, 1));
+        let by_rule = |id| d.hosts(HostQuery { rule: Some(id), sort: Some("host".into()), ..Default::default() });
+        let l = by_rule(wild.id).await.unwrap();
+        assert_eq!(l.total, 4);
+        assert!(l.hosts.iter().all(|h| h.rule == Some(wild.id) && h.tier == "new" && h.host != "demo.example.social"));
+        let l = by_rule(exact.id).await.unwrap();
+        assert_eq!(
+            (l.total, l.hosts[0].host.as_str(), l.hosts[0].tier.as_str()),
+            (1, "demo.example.social", "trusted")
+        );
+        assert_eq!(d.hosts(HostQuery { rule: Some(999), ..Default::default() }).await.unwrap().total, 0);
     }
 
     /// A tier a domain rule decides can't be set on the host: a 409 naming the rule, and no

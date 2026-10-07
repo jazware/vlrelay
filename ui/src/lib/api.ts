@@ -192,6 +192,7 @@ export type DomainRule = {
   note: string
   createdAtMs: number
   createdBy: string
+  /** Known hosts the rule decides: those its pattern matches less those a more specific rule takes. */
   matches: number
   /** The rule set's version when read: compares with a `rules` change's. Absent on an older relay. */
   version?: number

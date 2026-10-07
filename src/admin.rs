@@ -264,6 +264,9 @@ pub struct HostQuery {
     pub source: Option<String>,
     /// Only hosts with (true) or without (false) throttled accounts.
     pub throttled: Option<bool>,
+    /// Only hosts this domain rule decides (their `rule`): the hosts it
+    /// matches less those a more specific rule takes.
+    pub rule: Option<u64>,
     /// `atCap`, `lagging`, `erroring` or `throttledOrAtCap`, as
     /// [`HostQuery::keeps`] reads them.
     pub flag: Option<String>,
@@ -365,7 +368,8 @@ pub struct DomainRule {
     pub note: String,
     pub created_at_ms: i64,
     pub created_by: String,
-    /// Known hosts the pattern matches right now.
+    /// Known hosts the rule decides right now: those the pattern matches
+    /// less those a more specific rule takes.
     pub matches: u32,
     /// The rule set's version when it was read.
     #[serde(default)]
@@ -1096,7 +1100,9 @@ impl HostQuery {
             Some("throttledOrAtCap") => r.throttled_accounts > 0 || at_cap,
             _ => true,
         };
-        src && flag && self.throttled.is_none_or(|t| (r.throttled_accounts > 0) == t)
+        src && flag
+            && self.throttled.is_none_or(|t| (r.throttled_accounts > 0) == t)
+            && self.rule.is_none_or(|id| r.rule == Some(id))
     }
 }
 

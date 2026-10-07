@@ -8,7 +8,9 @@ import { Chip, Copy, Empty, HostStatusChip, KV, Over, Sec, Strip, TierTag } from
 import { errText, type Account, type Case, type CaseStatus, type DomainRule, type DomainRuleInput, type RuleEffect, type Severity, type SignalKey } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, dt, fmtNum, plural, shortDid } from '../../lib/console/fmt'
-import { useAccount, useCase, useCaseEvidence, useHostList, usePolicy, useRules } from '../../lib/console/queries'
+import { useAccount, useCase, useCaseEvidence, usePolicy, useRuleHosts, useRules } from '../../lib/console/queries'
+import { cached, keys } from '../../lib/console/cache'
+import { overriddenBy, overriddenRules } from '../../lib/console/ruleScope'
 import { accountTone, caseTone, sevTone } from '../../lib/console/tone'
 import * as W from '../../lib/console/writes'
 import '../../console-rules.css'
@@ -289,9 +291,11 @@ const COVERED_SHOWN = 5
 
 /** The hosts a rule decides right now (a more specific rule takes the rest), busiest first. */
 async function coveredHosts(r: DomainRule): Promise<{ hosts: string[]; total: number }> {
-  const l = await A.hosts({ q: baseDomain(r.pattern), sort: 'events', desc: true, limit: 200 })
+  const l = await A.hosts({ q: baseDomain(r.pattern), rule: r.id, sort: 'events', desc: true, limit: 200 })
   const hosts = l.hosts.filter((h) => h.rule === r.id).map((h) => h.host)
-  return { hosts, total: l.total <= l.hosts.length ? hosts.length : Math.max(r.matches, hosts.length) }
+  // an older relay ignores `rule`, so the rows are filtered here and the total is theirs
+  const exact = hosts.length === l.hosts.length
+  return { hosts, total: exact ? l.total : l.total <= l.hosts.length ? hosts.length : Math.max(r.matches, hosts.length) }
 }
 
 /** Deletes a rule behind a typed confirm that names the hosts it covers. `stay`: from a host, which stays open. */
@@ -303,6 +307,7 @@ export async function deleteRuleDialog(r: DomainRule, opts: { stay?: boolean } =
     // the confirm still opens with the rule's own count
   }
   const total = covered?.total ?? r.matches
+  const fallback = overriddenRules(r, cached<DomainRule[]>(keys.rules()) ?? [])[0]
   const named = covered?.hosts.slice(0, COVERED_SHOWN) ?? []
   return confirmAction({
     tone: 'err',
@@ -331,7 +336,15 @@ export async function deleteRuleDialog(r: DomainRule, opts: { stay?: boolean } =
       ...(total === 0
         ? []
         : [
-            r.effect.kind === 'ban' ? `${total === 1 ? 'It' : 'They'} may connect again on ${total === 1 ? 'its' : 'their'} next requestCrawl.` : `${total === 1 ? 'It goes' : 'They go'} back to ${total === 1 ? 'its' : 'their'} own tier and limits.`,
+            fallback ? (
+              <>
+                {total === 1 ? 'It goes' : 'They go'} to rule {fallback.id} (<span className="mono">{fallback.pattern}</span>) → <EffectChip e={fallback.effect} />, the rule this one overrides.
+              </>
+            ) : r.effect.kind === 'ban' ? (
+              `${total === 1 ? 'It' : 'They'} may connect again on ${total === 1 ? 'its' : 'their'} next requestCrawl.`
+            ) : (
+              `${total === 1 ? 'It goes' : 'They go'} back to ${total === 1 ? 'its' : 'their'} own tier and limits.`
+            ),
             'Hosts it already changed keep their state until they’re retiered or unbanned on the host.',
           ]),
       'Every node reloads the rules within 10 s.',
@@ -605,9 +618,25 @@ registerDetail('acct', {
 
 // ---------------------------------------------------------------- domain rule
 
-function RuleBody({ r }: { r: DomainRule }) {
-  const hosts = useHostList({ q: baseDomain(r.pattern), sort: 'events', desc: true, limit: 200 }, { poll: 15_000 })
-  const m = (hosts.data?.hosts ?? []).filter((h) => h.rule === r.id)
+/** One rule in a precedence list: its id, pattern and effect, and a count on the right. */
+const RuleLine = ({ r, x }: { r: DomainRule; x: ReactNode }) => (
+  <button type="button" className="cx-rrow" onClick={() => openPanel('rule', String(r.id))}>
+    <span className="sm muted">rule {r.id}</span>
+    <span className="nm mono sm" title={r.pattern}>
+      {r.pattern}
+    </span>
+    <span className="sm muted">→</span>
+    <EffectChip e={r.effect} />
+    <span className="x">{x}</span>
+  </button>
+)
+
+function RuleBody({ r, rules }: { r: DomainRule; rules: DomainRule[] }) {
+  const hosts = useRuleHosts(r)
+  const by = overriddenBy(r, rules)
+  const lost = by.reduce((n, s) => n + s.matches, 0)
+  const over = overriddenRules(r, rules)
+  const n = hosts.total
   return (
     <>
       <KV
@@ -615,21 +644,48 @@ function RuleBody({ r }: { r: DomainRule }) {
           ['Effect', <EffectChip key="e" e={r.effect} />],
           ['Note', r.note || <span className="muted">none</span>],
           ['Added', `${dt(r.createdAtMs)} by ${r.createdBy}`],
-          ['Matches', fmtNum(r.matches)],
+          [
+            'Covers',
+            <span key="c">
+              <b>{plural(n, 'host')}</b>
+              {lost > 0 && <span className="muted"> of the {fmtNum(n + lost)} its pattern matches</span>}
+            </span>,
+          ],
         ]}
       />
-      <Sec title="Matching hosts" digest={hosts.data ? plural(m.length, 'host') : '…'} open flush>
-        {m.length ? (
-          m.slice(0, 20).map((h) => (
-            <button key={h.host} type="button" className="cx-rrow" onClick={() => openPanel('host', h.host)}>
-              <span className="mono sm">{h.host}</span>
-              <span className="x">
-                <HostStatusChip s={h.status} />
-              </span>
-            </button>
-          ))
+      {by.length > 0 && (
+        <Sec title={<>Overridden on {plural(lost, 'host')}</>} digest={`by ${plural(by.length, 'more specific rule')}`} open flush>
+          {by.map((s) => (
+            <RuleLine key={s.id} r={s} x={s.matches ? plural(s.matches, 'host') : 'no host yet'} />
+          ))}
+        </Sec>
+      )}
+      {over.length > 0 && (
+        <Sec title={over.length === 1 ? <>Overrides rule {over[0].id}</> : <>Overrides {fmtNum(over.length)} rules</>} digest={n === 1 ? 'on its host' : `on these ${fmtNum(n)} hosts`} open flush>
+          {over.map((b) => (
+            <RuleLine key={b.id} r={b} x={`covers ${fmtNum(b.matches)}`} />
+          ))}
+        </Sec>
+      )}
+      <Sec title="Covered hosts" digest={hosts.data ? plural(n, 'host') : '…'} open flush>
+        {hosts.hosts.length ? (
+          <>
+            {hosts.hosts.slice(0, 20).map((h) => (
+              <button key={h.host} type="button" className="cx-rrow" onClick={() => openPanel('host', h.host)}>
+                <span className="nm mono sm">{h.host}</span>
+                <span className="x">
+                  <HostStatusChip s={h.status} />
+                </span>
+              </button>
+            ))}
+            {n > Math.min(20, hosts.hosts.length) && (
+              <div className="cx-rrow">
+                <span className="sm muted">and {fmtNum(n - Math.min(20, hosts.hosts.length))} more</span>
+              </div>
+            )}
+          </>
         ) : (
-          <Empty>{hosts.data ? 'No known host matches yet.' : 'Loading…'}</Empty>
+          <Empty>{hosts.data ? (lost > 0 ? 'Every host its pattern matches goes to a more specific rule.' : 'No known host matches yet.') : 'Loading…'}</Empty>
         )}
       </Sec>
       <div className="cx-form-row">
@@ -651,6 +707,6 @@ registerDetail('rule', {
     const l = useRules()
     const r = l.data?.find((x) => String(x.id) === id)
     if (!r) return { title: `Rule ${id}`, body: null, loading: l.loading, missing: l.data ? `There's no rule ${id} (deleted?).` : l.error ? String(l.error) : undefined }
-    return { title: r.pattern, chip: <EffectChip e={r.effect} />, foot: <>GET /admin/api/domain-rules</>, fresh: l, body: <RuleBody r={r} /> }
+    return { title: r.pattern, chip: <EffectChip e={r.effect} />, foot: <>GET /admin/api/domain-rules</>, fresh: l, body: <RuleBody r={r} rules={l.data ?? []} /> }
   },
 })

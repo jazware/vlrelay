@@ -1650,7 +1650,12 @@ mod tests {
         assert_eq!(hosts(NodeAdmin::sort_page(rows.clone(), &q)), ["b.example.com"]);
         // a host the relay pauses is still live, so it can be lagging
         let q: admin::HostQuery = serde_json::from_value(serde_json::json!({"flag": "lagging"})).unwrap();
-        assert_eq!(hosts(NodeAdmin::sort_page(rows, &q)), ["a.example.com", "b.example.com", "c.example.com"]);
+        assert_eq!(hosts(NodeAdmin::sort_page(rows.clone(), &q)), ["a.example.com", "b.example.com", "c.example.com"]);
+        let mut rows = rows;
+        rows[1].rule = Some(3);
+        rows[2].rule = Some(4);
+        let q: admin::HostQuery = serde_json::from_value(serde_json::json!({"rule": 3})).unwrap();
+        assert_eq!(hosts(NodeAdmin::sort_page(rows, &q)), ["b.example.com"]);
     }
 
     #[test]

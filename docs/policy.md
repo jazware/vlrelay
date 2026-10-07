@@ -120,6 +120,11 @@ with an effect of `ban`, `allow`, `tier` or `throttle`. An exact rule may also n
 IPv4 address or `localhost`, with a port (`127.0.0.1:30003`), which is how dev-network hosts are
 known. A spammer spinning up hosts on one domain gets caught as a group.
 
+When several rules match a host, the most specific one decides: an exact name before any wildcard,
+then the longest `*.` suffix. So `demo.example.social` can be trusted under a `*.example.social`
+that starts its hosts at `new`, and a rule's host count (`matches`) leaves out the hosts a more
+specific rule takes.
+
 ## Admission
 
 `requestCrawl` goes through these checks in order: the crawl switch, the hostname rules, domain

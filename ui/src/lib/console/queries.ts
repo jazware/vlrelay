@@ -1,5 +1,5 @@
 import { skipToken, useQuery } from '@tanstack/react-query'
-import { ApiError, publicStats, type Account, type Case, type CaseStatus, type ClusterView, type Consumer, type DiscoveryView, type FullPolicyDoc, type HostDetail, type HostRow, type Overview, type PolicyDoc, type PublicStats, type QCounts, type QRequests, type QuorumHistory, type QuorumView, type SettingsView, type StoreView } from '../api'
+import { ApiError, publicStats, type Account, type Case, type CaseStatus, type ClusterView, type Consumer, type DiscoveryView, type DomainRule, type FullPolicyDoc, type HostDetail, type HostRow, type Overview, type PolicyDoc, type PublicStats, type QCounts, type QRequests, type QuorumHistory, type QuorumView, type SettingsView, type StoreView } from '../api'
 import * as A from './adminAdapter'
 import { keys, olderCase, olderVersion, reconcileCase, reconcileRow, useLive, type Live } from './cache'
 import { heartbeatFailed, heartbeatOk } from './live'
@@ -200,6 +200,19 @@ export const fetchHosts = (q: A.HostQuery) => A.hosts(q).then((l) => ({ ...l, ho
 /** One filter of `GET hosts`. Rates are in the rows, so it polls (`poll`, 5 s by default). */
 export const useHostList = (q: A.HostQuery, o: { poll?: number; keep?: boolean; enabled?: boolean } = {}) =>
   useLive(keys.hosts(hostQueryKey(q)), () => fetchHosts(q), { poll: o.poll ?? 5000, keep: o.keep, enabled: o.enabled })
+
+/**
+ * The hosts a domain rule decides, busiest first (`hosts?rule=`), and how many. A `rules` change
+ * refetches it with the rule set. `q` (the pattern's domain, which every host it decides
+ * contains) narrows it on an older relay, which ignores `rule`: there the rows are filtered here
+ * and the count is the rule's own `matches`.
+ */
+export function useRuleHosts(r: DomainRule, limit = 50) {
+  const l = useHostList({ q: r.pattern.replace(/^\*\./, ''), rule: r.id, sort: 'events', desc: true, limit }, { poll: 15_000 })
+  const rows = l.data?.hosts ?? []
+  const filtered = rows.some((h) => h.rule !== r.id)
+  return { ...l, hosts: filtered ? rows.filter((h) => h.rule === r.id) : rows, total: l.data && !filtered ? l.data.total : r.matches }
+}
 
 /** Throttled hosts (they fall behind instead of dropping), for the banners and the badge. */
 export const useThrottledHosts = () => useHostList({ status: 'throttled', sort: 'lag', desc: true, limit: 200 })

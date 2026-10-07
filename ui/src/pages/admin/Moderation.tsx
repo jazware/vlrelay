@@ -8,6 +8,7 @@ import type { Account, Case, CaseStatus, DomainRule, HostRow, PolicyAudit, Signa
 import { cached, keys } from '../../lib/console/cache'
 import { ago, dt, fmtNum, fmtSi, plural, shortDid } from '../../lib/console/fmt'
 import { useAccountSearch, useCases, useHostList, useOverview, useRules, useRulesAudit, useSignals, useTakedowns } from '../../lib/console/queries'
+import { overriddenBy, overriddenRules } from '../../lib/console/ruleScope'
 import { sevTone } from '../../lib/console/tone'
 import { Link, useSearch } from '../../lib/router'
 import { signalOfKind } from './Policy'
@@ -264,6 +265,20 @@ function Lookup() {
   )
 }
 
+/** A rule's place among the others: the hosts more specific rules take from it, and the broader rule it wins over. */
+function Precedence({ r, rules }: { r: DomainRule; rules: DomainRule[] }) {
+  const by = overriddenBy(r, rules)
+  const lost = by.reduce((n, s) => n + s.matches, 0)
+  const over = overriddenRules(r, rules)[0]
+  const parts = [
+    ...(by.length ? [`${plural(lost, 'host')} to ${by.length === 1 ? `rule ${by[0].id}` : plural(by.length, 'rule')}`] : []),
+    ...(over ? [`overrides rule ${over.id}`] : []),
+  ]
+  if (!parts.length) return <span className="muted">—</span>
+  const title = [...by.map((s) => `rule ${s.id} (${s.pattern}) takes ${plural(s.matches, 'host')}`), ...(over ? [`wins over rule ${over.id} (${over.pattern}) on its hosts`] : [])].join('\n')
+  return <span title={title}>{parts.join(' · ')}</span>
+}
+
 function Rules() {
   const l = useRules()
   const audit = useRulesAudit()
@@ -275,7 +290,8 @@ function Rules() {
     { id: 'pattern', label: 'Pattern', sort: (a, b) => a.pattern.localeCompare(b.pattern), render: (r) => <span className="mono">{r.pattern}</span> },
     { id: 'effect', label: 'Effect', render: (r) => <EffectChip e={r.effect} /> },
     { id: 'note', label: 'Note', className: 'wrap sm t2', render: (r) => r.note || <span className="muted">—</span> },
-    { id: 'matches', label: 'Matches', r: true, sort: (a, b) => a.matches - b.matches, render: (r) => <span className="mono">{fmtNum(r.matches)}</span> },
+    { id: 'matches', label: 'Covers', r: true, sort: (a, b) => a.matches - b.matches, render: (r) => <span className="mono">{fmtNum(r.matches)}</span> },
+    { id: 'prec', label: 'Precedence', className: 'sm t2', render: (r) => <Precedence r={r} rules={l.data ?? []} /> },
     { id: 'by', label: 'By', render: (r) => <span className="sm">{r.createdBy}</span> },
     { id: 'at', label: 'Added', r: true, sort: (a, b) => a.createdAtMs - b.createdAtMs, render: (r) => <span className="sm muted" title={dt(r.createdAtMs)}>{ago(r.createdAtMs)}</span> },
   ]
