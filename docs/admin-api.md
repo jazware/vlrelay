@@ -172,10 +172,10 @@ sure the proxy overwrites the header on every request.
 | GET | `hosts` | `q`, `tier`, `status`, `source` (exact, a prefix ending in `:` or `*`, or `none`: not recorded), `throttled` (`true`: hosts with throttled accounts), `flag` (`atCap`; `lagging`: connected, throttled or in backpressure and over a minute behind; `erroring`: over 10% of frames rejected; `throttledOrAtCap`), `sort` (`host`, `tier`, `status`, `events`, `errors`, `accounts`, `seq`, `since`, `lag`, `throttled`, `source`), `desc`, `limit` (default 10,000), `offset` | `{total, hosts: HostRow[]}`: every host in the leader's table, each with its `status` (`connected`, `idle`, `backoff`, `throttled`: held at its own limits, its tier's, a domain rule's or an operator's throttle; `backpressure`: paused by the relay, which is behind, not by anything about the host; `suspended`, `banned`), `backpressureReason` while it's in `backpressure` (`inflight_full`: its own in-flight cap, `--host-inflight-events`/`--host-inflight-mb`; `node_inflight_full`: the node's over every host, `--inflight-events`/`--inflight-mb`; `queue_full`: its lane queue, usually the lanes waiting on identity lookups; null otherwise), the `node` reading it, `source` (how the relay found it: `requestCrawl`, `bootstrap:<relay>`, `plc` or `cli`), `topReason` (the reject reason with the most of its rejects in the last five minutes on the node reading it, or null) and `throttledAccounts` (accounts it created that the relay throttled past its cap and nobody released, the leader's count). Only this node's hosts carry live numbers |
 | GET | `hosts/admissions` | | `AdmissionLog`: `{newHostsToday, newHostsPerDay, entries}`, the cluster's new-host budget and the last 500 `requestCrawl`s this node answered, newest first: `{atMs, host, outcome, tier?, reason, source}`, with `outcome` one of `admitted` (a new host, or a known one woken), `refused`, `banned` or `rate-limited` |
 | GET | `hosts/{host}` | | `HostDetail`: the row, the limits in force, rejects by reason, a sample of recent rejects, 2 min of per-second events and rejects, operator actions, open cases. The rates and rejects are this node's |
-| POST | `hosts/{host}/action` | `{"action": "set-tier", "tier"}`, `{"action": "throttle", "eventsPerSec": n or null}`, `{"action": "suspend", "reason"}`, `{"action": "ban", "reason"}`, `{"action": "unban"}`, `{"action": "reconnect"}`, `{"action": "set-account-limit", "maxAccounts"}` (null: back to the tier's cap) | the updated `HostRow`. `reconnect` works only on the node reading the host, and elsewhere it's a 400 naming that node. A `set-tier` the host's domain rule would override (any tier under a `ban` rule, any but the rule's own tier and `throttled` under a `tier` rule) is a 409 `TierSetByRule` naming the rule, and nothing is recorded: change the rule instead |
+| POST | `hosts/{host}/action` | `{"action": "set-tier", "tier"}`, `{"action": "throttle", "eventsPerSec": n or null}`, `{"action": "suspend", "reason"}`, `{"action": "ban", "reason"}`, `{"action": "unban"}`, `{"action": "reconnect"}`, `{"action": "set-account-limit", "maxAccounts"}` (null: back to the tier's cap) | the updated `HostRow`, as this node applies it, or one marked `pending` ([Host actions](#host-actions)). `reconnect` works only on the node reading the host, and elsewhere it's a 400 naming that node. A `set-tier` the host's domain rule would override (any tier under a `ban` rule, any but the rule's own tier and `throttled` under a `tier` rule) is a 409 `TierSetByRule` naming the rule, and nothing is recorded: change the rule instead |
 | GET | `discovery` | | `DiscoveryView`: host discovery as the leader runs it (any node answers, asking it): `{leader, leading, connectsPerMin, requestsPerSec, sources}`. Each source (`bootstrap:<relay host>` for a seed relay's `listHosts`, `plc` for the PDS hosts the PLC export names) has `url`, `enabled`, `refreshIntervalSecs`, `nextRunMs` (now while a run is in progress), `pending` (`plc`), and its run's state: `runs`, `lastStartedMs`, `lastFinishedMs`, `cursor`, `inProgress`, `runRequested`, `hostsSeen`, `known` (the relay had them), `new`, `admitted`, `refused`, `errors`, `throttled` (429s and 5xxs waited out), `pages`, `resumed` (a new leader took the run over from its cursor), `lastError` |
 | POST | `discovery/run` | `{source?}` (a source's key; none: every enabled one) | `DiscoveryView` with the run requested |
-| POST | `hosts/{host}/release-throttled` | | `{released}`: lifts the relay throttle of every account the host created past its cap. The leader lists them and each lift is an entry on the log with the `#account` announcing the account's status, so consumers see it |
+| POST | `hosts/{host}/release-throttled` | | `{released}`: lifts the relay throttle of every account the host created past its cap. The leader lists them and each lift is an entry on the log with the `#account` announcing the account's status, so consumers see it. It answers once they've committed, and the host's row (`throttledAccounts`) and its one `host` event already show them |
 | GET, POST | `domain-rules` | POST `{pattern, effect, note}` | `DomainRule[]`, or the new rule |
 | PUT, DELETE | `domain-rules/{id}` | PUT as POST | the rule, or 204 |
 | GET, PUT | `policy` | PUT `{baseVersion, policy, note}` | `PolicyDoc` (version, policy, updated at/by) |
@@ -207,6 +207,32 @@ sure the proxy overwrites the header on every request.
 | GET, POST | `cases/{id}` | POST `{status?, note}` | `Case` |
 | GET | `cases/{id}/evidence` | | `CaseDetail`: the case, its trip count and the newest trips (what was measured, every signal's count at the time) |
 | GET | `changes` | `since` (an event id; the `Last-Event-ID` header wins) | `text/event-stream`: what changed, as it changes ([Change feed](#change-feed)) |
+
+## Host actions
+
+A host action's answer reads its own write. Tier, throttle, suspend, ban, unban and the account
+cap change the host's record, whose tier and policy fields (throttle, cap, the tier a ban
+restores, the action trail) live in the quorum log's host table, held by the leader. The node that
+takes the action sends the record to the leader at once, reads the table back until its copy holds
+the write, applies it to the host's limits and socket, and only then builds the `HostRow` it
+answers with and makes the action's one `host` event (same `version`). It's the same on the
+leader, a single-node relay included, and on any other member.
+
+That wait is bounded (`node::admin::HOST_ACTION_SETTLE`, 3 s). Past it, with no leader answering
+or another write to the host winning, the answer is the row as this node reads it so far, with
+`"pending": true`: the action was recorded on this node, not confirmed by the cluster. It may
+still land, and a later `host` event says when; reload the host before acting on it. `pending`
+appears only on an action's answer, never in a listing.
+
+Every other member applies the change when it next reads the table (every `--qlog-host-poll-ms`,
+500 ms), re-applying the host's limits and socket then, so its row and its own `host` event follow
+within about a second. The table reaches the bucket with the next entry the leader appends, so a
+leader lost in between takes an unlogged change with it; the acting node's answer doesn't wait
+for that.
+
+`reconnect` changes nothing in the table: it drops the socket on the node reading the host, and
+the reconnect's own status changes are later events. `release-throttled` goes through the log
+(above).
 
 ## Change feed
 
@@ -285,7 +311,7 @@ Rows that carry a version, for the console's stale-response checks:
 
 | Row | Field | Means |
 |---|---|---|
-| `HostRow` | `version`, `updatedAtMs` | The node-scoped version and time of the last change to the row as the answering node reads it (null until it sees one). A row's data is never older than its version |
+| `HostRow` | `version`, `updatedAtMs` | The node-scoped version and time of the last change to the row as the answering node reads it (null until it sees one). A row's data is never older than its version. A host action's answer carries its own event's version, or `pending` ([Host actions](#host-actions)) |
 | `PolicyDoc`, `FullPolicyDoc` | `version`, `updatedAtMs` | The document's version |
 | `DomainRule` | `version` | The rule set's version when it was read |
 | `ClusterView` | `lastSeq` | The commit index it was read at |
@@ -318,9 +344,9 @@ Any member serves the feed, and it covers the whole cluster:
 - A member that restarted, or that the serving node lost track of, gets a `*` event for each of
   those kinds with its `node`, so the console refetches what it shows of that member. A member
   that doesn't answer sends nothing, and the `cluster` event says why.
-- A tier change rides the host table, which members read from the leader, and a node's rows take
-  it up within half a minute. The node that ran the action makes its `host` event at once, and
-  each node makes another when its own row shows the new tier.
+- A host action rides the host table, which members read from the leader. The node that ran it
+  makes its `host` event as it answers, and each other node makes its own within about a second,
+  once its row shows the change ([Host actions](#host-actions)).
 
 ### admin_demo
 
@@ -385,7 +411,8 @@ their quorum status:
 | Consumers and kicks | this node. Each member's dashboard lists its own consumers |
 | Hosts list | every host in the leader's table, with the node reading each one |
 | Reconnect | the node reading the host. Elsewhere it's a 400 naming that node |
-| Tier, throttle, suspend, ban, domain rules, policy, cases | any node, through the shared policy store in the bucket |
+| Tier, throttle, suspend, ban, account cap | any node, through the leader's host table, and the answer reads its own write ([Host actions](#host-actions)) |
+| Domain rules, policy, cases | any node, through the shared policy store in the bucket |
 | Cluster and Quorum pages | every member's `status`, asked over the peer port with an 800 ms timeout. A member that doesn't answer is `stale`, with the error, and the page never waits on it |
 | Accounts | the leader, which holds every account's record. On a follower an account read is a 400 naming the leader |
 | Takedown, untakedown, release-throttled | any node. Each goes to the leader as an entry on the log (the record's flag and the `#account` frame together). On a follower the `Account` in a takedown's answer has only what that node knows (status, takedown, the leader as `node`) |

@@ -62,6 +62,8 @@ export type HostRow = {
   version?: string | null
   /** When that change was seen. */
   updatedAtMs?: number | null
+  /** Only on a host action's answer: the cluster hadn't confirmed it in time, so this is the node's view so far, not the result. A later `host` change says when it lands. */
+  pending?: boolean
 }
 
 export type CrawlAdmission = {

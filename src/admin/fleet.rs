@@ -333,6 +333,7 @@ mod tests {
             top_reason: None,
             version: None,
             updated_at_ms: None,
+            pending: false,
         }
     }
 

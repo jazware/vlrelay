@@ -1,12 +1,13 @@
 //! The operator API over the node's real state: hosts and their actions,
 //! consumers, the overview's numbers and account lookups and takedowns.
 //! Policy, domain rules, cases and host tier actions go to the policy
-//! engine's admin half (`node::policy`). The cluster and Quorum views are
+//! engine's admin half (`node::policy`); a host action's answer waits for
+//! the leader's host table to hold it (`Glue::settle_host`). The cluster and Quorum views are
 //! the quorum log's members (`node::quorum::Glue`).
 //!
 //! Numbers are this node's own: the hosts it reads, its consumers, its
 //! rates. Other members' rates and hosts show in the cluster view (from
-//! their statuses); their consumers, host details and host actions are on
+//! their statuses); their consumers, host details and reconnects are on
 //! their own dashboards. Accounts are the leader's records, so an account
 //! lookup or a takedown answers on any node only through the leader's log
 //! (takedowns) or on the leader itself (lookups).
@@ -48,7 +49,14 @@ pub struct NodeAdmin {
     rejects_prev: Mutex<RejectSample>,
     feed: Arc<crate::admin::changes::ChangeFeed>,
     watch: Mutex<changes::Watch>,
+    /// How long a host action waits to see its write in the cluster's host
+    /// table before answering `pending`.
+    settle: Duration,
 }
+
+/// [`NodeAdmin::settle`]'s default: the leader's table is a round trip
+/// away, so only a missing leader or a lost write takes this long.
+pub const HOST_ACTION_SETTLE: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 struct RejectSample {
@@ -130,6 +138,7 @@ impl NodeAdmin {
             }),
             feed: crate::admin::changes::ChangeFeed::new(&node.cfg.node_id),
             watch: Mutex::new(changes::Watch::default()),
+            settle: HOST_ACTION_SETTLE,
             node,
         }
     }
@@ -137,6 +146,11 @@ impl NodeAdmin {
     /// The process's effective config, for the Settings page.
     pub fn with_settings(mut self, s: admin::SettingsView) -> NodeAdmin {
         self.settings = Some(s);
+        self
+    }
+
+    pub fn with_settle(mut self, d: Duration) -> NodeAdmin {
+        self.settle = d;
         self
     }
 
@@ -265,6 +279,7 @@ impl NodeAdmin {
             top_reason: rejects.and_then(top_reason),
             version: None,
             updated_at_ms: None,
+            pending: false,
         }
     }
 
@@ -853,6 +868,8 @@ impl AdminSource for NodeAdmin {
         if self.node.manager.host(&k).is_none() {
             return Err(AdminError::NotFound(format!("unknown host {host}")));
         }
+        let _acting = self.acting(host);
+        let mut pending = false;
         match action {
             admin::HostAction::Reconnect if !self.node.manager.is_running(&k) => {
                 let owner = self.node.quorum.hosts.owners().get(host).cloned().unwrap_or_else(|| "nobody yet".into());
@@ -861,6 +878,10 @@ impl AdminSource for NodeAdmin {
             admin::HostAction::Reconnect => self.node.manager.kick(&k),
             a => {
                 self.admin().host_action(host, a, by).await?;
+                // this node's record reads the tier and policy from its copy
+                // of the leader's table, so the answer waits for that copy
+                // to hold the write
+                pending = !self.node.quorum.settle_host(host, self.settle).await;
                 // the socket follows now, not at the sync loop's next pass
                 self.policy.refresh_host(host).await?;
             }
@@ -869,6 +890,7 @@ impl AdminSource for NodeAdmin {
         if let Some(o) = self.node.quorum.hosts.owners().get(host) {
             row.node = o.clone();
         }
+        row.pending = pending;
         self.host_acted(&mut row);
         Ok(row)
     }
@@ -1174,8 +1196,20 @@ impl AdminSource for NodeAdmin {
     }
 
     async fn release_throttled(&self, host: &str, by: &str) -> AdminResult<admin::Released> {
+        let _acting = self.acting(host);
         let released = self.node.quorum.release_throttled(host).await.map_err(AdminError::Internal)?;
         tracing::info!(target: "vlrelay::audit", host, by, released, "released throttled accounts");
+        if released > 0 {
+            // the leader's count is in its table: read it now, so the row
+            // and its event show the release rather than the next poll's
+            self.node.quorum.refresh_table().await;
+            if let Ok(mut row) = self.host_row(host) {
+                if let Some(o) = self.node.quorum.hosts.owners().get(host) {
+                    row.node = o.clone();
+                }
+                self.host_acted(&mut row);
+            }
+        }
         Ok(admin::Released { released })
     }
 
@@ -1563,6 +1597,7 @@ mod tests {
             top_reason: None,
             version: None,
             updated_at_ms: None,
+            pending: false,
         }
     }
 

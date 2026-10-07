@@ -237,6 +237,12 @@ pub struct HostRow {
     pub version: Option<String>,
     #[serde(default)]
     pub updated_at_ms: Option<i64>,
+    /// Only on a host action's answer: the cluster hadn't confirmed the
+    /// change within a few seconds, so this is the answering node's view
+    /// so far, not the action's result. A later `host` change says when it
+    /// lands (docs/admin-api.md, "Host actions").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

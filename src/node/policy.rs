@@ -5,9 +5,10 @@
 //! - Host tiers and limits: the state host records and the engine own them.
 //!   A per-host cache of `Engine::for_host` is the upstream manager's
 //!   [`PolicySource`]; it's refreshed when a record is written through
-//!   [`PolicyHooks::hosts`] (the driver, operator actions), when the policy
-//!   or the domain rules change version, and every [`RESYNC_EVERY`] for
-//!   writes this node didn't make.
+//!   [`PolicyHooks::hosts`] (the driver, operator actions), when the quorum
+//!   log's host table moves a host's tier or policy (another member's
+//!   write), when the policy or the domain rules change version, and every
+//!   [`RESYNC_EVERY`] for anything else.
 //! - requestCrawl goes through `Engine::admit_host` ([`Admission`]).
 //! - Accounts this node hasn't seen go through [`AccountGate`]. Every one
 //!   counts toward its host's account cap. Only newly created ones (a
@@ -32,8 +33,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-/// Catches host records written elsewhere (a peer, the counter flush) and
-/// time-based limits.
+/// Catches what nothing announces (the counter flush, time-based limits).
 pub const RESYNC_EVERY: Duration = Duration::from_secs(30);
 
 /// Newly created accounts whose event was deferred, so their later events
@@ -275,6 +275,12 @@ impl PolicyHooks {
         if let Some(rx) = self.changed_rx.lock().take() {
             tokio::spawn(self.clone().sync_loop(rx));
         }
+    }
+
+    /// Where to name a host whose record changed elsewhere, for the sync
+    /// loop to re-apply.
+    pub fn changed_sender(&self) -> mpsc::UnboundedSender<String> {
+        self.changed.clone()
     }
 
     fn remember(&self, rec: &HostRecord) -> HostLimits {

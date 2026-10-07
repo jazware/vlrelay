@@ -1053,6 +1053,7 @@ impl Sim {
             node: self.host_shards[h.shard].clone().unwrap_or_default(),
             version: h.version.clone(),
             updated_at_ms: h.updated_at,
+            pending: false,
         }
     }
 
