@@ -1,7 +1,7 @@
 import { useState, useSyncExternalStore, type ReactNode } from 'react'
 import { confirmAction, FormDialog, openDialog } from '../../components/console/dialogs'
 import { registerDetail } from '../../components/console/Drawer'
-import { hostActionDialog, useHostsVersion, type HostVerb } from '../../components/console/hostActions'
+import { hostActionDialog, hostsChanged, useHostsVersion, type HostVerb } from '../../components/console/hostActions'
 import { closePanel, openPanel } from '../../components/console/nav'
 import { toast } from '../../components/console/toast'
 import { Chip, Copy, Empty, HostStatusChip, KV, Over, Sec, Strip, TierTag, type ChipKind } from '../../components/console/kit'
@@ -323,13 +323,55 @@ function RuleDialog({ rule, pattern, close }: { rule?: DomainRule; pattern?: str
 
 export const ruleDialog = (rule?: DomainRule, pattern?: string) => openDialog((close) => <RuleDialog rule={rule} pattern={pattern} close={close} />)
 
-export function deleteRuleDialog(r: DomainRule) {
+const COVERED_SHOWN = 5
+
+/** The hosts a rule decides right now (a more specific rule takes the rest), busiest first. */
+async function coveredHosts(r: DomainRule): Promise<{ hosts: string[]; total: number }> {
+  const l = await A.hosts({ q: baseDomain(r.pattern), sort: 'events', desc: true, limit: 200 })
+  const hosts = l.hosts.filter((h) => h.rule === r.id).map((h) => h.host)
+  return { hosts, total: l.total <= l.hosts.length ? hosts.length : Math.max(r.matches, hosts.length) }
+}
+
+/** Deletes a rule behind a typed confirm that names the hosts it covers. `stay`: from a host, which stays open. */
+export async function deleteRuleDialog(r: DomainRule, opts: { stay?: boolean } = {}) {
+  let covered: { hosts: string[]; total: number } | undefined
+  try {
+    covered = await coveredHosts(r)
+  } catch {
+    // the confirm still opens with the rule's own count
+  }
+  const total = covered?.total ?? r.matches
+  const named = covered?.hosts.slice(0, COVERED_SHOWN) ?? []
   return confirmAction({
     tone: 'err',
     title: `Delete rule ${r.id} (${r.pattern})?`,
     items: [
-      r.effect.kind === 'ban' ? `${plural(r.matches, 'banned host')} may connect again on ${r.matches === 1 ? 'its' : 'their'} next requestCrawl.` : `${plural(r.matches, 'host')} ${r.matches === 1 ? 'goes' : 'go'} back to ${r.matches === 1 ? 'its' : 'their'} own tier and limits.`,
-      'Hosts it already changed keep their state until they’re retiered or unbanned on the host.',
+      total === 0 ? (
+        'It covers no known host.'
+      ) : (
+        <>
+          It covers <b>{plural(total, 'host')}</b>
+          {named.length > 0 && (
+            <>
+              :{' '}
+              {named.map((h, i) => (
+                <span key={h}>
+                  {i > 0 && ', '}
+                  <span className="mono">{h}</span>
+                </span>
+              ))}
+              {total > named.length && ` and ${fmtNum(total - named.length)} more`}
+            </>
+          )}
+          .
+        </>
+      ),
+      ...(total === 0
+        ? []
+        : [
+            r.effect.kind === 'ban' ? `${total === 1 ? 'It' : 'They'} may connect again on ${total === 1 ? 'its' : 'their'} next requestCrawl.` : `${total === 1 ? 'It goes' : 'They go'} back to ${total === 1 ? 'its' : 'their'} own tier and limits.`,
+            'Hosts it already changed keep their state until they’re retiered or unbanned on the host.',
+          ]),
       'Every node reloads the rules within 10 s.',
     ],
     word: r.pattern,
@@ -339,7 +381,8 @@ export function deleteRuleDialog(r: DomainRule) {
       await A.deleteRule(r.id)
       rulesPoll.refresh()
       rulesAuditPoll.refresh()
-      closePanel()
+      hostsChanged()
+      if (!opts.stay) closePanel()
     },
     done: `Deleted rule ${r.id}`,
   })

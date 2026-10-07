@@ -911,9 +911,17 @@ impl Sim {
                 1 => "plc".into(),
                 _ => "bootstrap:relay1.us-east.bsky.network".into(),
             }),
-            rule: self.rules.iter().find(|r| rule_matches(&r.pattern, &h.name)).map(|r| r.id),
+            rule: self.rule_for(&h.name).map(|r| r.id),
             node: self.host_shards[h.shard].clone().unwrap_or_default(),
         }
+    }
+
+    /// The most specific rule, as the relay picks it: the longest name, an exact one first.
+    fn rule_for(&self, host: &str) -> Option<&DomainRule> {
+        self.rules
+            .iter()
+            .filter(|r| rule_matches(&r.pattern, host))
+            .max_by_key(|r| (r.pattern.trim_start_matches("*.").len(), !r.pattern.starts_with("*.")))
     }
 
     fn host_idx(&self, host: &str) -> AdminResult<usize> {
@@ -1188,6 +1196,18 @@ impl AdminSource for Demo {
             && !(x.is_finite() && *x >= 0.0)
         {
             return Err(AdminError::BadRequest("throttle must be ≥ 0 events/s".into()));
+        }
+        if let HostAction::SetTier { tier } = &action
+            && let Some(r) = s.rule_for(&s.hosts[i].name)
+        {
+            let wins = match &r.effect {
+                RuleEffect::Ban => Some("banned"),
+                RuleEffect::Tier { tier: t } if t != tier && tier != "throttled" => Some(t.as_str()),
+                _ => None,
+            };
+            if let Some(w) = wins {
+                return Err(AdminError::tier_set_by_rule(r.id, &r.pattern, w));
+            }
         }
         let h = &mut s.hosts[i];
         match &action {
@@ -2085,6 +2105,39 @@ mod tests {
             d.update_policy(PolicyUpdate { base_version: p.version, policy: np, note: String::new() }, "admin").await;
         assert!(matches!(stale, Err(AdminError::Conflict(_))));
         assert_eq!(d.policy_audit().await.unwrap()[0].changes, vec!["spam.rejectRatio: 0.5 → 0.3".to_string()]);
+    }
+
+    /// A tier a domain rule decides can't be set on the host: a 409 naming the rule, and no
+    /// operator action recorded.
+    #[tokio::test]
+    async fn set_tier_under_a_tier_rule_is_refused() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        let d = Demo::start(7);
+        let app = crate::admin::api_routes(d.clone(), "t".into());
+        let set = |host: &str, tier: &str| {
+            let req = Request::post(format!("/admin/api/hosts/{host}/action"))
+                .header("authorization", "Basic YWRtaW46dA==")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"action":"set-tier","tier":"{tier}"}}"#)))
+                .unwrap();
+            app.clone().oneshot(req)
+        };
+        let host = "pds-7f3a.fastvps.cloud";
+        let before = d.host(host).await.unwrap().actions.len();
+        let r = set(host, "trusted").await.unwrap();
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["error"], "TierSetByRule");
+        assert!(v["message"].as_str().unwrap().contains("rule 2 (*.fastvps.cloud)"), "{v}");
+        let det = d.host(host).await.unwrap();
+        assert_eq!((det.row.tier.as_str(), det.actions.len()), ("new", before));
+        // the rule's own tier and throttled still land; a ban rule refuses every tier
+        assert_eq!(set(host, "new").await.unwrap().status(), StatusCode::OK);
+        assert_eq!(set(host, "throttled").await.unwrap().status(), StatusCode::OK);
+        assert_eq!(set("pds.cryptoairdrop.live", "trusted").await.unwrap().status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

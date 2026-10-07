@@ -821,6 +821,12 @@ select.cx-inp {
   color: var(--ink);
   box-shadow: 0 0 0 1px var(--rule);
 }
+.cx-seg.ro button {
+  cursor: default;
+}
+.cx-seg.ro button:not(.on) {
+  color: var(--ink3);
+}
 .cx-seg button .n {
   font-family: var(--mono);
   font-size: 10.5px;
@@ -2977,6 +2983,24 @@ a.cx-rrow:hover {
 }
 .cx-why .bb .cx-form-row {
   margin-top: 9px;
+}
+
+/* ---------------------------------------------------------------- a host setting a domain rule decides (host actions) */
+.cx-byrule {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.cx-byrule .to {
+  color: var(--ink);
+  font-weight: 600;
+}
+.cx-act.wide {
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+.cx-act.wide .ad {
+  flex-basis: 100%;
 }
 
 /* ---------------------------------------------------------------- over a limit: ratio, value / limit, log bar */

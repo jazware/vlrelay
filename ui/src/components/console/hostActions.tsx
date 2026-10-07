@@ -25,14 +25,15 @@ export const useHostsVersion = () =>
     },
     () => version,
   )
-const changed = () => {
+/** Re-reads the hosts on screen: after a host action, or a rule change that moves hosts. */
+export const hostsChanged = () => {
   version++
   subs.forEach((l) => l())
 }
 
 function spec(verb: HostVerb, h: HostRow, arg?: string): ConfirmSpec | undefined {
   const name = h.host
-  const run = (a: HostAction) => A.hostAction(name, a).then((r) => (changed(), r))
+  const run = (a: HostAction) => A.hostAction(name, a).then((r) => (hostsChanged(), r))
   const call = (a: HostAction) => A.hostActionCall(name, a)
   switch (verb) {
     case 'settier': {

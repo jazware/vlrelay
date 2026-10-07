@@ -10,7 +10,7 @@ import { useLivePoll } from '../../lib/console/live'
 import { policyPoll } from '../../lib/console/polls'
 import { useRelay } from '../../lib/console/relay'
 import { SourceTag } from './hostSource'
-import { casesPoll, releaseDialog, rulesPoll } from './moderationDetail'
+import { casesPoll, deleteRuleDialog, releaseDialog, rulesPoll } from './moderationDetail'
 import { NodeTag, REASON_WHAT, reasonLabel } from './relayUi'
 
 // A PDS host in the slide-over or on its own page: its rates and limits, why its frames are
@@ -54,9 +54,45 @@ const HELD = new Set(['throttled', 'backoff', 'suspended', 'banned'])
 const by = (a: Acted) => `${a.by}, ${ago(a.atMs)}`
 const ruleName = (r: DomainRule) => (
   <button type="button" className="cx-linklike" onClick={() => openPanel('rule', String(r.id))}>
-    rule {r.id} <span className="mono">{r.pattern}</span>
+    rule {r.id} (<span className="mono">{r.pattern}</span>)
   </button>
 )
+const ruleButtons = (r: DomainRule) => [
+  <button key="edit" type="button" className="cx-btn sm" onClick={() => openPanel('rule', String(r.id))}>
+    Edit rule ›
+  </button>,
+  <button key="rm" type="button" className="cx-btn sm danger" onClick={() => deleteRuleDialog(r, { stay: true })}>
+    Remove rule…
+  </button>,
+]
+const ruleSets = (r: DomainRule) => (r.effect.kind === 'ban' ? 'banned' : r.effect.kind === 'tier' ? r.effect.tier : r.effect.kind === 'throttle' ? `${fmtNum(r.effect.eventsPerSec)} events/s` : 'allowed')
+
+/** A host setting a domain rule decides: the rule wins, so the row says which rule and what it sets. */
+function ByRule({ rule, children }: { rule: DomainRule; children?: ReactNode }) {
+  return (
+    <span className="cx-byrule">
+      <span>
+        Set by {ruleName(rule)}{' '}
+        <span className="nowrap">
+          → <span className="to">{ruleSets(rule)}</span>
+        </span>
+      </span>
+      {children}
+    </span>
+  )
+}
+
+/** Who holds the row's throttle: the operator, or a domain rule (some relays show a rule's rate there too). */
+function throttleOf(d: HostDetail, rule?: DomainRule) {
+  const r = d.row
+  const thrSet = r.throttle != null ? [...d.actions].sort((a, b) => b.atMs - a.atMs).find((a) => a.action.action === 'throttle' && a.action.eventsPerSec != null) : undefined
+  const ruleThr = rule?.effect.kind === 'throttle' ? rule.effect.eventsPerSec : undefined
+  const opThr = r.throttle != null && (!!thrSet || ruleThr === undefined || r.throttle !== ruleThr)
+  return { thrSet, ruleThr, opThr }
+}
+
+/** The rule that decides the host's tier: a tier rule, or a ban rule. `set-tier` against it is refused (409 TierSetByRule). */
+const tierRuleOf = (rule?: DomainRule) => (rule && (rule.effect.kind === 'tier' || rule.effect.kind === 'ban') ? rule : undefined)
 
 /**
  * Why a throttled, backing-off, suspended or banned host is held, in one place: the limit that
@@ -69,7 +105,8 @@ function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; 
   const acts = [...d.actions].sort((a, b) => b.atMs - a.atMs)
   const last = (k: HostAction['action']) => acts.find((a) => a.action.action === k)
   const rule = r.rule != null ? rules?.find((x) => x.id === r.rule) : undefined
-  const thrSet = r.throttle != null ? acts.find((a) => a.action.action === 'throttle' && a.action.eventsPerSec != null) : undefined
+  const { thrSet, ruleThr, opThr } = throttleOf(d, rule)
+  const ruleTier = rule?.effect.kind === 'tier' ? rule.effect.tier : undefined
   const hourUse = d.series.events.length ? (d.series.events.reduce((a, b) => a + b, 0) / d.series.events.length) * 3600 : r.eventsPerSec * 3600
   const binding: [string, number, number][] = (
     [
@@ -85,17 +122,20 @@ function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; 
   let title: ReactNode
   const lines: ReactNode[] = []
   const outs: ReactNode[] = []
-  const ruleOut = rule && (
-    <button key="rule" type="button" className="cx-btn sm" onClick={() => openPanel('rule', String(rule.id))}>
-      Edit rule {rule.id} ›
-    </button>
+  // a rule that sets something here is changed on the rule, never on the host
+  const ruleOut = rule && rule.effect.kind !== 'allow' ? ruleButtons(rule) : []
+  const ruleLine = (r: DomainRule, lead = 'Set') => (
+    <>
+      {lead} by {ruleName(r)} → {ruleSets(r)}
+      {r.note ? <> “{r.note}”</> : null} · {r.createdBy}, {ago(r.createdAtMs)}
+    </>
   )
   if (r.status === 'banned' || r.status === 'suspended') {
     tone = 'err'
     const act = last(r.status === 'banned' ? 'ban' : 'suspend')
     const byRule = r.status === 'banned' && rule?.effect.kind === 'ban'
     title = byRule ? <>Banned by domain rule {rule.id}</> : r.status === 'banned' ? 'Banned' : 'Suspended'
-    if (byRule) lines.push(<>Matched {ruleName(rule)}{rule.note ? <> “{rule.note}”</> : null} · {rule.createdBy}, {ago(rule.createdAtMs)}</>)
+    if (byRule) lines.push(ruleLine(rule))
     if (act && (act.action.action === 'ban' || act.action.action === 'suspend')) lines.push(<>By {by(act)}: {act.action.reason}</>)
     else if (!byRule) lines.push(<span className="muted">No operator action on record says who.</span>)
     lines.push(r.status === 'banned' ? 'Its socket stays closed and its requestCrawl is refused.' : 'Its socket is closed and its cursor kept: resuming loses nothing.')
@@ -105,7 +145,7 @@ function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; 
           {r.status === 'banned' ? 'Unban…' : 'Resume…'}
         </button>,
       )
-    if (ruleOut) outs.push(ruleOut)
+    if (byRule) outs.push(...ruleOut)
   } else if (r.status === 'backoff') {
     title = 'Backing off: its last connect failed'
     lines.push(`The reader retries on its own, waiting longer each time${r.connectedSinceMs ? `; it was last connected ${ago(r.connectedSinceMs)}` : ''}.`)
@@ -115,9 +155,6 @@ function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; 
       </button>,
     )
   } else {
-    // a domain rule's throttle shows on the row as `throttle` too; it's the operator's when an action set it or the rates differ
-    const ruleThr = rule?.effect.kind === 'throttle' ? rule.effect.eventsPerSec : undefined
-    const opThr = r.throttle != null && (!!thrSet || ruleThr === undefined || r.throttle !== ruleThr)
     const byRule = r.throttle != null && !opThr
     // the spam policy's auto-throttle sets the same host throttle, and its case says so
     const auto = opThr && !thrSet ? cases?.find((c) => c.host === r.host && /throttl/i.test(c.autoAction ?? '')) : undefined
@@ -140,13 +177,9 @@ function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; 
     )
     if (binding.length) lines.push(<>Binding: {binding.map(([l, u, v]) => `${l} ${fmtSi(u)} of ${fmtNum(v)}`).join(' · ')}</>)
     if (rule && (rule.effect.kind === 'tier' || rule.effect.kind === 'throttle'))
-      lines.push(
-        <>
-          {rule.effect.kind === 'tier' ? 'Tier from' : 'Throttle from'} {ruleName(rule)}
-          {rule.note ? <> “{rule.note}”</> : null} · {rule.createdBy}, {ago(rule.createdAtMs)}
-        </>,
-      )
-    if (!rule || rule.effect.kind !== 'tier') {
+      lines.push(ruleLine(rule, rule.effect.kind === 'tier' ? 'Tier set' : 'Throttle set'))
+    if (ruleTier && r.tier !== ruleTier) lines.push(<>It's {r.tier} now, which the rule doesn't override; it goes back to {ruleTier} when released.</>)
+    if (!ruleTier) {
       const set = last('set-tier')
       lines.push(
         set && set.action.action === 'set-tier' && set.action.tier === r.tier ? (
@@ -174,14 +207,20 @@ function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; 
           Lift throttle…
         </button>,
       )
-    // a tier change only helps when the tier is what binds
-    if (roomier && r.throttle == null && ruleThr === undefined)
+    // a tier change only helps when the tier is what binds, and under a tier rule only the rule's tier lands
+    if (ruleTier && r.tier !== ruleTier && r.throttle == null && ruleThr === undefined)
+      outs.push(
+        <button key="tier" type="button" className="cx-btn sm primary" onClick={() => hostActionDialog('settier', r, ruleTier)}>
+          Release to {ruleTier}, the rule's tier…
+        </button>,
+      )
+    else if (!ruleTier && roomier && r.throttle == null && ruleThr === undefined)
       outs.push(
         <button key="tier" type="button" className="cx-btn sm primary" onClick={() => hostActionDialog('settier', r, roomier[0])}>
           Set tier {roomier[0]} ({fmtNum(roomier[1].eventsPerSec)}/s)…
         </button>,
       )
-    if (ruleOut) outs.push(ruleOut)
+    outs.push(...ruleOut)
   }
   return (
     <div className={`cx-banner ${tone} cx-why`} role="note" aria-label="Why it's held">
@@ -199,9 +238,9 @@ function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; 
   )
 }
 
-/** An action row: what it does on the left, the control on the right. */
-const Act = ({ title, desc, children }: { title: string; desc: ReactNode; children: ReactNode }) => (
-  <div className="cx-act">
+/** An action row: what it does on the left, the control on the right (`wide`: the control below, for a long description). */
+const Act = ({ title, desc, wide, children }: { title: string; desc: ReactNode; wide?: boolean; children: ReactNode }) => (
+  <div className={`cx-act${wide ? ' wide' : ''}`}>
     <div className="ad">
       <b>{title}</b>
       {desc}
@@ -219,6 +258,10 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
   const live = r.status === 'connected' || r.status === 'throttled'
   const blocked = r.status === 'banned' || r.status === 'suspended'
   const tiers = Object.keys(pol.data?.policy.tiers ?? { [r.tier]: null })
+  const rule = r.rule != null ? rules.data?.find((x) => x.id === r.rule) : undefined
+  const tierRule = tierRuleOf(rule)
+  const banRule = rule?.effect.kind === 'ban' ? rule : undefined
+  const thr = throttleOf(d, rule)
   const tierCap = pol.data?.policy.tiers[r.tier]?.maxAccounts
   const ownCap = tierCap != null && d.limits.maxAccounts !== tierCap
   const cap = d.limits.maxAccounts
@@ -275,7 +318,12 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
           <Spark data={d.series.rejects} color="err" />
         </Mini>
       </Minis>
-      <Sec title="Limits in force" digest={`${r.tier} tier${r.throttle != null ? ` · operator throttle ${fmtNum(r.throttle)}/s` : ''}${ownCap ? ' · own account cap' : ''}`} open flush>
+      <Sec
+        title="Limits in force"
+        digest={`${r.tier} tier${thr.opThr ? ` · operator throttle ${fmtNum(r.throttle!)}/s` : ''}${thr.ruleThr !== undefined ? ` · rule throttle ${fmtNum(thr.ruleThr)}/s` : ''}${ownCap ? ' · own account cap' : ''}`}
+        open
+        flush
+      >
         <div className="cx-tw">
           <table className="cx-t compact">
             <thead>
@@ -356,19 +404,57 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
       </Sec>
       <Sec title="Actions" digest="each one is audited on the host record" open flush>
         <div className="cx-acts">
-          <Act title="Tier" desc="Overrides the tier until it's changed again.">
-            <Seg label="Tier" value={r.tier} options={tiers.map((t) => ({ v: t, label: t }))} onChange={(t) => t !== r.tier && hostActionDialog('settier', r, t)} />
+          <Act
+            title="Tier"
+            wide={!!tierRule}
+            desc={
+              tierRule ? (
+                <ByRule rule={tierRule}>
+                  {tierRule.effect.kind === 'tier' && r.tier !== tierRule.effect.tier && <span>It's {r.tier} now; the rule's tier applies when that's lifted.</span>}
+                </ByRule>
+              ) : (
+                "Overrides the tier until it's changed again."
+              )
+            }
+          >
+            <span className="cx-form-row">
+              <Seg
+                label="Tier"
+                value={tierRule?.effect.kind === 'tier' ? tierRule.effect.tier : banRule ? '' : r.tier}
+                options={tiers.map((t) => ({ v: t, label: t }))}
+                disabled={!!tierRule}
+                title={tierRule ? `Set by rule ${tierRule.id} (${tierRule.pattern}): change it on the rule` : undefined}
+                onChange={(t) => !tierRule && t !== r.tier && hostActionDialog('settier', r, t)}
+              />
+              {/* a ban rule's buttons are on the Ban row */}
+              {tierRule && !banRule && ruleButtons(tierRule)}
+            </span>
           </Act>
-          <Act title="Throttle" desc={r.throttle != null ? `Operator throttle at ${fmtNum(r.throttle)}/s.` : 'Hold its reader at a rate. The PDS buffers; nothing is dropped.'}>
+          <Act
+            title="Throttle"
+            wide={thr.ruleThr !== undefined}
+            desc={
+              thr.ruleThr !== undefined ? (
+                <ByRule rule={rule!}>
+                  <span>{thr.opThr ? `An operator throttle at ${fmtNum(r.throttle!)}/s holds too; the lower one wins.` : 'An operator throttle only holds below it.'}</span>
+                </ByRule>
+              ) : thr.opThr ? (
+                `Operator throttle at ${fmtNum(r.throttle!)}/s.`
+              ) : (
+                'Hold its reader at a rate. The PDS buffers; nothing is dropped.'
+              )
+            }
+          >
             <span className="cx-form-row">
               <button type="button" className="cx-btn sm" onClick={() => hostActionDialog('throttle', r)}>
                 Throttle…
               </button>
-              {r.throttle != null && (
+              {thr.opThr && (
                 <button type="button" className="cx-btn sm" onClick={() => hostActionDialog('unthrottle', r)}>
                   Lift
                 </button>
               )}
+              {thr.ruleThr !== undefined && ruleButtons(rule!)}
             </span>
           </Act>
           <Act title="Account cap" desc={`${ownCap ? 'Its own cap' : 'The tier cap'}: ${cap ? fmtNum(cap) : 'none'}.`}>
@@ -394,7 +480,11 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
       </Sec>
       <Sec title="Suspend or ban" danger open={page || blocked} flush>
         <div className="cx-acts">
-          {blocked ? (
+          {banRule && r.status !== 'suspended' ? (
+            <Act title="Ban" wide desc={<ByRule rule={banRule} />}>
+              <span className="cx-form-row">{ruleButtons(banRule)}</span>
+            </Act>
+          ) : blocked ? (
             <Act title={r.status === 'banned' ? 'Unban' : 'Resume'} desc="It can connect again and its requestCrawl works.">
               <button type="button" className="cx-btn sm" onClick={() => hostActionDialog('unban', r)}>
                 {r.status === 'banned' ? 'Unban…' : 'Resume…'}

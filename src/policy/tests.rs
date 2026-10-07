@@ -799,6 +799,30 @@ async fn policy_admin_maps_the_wire_types() {
     assert!(a.domain_rules().await.unwrap().is_empty());
     assert!(matches!(a.delete_domain_rule(1, "op").await, Err(crate::admin::AdminError::NotFound(_))));
 
+    // a tier a domain rule decides is refused, not recorded and ignored
+    let rule_input =
+        |effect| crate::admin::DomainRuleInput { pattern: "pds.example.com".into(), effect, note: String::new() };
+    let trusted = crate::admin::RuleEffect::Tier { tier: "trusted".into() };
+    let rule = a.create_domain_rule(rule_input(trusted), "op").await.unwrap();
+    let err = a.host_action("pds.example.com", HostAction::SetTier { tier: "new".into() }, "op").await.unwrap_err();
+    assert!(
+        matches!(&err, crate::admin::AdminError::TierSetByRule(m) if m.contains(&format!("rule {} (pds.example.com)", rule.id))),
+        "{err}"
+    );
+    let r = hosts.get_host("pds.example.com").await.unwrap().unwrap();
+    assert_eq!((r.tier, PolicyAdmin::host_actions(&r).len()), (Tier::Trusted, 3));
+    // the rule's own tier and throttled take effect, so they land
+    a.host_action("pds.example.com", HostAction::SetTier { tier: "trusted".into() }, "op").await.unwrap();
+    a.host_action("pds.example.com", HostAction::SetTier { tier: "throttled".into() }, "op").await.unwrap();
+    assert_eq!(e.for_host(&hosts.get_host("pds.example.com").await.unwrap().unwrap()).tier, Tier::Throttled);
+    a.update_domain_rule(rule.id, rule_input(crate::admin::RuleEffect::Ban), "op").await.unwrap();
+    assert!(matches!(
+        a.host_action("pds.example.com", HostAction::SetTier { tier: "throttled".into() }, "op").await,
+        Err(crate::admin::AdminError::TierSetByRule(_))
+    ));
+    a.delete_domain_rule(rule.id, "op").await.unwrap();
+    a.host_action("pds.example.com", HostAction::SetTier { tier: "trusted".into() }, "op").await.unwrap();
+
     // cases through the wire types
     e.cases.open_or_update(open("farm.example", 400.0, 1)).await.unwrap();
     assert_eq!(a.cases(Default::default()).await.unwrap().len(), 1);

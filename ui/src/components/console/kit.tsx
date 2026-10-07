@@ -618,11 +618,12 @@ export function Toggle({ on, onChange, label }: { on: boolean; onChange: (v: boo
 }
 
 /** A segmented control. */
-export function Seg<T extends string>({ value, options, onChange, label }: { value: T; options: { v: T; label: ReactNode; n?: ReactNode }[]; onChange: (v: T) => void; label: string }) {
+/** `disabled`: shows the value but takes no clicks (a value something else decides; `title` says what). */
+export function Seg<T extends string>({ value, options, onChange, label, disabled, title }: { value: T; options: { v: T; label: ReactNode; n?: ReactNode }[]; onChange: (v: T) => void; label: string; disabled?: boolean; title?: string }) {
   return (
-    <div className="cx-seg" role="group" aria-label={label}>
+    <div className={`cx-seg${disabled ? ' ro' : ''}`} role="group" aria-label={label} aria-disabled={disabled || undefined} title={title}>
       {options.map((o) => (
-        <button key={o.v} type="button" className={o.v === value ? 'on' : undefined} aria-pressed={o.v === value} onClick={() => onChange(o.v)}>
+        <button key={o.v} type="button" className={o.v === value ? 'on' : undefined} aria-pressed={o.v === value} disabled={disabled} onClick={() => onChange(o.v)}>
           {o.label}
           {o.n !== undefined && <span className="n">{o.n}</span>}
         </button>

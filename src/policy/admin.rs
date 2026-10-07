@@ -364,6 +364,21 @@ impl PolicyAdmin {
                 return Err(AdminError::BadRequest("reconnect is an upstream action, not a policy one".into()));
             }
         };
+        if let Manual::SetTier(t) = m
+            && !matches!(t, Tier::Suspended | Tier::Banned)
+            && let Some(r) = self.engine.rule_for(host)
+        {
+            // what `Engine::for_host` does with the new record: a ban rule always wins, a tier
+            // rule unless the host is throttled
+            let wins = match r.effect {
+                RuleEffect::Ban => Some(Tier::Banned),
+                RuleEffect::Tier { tier } if tier != t && t != Tier::Throttled => Some(tier),
+                _ => None,
+            };
+            if let Some(w) = wins {
+                return Err(AdminError::tier_set_by_rule(r.id, &r.pattern, tier_name(w)));
+            }
+        }
         let entry = serde_json::to_value(HostActionRecord { at_ms: now_ms(), by: by.to_string(), action })
             .map_err(anyhow::Error::from)?;
         let mut outcome: Option<Result<Tier, String>> = None;

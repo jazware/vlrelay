@@ -1069,6 +1069,10 @@ pub enum AdminError {
     /// A CAS update against a stale version.
     #[error("{0}")]
     Conflict(String),
+    /// `set-tier` on a host whose tier a domain rule decides. The rule would
+    /// win, so the action is refused instead of recorded and ignored.
+    #[error("{0}")]
+    TierSetByRule(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -1079,12 +1083,21 @@ impl IntoResponse for AdminError {
             AdminError::NotFound(_) => (StatusCode::NOT_FOUND, "NotFound"),
             AdminError::BadRequest(_) => (StatusCode::BAD_REQUEST, "InvalidRequest"),
             AdminError::Conflict(_) => (StatusCode::CONFLICT, "VersionConflict"),
+            AdminError::TierSetByRule(_) => (StatusCode::CONFLICT, "TierSetByRule"),
             AdminError::Internal(e) => {
                 tracing::error!(error = %e, "admin api");
                 (StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError")
             }
         };
         (status, Json(serde_json::json!({ "error": error, "message": self.to_string() }))).into_response()
+    }
+}
+
+impl AdminError {
+    pub fn tier_set_by_rule(id: u64, pattern: &str, tier: &str) -> AdminError {
+        AdminError::TierSetByRule(format!(
+            "domain rule {id} ({pattern}) sets this host's tier to {tier}: edit or remove the rule to change it"
+        ))
     }
 }
 
