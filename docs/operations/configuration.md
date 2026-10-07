@@ -86,6 +86,7 @@ Without `--memory`, the four `--s3-*` values are required (the keys directly or 
 | `--plc-export-url <PLC_EXPORT_URL>` | `VLRELAY_PLC_EXPORT_URL` |  | The directory --plc-export reads (default: --plc-url) |
 | `--plc-export-rate <PLC_EXPORT_RATE>` |  | `2` | /export requests per second, all streams together (a 429 waits out its Retry-After on top) |
 | `--plc-export-streams <PLC_EXPORT_STREAMS>` |  | `4` | Time windows of the export read side by side on a fresh start |
+| `--plc-seeds-slatedb <PLC_SEEDS_SLATEDB>` | `VLRELAY_PLC_SEEDS_SLATEDB` | `compactions=1,subcompactions=1,fetch-tasks=2,fetch-kb=1024,sst-mb=64,memtable-mb=128` | Memory bounds of the PLC seeds' SlateDB on the leader, as `key=value,...`: compactions at once, subcompactions each, fetch-tasks and fetch-kb of read-ahead per input SST, sst-mb per output SST, memtable-mb unflushed. Keys left out keep the defaults shown. A compaction holds about subcompactions x 8 x fetch-tasks x fetch-kb, plus its output's upload buffers |
 | `--bootstrap-relay <BOOTSTRAP_RELAYS>` | `VLRELAY_BOOTSTRAP_RELAYS` |  | A relay whose com.atproto.sync.listHosts seeds host discovery (read only; repeatable): added to the policy's discovery.seedRelays when it has none yet. The dashboard edits the list after that |
 | `--dev-mode` |  |  | Allows plain ws://, IPs, localhost and ports for upstreams and DID documents. Implied by an http:// --host or a loopback --plc-url |
 | `--did-lookups-per-sec <DID_LOOKUPS_PER_SEC>` |  | `50` | DID document fetches per second, all DIDs together |
@@ -105,6 +106,12 @@ Without `--memory`, the four `--s3-*` values are required (the keys directly or 
 | `--ring-mb <RING_MB>` |  |  | The firehose's in-memory ring of recent events, in MiB (default 512); older cursors read the node's log, then the bucket |
 | `--max-lag-mb <MAX_LAG_MB>` |  |  | Dev mode only: how far a live consumer may fall behind before `ConsumerTooSlow`, in MiB (default 128) |
 | `--log-compression <LOG_COMPRESSION>` |  | `-1` | zstd level for log segments: 0 stores them uncompressed, negative levels are zstd's fast ones. Firehose frames are mostly hashes: on production frames -1 compresses 1.8x faster than 1 for 0.6% more bytes (docs/perf.md, "Compression") |
+| `--event-horizon-secs <EVENT_HORIZON_SECS>` |  | `86400` | Per-host limits and spam signals count a host's events by the time it stamped on them, so a replayed backlog costs what the traffic did; a time older than this counts at this horizon |
+| `--lag-case-minutes <LAG_CASE_MINUTES>` |  | `10` | A host's reader this far behind its stream (in minutes) opens a read-lag case, once it has stayed there --lag-case-sustain-secs while the relay had room for it |
+| `--lag-case-sustain-secs <LAG_CASE_SUSTAIN_SECS>` |  | `120` |  |
+| `--lag-case-grace-secs <LAG_CASE_GRACE_SECS>` |  | `180` | After the relay held a host back (backpressure), or this node was over --lag-case-pressure-pct, its lag doesn't open a case for this long |
+| `--lag-case-pressure-pct <LAG_CASE_PRESSURE_PCT>` |  | `50` | This node's in-flight caps or busiest lane this full (percent) count as the relay's own lag |
+| `--lag-case-resolve-secs <LAG_CASE_RESOLVE_SECS>` |  | `600` | An open read-lag case resolves itself once its host's lag has been under the threshold this long |
 
 ## Quorum log
 
@@ -129,9 +136,10 @@ Every member uses the same bucket and `--prefix`. A node with no `--qlog-peer` i
 | `--qlog-election-ms <QLOG_ELECTION_MS>` |  | `1000` | Silence from the leader that starts an election |
 | `--qlog-heartbeat-ms <QLOG_HEARTBEAT_MS>` |  | `100` | How often the leader heartbeats its followers |
 | `--qlog-state-compactor-poll-ms <QLOG_STATE_COMPACTOR_POLL_MS>` |  | `30000` | The state's SlateDB compactor and worker poll |
+| `--qlog-state-slatedb <QLOG_STATE_SLATEDB>` | `VLRELAY_QLOG_STATE_SLATEDB` | `compactions=2,subcompactions=1,fetch-tasks=2,fetch-kb=1024,sst-mb=256,memtable-mb=256` | Memory bounds of the state's SlateDB, as --plc-seeds-slatedb spells them. Two compactions keep L0s draining while a long merge runs: a seal waits once 32 L0s are queued |
 | `--qlog-no-auto-recover` |  |  | A lost quorum waits for an operator instead of recovering from the bucket |
 | `--qlog-segment-mb <QLOG_SEGMENT_MB>` |  | `64` | Commitlog file size on the local disk |
-| `--qlog-disk-retain-mb <QLOG_DISK_RETAIN_MB>` |  | `4096` | Flushed commitlog kept on the local disk, for followers catching up |
+| `--qlog-disk-retain-mb <QLOG_DISK_RETAIN_MB>` |  | `4096` | Flushed commitlog kept on the local disk, for followers catching up and cursors older than the ring. A start reads all of it (~7 s for 4 GiB); older cursors read the bucket instead |
 | `--durability <DURABILITY>` | `VLRELAY_DURABILITY` |  | When an entry counts on this node: `fsync` (after its fdatasync), `page-cache` (once written to the commitlog, fdatasync'd every --durability-sync-ms; a power cut on a majority within that window is a bucket recovery) or `memory` (no commitlog). Default: page-cache for three members or more, fsync below; a single node only runs fsync |
 | `--durability-sync-ms <DURABILITY_SYNC_MS>` |  | `100` | Page-cache mode's background fdatasync interval |
 | `--slatedb-cache-mb <SLATEDB_CACHE_MB>` | `VLRELAY_SLATEDB_CACHE_MB` | `320` | SlateDB's block and metadata cache, shared by every database this node opens (the quorum log's state, the PLC seeds): the total in MiB, four parts blocks to one of indexes and filters |
@@ -149,3 +157,20 @@ For the chaos harness (`tests/qlog/relay-chaos.sh`); never on a production node.
 | `--qlog-power-cut-on-usr1` |  |  | Chaos: SIGUSR1 is a power cut |
 | `--qlog-fsync-delay-us <QLOG_FSYNC_DELAY_US>` |  |  | Chaos: sleep this long before each commitlog fsync (emulates a disk) |
 | `--qlog-unsafe-trust-log` |  |  | Mutation tests only: trust the commitlog after a power loss in page-cache mode (the check the chaos must catch it without) |
+
+## A small box
+
+A single node at ~3,400 hosts runs on ~1.3 GB of heap and half a core without `--plc-export`. On
+a 2 vCPU / 4 GB box:
+
+- Leave `--plc-export` off, or run it at `--plc-export-rate 1 --plc-export-streams 1` with the
+  default `--plc-seeds-slatedb`. The seeds' SlateDB then runs one compaction at a time, with no
+  subcompactions, 2 x 1 MiB of read-ahead per input and 128 MiB of memtables. On a 40M-row seeds
+  database with compactions owed, reopened and fed at the export's pace with a slow bucket, that
+  peaked at 441 MB against 882 MB with SlateDB's own defaults, and under a 700 MiB cap the
+  defaults were OOM-killed in 85 s where the bounds ran to the end (`seeds_bench`). Watch the
+  process's memory through the fill, about 28 hours at rate 1 (14 at the default 2).
+- `--qlog-disk-retain-mb 1024`: a single node has no followers to catch up, so the disk only
+  serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of
+  it, about 7 s for the default 4 GiB.
+- Keep `--slatedb-cache-mb` at 320. The state's and the seeds' databases share it.

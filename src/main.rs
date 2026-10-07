@@ -72,6 +72,14 @@ struct Args {
     /// Time windows of the export read side by side on a fresh start.
     #[arg(long, default_value_t = 4)]
     plc_export_streams: usize,
+    /// Memory bounds of the PLC seeds' SlateDB on the leader, as
+    /// `key=value,...`: compactions at once, subcompactions each,
+    /// fetch-tasks and fetch-kb of read-ahead per input SST, sst-mb per
+    /// output SST, memtable-mb unflushed. Keys left out keep the defaults
+    /// shown. A compaction holds about subcompactions x 8 x fetch-tasks x
+    /// fetch-kb, plus its output's upload buffers.
+    #[arg(long, env = "VLRELAY_PLC_SEEDS_SLATEDB", default_value_t = vlrelay::qlog::state::Bounds::SEEDS.to_string())]
+    plc_seeds_slatedb: String,
     /// A relay whose com.atproto.sync.listHosts seeds host discovery (read
     /// only; repeatable): added to the policy's discovery.seedRelays when
     /// it has none yet. The dashboard edits the list after that.
@@ -259,6 +267,11 @@ struct QuorumArgs {
     /// The state's SlateDB compactor and worker poll.
     #[arg(long, default_value_t = 30_000)]
     qlog_state_compactor_poll_ms: u64,
+    /// Memory bounds of the state's SlateDB, as --plc-seeds-slatedb spells
+    /// them. Two compactions keep L0s draining while a long merge runs: a
+    /// seal waits once 32 L0s are queued.
+    #[arg(long, env = "VLRELAY_QLOG_STATE_SLATEDB", default_value_t = vlrelay::qlog::state::Bounds::STATE.to_string())]
+    qlog_state_slatedb: String,
     /// A lost quorum waits for an operator instead of recovering from the
     /// bucket.
     #[arg(long)]
@@ -266,7 +279,9 @@ struct QuorumArgs {
     /// Commitlog file size on the local disk.
     #[arg(long, default_value_t = 64)]
     qlog_segment_mb: u64,
-    /// Flushed commitlog kept on the local disk, for followers catching up.
+    /// Flushed commitlog kept on the local disk, for followers catching up
+    /// and cursors older than the ring. A start reads all of it (~7 s for
+    /// 4 GiB); older cursors read the bucket instead.
     #[arg(long, default_value_t = 4096)]
     qlog_disk_retain_mb: u64,
     /// Committed log kept in memory (default 64 with --qlog-dir, else 512).
@@ -345,6 +360,8 @@ fn quorum_setup(q: &QuorumArgs, node_id: &str) -> anyhow::Result<vlrelay::node::
     s.trust_after_power_loss = q.qlog_unsafe_trust_log;
     s.fsync_delay = q.qlog_fsync_delay_us.map(Duration::from_micros);
     vlrelay::qlog::state::set_compactor_poll(Duration::from_millis(q.qlog_state_compactor_poll_ms));
+    let bounds = vlrelay::qlog::state::Bounds::STATE.parse(&q.qlog_state_slatedb);
+    vlrelay::qlog::state::set_state_bounds(bounds.map_err(|e| anyhow::anyhow!("--qlog-state-slatedb: {e}"))?);
     vlrelay::qlog::cache::configure(q.slatedb_cache_mb);
     if let Some(at) = q.qlog_crash_at.clone().filter(|a| !a.is_empty()) {
         use vlrelay::qlog::flush::Step;
@@ -468,6 +485,8 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
         cfg.identity.burst = cfg.identity.burst.max(1000.0);
     }
     let mut q = quorum_setup(&a.quorum, &a.node_id)?;
+    let bounds = vlrelay::qlog::state::Bounds::SEEDS.parse(&a.plc_seeds_slatedb);
+    vlrelay::qlog::state::set_seed_bounds(bounds.map_err(|e| anyhow::anyhow!("--plc-seeds-slatedb: {e}"))?);
     if a.plc_export {
         let mut pc = vlrelay::plc_seed::ingest::Config::new(a.plc_export_url.as_deref().unwrap_or(&a.plc_url));
         anyhow::ensure!(a.plc_export_rate > 0.0, "--plc-export-rate must be above 0");

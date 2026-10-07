@@ -82,13 +82,142 @@ fn compactor_poll() -> Duration {
     Duration::from_millis(COMPACTOR_POLL_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-pub(crate) fn settings(l0_bytes: usize) -> slatedb::Settings {
+/// How much memory a SlateDB's memtables and compactor may hold, as
+/// `--qlog-state-slatedb` / `--plc-seeds-slatedb` spell it
+/// (`compactions=1,subcompactions=1,fetch-tasks=2,fetch-kb=1024,sst-mb=64,memtable-mb=128`;
+/// a key left out keeps its default).
+///
+/// SlateDB's own defaults are sized for a big box: 4 compactions of 4
+/// subcompactions each, every one reading up to 8 sources 4 x 2 MiB ahead
+/// and streaming its output through a multipart writer that buffers parts
+/// while the bucket is slow, plus 256 MiB of memtables per database with
+/// the WAL off. On a 4 GB node the seeds' compactions alone took the
+/// process past its memory limit. A compaction's peak is roughly
+/// `subcompactions x (sources x fetch-tasks x fetch-kb + its output's
+/// buffered parts)`, so these bound it per database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bounds {
+    /// Compactions at once (the coordinator's and its worker's).
+    pub compactions: usize,
+    /// Parts one compaction is split into, run side by side (1: none).
+    pub subcompactions: usize,
+    /// Read-ahead requests in flight per input SST.
+    pub fetch_tasks: usize,
+    /// Bytes per read-ahead request.
+    pub fetch_bytes: usize,
+    /// A compaction's output SSTs roll at this size.
+    pub sst_bytes: usize,
+    /// Memtables, frozen ones included, not yet in the bucket: past it
+    /// writes wait (the WAL is off).
+    pub memtable_bytes: usize,
+}
+
+impl Bounds {
+    /// The state takes one L0 per seal and stalls seals at `l0_max_ssts`:
+    /// a second compaction keeps L0s draining while a long sorted-run merge
+    /// holds the first. Its memtables keep their old cap: a flush
+    /// interval's writes fit one, and a smaller cap would hold the applier
+    /// back during a catch-up.
+    pub const STATE: Bounds = Bounds {
+        compactions: 2,
+        subcompactions: 1,
+        fetch_tasks: 2,
+        fetch_bytes: 1 << 20,
+        sst_bytes: 256 << 20,
+        memtable_bytes: 256 << 20,
+    };
+
+    /// The seeds are a cache filled in the background: one compaction at a
+    /// time is enough, and a slower fill costs nothing but time.
+    pub const SEEDS: Bounds = Bounds {
+        compactions: 1,
+        subcompactions: 1,
+        fetch_tasks: 2,
+        fetch_bytes: 1 << 20,
+        sst_bytes: 64 << 20,
+        memtable_bytes: 128 << 20,
+    };
+
+    /// SlateDB's own, as every database ran before the bounds (benches).
+    pub const SLATEDB_DEFAULT: Bounds = Bounds {
+        compactions: 4,
+        subcompactions: 4,
+        fetch_tasks: 4,
+        fetch_bytes: 2 << 20,
+        sst_bytes: 256 << 20,
+        memtable_bytes: 256 << 20,
+    };
+
+    /// `self` with the keys `spec` names changed.
+    pub fn parse(self, spec: &str) -> Result<Bounds, String> {
+        let mut b = self;
+        for kv in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let (k, v) = kv.split_once('=').ok_or_else(|| format!("{kv}: want key=value"))?;
+            let n: usize = v.trim().parse().map_err(|e| format!("{kv}: {e}"))?;
+            if n == 0 {
+                return Err(format!("{kv}: must be at least 1"));
+            }
+            match k.trim() {
+                "compactions" => b.compactions = n,
+                "subcompactions" => b.subcompactions = n,
+                "fetch-tasks" => b.fetch_tasks = n,
+                "fetch-kb" => b.fetch_bytes = n << 10,
+                "sst-mb" => b.sst_bytes = n << 20,
+                "memtable-mb" => b.memtable_bytes = n << 20,
+                k => {
+                    return Err(format!(
+                        "unknown key {k} (compactions, subcompactions, fetch-tasks, fetch-kb, sst-mb, memtable-mb)"
+                    ));
+                }
+            }
+        }
+        Ok(b)
+    }
+}
+
+impl std::fmt::Display for Bounds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "compactions={},subcompactions={},fetch-tasks={},fetch-kb={},sst-mb={},memtable-mb={}",
+            self.compactions,
+            self.subcompactions,
+            self.fetch_tasks,
+            self.fetch_bytes >> 10,
+            self.sst_bytes >> 20,
+            self.memtable_bytes >> 20
+        )
+    }
+}
+
+static STATE_BOUNDS: parking_lot::RwLock<Bounds> = parking_lot::RwLock::new(Bounds::STATE);
+static SEED_BOUNDS: parking_lot::RwLock<Bounds> = parking_lot::RwLock::new(Bounds::SEEDS);
+
+/// Sets the bounds every later open of the state uses.
+pub fn set_state_bounds(b: Bounds) {
+    *STATE_BOUNDS.write() = b;
+}
+
+pub fn state_bounds() -> Bounds {
+    *STATE_BOUNDS.read()
+}
+
+/// Sets the bounds every later open of the PLC seeds' writer uses.
+pub fn set_seed_bounds(b: Bounds) {
+    *SEED_BOUNDS.write() = b;
+}
+
+pub fn seed_bounds() -> Bounds {
+    *SEED_BOUNDS.read()
+}
+
+pub(crate) fn settings(l0_bytes: usize, b: Bounds) -> slatedb::Settings {
     let poll = compactor_poll();
     slatedb::Settings {
         wal_enabled: false,
         l0_sst_size_bytes: l0_bytes,
         // above the L0 size: with the WAL off, a cap below it stalls writes
-        max_unflushed_bytes: (l0_bytes * 4).max(256 << 20),
+        max_unflushed_bytes: b.memtable_bytes.max(l0_bytes * 2),
         // every seal uploads an L0, and an upload past this many waits for
         // the compactor (seen as 1-5 s seals at 2 s flushes with the
         // default 8); 32 is minutes of flushes at any interval used here
@@ -99,8 +228,14 @@ pub(crate) fn settings(l0_bytes: usize) -> slatedb::Settings {
         manifest_poll_interval: std::time::Duration::from_secs(10),
         compactor_options: Some(slatedb::config::CompactorOptions {
             poll_interval: poll,
+            max_concurrent_compactions: b.compactions,
             worker: Some(slatedb::config::CompactionWorkerOptions {
                 compactions_poll_interval: poll,
+                max_concurrent_compactions: b.compactions,
+                max_subcompactions: b.subcompactions,
+                max_fetch_tasks: b.fetch_tasks,
+                bytes_to_fetch: b.fetch_bytes,
+                max_sst_size: b.sst_bytes,
                 ..Default::default()
             }),
             ..Default::default()
@@ -168,7 +303,7 @@ impl State {
         let path = db_path(store, rel);
         let (cache, id) = super::cache::for_db(path.as_ref());
         let db = Db::builder(path.clone(), store.raw.clone())
-            .with_settings(settings(l0_bytes))
+            .with_settings(settings(l0_bytes, state_bounds()))
             .with_db_cache(cache, id)
             .build()
             .await?;
@@ -389,6 +524,28 @@ mod tests {
     /// Memtables freeze and upload on their own (tiny L0s) before and after
     /// the seal, and writes go on right after it: the checkpoint still holds
     /// exactly the seal point, by its manifest and by its contents.
+    #[test]
+    fn bounds_parse_over_their_defaults_and_reach_the_settings() {
+        let b = Bounds::SEEDS.parse("compactions=3, fetch-kb=512,memtable-mb=96").unwrap();
+        assert_eq!(b, Bounds { compactions: 3, fetch_bytes: 512 << 10, memtable_bytes: 96 << 20, ..Bounds::SEEDS });
+        assert_eq!(Bounds::STATE.parse(&Bounds::SEEDS.to_string()).unwrap(), Bounds::SEEDS);
+        assert_eq!(Bounds::SEEDS.parse("").unwrap(), Bounds::SEEDS);
+        for bad in ["compactions", "compactions=0", "compactions=x", "zstd=1"] {
+            assert!(Bounds::SEEDS.parse(bad).is_err(), "{bad}");
+        }
+        let s = settings(64 << 20, Bounds::SEEDS);
+        let c = s.compactor_options.unwrap();
+        let w = c.worker.unwrap();
+        assert_eq!(c.max_concurrent_compactions, 1);
+        assert_eq!(
+            (w.max_concurrent_compactions, w.max_subcompactions, w.max_fetch_tasks, w.bytes_to_fetch, w.max_sst_size),
+            (1, 1, 2, 1 << 20, 64 << 20)
+        );
+        assert_eq!(s.max_unflushed_bytes, 128 << 20);
+        // never below two L0s: with the WAL off a smaller cap stalls writes
+        assert_eq!(settings(96 << 20, Bounds::SEEDS).max_unflushed_bytes, 192 << 20);
+    }
+
     #[tokio::test]
     async fn a_seal_holds_exactly_its_point_across_automatic_flushes() {
         let store = Store::memory(None);
