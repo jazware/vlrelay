@@ -58,6 +58,10 @@ export type HostRow = {
   topReason: RejectReason | null
   /** Events/s, 1 s apart, oldest first: only on the overview's top hosts. */
   history?: number[]
+  /** Node-scoped version of the row's last change as the answering node reads it (see `compareVersions`); null until it sees one. Absent on an older relay. */
+  version?: string | null
+  /** When that change was seen. */
+  updatedAtMs?: number | null
 }
 
 export type CrawlAdmission = {
@@ -177,7 +181,17 @@ export type HostDetail = {
 }
 
 export type RuleEffect = { kind: 'ban' } | { kind: 'allow' } | { kind: 'tier'; tier: string } | { kind: 'throttle'; eventsPerSec: number }
-export type DomainRule = { id: number; pattern: string; effect: RuleEffect; note: string; createdAtMs: number; createdBy: string; matches: number }
+export type DomainRule = {
+  id: number
+  pattern: string
+  effect: RuleEffect
+  note: string
+  createdAtMs: number
+  createdBy: string
+  matches: number
+  /** The rule set's version when read: compares with a `rules` change's. Absent on an older relay. */
+  version?: number
+}
 export type DomainRuleInput = { pattern: string; effect: RuleEffect; note: string }
 
 export type SpamThresholds = {
@@ -707,3 +721,61 @@ export type RejectTop = {
   sample?: { atMs: number; did: string; reason: string; upstreamSeq: number; detail: string }
 }
 
+
+// ---------------------------------------------------------------- change feed
+
+// `GET /admin/api/changes` (docs/admin-api.md, "Change feed"): Server-Sent
+// Events naming what changed. Read it with fetch so the token and
+// Last-Event-ID go along; EventSource can't send Authorization.
+
+export type ChangeKind = 'host' | 'policy' | 'rules' | 'takedown' | 'account' | 'cluster' | 'consumer' | 'discovery' | 'plc' | 'case'
+
+/** `version`: a number in a string (a log seq or a document version, cluster-wide) or `<node>:<counter>` (node-scoped). `id` `*`: more than 256 of the kind changed at once, refetch the list. */
+export type Change = {
+  kind: ChangeKind
+  id: string
+  version: string
+  /** Whose observation it is: the node that read the host, served the consumer, ran discovery or saw the commit. */
+  node: string
+  atMs: number
+  hint?: ChangeHint
+}
+
+export type ChangeHint = {
+  status?: HostStatus
+  backpressureReason?: BackpressureReason | null
+  tier?: string
+  takedown?: boolean
+  host?: string
+  epoch?: number
+  leader?: string | null
+  event?: 'connect' | 'disconnect'
+  inProgress?: boolean
+  caughtUp?: boolean
+  [k: string]: unknown
+}
+
+/** `event: hello`, first on every connection, with no id. */
+export type ChangeHello = { node: string; boot: string; atMs: number; resumed: boolean }
+
+/** `event: resync`: refetch everything shown, then carry on from live. */
+export type ChangeResync = { reason: 'unknown-cursor' | 'expired' | 'lagged'; atMs: number }
+
+export type ChangeMessage =
+  | { event: 'hello'; data: ChangeHello }
+  | { event: 'change'; id: string; data: Change }
+  | { event: 'resync'; id: string; data: ChangeResync }
+
+/** -1, 0 or 1 when the two versions compare (both numbers, or both from one node), null when they don't: then treat the event as new. */
+export function compareVersions(a: string, b: string): -1 | 0 | 1 | null {
+  const split = (v: string): [string, bigint] | null => {
+    const i = v.lastIndexOf(':')
+    const n = i < 0 ? v : v.slice(i + 1)
+    if (!/^\d+$/.test(n)) return null
+    return [i < 0 ? '' : v.slice(0, i), BigInt(n)]
+  }
+  const x = split(a)
+  const y = split(b)
+  if (!x || !y || x[0] !== y[0]) return null
+  return x[1] < y[1] ? -1 : x[1] > y[1] ? 1 : 0
+}

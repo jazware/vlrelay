@@ -206,6 +206,129 @@ sure the proxy overwrites the header on every request.
 | GET | `cases` | `status`: open, acknowledged, resolved, dismissed | `Case[]`, worst severity first |
 | GET, POST | `cases/{id}` | POST `{status?, note}` | `Case` |
 | GET | `cases/{id}/evidence` | | `CaseDetail`: the case, its trip count and the newest trips (what was measured, every signal's count at the time) |
+| GET | `changes` | `since` (an event id; the `Last-Event-ID` header wins) | `text/event-stream`: what changed, as it changes ([Change feed](#change-feed)) |
+
+## Change feed
+
+`GET /admin/api/changes` is one Server-Sent Events stream that says what changed and when, so the
+console refetches (or patches) the rows that moved instead of polling every page. An event names
+an entity and its new version and carries little else: the endpoints above stay the source of
+the data.
+
+```bash
+curl -N -u admin:$TOKEN https://relay.example.com/admin/api/changes
+```
+
+It takes the same auth as every other endpoint. `EventSource` can't send an `Authorization`
+header, so with the token the console reads the stream with `fetch` and a `ReadableStream`, which
+also lets it send `Last-Event-ID`. Signed in through a proxy, a plain `EventSource` works. A relay
+without the feed answers 404, and the console goes on polling. A node serves at most 64 feeds at
+once, and the next one is a 503 (`TooManyFeeds`).
+
+### Messages
+
+| Event | `id:` | Data | When |
+|---|---|---|---|
+| `hello` | none | `{node, boot, atMs, resumed}` | First on every connection. `resumed` is true when the feed picked up after the `Last-Event-ID` it was sent, with nothing missed |
+| `change` | `<boot>.<n>` | `Change`: `{kind, id, version, node, atMs, hint?}` | Something changed (the kinds below) |
+| `resync` | `<boot>.<n>` | `{reason, atMs}` | The feed can't say what the client missed: refetch everything the page shows. `reason` is `unknown-cursor` (a `Last-Event-ID` from another node or before a restart), `expired` (older than the node keeps) or `lagged` (this client fell more than 1,024 events behind) |
+| comment | | `: ping` | Every 15 s, so proxies keep the stream open and the client can tell a dead one |
+
+`boot` is fixed for the life of the serving process and `n` counts up from 1. A client sends the
+last `id:` it saw as `Last-Event-ID` (or `?since=`) when it reconnects. The serving node keeps its
+last 4,096 events, and a cursor among them is replayed from the next event on, so a reconnect
+inside that window misses nothing. Anything else gets `hello` with `resumed: false` and then a
+`resync`. With no cursor at all the feed starts live, after `hello`, and the client does its usual
+first fetch.
+
+After a `resync` the stream goes on from live, and the `resync`'s own id is the cursor to resume
+from.
+
+### Kinds
+
+| `kind` | `id` | `version` | What makes one | `hint` | Refetch |
+|---|---|---|---|---|---|
+| `host` | hostname | node-scoped | The host's row as `node` reads it: status (backpressure included, with its reason), tier, throttle, domain rule, account cap, source, owner, throttled accounts. An operator's host action makes one at once on the node that ran it | `{status, backpressureReason?, tier}` | `hosts`, `hosts/{host}` |
+| `policy` | `policy` | the policy document's version | A saved policy (`PUT policy` or `policy/full`) | | `policy`, `policy/full`, `policy/audit`, `policy/usage` |
+| `rules` | `rules` | the domain rules' version | A rule added, changed or deleted | | `domain-rules`, `domain-rules/audit`, `hosts` (the `rule` column) |
+| `takedown` | DID | log seq | A takedown or its reversal, committed | `{takedown}` | `takedowns`, `accounts/{did}` |
+| `account` | DID | log seq | A relay throttle lifted (`release-throttled`), committed | `{host}` | `accounts/{did}`, the host's row |
+| `cluster` | `quorum` | log seq: the commit index when `node` saw it | The leader, the epoch, the members or learners changed, or a bucket recovery | `{epoch, leader}` | `cluster`, `cluster/quorum`, `cluster/quorum/history` |
+| `consumer` | `<node>/<consumer id>` | node-scoped | A `subscribeRepos` consumer connected or left (a kick included) | `{event}`: `connect` or `disconnect` | `consumers` |
+| `discovery` | the source's key (`plc`, `bootstrap:<relay host>`) | node-scoped (the leader's) | A run started, finished or moved on | `{inProgress}` | `discovery` |
+| `plc` | `export` | node-scoped (the leader's) | The PLC export read on, or caught up | `{caughtUp}` | `ops/plc` |
+| `case` | the case id | node-scoped | A case opened, tripped again or changed through the API | `{status}` | `cases`, `cases/{id}` |
+
+An `id` of `*` means more than 256 of that kind changed within one window: refetch the kind's list
+rather than each row. A `*` with a `node` is about that node's view only.
+
+`node` is the node whose observation it is: the one that read the host, served the consumer, ran
+discovery or saw the commit. The `hint` is a convenience for patching a row before the refetch
+lands. It may be absent, and the refetched row wins.
+
+### Versions
+
+Every `version` is a string, in one of two forms:
+
+- **A number** (`"48213"`): a log seq (the commit index for `cluster`), or a document's version
+  for `policy` and `rules`. These are cluster-wide, so they compare across nodes: a bigger one is
+  newer for the same kind and id. `PolicyDoc.version`, `FullPolicyDoc.version`,
+  `DomainRule.version` and `ClusterView.lastSeq` are the matching row versions.
+- **Node-scoped** (`"n2:1759816523004117"`): `<node>:<counter>`. It compares only with another
+  version from the same node, and the counter keeps counting up across that node's restarts
+  (it starts from the clock in microseconds). `HostRow.version` is one.
+
+Two versions that don't compare (different forms, or two nodes) say nothing about which is newer:
+treat the event as new and refetch. `compareVersions` in `ui/src/lib/api.ts` does this.
+
+Rows that carry a version, for the console's stale-response checks:
+
+| Row | Field | Means |
+|---|---|---|
+| `HostRow` | `version`, `updatedAtMs` | The node-scoped version and time of the last change to the row as the answering node reads it (null until it sees one). A row's data is never older than its version |
+| `PolicyDoc`, `FullPolicyDoc` | `version`, `updatedAtMs` | The document's version |
+| `DomainRule` | `version` | The rule set's version when it was read |
+| `ClusterView` | `lastSeq` | The commit index it was read at |
+| `Case` | `updatedAtMs` | When it last changed |
+
+Consumers, discovery, the PLC view, takedowns and the quorum statuses carry live numbers and no
+version. Their events only say when to refetch.
+
+### Order and delivery
+
+- One serving node's feed is in the order it emits. Log-backed events come in commit order, and
+  one node's node-scoped events come in that node's order. There is no order between sources.
+- Delivery is at least once. The same change can come twice (a policy version seen by two nodes,
+  a replay), so applying an event must be idempotent.
+- Hot entities are coalesced: a host, consumer, discovery source or the PLC export makes at most
+  one event per second, carrying its latest state. Log-backed events go out as their entries
+  commit.
+
+### Across members
+
+Any member serves the feed, and it covers the whole cluster:
+
+- **Log-backed** kinds (`takedown`, `account`, `cluster`) come from the serving node's own copy of
+  the log, so they reach every feed as each node commits.
+- **Node-scoped** kinds (`host`, `consumer`, `discovery`, `plc`, `case`) and the document kinds
+  (`policy`, `rules`) are made by the node that saw them. While it has a feed open, the serving
+  node asks every other member for its new events once a second over the peer port (as
+  `consumers` does), so they arrive within about two seconds. A member forwards a `host` event
+  only for a host it reads, since its status is live only there.
+- A member that restarted, or that the serving node lost track of, gets a `*` event for each of
+  those kinds with its `node`, so the console refetches what it shows of that member. A member
+  that doesn't answer sends nothing, and the `cluster` event says why.
+- A tier change rides the host table, which members read from the leader, so a node shows it a
+  few seconds later than the node that made it. The node that ran the action makes its `host`
+  event at once.
+
+### admin_demo
+
+`admin_demo` serves the feed over its simulation: host statuses flapping, consumers coming and
+going, a discovery run and the PLC export moving, every few seconds, and an event for each action
+(host actions, throttled-account release, takedowns, policy and rule edits, membership changes,
+kicks), with versions from its simulated log and nodes. Its rows carry `version` and
+`updatedAtMs` the same way.
 
 ## Policy
 
@@ -268,6 +391,7 @@ their quorum status:
 | Takedown, untakedown, release-throttled | any node. Each goes to the leader as an entry on the log (the record's flag and the `#account` frame together). On a follower the `Account` in a takedown's answer has only what that node knows (status, takedown, the leader as `node`) |
 | Admissions, tail, store | this node: the `requestCrawl`s it answered, the frames it read, the requests it sent. Retention is the leader's last pass, read from the bucket |
 | Membership changes | any node, which sends them to the leader with `--qlog-admin-token` |
+| Change feed | any node: its own events and the log's, and every other member's, asked for once a second while a feed is open ([Change feed](#across-members)) |
 
 So to look at a member's consumers or a host's live numbers, open that member's dashboard. To
 read accounts, open the leader's.
