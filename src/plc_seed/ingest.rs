@@ -148,27 +148,76 @@ pub struct Stats {
     pub caught_up: AtomicBool,
     /// The newest `createdAt` read, unix ms.
     pub newest_ms: AtomicU64,
-    /// (when, ops) at the last [`Stats::rate`] sample, and the rate then.
-    sampled: Mutex<Option<(Instant, u64, f64)>>,
+    /// [`Stats::rate`]'s value, f64 bits, kept by the ingest loop's
+    /// [`RateMeter`].
+    rate_bits: AtomicU64,
 }
 
 impl Stats {
-    /// Ops read per second since the previous call at least 2 s ago.
+    /// Export ops read per second, smoothed over about
+    /// [`RateMeter::TAU`]; 0 when no ingest is running.
     pub fn rate(&self) -> f64 {
-        let ops = self.ops.load(Relaxed);
-        let mut s = self.sampled.lock();
-        match *s {
-            Some((at, _, r)) if at.elapsed() < Duration::from_secs(2) => r,
-            Some((at, n, _)) => {
-                let r = ops.saturating_sub(n) as f64 / at.elapsed().as_secs_f64();
-                *s = Some((Instant::now(), ops, r));
-                r
-            }
-            None => {
-                *s = Some((Instant::now(), ops, 0.0));
-                0.0
-            }
+        f64::from_bits(self.rate_bits.load(Relaxed))
+    }
+
+    fn set_rate(&self, r: f64) {
+        self.rate_bits.store(r.to_bits(), Relaxed);
+    }
+}
+
+struct ZeroRate<'a>(&'a Stats);
+
+impl Drop for ZeroRate<'_> {
+    fn drop(&mut self) {
+        self.0.set_rate(0.0);
+    }
+}
+
+/// An exponentially weighted ops rate, sampled by the ingest loop so the
+/// admin view's value doesn't depend on who reads it or how often.
+#[derive(Debug)]
+pub struct RateMeter {
+    at: Instant,
+    ops: u64,
+    ewma: f64,
+    /// The weight the EWMA has gathered since the start, 1 - e^(-t/τ).
+    weight: f64,
+}
+
+impl RateMeter {
+    /// The export reads in pages of up to 1,000 ops at a couple of requests
+    /// a second, so per-second counts are bursty; ~15 s smooths a few
+    /// pages while still showing a pace-out or catch-up within half a
+    /// minute.
+    pub const TAU: Duration = Duration::from_secs(15);
+    /// The loop wakes at least every `apply_every` (2 s) even when idle;
+    /// sampling no more often than this keeps each sample's interval long
+    /// enough to hold whole pages.
+    pub const EVERY: Duration = Duration::from_secs(1);
+
+    pub fn new(now: Instant, ops: u64) -> RateMeter {
+        RateMeter { at: now, ops, ewma: 0.0, weight: 0.0 }
+    }
+
+    /// Folds in the ops since the last sample, if at least [`Self::EVERY`]
+    /// has passed, and publishes the rate to `stats`.
+    pub fn sample(&mut self, stats: &Stats, now: Instant, ops: u64) {
+        let dt = now.saturating_duration_since(self.at);
+        if dt < Self::EVERY {
+            return;
         }
+        let inst = ops.saturating_sub(self.ops) as f64 / dt.as_secs_f64();
+        // α from the actual interval, so a late sample (a slow apply or
+        // checkpoint) weighs what that much time should.
+        let alpha = 1.0 - (-dt.as_secs_f64() / Self::TAU.as_secs_f64()).exp();
+        self.ewma += alpha * (inst - self.ewma);
+        self.weight += alpha * (1.0 - self.weight);
+        self.at = now;
+        self.ops = ops;
+        // Dividing by the weight gathered so far debiases the start (the
+        // EWMA begins at 0): the first samples read as the average since
+        // the start rather than a slow climb from 0.
+        stats.set_rate(self.ewma / self.weight);
     }
 }
 
@@ -344,6 +393,10 @@ impl Ingester {
         let mut last_apply = Instant::now();
         let mut last_ck = Instant::now();
         let mut last_log = (Instant::now(), self.stats.ops.load(Relaxed));
+        let mut meter = RateMeter::new(Instant::now(), self.stats.ops.load(Relaxed));
+        // A stopped run (an error's backoff, a lost term) reads nothing, so
+        // its last rate mustn't linger.
+        let _zero = ZeroRate(&self.stats);
         let mut dirty = false;
         let mut tail_short = false;
         loop {
@@ -387,6 +440,7 @@ impl Ingester {
                 dirty = false;
                 last_ck = Instant::now();
             }
+            meter.sample(&self.stats, Instant::now(), self.stats.ops.load(Relaxed));
             if last_log.0.elapsed() >= Duration::from_secs(60) {
                 let ops = self.stats.ops.load(Relaxed);
                 tracing::info!(

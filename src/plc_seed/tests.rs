@@ -697,3 +697,47 @@ async fn export_throughput_scales_with_streams() {
     }
     assert!(rates[1] > rates[0] * 2.5, "pages/s with 1 and 4 streams: {rates:?}");
 }
+
+#[test]
+fn rate_meter_rises_holds_and_decays() {
+    use super::ingest::{RateMeter, Stats};
+    use std::time::{Duration, Instant};
+    let stats = Stats::default();
+    let t0 = Instant::now();
+    let mut m = RateMeter::new(t0, 0);
+    assert_eq!(stats.rate(), 0.0);
+    // 1,000-op pages every 2 s (500 ops/s), sampled every second like the
+    // loop does, so samples alternate between a page and nothing.
+    let mut ops = 0u64;
+    let at = |secs: u64, m: &mut RateMeter, ops: u64| m.sample(&stats, t0 + Duration::from_secs(secs), ops);
+    for s in 1..=2 {
+        if s % 2 == 0 {
+            ops += 1000;
+        }
+        at(s, &mut m, ops);
+    }
+    let early = stats.rate();
+    assert!(early > 250.0, "rises within a couple of samples: {early}");
+    // Sub-interval samples change nothing.
+    m.sample(&stats, t0 + Duration::from_millis(2500), ops + 10_000);
+    assert_eq!(stats.rate(), early);
+    for s in 3..=120 {
+        if s % 2 == 0 {
+            ops += 1000;
+        }
+        at(s, &mut m, ops);
+    }
+    let steady = stats.rate();
+    assert!((steady - 500.0).abs() / 500.0 < 0.05, "steady state: {steady}");
+    // Reads are pure: they never reset or move the value.
+    assert_eq!(stats.rate(), stats.rate());
+    assert_eq!(stats.rate(), steady);
+    // Idle (paced out or caught up); the idle loop still wakes every 2 s.
+    for s in (122..=180).step_by(2) {
+        at(s, &mut m, ops);
+    }
+    let idle = stats.rate();
+    assert!(idle < steady * 0.05, "decays when idle: {idle}");
+    at(240, &mut m, ops);
+    assert!(stats.rate() < idle);
+}
