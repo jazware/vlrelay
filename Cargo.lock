@@ -3852,7 +3852,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slate-metrics"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlpds?rev=838d36fa85767b6f316bc260429e4d3968d43b2c#838d36fa85767b6f316bc260429e4d3968d43b2c"
+source = "git+https://github.com/jazware/vlpds?rev=89684b8e120dac35b5458ec5204b24b24265e048#89684b8e120dac35b5458ec5204b24b24265e048"
 dependencies = [
  "parking_lot",
  "prometheus",
@@ -3866,7 +3866,7 @@ dependencies = [
 [[package]]
 name = "slatedb"
 version = "0.17.0"
-source = "git+https://github.com/jazware/slatedb?rev=11b27b89caeff4b6fd788fab4919aa835fe04f03#11b27b89caeff4b6fd788fab4919aa835fe04f03"
+source = "git+https://github.com/jazware/slatedb?rev=9bbeb849e6ead04556c831c50078568ca118903c#9bbeb849e6ead04556c831c50078568ca118903c"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -3912,7 +3912,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.17.0"
-source = "git+https://github.com/jazware/slatedb?rev=11b27b89caeff4b6fd788fab4919aa835fe04f03#11b27b89caeff4b6fd788fab4919aa835fe04f03"
+source = "git+https://github.com/jazware/slatedb?rev=9bbeb849e6ead04556c831c50078568ca118903c#9bbeb849e6ead04556c831c50078568ca118903c"
 dependencies = [
  "chrono",
  "log",
@@ -3927,7 +3927,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.17.0"
-source = "git+https://github.com/jazware/slatedb?rev=11b27b89caeff4b6fd788fab4919aa835fe04f03#11b27b89caeff4b6fd788fab4919aa835fe04f03"
+source = "git+https://github.com/jazware/slatedb?rev=9bbeb849e6ead04556c831c50078568ca118903c#9bbeb849e6ead04556c831c50078568ca118903c"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4645,7 +4645,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vlpds"
 version = "1.0.0"
-source = "git+https://github.com/jazware/vlpds?rev=838d36fa85767b6f316bc260429e4d3968d43b2c#838d36fa85767b6f316bc260429e4d3968d43b2c"
+source = "git+https://github.com/jazware/vlpds?rev=89684b8e120dac35b5458ec5204b24b24265e048#89684b8e120dac35b5458ec5204b24b24265e048"
 dependencies = [
  "anyhow",
  "argon2",
