@@ -122,13 +122,19 @@ impl NodeAdmin {
 
     /// The versions the rows carry: the last change this node saw to each.
     pub(super) fn stamp(&self, rows: &mut [admin::HostRow]) {
+        let owners = self.node.quorum.hosts.owners();
         let w = self.watch.lock();
-        let Some(seen) = &w.hosts else { return };
         for r in rows {
-            if let Some(s) = seen.get(&r.host) {
+            if let Some(s) = w.hosts.as_ref().and_then(|seen| seen.get(&r.host)) {
                 r.version = s.version.clone();
                 r.updated_at_ms = s.at_ms;
             }
+            let owner = owners.get(&r.host).map_or(self.id(), String::as_str);
+            r.owner_version = match owner == self.id() {
+                // a touch's version is the row's before the flush publishes it
+                true => r.version.clone().or_else(|| self.feed.host_version(owner, &r.host)),
+                false => self.feed.host_version(owner, &r.host),
+            };
         }
     }
 
@@ -149,6 +155,9 @@ impl NodeAdmin {
                 row.host.clone(),
                 Seen { sig: HostSig::of(row), version: Some(version.clone()), at_ms: Some(at) },
             );
+        }
+        if row.node == self.id() {
+            row.owner_version = Some(version.clone());
         }
         row.version = Some(version);
         row.updated_at_ms = Some(at);
@@ -360,7 +369,7 @@ impl NodeAdmin {
 mod tests {
     use super::*;
     use crate::admin::AdminSource;
-    use crate::admin::changes::Change;
+    use crate::admin::changes::{Change, compare_versions};
     use crate::node::quorum::QuorumSetup;
     use crate::node::{Node, NodeConfig};
     use crate::types::Host;
@@ -558,6 +567,24 @@ mod tests {
                 if what.starts_with("SetTier") {
                     assert_eq!(ev.hint.as_ref().unwrap()["tier"], "default", "{what}: {ev:?}");
                 }
+            }
+            // every node's row names the owner's newest version, which
+            // orders against the owner's own events without any clock
+            let owner = acting.node.quorum.hosts.owners()[&host].clone();
+            let theirs = until(&format!("{what}: the owner's event"), || {
+                admins[owner.as_str()]
+                    .feed()
+                    .host_version(&owner, &host)
+                    .filter(|v| own_host_events(&admins[owner.as_str()], &host, t0).iter().any(|c| &c.version == v))
+            })
+            .await;
+            assert!(theirs.starts_with(&format!("{owner}:")), "{theirs}");
+            for id in ids {
+                until(&format!("{what}: ownerVersion on {id}"), || {
+                    let ov = listed(&admins[id], &host)?.owner_version?;
+                    (compare_versions(&ov, &theirs) != Some(std::cmp::Ordering::Less)).then_some(())
+                })
+                .await;
             }
             tokio::time::sleep(Duration::from_millis(2500)).await;
             let mine = own_host_events(&acting, &host, t0);

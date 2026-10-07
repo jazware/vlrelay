@@ -237,6 +237,12 @@ pub struct HostRow {
     pub version: Option<String>,
     #[serde(default)]
     pub updated_at_ms: Option<i64>,
+    /// The newest `host` version the host's owner (`node`) made, as far as
+    /// the answering node has heard: comparable with the owner's own events
+    /// whichever node answers, where `version` is the answering node's and
+    /// `updatedAtMs` is its clock. None until it has heard one.
+    #[serde(default)]
+    pub owner_version: Option<String>,
     /// Only on a host action's answer: the cluster hadn't confirmed the
     /// change within a few seconds, so this is the answering node's view
     /// so far, not the action's result. A later `host` change says when it

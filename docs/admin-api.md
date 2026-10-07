@@ -249,7 +249,10 @@ It takes the same auth as every other endpoint. `EventSource` can't send an `Aut
 header, so with the token the console reads the stream with `fetch` and a `ReadableStream`, which
 also lets it send `Last-Event-ID`. Signed in through a proxy, a plain `EventSource` works. A relay
 without the feed answers 404, and the console goes on polling. A node serves at most 64 feeds at
-once, and the next one is a 503 (`TooManyFeeds`).
+once. A client that disconnects frees its slot as the node sees the connection close, but a
+proxy can hold the node's side open until a write fails (the next `ping`), so a full node closes
+its oldest feed for a new one when that feed is at least 15 s old: the closed client reconnects
+and resumes from its last id. With every feed younger, the new one is a 503 (`TooManyFeeds`).
 
 ### Messages
 
@@ -311,7 +314,7 @@ Rows that carry a version, for the console's stale-response checks:
 
 | Row | Field | Means |
 |---|---|---|
-| `HostRow` | `version`, `updatedAtMs` | The node-scoped version and time of the last change to the row as the answering node reads it (null until it sees one). A row's data is never older than its version. A host action's answer carries its own event's version, or `pending` ([Host actions](#host-actions)) |
+| `HostRow` | `version`, `updatedAtMs` | The node-scoped version and time of the last change to the row as the answering node reads it (null until it sees one). A row's data is never older than its version. A host action's answer carries its own event's version, or `pending` ([Host actions](#host-actions)). `ownerVersion` is the newest `host` version the host's owner (the row's `node`) made, as far as the answering node has heard (null until it has): to tell whether the owner's status in a row or an event is newer, compare `ownerVersion` with the `version` of a `host` event whose `node` is the owner (both are that node's), never `atMs` with `updatedAtMs`, which are different nodes' clocks |
 | `PolicyDoc`, `FullPolicyDoc` | `version`, `updatedAtMs` | The document's version |
 | `DomainRule` | `version` | The rule set's version when it was read |
 | `ClusterView` | `lastSeq` | The commit index it was read at |

@@ -62,6 +62,8 @@ export type HostRow = {
   version?: string | null
   /** When that change was seen. */
   updatedAtMs?: number | null
+  /** The newest `host` version the owner (`node`) made, as far as the answering node has heard: compare it with a `host` event's `version` when the event's `node` is the owner (same node, no clocks). Null until heard; absent on an older relay. */
+  ownerVersion?: string | null
   /** Only on a host action's answer: the cluster hadn't confirmed it in time, so this is the node's view so far, not the result. A later `host` change says when it lands. */
   pending?: boolean
 }

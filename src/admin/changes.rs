@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
@@ -25,6 +24,11 @@ pub const RING: usize = 4096;
 /// Events one client may fall behind before it gets a `resync`.
 pub const CLIENT_BUFFER: usize = 1024;
 pub const MAX_FEEDS: usize = 64;
+/// A full node closes its oldest feed for a new one if that feed is at
+/// least this old: a page reloaded behind a proxy can leave its old feed
+/// counted until a write to it fails, and a client closed this way
+/// reconnects and resumes from its last id.
+pub const EVICT_AFTER: Duration = Duration::from_secs(15);
 /// More ids of one kind than this in one flush become a single `*`.
 pub const STAR_AT: usize = 256;
 pub const COALESCE: Duration = Duration::from_secs(1);
@@ -140,10 +144,12 @@ pub struct ChangeFeed {
     inner: Mutex<Inner>,
     tx: broadcast::Sender<Arc<Stored>>,
     pending: Mutex<BTreeMap<(ChangeKind, String), Pending>>,
-    feeds: AtomicUsize,
+    feeds: Mutex<Slots>,
     pulled_at: Mutex<Option<Instant>>,
     /// member -> (its boot, the cursor to send it).
     members: Mutex<HashMap<String, (String, u64)>>,
+    /// node -> host -> the newest `host` version that node made.
+    host_versions: Mutex<HashMap<String, HashMap<String, String>>>,
 }
 
 pub fn now_ms() -> i64 {
@@ -169,7 +175,8 @@ impl ChangeFeed {
             }),
             tx,
             pending: Mutex::new(BTreeMap::new()),
-            feeds: AtomicUsize::new(0),
+            feeds: Mutex::new(Slots::default()),
+            host_versions: Mutex::new(HashMap::new()),
             pulled_at: Mutex::new(None),
             members: Mutex::new(HashMap::new()),
         })
@@ -200,11 +207,11 @@ impl ChangeFeed {
     /// A feed is open here, or a member pulled lately: sources that cost
     /// something to watch run only then.
     pub fn wanted(&self) -> bool {
-        self.feeds.load(Ordering::Relaxed) > 0 || self.pulled_at.lock().is_some_and(|t| t.elapsed() < PULLED_FOR)
+        self.open_feeds() > 0 || self.pulled_at.lock().is_some_and(|t| t.elapsed() < PULLED_FOR)
     }
 
     pub fn open_feeds(&self) -> usize {
-        self.feeds.load(Ordering::Relaxed)
+        self.feeds.lock().open.len()
     }
 
     /// What the ring holds, oldest first.
@@ -219,6 +226,13 @@ impl ChangeFeed {
 
     /// Into the ring and out to every open feed now.
     pub fn publish(&self, change: Change, forward: bool) {
+        if change.kind == ChangeKind::Host && change.id != "*" {
+            let mut hv = self.host_versions.lock();
+            let v = hv.entry(change.node.clone()).or_default().entry(change.id.clone()).or_default();
+            if compare_versions(&change.version, v) != Some(std::cmp::Ordering::Less) {
+                *v = change.version.clone();
+            }
+        }
         let mut i = self.inner.lock();
         if change.kind.deduped() {
             let key = (change.kind, change.id.clone(), change.version.clone());
@@ -395,19 +409,39 @@ impl ChangeFeed {
         a.more
     }
 
+    /// The newest `host` event `node` made for `host` that this feed has.
+    pub fn host_version(&self, node: &str, host: &str) -> Option<String> {
+        self.host_versions.lock().get(node)?.get(host).cloned()
+    }
+
     /// Forgets members no longer in the cluster.
     pub fn retain_members(&self, keep: &[String]) {
         self.members.lock().retain(|m, _| keep.contains(m));
+        let me = self.node.as_str();
+        self.host_versions.lock().retain(|m, _| m == me || keep.contains(m));
     }
 
     /// An open feed: the replay owed to the client's cursor, and its live
     /// events from then on.
     pub fn subscribe(self: &Arc<Self>, since: Option<&str>) -> Result<Subscription, TooManyFeeds> {
-        if self.feeds.fetch_add(1, Ordering::AcqRel) >= MAX_FEEDS {
-            self.feeds.fetch_sub(1, Ordering::AcqRel);
-            return Err(TooManyFeeds);
-        }
-        let guard = FeedGuard(self.clone());
+        let close = Arc::new(tokio::sync::Notify::new());
+        let slot = {
+            let mut f = self.feeds.lock();
+            if f.open.len() >= MAX_FEEDS {
+                let (&oldest, (at, _)) = f.open.iter().next().expect("full");
+                if at.elapsed() < EVICT_AFTER {
+                    return Err(TooManyFeeds);
+                }
+                if let Some((_, c)) = f.open.remove(&oldest) {
+                    c.notify_one();
+                }
+            }
+            f.next += 1;
+            let n = f.next;
+            f.open.insert(n, (Instant::now(), close.clone()));
+            n
+        };
+        let guard = FeedGuard(self.clone(), slot, close);
         let i = self.inner.lock();
         let rx = self.tx.subscribe();
         let last = i.next - 1;
@@ -422,7 +456,7 @@ impl ChangeFeed {
             Some(Some((_, n))) => (true, i.ring.iter().filter(|s| s.n > n).cloned().collect(), None),
         };
         drop(i);
-        Ok(Subscription { feed: self.clone(), resumed, replay, resync, resync_at: last, rx, _guard: guard })
+        Ok(Subscription { feed: self.clone(), resumed, replay, resync, resync_at: last, rx, guard })
     }
 
     /// The SSE response for one client.
@@ -439,11 +473,18 @@ impl ChangeFeed {
 #[derive(Debug)]
 pub struct TooManyFeeds;
 
-struct FeedGuard(Arc<ChangeFeed>);
+/// The open feeds by when they opened, each with what closes it.
+#[derive(Default)]
+struct Slots {
+    next: u64,
+    open: BTreeMap<u64, (Instant, Arc<tokio::sync::Notify>)>,
+}
+
+struct FeedGuard(Arc<ChangeFeed>, u64, Arc<tokio::sync::Notify>);
 
 impl Drop for FeedGuard {
     fn drop(&mut self) {
-        self.0.feeds.fetch_sub(1, Ordering::AcqRel);
+        self.0.feeds.lock().open.remove(&self.1);
     }
 }
 
@@ -455,7 +496,7 @@ pub struct Subscription {
     /// The id a first `resync` carries: everything after it comes live.
     resync_at: u64,
     pub rx: broadcast::Receiver<Arc<Stored>>,
-    _guard: FeedGuard,
+    guard: FeedGuard,
 }
 
 /// One SSE message, before it's framed.
@@ -505,7 +546,11 @@ impl Subscription {
         let head = futures::stream::iter(first);
         let live = futures::stream::unfold((self, false), |(mut sub, mut lagged)| async move {
             loop {
-                match sub.rx.recv().await {
+                let got = tokio::select! {
+                    r = sub.rx.recv() => r,
+                    _ = sub.guard.2.notified() => return None,
+                };
+                match got {
                     Ok(s) => {
                         let mut out = Vec::with_capacity(2);
                         if lagged {
@@ -707,5 +752,75 @@ mod tests {
         drop(subs);
         assert!(f.subscribe(None).is_ok());
         assert_eq!(f.open_feeds(), 0);
+    }
+
+    /// A full node gives a new client the oldest feed's slot once that feed
+    /// is old enough to be a reloaded page's leftover; the old one ends.
+    #[tokio::test]
+    async fn a_full_node_closes_its_oldest_feed_for_a_new_one() {
+        let f = ChangeFeed::new("n1");
+        let mut subs: Vec<_> = (0..MAX_FEEDS).map(|_| f.subscribe(None).unwrap()).collect();
+        assert!(f.subscribe(None).is_err(), "every feed is new");
+        if let Some((at, _)) = f.feeds.lock().open.values_mut().next() {
+            *at -= EVICT_AFTER;
+        }
+        let new = f.subscribe(None).unwrap();
+        assert_eq!(f.open_feeds(), MAX_FEEDS);
+        let oldest = subs.remove(0).into_messages();
+        let got: Vec<Message> = tokio::time::timeout(Duration::from_secs(2), oldest.collect()).await.unwrap();
+        assert!(matches!(got.as_slice(), [Message::Hello(_)]), "{got:?}");
+        assert!(f.subscribe(None).is_err(), "the next oldest is new");
+        drop((subs, new));
+        assert_eq!(f.open_feeds(), 0);
+    }
+
+    /// A client that goes away frees its slot at once, not at the next
+    /// write that fails (a ping, up to 15 s later), so a reloaded page's
+    /// new feed isn't refused while the old one is still counted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_closed_client_frees_its_slot_at_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let f = ChangeFeed::new("n1");
+        let feed = f.clone();
+        let app = axum::Router::new().route(
+            "/changes",
+            axum::routing::get(move || {
+                let feed = feed.clone();
+                async move {
+                    use axum::response::IntoResponse;
+                    match feed.sse(None) {
+                        Ok(sse) => sse.into_response(),
+                        Err(TooManyFeeds) => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    }
+                }
+            }),
+        );
+        let lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = lis.local_addr().unwrap();
+        tokio::spawn(axum::serve(lis, app).into_future());
+        let open = || async move {
+            let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+            c.write_all(b"GET /changes HTTP/1.1\r\nhost: x\r\naccept: text/event-stream\r\n\r\n").await.unwrap();
+            let mut buf = vec![0u8; 512];
+            let n = c.read(&mut buf).await.unwrap();
+            let status = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or_default().to_string();
+            (c, status)
+        };
+        let mut conns = Vec::new();
+        for _ in 0..MAX_FEEDS {
+            let (c, status) = open().await;
+            assert!(status.contains("200"), "{status}");
+            conns.push(c);
+        }
+        assert_eq!(f.open_feeds(), MAX_FEEDS);
+        assert!(open().await.1.contains("503"));
+        drop(conns.pop());
+        let t = Instant::now();
+        while f.open_feeds() == MAX_FEEDS {
+            assert!(t.elapsed() < Duration::from_millis(500), "the slot is still held");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (_c, status) = open().await;
+        assert!(status.contains("200"), "{status} after {:?}", t.elapsed());
     }
 }
