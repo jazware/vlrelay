@@ -6,7 +6,7 @@
 //! filtering it, so a field added to `Overview` stays private until
 //! someone adds it here on purpose.
 
-use super::{AdminResult, AdminSource, History, Overview, QuorumView};
+use super::{AdminResult, AdminSource, History, HostStatus, Overview, QuorumView};
 use axum::{
     Router,
     body::Bytes,
@@ -38,6 +38,9 @@ pub struct PublicStats {
     pub time_to_firehose_p50_ms: f64,
     pub time_to_firehose_p99_ms: f64,
     pub hosts_connected: u32,
+    /// Hosts the relay itself is pausing because it's behind (a count: never
+    /// which ones).
+    pub hosts_backpressure: u32,
     pub consumers: u32,
     /// The firehose's newest seq, which any consumer can see anyway.
     pub last_seq: i64,
@@ -147,6 +150,7 @@ pub fn project(o: &Overview, quorum: Option<&QuorumView>) -> PublicStats {
         time_to_firehose_p50_ms: o.time_to_firehose_p50_ms,
         time_to_firehose_p99_ms: o.time_to_firehose_p99_ms,
         hosts_connected: o.hosts_connected,
+        hosts_backpressure: o.hosts_by_status.get(&HostStatus::Backpressure).copied().unwrap_or(0),
         consumers: o.consumers,
         last_seq: o.last_seq,
         nodes,
@@ -223,7 +227,7 @@ mod tests {
 
     /// Every key the public endpoint may send. A new one fails here until
     /// someone decides it's safe.
-    const ALLOWED: [&str; 16] = [
+    const ALLOWED: [&str; 17] = [
         "timeMs",
         "version",
         "uptimeSecs",
@@ -233,6 +237,7 @@ mod tests {
         "timeToFirehoseP50Ms",
         "timeToFirehoseP99Ms",
         "hostsConnected",
+        "hostsBackpressure",
         "consumers",
         "lastSeq",
         "nodes",

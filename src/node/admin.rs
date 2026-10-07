@@ -19,7 +19,7 @@ use crate::admin::{self, AdminError, AdminResult, AdminSource, RejectReason};
 use crate::policy::admin::PolicyAdmin;
 use crate::state::{AccountStatus, Upstream};
 use crate::types::Host;
-use crate::upstream::{HostStatus, HostView, Tier};
+use crate::upstream::{Backpressure, HostStatus, HostView, Tier};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
@@ -171,6 +171,7 @@ pub fn host_status_label(h: &HostView) -> &'static str {
         admin::HostStatus::Idle => "idle",
         admin::HostStatus::Backoff | admin::HostStatus::Offline => "backoff",
         admin::HostStatus::Throttled => "throttled",
+        admin::HostStatus::Backpressure => "backpressure",
         admin::HostStatus::Suspended => "suspended",
         admin::HostStatus::Banned => "banned",
     }
@@ -187,7 +188,19 @@ fn status(h: &HostView) -> admin::HostStatus {
         HostStatus::Idle => admin::HostStatus::Idle,
         HostStatus::Connecting | HostStatus::Backoff => admin::HostStatus::Backoff,
         HostStatus::Throttled => admin::HostStatus::Throttled,
+        HostStatus::Backpressure => admin::HostStatus::Backpressure,
     }
+}
+
+fn backpressure_reason(h: &HostView) -> Option<admin::BackpressureReason> {
+    if status(h) != admin::HostStatus::Backpressure {
+        return None;
+    }
+    h.backpressure.map(|b| match b {
+        Backpressure::InflightFull => admin::BackpressureReason::InflightFull,
+        Backpressure::NodeInflightFull => admin::BackpressureReason::NodeInflightFull,
+        Backpressure::QueueFull => admin::BackpressureReason::QueueFull,
+    })
 }
 
 /// The dashboard's coarser reject classes.
@@ -223,13 +236,17 @@ impl NodeAdmin {
             host: h.record.hostname.clone(),
             tier: h.record.tier.as_str().into(),
             status: status(h),
+            backpressure_reason: backpressure_reason(h),
             events_per_sec: rate,
             error_rate: ratio,
             accounts: self.policy.accounts(&h.record.hostname).unwrap_or(h.record.account_count),
             last_upstream_seq: h.received_seq.unwrap_or(0),
-            connected_since_ms: (h.record.status == HostStatus::Active)
-                .then_some(h.record.last_connected_ms.map(|m| m as i64))
-                .flatten(),
+            connected_since_ms: matches!(
+                h.record.status,
+                HostStatus::Active | HostStatus::Throttled | HostStatus::Backpressure
+            )
+            .then_some(h.record.last_connected_ms.map(|m| m as i64))
+            .flatten(),
             lag_ms: h.read_lag_ms.unwrap_or(0) as f64,
             throttle: self.policy.throttle(&h.record.hostname),
             rule: self.policy.limits(&h.record.hostname).and_then(|l| l.rule),
@@ -480,7 +497,7 @@ impl NodeAdmin {
             .iter()
             .filter_map(|r| {
                 let inflight = self.node.acks.pending_for(&Host(r.host.clone())) as u64;
-                let paused = r.status == admin::HostStatus::Throttled;
+                let paused = r.status == admin::HostStatus::Backpressure;
                 (inflight > 0 || paused).then(|| admin::PipelineHost {
                     host: r.host.clone(),
                     node: self.id().to_string(),
@@ -1468,6 +1485,96 @@ pub(crate) fn merge_rejects(all: Vec<admin::RejectTop>, limit: usize) -> Vec<adm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view(tier: Tier, st: HostStatus, bp: Option<Backpressure>) -> HostView {
+        let mut record = crate::upstream::HostRecord::new(&Host("pds.example.com".into()), tier);
+        record.status = st;
+        HostView {
+            record,
+            received_seq: None,
+            frames: 0,
+            bytes: 0,
+            connects: 1,
+            read_lag_ms: None,
+            inflight_events: 0,
+            inflight_bytes: 0,
+            paused: false,
+            backpressure: bp,
+        }
+    }
+
+    fn row(host: &str, status: admin::HostStatus, reason: Option<admin::BackpressureReason>) -> admin::HostRow {
+        admin::HostRow {
+            host: host.into(),
+            tier: "trusted".into(),
+            status,
+            backpressure_reason: reason,
+            events_per_sec: 1.0,
+            error_rate: 0.0,
+            accounts: 1,
+            last_upstream_seq: 1,
+            connected_since_ms: None,
+            lag_ms: 120_000.0,
+            throttle: None,
+            rule: None,
+            node: "n1".into(),
+            max_accounts: 0,
+            history: Vec::new(),
+            throttled_accounts: 0,
+            source: None,
+            top_reason: None,
+        }
+    }
+
+    #[test]
+    fn relay_backpressure_is_its_own_status_with_a_reason() {
+        let bp = view(Tier::Trusted, HostStatus::Backpressure, Some(Backpressure::QueueFull));
+        assert_eq!(status(&bp), admin::HostStatus::Backpressure);
+        assert_eq!(backpressure_reason(&bp), Some(admin::BackpressureReason::QueueFull));
+        assert_eq!(host_status_label(&bp), "backpressure");
+        let inflight = view(Tier::Default, HostStatus::Backpressure, Some(Backpressure::InflightFull));
+        assert_eq!(backpressure_reason(&inflight), Some(admin::BackpressureReason::InflightFull));
+        let node = view(Tier::Default, HostStatus::Backpressure, Some(Backpressure::NodeInflightFull));
+        assert_eq!(backpressure_reason(&node), Some(admin::BackpressureReason::NodeInflightFull));
+
+        // the limiter's pause (tier, rule or operator limits) stays throttled, with no reason
+        let thr = view(Tier::Throttled, HostStatus::Throttled, None);
+        assert_eq!((status(&thr), backpressure_reason(&thr)), (admin::HostStatus::Throttled, None));
+        assert_eq!(host_status_label(&thr), "throttled");
+        let active = view(Tier::Throttled, HostStatus::Active, None);
+        assert_eq!((status(&active), backpressure_reason(&active)), (admin::HostStatus::Connected, None));
+        // a ban outranks whatever the reader was last doing
+        let banned = view(Tier::Banned, HostStatus::Backpressure, Some(Backpressure::QueueFull));
+        assert_eq!((status(&banned), backpressure_reason(&banned)), (admin::HostStatus::Banned, None));
+    }
+
+    #[test]
+    fn host_rows_carry_and_filter_backpressure() {
+        let v = serde_json::to_value(row(
+            "a.example.com",
+            admin::HostStatus::Backpressure,
+            Some(admin::BackpressureReason::QueueFull),
+        ))
+        .unwrap();
+        assert_eq!((&v["status"], &v["backpressureReason"]), (&"backpressure".into(), &"queue_full".into()));
+        let v = serde_json::to_value(row("b.example.com", admin::HostStatus::Throttled, None)).unwrap();
+        assert_eq!((&v["status"], &v["backpressureReason"]), (&"throttled".into(), &serde_json::Value::Null));
+
+        let rows = vec![
+            row("a.example.com", admin::HostStatus::Backpressure, Some(admin::BackpressureReason::InflightFull)),
+            row("b.example.com", admin::HostStatus::Throttled, None),
+            row("c.example.com", admin::HostStatus::Connected, None),
+            row("d.example.com", admin::HostStatus::Idle, None),
+        ];
+        let q: admin::HostQuery = serde_json::from_value(serde_json::json!({"status": "backpressure"})).unwrap();
+        let hosts = |l: admin::HostList| l.hosts.into_iter().map(|r| r.host).collect::<Vec<_>>();
+        assert_eq!(hosts(NodeAdmin::sort_page(rows.clone(), &q)), ["a.example.com"]);
+        let q: admin::HostQuery = serde_json::from_value(serde_json::json!({"status": "throttled"})).unwrap();
+        assert_eq!(hosts(NodeAdmin::sort_page(rows.clone(), &q)), ["b.example.com"]);
+        // a host the relay pauses is still live, so it can be lagging
+        let q: admin::HostQuery = serde_json::from_value(serde_json::json!({"flag": "lagging"})).unwrap();
+        assert_eq!(hosts(NodeAdmin::sort_page(rows, &q)), ["a.example.com", "b.example.com", "c.example.com"]);
+    }
 
     #[test]
     fn throttled_and_deferred_accounts_are_held_in_the_tail() {

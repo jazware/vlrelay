@@ -1,14 +1,15 @@
 import { useEffect, type ReactNode } from 'react'
 import { registerDetail } from '../../components/console/Drawer'
 import { openPanel } from '../../components/console/nav'
-import { BIG_HOST_CAP, hostActionDialog, useHostsVersion } from '../../components/console/hostActions'
+import { BIG_HOST_CAP, actedRow, hostActionDialog, useHostsVersion } from '../../components/console/hostActions'
 import { Bars, Copy, Empty, Glyph, HostStatusChip, KV, Meter, Mini, Minis, Sec, Seg, Spark, Strip, TierTag } from '../../components/console/kit'
-import type { Case, DomainRule, HostAction, HostDetail, Policy, RejectReason } from '../../lib/api'
+import type { BackpressureReason, Case, DomainRule, HostAction, HostDetail, Policy, RejectReason } from '../../lib/api'
 import { host as fetchHost } from '../../lib/console/adminAdapter'
 import { ago, dt, fmtMs, fmtNum, fmtRatio, fmtSi, plural, shortDid } from '../../lib/console/fmt'
 import { useLivePoll } from '../../lib/console/live'
 import { policyPoll } from '../../lib/console/polls'
 import { useRelay } from '../../lib/console/relay'
+import { Link } from '../../lib/router'
 import { SourceTag } from './hostSource'
 import { casesPoll, deleteRuleDialog, releaseDialog, rulesPoll } from './moderationDetail'
 import { NodeTag, REASON_WHAT, reasonLabel } from './relayUi'
@@ -49,7 +50,31 @@ const cols = (page: boolean, a: ReactNode, b: ReactNode) =>
   )
 
 type Acted = HostDetail['actions'][number]
-const HELD = new Set(['throttled', 'backoff', 'suspended', 'banned'])
+const HELD = new Set(['throttled', 'backpressure', 'backoff', 'suspended', 'banned'])
+
+/** What's full while the relay pauses a host, in a few words, for the Upstream panel. */
+const BP_SHORT: Record<BackpressureReason, string> = {
+  inflight_full: 'its in-flight cap',
+  node_inflight_full: 'the node’s in-flight cap',
+  queue_full: 'lane queue full',
+}
+
+/** Why-it's-held for a host the relay pauses: the title and what's going on, by what's full. */
+const BP_WHY: Record<BackpressureReason | 'unknown', [string, string]> = {
+  queue_full: [
+    'Paused: the relay is behind on identity lookups, not this host’s limits',
+    'Its lane queue is full: the relay’s lanes aren’t taking its frames as fast as it sends them, most often while they wait on DID document lookups. Its reader resumes on its own as they drain, and its PDS buffers meanwhile.',
+  ],
+  inflight_full: [
+    'Paused: its frames are waiting on the relay, not on this host’s limits',
+    'It has as many frames read and not yet durable as one host may (--host-inflight-events, --host-inflight-mb). Its reader resumes as they commit, and its PDS buffers meanwhile.',
+  ],
+  node_inflight_full: [
+    'Paused: the relay is at its in-flight cap across every host',
+    'This node has as many frames read and not yet durable as it allows over all its hosts (--inflight-events, --inflight-mb), so every host it reads waits for commits. The node is behind, not this host.',
+  ],
+  unknown: ['Paused by the relay, which is behind', 'Its reader resumes on its own once the relay catches up, and its PDS buffers meanwhile.'],
+}
 
 const by = (a: Acted) => `${a.by}, ${ago(a.atMs)}`
 const ruleName = (r: DomainRule) => (
@@ -118,7 +143,7 @@ function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; 
   const here = policy?.tiers[r.tier]?.eventsPerSec ?? lim.eventsPerSec
   const roomier = tiers.find(([t, l]) => t !== r.tier && l.eventsPerSec > here)
 
-  let tone: 'warn' | 'err' = 'warn'
+  let tone: 'info' | 'warn' | 'err' = 'warn'
   let title: ReactNode
   const lines: ReactNode[] = []
   const outs: ReactNode[] = []
@@ -146,6 +171,17 @@ function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; 
         </button>,
       )
     if (byRule) outs.push(...ruleOut)
+  } else if (r.status === 'backpressure') {
+    tone = 'info'
+    const [t, what] = BP_WHY[r.backpressureReason ?? 'unknown']
+    title = t
+    lines.push(what)
+    lines.push(r.throttle != null ? <>Its tier ({r.tier}) and throttle aren't what holds it: changing them won't release it.</> : <>Its tier ({r.tier}) isn't what holds it: changing it won't release it.</>)
+    outs.push(
+      <Link key="q" className="cx-btn sm" to="/admin/quorum">
+        The relay's backlog ›
+      </Link>,
+    )
   } else if (r.status === 'backoff') {
     title = 'Backing off: its last connect failed'
     lines.push(`The reader retries on its own, waiting longer each time${r.connectedSinceMs ? `; it was last connected ${ago(r.connectedSinceMs)}` : ''}.`)
@@ -255,7 +291,7 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
   const rules = rulesPoll.use()
   const cases = casesPoll.use()
   const r = d.row
-  const live = r.status === 'connected' || r.status === 'throttled'
+  const live = r.status === 'connected' || r.status === 'throttled' || r.status === 'backpressure'
   const blocked = r.status === 'banned' || r.status === 'suspended'
   const tiers = Object.keys(pol.data?.policy.tiers ?? { [r.tier]: null })
   const rule = r.rule != null ? rules.data?.find((x) => x.id === r.rule) : undefined
@@ -384,7 +420,13 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
         <KV
           rows={[
             ['Socket', <Copy key="s" text={`wss://${r.host}/xrpc/com.atproto.sync.subscribeRepos?cursor=${r.lastUpstreamSeq}`} />],
-            ['Status', <span key="st"><HostStatusChip s={r.status} /> {r.connectedSinceMs ? `since ${ago(r.connectedSinceMs)}` : ''}</span>],
+            [
+              'Status',
+              <span key="st">
+                <HostStatusChip s={r.status} /> {r.status === 'backpressure' && r.backpressureReason ? <span className="muted sm">{BP_SHORT[r.backpressureReason]} </span> : null}
+                {r.connectedSinceMs ? `since ${ago(r.connectedSinceMs)}` : ''}
+              </span>,
+            ],
             ['Reader', <NodeTag key="n" view={view} id={r.node} />],
             ['Tier', <TierTag key="t" t={r.tier} />],
             [
@@ -565,7 +607,9 @@ registerDetail('host', {
     useEffect(() => {
       if (v) reload()
     }, [v, reload])
-    const d = l.data
+    // the action's answer is the host as it is now: show it until a poll newer than it lands
+    const acted = actedRow(id)
+    const d = l.data && acted && acted.at > (l.at ?? 0) ? { ...l.data, row: acted.row } : l.data
     if (!d)
       return {
         title: id,
@@ -577,7 +621,7 @@ registerDetail('host', {
       title: d.row.host,
       chip: (
         <>
-          <HostStatusChip s={d.row.status} /> <TierTag t={d.row.tier} />
+          <HostStatusChip s={d.row.status} /> <TierTag t={d.row.tier} labeled />
         </>
       ),
       foot: (

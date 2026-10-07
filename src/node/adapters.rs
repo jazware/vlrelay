@@ -115,7 +115,7 @@ pub(crate) fn to_upstream(r: &state::HostRecord) -> upstream::HostRecord {
 /// cursor, onto the host's record (the tier is the caller's call).
 pub(crate) fn apply_upstream(rec: &mut state::HostRecord, r: &upstream::HostRecord) {
     rec.conn = match r.status {
-        HostStatus::Active | HostStatus::Throttled => state::Conn::Active,
+        HostStatus::Active | HostStatus::Throttled | HostStatus::Backpressure => state::Conn::Active,
         HostStatus::Idle => state::Conn::Idle,
         HostStatus::Connecting | HostStatus::Backoff => state::Conn::Offline,
     };

@@ -2508,6 +2508,21 @@ a.cx-rrow:hover {
   color: var(--warn);
   border-color: transparent;
 }
+/* beside a status chip: square, outlined and prefixed, never filled like a chip */
+.cx-tier.labeled {
+  background: transparent;
+  border-style: solid;
+  border-radius: 0;
+  display: inline-flex;
+  gap: 4px;
+  align-items: baseline;
+}
+.cx-tier.labeled.t-throttled {
+  border-color: color-mix(in oklab, var(--warn) 45%, var(--rule));
+}
+.cx-tier.labeled .k {
+  color: var(--ink3);
+}
 .cx-pager {
   display: flex;
   gap: 8px;

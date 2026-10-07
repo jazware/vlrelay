@@ -121,6 +121,14 @@ impl Flow {
         self.full(h).is_none()
     }
 
+    /// The cap `h` is at, as the host's status reports it.
+    pub fn backpressure(&self, h: &HostFlow) -> Option<super::Backpressure> {
+        self.full(h).map(|cap| match cap {
+            "host" => super::Backpressure::InflightFull,
+            _ => super::Backpressure::NodeInflightFull,
+        })
+    }
+
     /// Counts a frame of `len` bytes in flight until the permit drops.
     pub fn acquire(self: &Arc<Self>, h: &Arc<HostFlow>, len: usize) -> Arc<Permit> {
         h.counts.events.fetch_add(1, Ordering::Relaxed);

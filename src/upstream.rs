@@ -19,8 +19,8 @@ pub mod limits;
 
 pub use crawl::{Admission, CrawlError, CrawlPolicy, Crawler, DomainAction, DomainRule};
 pub use host::{
-    ErrorCounters, HostEntry, HostRecord, HostStatus, HostStore, HostView, HostnameError, MemHostStore, Registry, Tier,
-    normalize_hostname,
+    Backpressure, ErrorCounters, HostEntry, HostRecord, HostStatus, HostStore, HostView, HostnameError, MemHostStore,
+    Registry, Tier, normalize_hostname,
 };
 pub use limits::{Limits, TierLimits, TokenBucket};
 

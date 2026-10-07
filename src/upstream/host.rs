@@ -63,13 +63,43 @@ pub enum HostStatus {
     Active,
     /// Waiting out a backoff after a failed or dropped connection.
     Backoff,
-    /// Held off by its rate limit or a full queue: the socket isn't being read.
+    /// Held off by its own limits (its tier's, a domain rule's or an
+    /// operator's throttle): the socket isn't being read.
     Throttled,
+    /// Held off by the relay, not by anything about the host: the pipeline
+    /// behind it is full ([`HostEntry::backpressure`] says which part).
+    Backpressure,
 }
 
 impl HostStatus {
-    const ALL: [HostStatus; 5] =
-        [HostStatus::Idle, HostStatus::Connecting, HostStatus::Active, HostStatus::Backoff, HostStatus::Throttled];
+    const ALL: [HostStatus; 6] = [
+        HostStatus::Idle,
+        HostStatus::Connecting,
+        HostStatus::Active,
+        HostStatus::Backoff,
+        HostStatus::Throttled,
+        HostStatus::Backpressure,
+    ];
+}
+
+/// Which part of the relay is full while a host is in [`HostStatus::Backpressure`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backpressure {
+    /// The host's own in-flight cap: frames it sent are read and not yet
+    /// durable (`--host-inflight-events`, `--host-inflight-mb`).
+    InflightFull,
+    /// The node's in-flight cap over every host (`--inflight-events`,
+    /// `--inflight-mb`).
+    NodeInflightFull,
+    /// Its fair-queue slot is full: the lanes aren't taking frames, usually
+    /// while they wait on identity lookups.
+    QueueFull,
+}
+
+impl Backpressure {
+    const ALL: [Backpressure; 3] =
+        [Backpressure::InflightFull, Backpressure::NodeInflightFull, Backpressure::QueueFull];
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +219,8 @@ pub struct HostEntry {
     /// 0 for none yet).
     read_at_ms: AtomicI64,
     read_event_ms: AtomicI64,
+    /// A [`Backpressure`] as u8; read only while the status says so.
+    backpressure: AtomicU8,
 }
 
 impl HostEntry {
@@ -213,6 +245,7 @@ impl HostEntry {
             limits_gen: AtomicU64::new(0),
             read_at_ms: AtomicI64::new(0),
             read_event_ms: AtomicI64::new(0),
+            backpressure: AtomicU8::new(0),
         }
     }
 
@@ -230,7 +263,11 @@ impl HostEntry {
         if at == 0 {
             return None;
         }
-        let held = if self.status() == HostStatus::Throttled { now_ms() as i64 - at } else { 0 };
+        let held = if matches!(self.status(), HostStatus::Throttled | HostStatus::Backpressure) {
+            now_ms() as i64 - at
+        } else {
+            0
+        };
         Some((at - ev + held).max(0))
     }
 
@@ -270,6 +307,19 @@ impl HostEntry {
         if self.status.swap(s as u8, Ordering::Relaxed) != s as u8 {
             self.dirty.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Paused by the relay: the reason first, so a reader that sees the
+    /// status sees its reason.
+    pub(crate) fn set_backpressure(&self, why: Backpressure) {
+        self.backpressure.store(why as u8, Ordering::Release);
+        self.set_status(HostStatus::Backpressure);
+    }
+
+    /// What's full while the status is [`HostStatus::Backpressure`].
+    pub fn backpressure(&self) -> Option<Backpressure> {
+        (self.status() == HostStatus::Backpressure)
+            .then(|| Backpressure::ALL[self.backpressure.load(Ordering::Acquire) as usize])
     }
 
     /// Last seq read off the socket (not necessarily durable).
@@ -363,6 +413,7 @@ impl HostEntry {
             inflight_events: self.flow.events() as u64,
             inflight_bytes: self.flow.bytes() as u64,
             paused: self.flow.paused(),
+            backpressure: self.backpressure(),
         }
     }
 }
@@ -383,6 +434,8 @@ pub struct HostView {
     pub inflight_bytes: u64,
     /// Not read: at its in-flight cap or the node's.
     pub paused: bool,
+    /// Set while the status is `backpressure`.
+    pub backpressure: Option<Backpressure>,
 }
 
 pub struct Registry {
@@ -603,6 +656,38 @@ mod tests {
         assert!(e.read_lag_ms().unwrap() < 31_000);
         e.set_status(HostStatus::Throttled);
         assert!(e.read_lag_ms().unwrap() >= 90_000);
+    }
+
+    #[test]
+    fn backpressure_carries_its_reason_until_the_status_moves() {
+        let e = HostEntry::from_record(&HostRecord::new(&Host("pds.example.com".into()), Tier::Trusted));
+        e.set_status(HostStatus::Active);
+        assert_eq!(e.backpressure(), None);
+        e.set_backpressure(Backpressure::QueueFull);
+        assert_eq!((e.status(), e.backpressure()), (HostStatus::Backpressure, Some(Backpressure::QueueFull)));
+        assert_eq!(e.view().backpressure, Some(Backpressure::QueueFull));
+        e.set_backpressure(Backpressure::InflightFull);
+        assert_eq!(e.backpressure(), Some(Backpressure::InflightFull));
+        // the limiter's pause is the host's own limits, not the relay
+        e.set_status(HostStatus::Throttled);
+        assert_eq!(e.backpressure(), None);
+        e.set_backpressure(Backpressure::NodeInflightFull);
+        e.set_status(HostStatus::Active);
+        assert_eq!((e.status(), e.view().backpressure), (HostStatus::Active, None));
+        let r = e.record();
+        assert_eq!(serde_json::to_value(HostStatus::Backpressure).unwrap(), "backpressure");
+        assert_eq!(serde_json::to_value(Backpressure::NodeInflightFull).unwrap(), "node_inflight_full");
+        assert_eq!(serde_json::from_value::<HostRecord>(serde_json::to_value(&r).unwrap()).unwrap(), r);
+    }
+
+    #[test]
+    fn read_lag_counts_held_time_under_backpressure_too() {
+        let e = HostEntry::from_record(&HostRecord::new(&Host("pds.example.com".into()), Tier::Default));
+        e.note_event_time(now_ms() as i64 - 1_000);
+        e.read_at_ms.fetch_sub(60_000, Ordering::Relaxed);
+        e.read_event_ms.fetch_sub(60_000, Ordering::Relaxed);
+        e.set_backpressure(Backpressure::QueueFull);
+        assert!(e.read_lag_ms().unwrap() >= 60_000);
     }
 
     fn ok(s: &str) -> String {

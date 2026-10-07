@@ -55,6 +55,8 @@ const hostLink = (h: string) => (
 export function relayBanners(o: {
   view?: RelayView
   throttled?: HostRow[]
+  /** Hosts the relay pauses because it's behind (the overview's `hostsByStatus.backpressure`). */
+  backpressure?: number
   capped?: HostList
   consumers?: Consumer[]
   slowCutMs: number
@@ -102,6 +104,22 @@ export function relayBanners(o: {
   for (const n of o.view?.nodes ?? []) {
     if (!n.stale || q?.members.includes(n.id)) continue
     out.push({ id: `stale-${n.id}`, tone: 'warn', title: `${n.id} didn't answer`, desc: n.error ?? 'its numbers are left out of the totals' })
+  }
+
+  if (o.backpressure) {
+    out.push({
+      id: 'backpressure',
+      tone: 'info',
+      title: `${plural(o.backpressure, 'host')} paused by the relay`,
+      desc: 'backpressure: the relay is behind, not their limits',
+      body: (
+        <p>
+          The relay stops reading a host while its own pipeline is full: the lanes waiting on identity lookups, or frames read and not yet durable at an in-flight cap. Their PDSes buffer
+          and they resume as it catches up; a tier or throttle change doesn't release them. <Link to="/admin/hosts?status=backpressure">Hosts in backpressure</Link> ·{' '}
+          <Link to="/admin/quorum">the ack backlog</Link>
+        </p>
+      ),
+    })
   }
 
   const behind = (o.throttled ?? []).filter((h) => h.lagMs > 60_000)

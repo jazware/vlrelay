@@ -522,7 +522,7 @@ function ErrorBudget() {
   const d = useDraft()
   const ratio = num(getIn(d.body, 'transitions.errorRatio'))
   const l = useLivePoll(() => A.hosts({ sort: 'errors', desc: true, limit: 200 }), 'errs', 15_000)
-  const over = (l.data?.hosts ?? []).filter((h) => (h.status === 'connected' || h.status === 'throttled') && h.errorRate > ratio).length
+  const over = (l.data?.hosts ?? []).filter((h) => (h.status === 'connected' || h.status === 'throttled' || h.status === 'backpressure') && h.errorRate > ratio).length
   return (
     <Knob
       path="transitions.errorRatio"

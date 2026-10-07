@@ -4,7 +4,7 @@
 use super::fair::HostQueue;
 use super::flow::Flow;
 use super::frame::{Peek, peek};
-use super::host::{HostEntry, HostStatus};
+use super::host::{Backpressure, HostEntry, HostStatus};
 use super::limits::{HostLimiter, TokenBucket};
 use super::{ConnectFn, CursorSource, UpstreamConfig};
 use crate::types::{Host, UpstreamFrame};
@@ -158,8 +158,8 @@ impl HostTask {
         let mut got_frames = false;
         let mut last_seq = self.entry.received_seq();
         let end = loop {
-            if !self.flow.has_room(&self.entry.flow) {
-                self.entry.set_status(HostStatus::Throttled);
+            if let Some(why) = self.flow.backpressure(&self.entry.flow) {
+                self.entry.set_backpressure(why);
                 tokio::select! {
                     biased;
                     _ = self.stop.changed() => break End::Stopped,
@@ -286,8 +286,8 @@ impl HostTask {
             }
             let pause = limiter.take(len, now);
             let full = self.queue.len() >= self.queue_capacity_hint();
-            if pause > Duration::ZERO || full {
-                self.entry.set_status(HostStatus::Throttled);
+            if full {
+                self.entry.set_backpressure(Backpressure::QueueFull);
             }
             tokio::select! {
                 biased;
@@ -296,6 +296,7 @@ impl HostTask {
                 _ = async {
                     self.queue.push(frame).await;
                     if pause > Duration::ZERO {
+                        self.entry.set_status(HostStatus::Throttled);
                         tokio::time::sleep(pause).await;
                     }
                 } => {}

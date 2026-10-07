@@ -25,7 +25,7 @@ const PAGE = 100
 type Flag = '' | 'cap' | 'lag' | 'err' | 'thr'
 const FLAG: Record<Exclude<Flag, ''>, A.HostFlag> = { cap: 'atCap', lag: 'lagging', err: 'erroring', thr: 'throttledOrAtCap' }
 const SORTABLE: A.HostSort[] = ['host', 'status', 'events', 'errors', 'accounts', 'throttled', 'lag', 'seq', 'source']
-const live = (h: HostRow) => h.status === 'connected' || h.status === 'throttled'
+const live = (h: HostRow) => h.status === 'connected' || h.status === 'throttled' || h.status === 'backpressure'
 
 function useUrlState() {
   const s = useSearch()
@@ -107,7 +107,7 @@ export function Hosts() {
     if (u.page >= pages && pages > 0 && list.data) setUrl({ page: pages - 1 }, u)
   }, [pages, u, list.data])
 
-  const banners = relayBanners({ view, throttled: thr.data?.hosts, capped: cap.data, slowCutMs: slowLagMs(polFull.data), scope: 'hosts' })
+  const banners = relayBanners({ view, throttled: thr.data?.hosts, backpressure: ov.data?.hostsByStatus.backpressure, capped: cap.data, slowCutMs: slowLagMs(polFull.data), scope: 'hosts' })
   const statusTiles: TileSpec[] = HOST_STATUSES.map((s) => ({
     label: (
       <button type="button" className="cx-tilebtn" onClick={() => setUrl({ status: u.status === s ? '' : s }, u)} aria-pressed={u.status === s}>

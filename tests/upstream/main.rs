@@ -12,9 +12,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use vlrelay::types::{Host, UpstreamFrame};
+use vlrelay::upstream::flow::FlowLimits;
 use vlrelay::upstream::{
-    CrawlPolicy, Crawler, DomainAction, DomainRule, HostRecord, HostStatus, HostStore, Limits, Manager, MemHostStore,
-    Tier, TierLimits, UpstreamConfig,
+    Backpressure, CrawlPolicy, Crawler, DomainAction, DomainRule, HostRecord, HostStatus, HostStore, Limits, Manager,
+    MemHostStore, Tier, TierLimits, UpstreamConfig,
 };
 
 fn dev_config() -> UpstreamConfig {
@@ -300,6 +301,66 @@ async fn rate_limit_pauses_reads() {
     }
     assert!(n2 > 2000, "trusted delivered {n2} in 0.5 s (from {before})");
     m.shutdown().await.unwrap();
+}
+
+/// Nobody takes frames, so the relay pauses the host itself: `backpressure`
+/// naming what's full, never `throttled` (its limits are unlimited here).
+/// Once frames are taken again the status clears.
+async fn backpressured(tweak: impl FnOnce(&mut UpstreamConfig), want: Backpressure) {
+    let fan = Fan::spawn().await;
+    fan.set("busy", HostSpec::rate(2000.0, 200));
+    let mut cfg = fan_config(&fan);
+    cfg.limits = Limits::unlimited();
+    tweak(&mut cfg);
+    let (m, mut rx) = Manager::new(cfg, Arc::new(MemHostStore::default()), None);
+    m.start().await.unwrap();
+    let h = Host("busy.fan.test".into());
+    m.admit(&h, Tier::Default).await.unwrap();
+    let mut throttled = false;
+    wait_for(&format!("{want:?}"), Duration::from_secs(5), || {
+        let v = m.host(&h).unwrap();
+        throttled |= v.record.status == HostStatus::Throttled;
+        v.backpressure == Some(want)
+    })
+    .await;
+    assert_eq!(m.host(&h).unwrap().record.status, HostStatus::Backpressure);
+    let t = Instant::now();
+    let mut clear = false;
+    while !clear && t.elapsed() < Duration::from_secs(5) {
+        while rx.try_recv().is_ok() {}
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        while rx.try_recv().is_ok() {}
+        let v = m.host(&h).unwrap();
+        throttled |= v.record.status == HostStatus::Throttled;
+        clear = v.record.status == HostStatus::Active && v.backpressure.is_none();
+    }
+    assert!(clear, "still {:?} {:?}", m.host(&h).unwrap().record.status, m.host(&h).unwrap().backpressure);
+    assert!(!throttled, "an unlimited host showed as throttled");
+    m.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_inflight_cap_is_backpressure() {
+    backpressured(|c| c.inflight = FlowLimits { host_events: 16, ..FlowLimits::default() }, Backpressure::InflightFull)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_inflight_cap_is_backpressure() {
+    backpressured(|c| c.inflight = FlowLimits { events: 16, ..FlowLimits::default() }, Backpressure::NodeInflightFull)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_lane_queue_is_backpressure() {
+    backpressured(
+        |c| {
+            c.output_capacity = 1;
+            c.host_queue_frames = 4;
+        },
+        Backpressure::QueueFull,
+    )
+    .await;
 }
 
 /// One host at 50x the rate of 20 others, a consumer that can't keep up

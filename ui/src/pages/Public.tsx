@@ -196,7 +196,7 @@ export function Public() {
           <Fig v={s ? fmtSi(s.eventsInPerSec) : '…'} unit="/s" label="Events in" em="frames read from PDSes" />
           <Fig v={s ? fmtSi(s.streamEventsPerSec || s.eventsOutPerSec) : '…'} unit="/s" label="Firehose events" em={s && `${fmtSi(s.eventsOutPerSec)}/s sent to all consumers`} />
           <Fig v={s ? fmtMs(s.timeToFirehoseP50Ms) : '…'} label="Time to firehose, p50" em={s && `p99 ${fmtMs(s.timeToFirehoseP99Ms)}`} />
-          <Fig v={s ? fmtNum(s.hostsConnected) : '…'} label="Connected PDS hosts" em="sockets open now" />
+          <Fig v={s ? fmtNum(s.hostsConnected) : '…'} label="Connected PDS hosts" em={s?.hostsBackpressure ? `sockets open now · ${fmtNum(s.hostsBackpressure)} more waiting on the relay` : 'sockets open now'} />
           <Fig v={s ? fmtNum(s.consumers) : '…'} label="Consumers" em="firehose subscribers" />
         </section>
 

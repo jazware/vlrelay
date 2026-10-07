@@ -15,7 +15,10 @@ export class ApiError extends Error {
 
 // ---------------------------------------------------------------- wire types
 
-export type HostStatus = 'connected' | 'idle' | 'backoff' | 'offline' | 'throttled' | 'suspended' | 'banned'
+/** `throttled`: held at its own limits (tier, rule or operator). `backpressure`: paused by the relay, which is behind. */
+export type HostStatus = 'connected' | 'idle' | 'backoff' | 'offline' | 'throttled' | 'backpressure' | 'suspended' | 'banned'
+/** What's full while a host is in `backpressure`: its in-flight cap, the node's, or its lane queue (usually an identity backlog). */
+export type BackpressureReason = 'inflight_full' | 'node_inflight_full' | 'queue_full'
 export type Severity = 'info' | 'warn' | 'high' | 'critical'
 export type RejectReason =
   | 'bad-signature'
@@ -34,6 +37,8 @@ export type HostRow = {
   host: string
   tier: string
   status: HostStatus
+  /** Set while `status` is `backpressure`. */
+  backpressureReason?: BackpressureReason | null
   eventsPerSec: number
   errorRate: number
   accounts: number
@@ -514,6 +519,8 @@ export type PublicStats = {
   timeToFirehoseP50Ms: number
   timeToFirehoseP99Ms: number
   hostsConnected: number
+  /** Hosts the relay pauses because it's behind (a count only). */
+  hostsBackpressure: number
   consumers: number
   lastSeq: number
   nodes: number

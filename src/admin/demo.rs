@@ -132,6 +132,8 @@ struct SimHost {
     redial_at: Option<i64>,
     lag_base: f64,
     throttle: Option<f64>,
+    /// Why the relay pauses it, while its status is `backpressure`.
+    backpressure: Option<BackpressureReason>,
     rate: f64,
     err: f64,
     lag: f64,
@@ -261,6 +263,7 @@ impl Sim {
                     _ => rng.range(15.0, 180.0),
                 },
                 throttle: None,
+                backpressure: None,
                 rate: base_rate,
                 err: err_base,
                 lag: 0.0,
@@ -684,7 +687,10 @@ impl Sim {
                 }
                 _ => {}
             }
-            let live = matches!(h.status, HostStatus::Connected | HostStatus::Idle | HostStatus::Throttled);
+            let live = matches!(
+                h.status,
+                HostStatus::Connected | HostStatus::Idle | HostStatus::Throttled | HostStatus::Backpressure
+            );
             let (rate, err) = if live {
                 let burst = match h.profile {
                     Profile::SpamAccounts | Profile::Flood => 1.0 + 0.6 * ((t / 37.0 + i as f64).sin()).max(0.0),
@@ -694,8 +700,18 @@ impl Sim {
                 let tier_cap = policy.tiers.get(&h.tier).map(|l| l.events_per_sec).unwrap_or(f64::INFINITY);
                 let cap = h.throttle.unwrap_or(f64::INFINITY).min(tier_cap);
                 let rate = want.min(cap);
+                // a few hosts at a time wait on the relay (an identity backlog, a full in-flight
+                // cap), so the console's backpressure states always have someone in them
+                h.backpressure = match i % 211 {
+                    5 => Some(BackpressureReason::QueueFull),
+                    18 if (t / 47.0 + i as f64).sin() > 0.2 => Some(BackpressureReason::QueueFull),
+                    29 if (t / 61.0 + i as f64).sin() > 0.4 => Some(BackpressureReason::InflightFull),
+                    _ => None,
+                };
                 h.status = if want > cap * 1.001 {
                     HostStatus::Throttled
+                } else if h.backpressure.is_some() {
+                    HostStatus::Backpressure
                 } else if rate < 0.002 && h.profile == Profile::SelfHosted {
                     HostStatus::Idle
                 } else {
@@ -823,7 +839,10 @@ impl Sim {
         let tier_newh = |t: &str| tiers.get(t).map(|l| l.new_accounts_per_hour as f64).unwrap_or(0.0);
         let mut open = Vec::new();
         for (i, h) in self.hosts.iter().enumerate() {
-            if !matches!(h.status, HostStatus::Connected | HostStatus::Throttled | HostStatus::Idle) {
+            if !matches!(
+                h.status,
+                HostStatus::Connected | HostStatus::Throttled | HostStatus::Backpressure | HostStatus::Idle
+            ) {
                 continue;
             }
             let sigs_per_min = h.rate * h.err * 60.0 * if h.profile == Profile::SpamSigs { 0.8 } else { 0.0 };
@@ -895,6 +914,7 @@ impl Sim {
             host: h.name.clone(),
             tier: h.tier.clone(),
             status: h.status,
+            backpressure_reason: h.backpressure.filter(|_| h.status == HostStatus::Backpressure),
             events_per_sec: round2(h.rate),
             error_rate: (h.err * 10_000.0).round() / 10_000.0,
             accounts: h.accounts,
@@ -1079,7 +1099,12 @@ impl AdminSource for Demo {
         let connected = s
             .hosts
             .iter()
-            .filter(|h| matches!(h.status, HostStatus::Connected | HostStatus::Idle | HostStatus::Throttled))
+            .filter(|h| {
+                matches!(
+                    h.status,
+                    HostStatus::Connected | HostStatus::Idle | HostStatus::Throttled | HostStatus::Backpressure
+                )
+            })
             .count();
         Ok(Overview {
             time_ms: s.now_ms,
@@ -2307,6 +2332,17 @@ mod tests {
             h["throttledAccounts"].as_u64().unwrap() > 0 || (cap > 0 && n >= cap)
         }));
         assert_eq!(call("GET", "/admin/api/hosts?flag=nope", true).await.unwrap().status(), StatusCode::BAD_REQUEST);
+
+        // some hosts wait on the relay, each saying what's full; nobody else carries a reason
+        let bp = json(call("GET", "/admin/api/hosts?status=backpressure", true).await.unwrap()).await;
+        let hs = bp["hosts"].as_array().unwrap();
+        assert!(!hs.is_empty(), "no demo host in backpressure");
+        assert!(hs.iter().all(|h| h["status"] == "backpressure"
+            && matches!(
+                h["backpressureReason"].as_str(),
+                Some("inflight_full" | "node_inflight_full" | "queue_full")
+            )));
+        assert!(all.hosts.iter().all(|h| (h.status == HostStatus::Backpressure) == h.backpressure_reason.is_some()));
 
         // the tiers are one set wherever the console reads them
         let tiers = |v: &serde_json::Value| -> std::collections::BTreeSet<String> {

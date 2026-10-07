@@ -316,6 +316,7 @@ mod tests {
             host: host.into(),
             tier: "default".into(),
             status: HostStatus::Connected,
+            backpressure_reason: None,
             events_per_sec: eps,
             error_rate: 0.0,
             accounts: 1,

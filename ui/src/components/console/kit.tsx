@@ -509,12 +509,29 @@ export function NeedsVersion({ what, endpoint, children }: { what: ReactNode; en
 
 // ---------------------------------------------------------------- relay parts
 
-const HOST_TONE: Record<string, Tone> = { connected: 'ok', idle: 'idle', backoff: 'warn', offline: 'err', throttled: 'warn', suspended: 'err', banned: 'err' }
+// backpressure is the relay's own state, not the host's: info, so it never reads as a throttle
+const HOST_TONE: Record<string, Tone> = { connected: 'ok', idle: 'idle', backoff: 'warn', offline: 'err', throttled: 'warn', backpressure: 'info', suspended: 'err', banned: 'err' }
+const HOST_TITLE: Record<string, string> = {
+  throttled: 'Held at its own limits: its tier, a domain rule or an operator throttle',
+  backpressure: 'Paused by the relay, which is behind: not this host’s limits',
+}
 export const hostTone = (s: string): Tone => HOST_TONE[s] ?? 'idle'
-export const HostStatusChip = ({ s }: { s: string }) => <Chip k={hostTone(s)}>{s}</Chip>
+export const HostStatusChip = ({ s }: { s: string }) => (
+  <Chip k={hostTone(s)} title={HOST_TITLE[s]}>
+    {s}
+  </Chip>
+)
 
-/** A tier name, outlined; the policy decides what the names are. */
-export const TierTag = ({ t }: { t: string }) => <span className={`cx-tier t-${t.replace(/[^a-z0-9-]/gi, '')}`}>{t}</span>
+/**
+ * A tier name, outlined; the policy decides what the names are. `labeled` spells out "tier: …"
+ * where it sits beside a status chip (a host's header), so a throttled tier never reads as a status.
+ */
+export const TierTag = ({ t, labeled }: { t: string; labeled?: boolean }) => (
+  <span className={`cx-tier t-${t.replace(/[^a-z0-9-]/gi, '')}${labeled ? ' labeled' : ''}`} title={labeled ? `Policy tier ${t}` : undefined}>
+    {labeled && <span className="k">tier:</span>}
+    {t}
+  </span>
+)
 
 /** A hostname with its first label in ink and the rest muted. */
 export function HostName({ host, short }: { host: string; short?: boolean }) {

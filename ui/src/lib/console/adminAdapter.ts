@@ -79,7 +79,7 @@ export type HostQuery = {
   limit?: number
   offset?: number
 }
-/** `lagging`: connected or throttled and over a minute behind; `erroring`: over 10% of frames rejected. */
+/** `lagging`: connected, throttled or in backpressure and over a minute behind; `erroring`: over 10% of frames rejected. */
 export type HostFlag = 'atCap' | 'lagging' | 'erroring' | 'throttledOrAtCap'
 /** Server-side filter, sort and page (`limit` default 10,000 on the server). */
 export const hosts = (q: HostQuery) =>

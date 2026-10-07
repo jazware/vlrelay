@@ -42,12 +42,29 @@ pub enum HostStatus {
     Backoff,
     /// Gave up redialing; comes back on the next requestCrawl.
     Offline,
-    /// Over its tier's limit, or throttled by an operator.
+    /// Held at its own limits: its tier's, a domain rule's or an operator's
+    /// throttle.
     Throttled,
+    /// Paused by the relay, not by its limits: the pipeline behind the
+    /// socket is full ([`HostRow::backpressure_reason`] says which part).
+    Backpressure,
     /// Paused by an operator: no socket, cursor kept.
     Suspended,
     /// Banned: no socket, its events are dropped, requestCrawl refused.
     Banned,
+}
+
+/// What's full while a host is in [`HostStatus::Backpressure`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackpressureReason {
+    /// The host's in-flight cap: frames read from it and not yet durable.
+    InflightFull,
+    /// The node's in-flight cap, over every host it reads.
+    NodeInflightFull,
+    /// Its fair-queue slot: the lanes aren't taking frames, usually while
+    /// they wait on identity lookups.
+    QueueFull,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -175,6 +192,9 @@ pub struct HostRow {
     pub host: String,
     pub tier: String,
     pub status: HostStatus,
+    /// Set while `status` is `backpressure`.
+    #[serde(default)]
+    pub backpressure_reason: Option<BackpressureReason>,
     pub events_per_sec: f64,
     /// Rejected frames / all frames, last minute.
     pub error_rate: f64,
@@ -777,7 +797,7 @@ pub struct PipelineHost {
     pub inflight: u64,
     /// The host's in-flight cap, once the relay has one.
     pub inflight_cap: Option<u64>,
-    /// Its reader is paused (over its rate, or the pipeline is full).
+    /// Its reader is paused by the relay (status `backpressure`).
     pub paused: bool,
     pub status: Option<HostStatus>,
     pub events_per_sec: f64,
@@ -1045,7 +1065,7 @@ impl HostQuery {
                 None => have == want,
             }
         });
-        let live = matches!(r.status, HostStatus::Connected | HostStatus::Throttled);
+        let live = matches!(r.status, HostStatus::Connected | HostStatus::Throttled | HostStatus::Backpressure);
         let at_cap = r.max_accounts > 0 && r.accounts >= r.max_accounts;
         let flag = match self.flag.as_deref() {
             Some("atCap") => at_cap,

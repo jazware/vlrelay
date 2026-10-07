@@ -71,7 +71,7 @@ it reads, the events it submits and its own consumers.
 | `vlrelay_stage_seconds` | histogram | `stage` | Wall time per event in a pipeline stage |
 | `vlrelay_stage_busy_us_total` | counter | `stage` | Microseconds spent in a stage, summed over events |
 | `vlrelay_durable_lag_ms` | gauge | | Mean time from submitting an event to the leader to its commit, over the last second |
-| `vlrelay_hosts` | gauge | `status` | Upstream hosts by status |
+| `vlrelay_hosts` | gauge | `status` | Upstream hosts by status: `connected`, `idle`, `backoff`, `throttled` (held at its own limits), `backpressure` (paused because the relay is behind), `suspended`, `banned` |
 | `vlrelay_host_read_lag_max_seconds` | gauge | | The furthest any host reader on this node is behind its host's stream: the newest frame's age when it was read (read time minus the event's `time`), plus the time since while the reader is held back by its limits |
 | `vlrelay_hosts_lagging` | gauge | | Hosts whose reader is more than a minute behind. Hosts and host detail on the dashboard show each host's lag |
 | `vlrelay_consumers` | gauge | | Connected `subscribeRepos` consumers |
@@ -126,7 +126,9 @@ never resets it.
 
 `vlrelay_lane_queued` and `vlrelay_upstream_inflight_events` are the backlog between reading an
 event and the leader's answer. When they climb and keep climbing, the node is behind, and the
-in-flight caps start pausing host sockets (`vlrelay_upstream_paused_hosts`).
+in-flight caps start pausing host sockets (`vlrelay_upstream_paused_hosts`). Those hosts, and
+any whose lane queue is full, count as `vlrelay_hosts{status="backpressure"}`, not `throttled`:
+the relay is behind, not the hosts.
 
 Time to firehose is the pipeline, the submit to the leader, the quorum commit and the emit. The
 commit waits until two of the three nodes hold the event on disk, so fsync time sets much of it.

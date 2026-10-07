@@ -217,7 +217,7 @@ export function releaseDialog(host: string, atCap: boolean) {
     ],
     action: 'Lift accounts',
     call: `POST /admin/api/hosts/${host}/release-throttled`,
-    run: () => A.releaseThrottled(host),
+    run: () => A.releaseThrottled(host).then((r) => (hostsChanged(), r)),
     done: (r) => `Lifted ${plural((r as { released: number }).released, 'account')}`,
   })
 }

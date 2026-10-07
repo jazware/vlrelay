@@ -14,6 +14,9 @@ export type HostVerb = 'settier' | 'throttle' | 'unthrottle' | 'suspend' | 'ban'
 
 // pages re-read a host (and the lists) after an action lands
 let version = 0
+let acted: { row: HostRow; at: number } | undefined
+/** The row the last host action answered with, if it was this host's (and when it landed). */
+export const actedRow = (host: string) => (acted?.row.host === host ? acted : undefined)
 const subs = new Set<() => void>()
 export const useHostsVersion = () =>
   useSyncExternalStore(
@@ -25,15 +28,16 @@ export const useHostsVersion = () =>
     },
     () => version,
   )
-/** Re-reads the hosts on screen: after a host action, or a rule change that moves hosts. */
-export const hostsChanged = () => {
+/** Re-reads the hosts on screen: after a host action (with the row it answered), or a rule change that moves hosts. */
+export const hostsChanged = (row?: HostRow) => {
+  if (row) acted = { row, at: Date.now() }
   version++
   subs.forEach((l) => l())
 }
 
 function spec(verb: HostVerb, h: HostRow, arg?: string): ConfirmSpec | undefined {
   const name = h.host
-  const run = (a: HostAction) => A.hostAction(name, a).then((r) => (hostsChanged(), r))
+  const run = (a: HostAction) => A.hostAction(name, a).then((r) => (hostsChanged(r), r))
   const call = (a: HostAction) => A.hostActionCall(name, a)
   switch (verb) {
     case 'settier': {
@@ -43,7 +47,11 @@ function spec(verb: HostVerb, h: HostRow, arg?: string): ConfirmSpec | undefined
         tone: 'warn',
         primary: true,
         title: `Move ${name} to ${arg}?`,
-        items: [`Its limits become the ${arg} tier's on every node within a few seconds.`, h.status === 'throttled' && arg !== 'throttled' ? 'Its reader is released and catches up from its cursor.' : 'It overrides the tier until it is changed again.'],
+        items: [
+          `Its limits become the ${arg} tier's on every node within a few seconds.`,
+          h.tier === 'throttled' && arg !== 'throttled' ? 'Its reader is released and catches up from its cursor.' : 'It overrides the tier until it is changed again.',
+          ...(h.status === 'backpressure' ? ['It’s paused by the relay’s backpressure right now, which no tier changes: it resumes when the relay catches up.'] : []),
+        ],
         action: 'Set tier',
         call: call(a),
         run: () => run(a),

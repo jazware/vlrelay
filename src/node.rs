@@ -735,7 +735,7 @@ impl Node {
             for h in &hosts {
                 *by_status.entry(admin::host_status_label(h)).or_default() += 1;
             }
-            for s in ["connected", "idle", "backoff", "throttled", "suspended", "banned"] {
+            for s in ["connected", "idle", "backoff", "throttled", "backpressure", "suspended", "banned"] {
                 metrics::HOSTS.with_label_values(&[s]).set(by_status.get(s).copied().unwrap_or(0));
             }
             upstream::flow::HOST_INFLIGHT_MAX.set(hosts.iter().map(|h| h.inflight_events).max().unwrap_or(0) as i64);
