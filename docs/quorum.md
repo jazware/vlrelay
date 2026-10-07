@@ -1209,7 +1209,7 @@ What that does to the estimates that assumed ~200 ms round trips:
 
 ### Measuring a real host (OVH, Hetzner)
 
-Measured so far: one real host, vps1 (an ex-vlpds OVH VPS), single node only; numbers [below](#vps1-one-ovh-vps-single-node). The 3-box run and real R2 are still to do (R2: [tests/qlog/R2_HOUR.md](../tests/qlog/R2_HOUR.md), with its request guards). To run on candidate hosts, with Jaz's OK:
+Measured so far: vps1 (an ex-vlpds OVH VPS) as a single node, [below](#vps1-one-ovh-vps-single-node), and one fsync run of a real 3-box cluster (vps1, benchbox and devhost over Tailscale), [below that](#real-3-box-run), which hit Tailscale's userspace ceiling on vps1 (R2: [Real R2 hour](#real-r2-hour)). To run on candidate hosts, with Jaz's OK:
 
 1. **fsync**, on each box, on the disk the commitlog would use (no root, needs `fio`):
    ```
@@ -1273,6 +1273,43 @@ Single node (`run_single.sh`): the commitlog on the disk, MinIO on the same disk
 - **Over the internet.** The node on vps1, driven from benchbox through an ssh tunnel (4.5 ms RTT): ack p50 / p99 5.97 / 8.66 ms at 350/s and 6.79 / 11.6 ms at 3,500/s, so RTT + ~1.5-2.3 ms. That's what a host owner in the same metro sees.
 
 What it changes: nothing in the study's conclusions. The VPS fsync it assumed is right (0.6-0.9 ms, steady). A 2 vCPU VPS carries 10x on one node with room to spare. The 3-box run still has to measure replication across real hosts.
+
+#### Real 3-box run
+
+Run on 2026-10-07 from 02:20 to 02:28 UTC, and cut short: Jaz spun multi-host testing down after the first run. The cluster was n1 on vps1 (the OVH VPS above), n2 on benchbox and n3 on devhost (a lab VM: 16 vCPU, a `QEMU HARDDISK` on LVM). The members talked over Tailscale. MinIO for `qlog/leader` and the bucket, the load generator and the checker all ran on benchbox. All three boxes ran one Haswell build. Each commitlog was on its own box's disk. Flushes ran every 10 s. `tests/qlog/3box/run.sh` puts n1 first in `--members`, so with no leader yet vps1 campaigns first. It then runs 180 s of steady load, and kills the leader 15 s into a 60 s load, restarting it 1 s later. `3box/report.py` splits `report.py`'s output into those two parts. devhost has no fio and no root, so `tests/qlog/fsync_probe.py` runs the same tests in Python. On vps1 it read within ~5% of fio.
+
+| fdatasync p50 / p99 | 4 KiB | 64 KiB | 1 MiB (MiB/s) | 64 KiB, 3 writers |
+|---|---|---|---|---|
+| vps1 (fio) | 0.59 / 0.91 ms | 0.70 / 0.97 | 1.17 / 1.73 (515) | 0.90 / 1.52 |
+| devhost (python) | 1.04 / 7.17 | 1.15 / 1.84 | 2.06 / 3.02 (289) | 2.37 / 4.51 |
+
+| tailnet RTT, 200 pings | p50 | p99 |
+|---|---|---|
+| vps1 - devhost | 5.19 ms | 6.45 |
+| benchbox - vps1 | 5.67 | 7.64 |
+| benchbox - devhost (one LAN) | 0.93 | 2.71 |
+
+Every path was direct, not DERP.
+
+**fsync durability, 3,500/s, vps1 leading: a Tailscale ceiling, not a relay one.** At 3,500/s a leader sends ~37 MB/s of frames (5.3 KB each, to two followers) and takes in ~19 MB/s of submits. On vps1 all of that goes through tailscaled, and wireguard-go encrypts in userspace. tailscaled sat at 145% of vps1's 2 vCPU while qlog used 27%. vps1's tailnet egress topped out at ~21 MB/s. Followers missed heartbeats and called elections. vps1 won back epochs 3 and 5, then benchbox took epoch 6, 75 s into the run. Until then the client ack was 0.9-4 s p50, the load retried 114,266 submits, and benchbox's follower fell ~18k seqs behind. Local runs sustain 3,500/s and far more ([Phase 2](#tests-chaos-and-numbers-phase-2), [vps1 single node](#vps1-one-ovh-vps-single-node)). So the limit is userspace WireGuard on a 2 vCPU box: a leader there wants a cheaper transport (kernel WireGuard, or TLS between members) or more cores. That wasn't tried here.
+
+**The same run once benchbox led** (followers devhost, 0.9 ms away, and vps1, 5.7 ms away), for the last 105 s at 3,500/s:
+
+| | measured | expected |
+|---|---|---|
+| client ack (benchbox to the leader, local) | 3.6 ms p50; per-second p99 16 ms median, 202 worst | commit ≈ max(leader fsync, RTT + follower fsync) = max(2.8, 0.9 + 1.4) ms, times 1-1.7: 2.8-4.8 ms. The emulated "2.7 ms" row gives 2.96 / 3.17 |
+| commitlog fsync p50 / p99 | benchbox 2.8 / 9.7 ms, devhost 1.4 / 8.5, vps1 1.0 / 4.3 | fio: benchbox 2.7, devhost 1.15, vps1 0.70 |
+| events per group commit | p50 18, p99 795 | 17-18 at 3,500/s |
+| node CPU, max RSS | vps1 0.23 cores, 781 MB; benchbox 0.12, 1.5 GB; devhost 0.22, 1.1 GB | 0.06-0.07 leader, 0.04 follower (Phase 2, benchbox) |
+| busy cores, whole box | vps1 0.92, benchbox 0.85, devhost 2.05 (its own services included) | |
+
+With a leader on the LAN the ack is the leader's own fsync (benchbox's consumer NVMe), as the model says. The extra CPU and RSS against Phase 2 come from catching up after the first 75 s (`disk_reads` 183-278, 4 GB of commitlog on each node), so they aren't steady-state numbers.
+
+**The kill.** `run.sh` (since fixed) killed vps1, which by then was a follower, so this was a follower kill, not the planned leader failover. The emission pause was 212 ms. vps1's restart replayed 4.0 GB of commitlog (61 segments) in 5.4 s, ~1.35 s a GB against benchbox's ~0.35, on 2 vCPU. It answered at +5.6 s, followed at +5.6 s, and caught up to the leader's commit at +9.8 s. In the 60 s around it the ack was 11.3 ms p50 and 205 ms p99, with 5 retries.
+
+**Checker:** PASS. 891,399 seqs, 0 violations, 0 holes, 0 acked-but-not-emitted, 0 re-ingested. A consumer from cursor 0 through the bucket read all of them dense and matching in 82.5 s. Three leader changes under overload and a kill all came out clean. 31,321 events were emitted at two seqs. Those are the load generator's retries of submits that timed out but committed. That's at-least-once from the submitter's side, and none crossed a gap.
+
+Not run, because the session was stopped: page-cache and memory durability, the 350/s runs that would show a vps1-led commit away from the WireGuard ceiling (expected ≈ 5.2 ms RTT to devhost + ~1 ms fsync, so ~6-7 ms commit and ~12-13 ms at a submitter in benchbox's metro), and a real leader kill.
 
 ## Inputs
 
