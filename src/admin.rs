@@ -770,6 +770,28 @@ pub struct PipelineHost {
     pub events_per_sec: f64,
 }
 
+/// One host's rejects, for `ops/rejects/top`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectTop {
+    pub host: String,
+    /// Over the answering nodes' last sample windows (~10 s or more).
+    pub rejects_per_sec: f64,
+    /// Since each node's start.
+    pub total: u64,
+    pub last_at_ms: Option<i64>,
+    /// The newest one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample: Option<RejectSample>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct RejectTopQuery {
+    /// A reason (`bad-signature`, `prev-data-mismatch` ...); none: all.
+    pub reason: Option<RejectReason>,
+    pub limit: Option<usize>,
+}
+
 /// Host discovery as the leader runs it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1134,6 +1156,10 @@ pub trait AdminSource: Send + Sync + 'static {
     fn flush_now(&self, _by: &str) -> impl Future<Output = AdminResult<serde_json::Value>> + Send {
         async { Err(AdminError::NotFound("this relay doesn't run the quorum log".into())) }
     }
+    /// The hosts with the most rejects (of `reason`), across the members.
+    fn rejects_top(&self, _q: RejectTopQuery) -> impl Future<Output = AdminResult<Vec<RejectTop>>> + Send {
+        async { Err(AdminError::NotFound("this relay doesn't rank its rejects".into())) }
+    }
     fn discovery(&self) -> impl Future<Output = AdminResult<DiscoveryView>> + Send {
         async { Err(AdminError::NotFound("this relay doesn't run host discovery".into())) }
     }
@@ -1213,6 +1239,7 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
         .route("/admin/api/ops/tail", get(tail::<S>))
         .route("/admin/api/store", get(store::<S>))
         .route("/admin/api/discovery", get(discovery::<S>))
+        .route("/admin/api/ops/rejects/top", get(rejects_top::<S>))
         .route("/admin/api/discovery/run", post(discovery_run::<S>))
         .route("/admin/api/policy/usage", get(policy_usage::<S>))
         .route("/admin/api/policy/signals", get(policy_signals::<S>))
@@ -1368,6 +1395,12 @@ async fn quorum_history<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Quo
 async fn flush_now<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<serde_json::Value>> {
     tracing::info!(target: "vlrelay::audit", by = BY, "flush now");
     Ok(Json(c.src.flush_now(BY).await?))
+}
+async fn rejects_top<S: AdminSource>(
+    State(c): Ax<S>,
+    Query(q): Query<RejectTopQuery>,
+) -> AdminResult<Json<Vec<RejectTop>>> {
+    Ok(Json(c.src.rejects_top(q).await?))
 }
 async fn discovery<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<DiscoveryView>> {
     Ok(Json(c.src.discovery().await?))

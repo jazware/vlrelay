@@ -1875,6 +1875,37 @@ impl AdminSource for Demo {
         Ok(v)
     }
 
+    async fn rejects_top(&self, q: RejectTopQuery) -> AdminResult<Vec<RejectTop>> {
+        let s = self.sim.lock();
+        let limit = q.limit.unwrap_or(10).clamp(1, 500);
+        let mut v: Vec<RejectTop> = s
+            .hosts
+            .iter()
+            .filter_map(|h| {
+                let all: u64 = h.by_reason.values().sum();
+                let total = match q.reason {
+                    Some(r) => h.by_reason.get(&r).copied().unwrap_or(0),
+                    None => all,
+                };
+                if total == 0 {
+                    return None;
+                }
+                let share = total as f64 / all.max(1) as f64;
+                let sample = h.recent.iter().rev().find(|x| q.reason.is_none_or(|r| r == x.reason)).cloned();
+                Some(RejectTop {
+                    host: h.name.clone(),
+                    rejects_per_sec: round2(h.rate * h.err * share),
+                    total,
+                    last_at_ms: sample.as_ref().map(|x| x.at_ms),
+                    sample,
+                })
+            })
+            .collect();
+        v.sort_by(|a, b| b.rejects_per_sec.total_cmp(&a.rejects_per_sec).then(b.total.cmp(&a.total)));
+        v.truncate(limit);
+        Ok(v)
+    }
+
     async fn cluster(&self) -> AdminResult<ClusterView> {
         let s = self.sim.lock();
         let (leader, epoch, members, learners) = self.extra.lock().roles();
@@ -2217,6 +2248,13 @@ mod tests {
         assert_eq!(tiers(&pol["policy"]["tiers"]), tiers(&full["policy"]["tiers"]));
         let names = tiers(&pol["policy"]["tiers"]);
         assert!(all.hosts.iter().all(|h| names.contains(&h.tier)), "a host in a tier the policy doesn't have");
+
+        let top = json(call("GET", "/admin/api/ops/rejects/top?reason=bad-signature&limit=3", true).await.unwrap()).await;
+        let top = top.as_array().unwrap();
+        assert!(!top.is_empty() && top.len() <= 3);
+        assert!(top.iter().all(|t| t["host"].is_string() && t["rejectsPerSec"].is_number() && t["total"].as_u64() > Some(0)));
+        assert!(top.iter().all(|t| t["sample"].is_null() || t["sample"]["reason"] == "bad-signature"));
+        assert!(top.windows(2).all(|w| w[0]["rejectsPerSec"].as_f64() >= w[1]["rejectsPerSec"].as_f64()));
 
         let p = json(call("GET", "/admin/api/ops/plc", true).await.unwrap()).await;
         assert_eq!(p["enabled"], true);

@@ -657,3 +657,15 @@ export type DiscoverySource = {
 }
 export type DiscoveryView = { leader: string | null; leading: boolean; connectsPerMin: number; requestsPerSec: number; sources: DiscoverySource[] }
 
+/** GET ops/rejects/top?reason=&limit=: the hosts with the most rejects (of one reason), across the members. */
+export type RejectTop = {
+  host: string
+  /** over each member's last sample window (~10 s) */
+  rejectsPerSec: number
+  /** since each member's start */
+  total: number
+  lastAtMs: number | null
+  /** the newest one */
+  sample?: { atMs: number; did: string; reason: string; upstreamSeq: number; detail: string }
+}
+
