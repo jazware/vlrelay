@@ -37,11 +37,16 @@ static SHARED: OnceLock<Shared> = OnceLock::new();
 /// Sizes the node's cache; only before the first database opens (later
 /// calls, and opens before any call, get the default).
 pub fn configure(total_mb: u64) -> &'static Shared {
-    SHARED.get_or_init(|| Shared::new(total_mb))
+    SHARED.get_or_init(|| exported(Shared::new(total_mb)))
 }
 
 pub fn shared() -> &'static Shared {
-    SHARED.get_or_init(|| Shared::new(DEFAULT_MB))
+    SHARED.get_or_init(|| exported(Shared::new(DEFAULT_MB)))
+}
+
+fn exported(s: Shared) -> Shared {
+    slate_metrics::register_cache("node", s.cache.clone());
+    s
 }
 
 /// The shared cache and the id that keeps `path`'s entries apart from

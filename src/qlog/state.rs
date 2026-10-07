@@ -287,6 +287,11 @@ pub struct State {
     cursors: BTreeMap<String, u64>,
 }
 
+/// The `db` label of the state's SlateDB series and `/admin/api/store` shape.
+pub const DB_LABEL: &str = "qlog_state";
+/// A checkpoint read whole (a recovering leader's), while it runs.
+pub const CHECKPOINT_LABEL: &str = "qlog_state_checkpoint";
+
 impl State {
     /// Opens `qlog/state` as its writer, at whatever its last durable flush
     /// reached (at or past the last manifest's F: the leader seals before it
@@ -305,8 +310,10 @@ impl State {
         let db = Db::builder(path.clone(), store.raw.clone())
             .with_settings(settings(l0_bytes, state_bounds()))
             .with_db_cache(cache, id)
+            .with_metrics_recorder(slate_metrics::recorder(DB_LABEL))
             .build()
             .await?;
+        slate_metrics::register(DB_LABEL, &db);
         let applied = match db.get(APPLIED).await? {
             Some(v) => u64::from_be_bytes(v.as_ref().try_into()?),
             None => 0,
@@ -491,8 +498,10 @@ pub async fn read_checkpoint(store: &Store, r: &StateRef) -> anyhow::Result<(BTr
     let reader = DbReader::builder(path, store.raw.clone())
         .with_db_cache(cache, id)
         .with_reader_mode(DbReaderMode::Checkpoint(r.checkpoint.parse()?))
+        .with_metrics_recorder(slate_metrics::recorder(CHECKPOINT_LABEL))
         .build()
         .await?;
+    slate_metrics::register_reader(CHECKPOINT_LABEL, &reader);
     let mut out = BTreeMap::new();
     let mut it = reader.scan::<std::ops::RangeFull>(..).await?;
     while let Some(kv) = it.next().await? {
@@ -590,6 +599,31 @@ mod tests {
         // a writer opened afterwards sees the last applied point and goes on
         let st = State::open(&store, DEFAULT_PATH).await.unwrap();
         assert!(st.applied() >= refs.last().unwrap().0.seq);
+        st.close().await;
+    }
+
+    /// The state's SlateDB is in /metrics under `db="qlog_state"` and in
+    /// `GET /admin/api/store`'s `dbs`.
+    #[tokio::test]
+    async fn the_state_db_exports_its_metrics_and_shape() {
+        let store = Store::memory(None);
+        let mut st = State::open(&store, DEFAULT_PATH).await.unwrap();
+        let es: Vec<Entry> = (1..=50).map(|s| entry(s, 300)).collect();
+        st.apply(&es).await.unwrap();
+        st.seal().await.unwrap();
+        let shape = slate_metrics::shapes().into_iter().find(|d| d.db == DB_LABEL).unwrap();
+        assert_eq!(shape.role, "writer");
+        assert!(shape.memtable_bytes.is_some());
+        let fams = prometheus::gather();
+        let dbs = |name: &str| -> Vec<String> {
+            fams.iter()
+                .filter(|f| f.name() == name)
+                .flat_map(|f| f.get_metric())
+                .flat_map(|m| m.get_label().iter().filter(|l| l.name() == "db").map(|l| l.value().to_string()))
+                .collect()
+        };
+        assert!(dbs("slatedb_db_write_ops_total").iter().any(|d| d == DB_LABEL));
+        assert!(dbs("slatedb_lsm_ssts").iter().any(|d| d == DB_LABEL));
         st.close().await;
     }
 

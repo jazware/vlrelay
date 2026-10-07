@@ -3850,6 +3850,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "slate-metrics"
+version = "0.1.0"
+source = "git+https://github.com/jazware/vlpds?rev=838d36fa85767b6f316bc260429e4d3968d43b2c#838d36fa85767b6f316bc260429e4d3968d43b2c"
+dependencies = [
+ "parking_lot",
+ "prometheus",
+ "serde",
+ "slatedb",
+ "slatedb-common",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "slatedb"
 version = "0.17.0"
 source = "git+https://github.com/jazware/slatedb?rev=11b27b89caeff4b6fd788fab4919aa835fe04f03#11b27b89caeff4b6fd788fab4919aa835fe04f03"
@@ -4631,7 +4645,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vlpds"
 version = "1.0.0"
-source = "git+https://github.com/jazware/vlpds?rev=60fbd09b3c7e36f4b3e15061e111655812bd67a7#60fbd09b3c7e36f4b3e15061e111655812bd67a7"
+source = "git+https://github.com/jazware/vlpds?rev=838d36fa85767b6f316bc260429e4d3968d43b2c#838d36fa85767b6f316bc260429e4d3968d43b2c"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4674,8 +4688,8 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
+ "slate-metrics",
  "slatedb",
- "slatedb-common",
  "thiserror 2.0.21",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
@@ -4726,6 +4740,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "shrike",
+ "slate-metrics",
  "slatedb",
  "tempfile",
  "thiserror 2.0.21",

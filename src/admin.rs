@@ -1124,6 +1124,11 @@ pub struct StoreView {
     /// The leader's last retention pass, as it wrote it; None before the
     /// first or with retention off.
     pub retention: Option<serde_json::Value>,
+    /// Every SlateDB database this node has open (the quorum log's state,
+    /// the PLC seeds' writer or reader): its LSM shape, memtable, cache and
+    /// compaction, as `slatedb_*{db=...}` exports them.
+    #[serde(default)]
+    pub dbs: Vec<slate_metrics::DbShape>,
 }
 
 /// The cluster budgets against their use on the answering node.

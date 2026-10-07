@@ -106,6 +106,31 @@ export type StoreView = {
   purposes: StorePurpose[]
   latency: StoreLatency[]
   retention: Record<string, unknown> | null
+  /** Every SlateDB database the answering node has open (slate-metrics' DbShape). */
+  dbs: DbShape[]
+}
+/** A SlateDB database's LSM shape; bytes are estimates from each SST's index offset. */
+export type DbShape = {
+  /** The `db` label of its slatedb_* series: qlog_state, plc_seeds, plc_seeds_reader, qlog_state_checkpoint. */
+  db: string
+  role: 'writer' | 'reader'
+  manifestId: number
+  durableSeq: number
+  l0Ssts: number
+  l0Bytes: number
+  /** Newest first. */
+  sortedRuns: { id: number; ssts: number; bytes: number }[]
+  sstCount: number
+  totalBytes: number
+  checkpoints: number
+  externalDbs: number
+  /** Mutable plus immutable memtables; null on a reader. */
+  memtableBytes: number | null
+  walBufferBytes: number | null
+  /** Since the handle opened. */
+  cache: { kind: string; hits: number; misses: number }[]
+  compaction: { running: number | null; bytesInFlight: number | null; bytesCompacted: number; lastAtSecs: number | null }
+  stalls: { backpressure: number; l0Stalls: number }
 }
 
 export type History = {

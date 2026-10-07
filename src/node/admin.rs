@@ -1500,6 +1500,7 @@ pub(crate) fn store_view(
         purposes,
         latency: store_latency(),
         retention,
+        dbs: slate_metrics::shapes(),
     }
 }
 

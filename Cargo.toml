@@ -11,7 +11,10 @@ publish = false
 # crypto, MST, CAR and DID resolution. Factored into shared crates once the
 # relay settles which pieces it needs.
 # the public vlpds at the commit this one was exported against
-vlpds = { git = "https://github.com/jazware/vlpds", rev = "60fbd09b3c7e36f4b3e15061e111655812bd67a7" }
+vlpds = { git = "https://github.com/jazware/vlpds", rev = "838d36fa85767b6f316bc260429e4d3968d43b2c" }
+# SlateDB metrics with a `db` label per database, and each one's shape for
+# GET /admin/api/store
+slate-metrics = { git = "https://github.com/jazware/vlpds", rev = "838d36fa85767b6f316bc260429e4d3968d43b2c" }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws", "macros", "http2"] }
