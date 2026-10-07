@@ -1250,9 +1250,17 @@ pub enum AdminError {
     /// win, so the action is refused instead of recorded and ignored.
     #[error("{0}")]
     TierSetByRule(String),
+    /// Something this depends on (the bucket) failed for now: 503 with a
+    /// Retry-After, so a client retries instead of reporting a bug.
+    #[error("{0}")]
+    Unavailable(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
+
+/// What an [`AdminError::Unavailable`] asks a client to wait, in seconds:
+/// about one bucket call's deadline.
+pub const UNAVAILABLE_RETRY_AFTER_SECS: u64 = 5;
 
 impl IntoResponse for AdminError {
     fn into_response(self) -> Response {
@@ -1261,6 +1269,16 @@ impl IntoResponse for AdminError {
             AdminError::BadRequest(_) => (StatusCode::BAD_REQUEST, "InvalidRequest"),
             AdminError::Conflict(_) => (StatusCode::CONFLICT, "VersionConflict"),
             AdminError::TierSetByRule(_) => (StatusCode::CONFLICT, "TierSetByRule"),
+            AdminError::Unavailable(m) => {
+                tracing::warn!(error = %m, "admin api: unavailable");
+                let body = Json(serde_json::json!({ "error": "Unavailable", "message": self.to_string() }));
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::RETRY_AFTER, UNAVAILABLE_RETRY_AFTER_SECS.to_string())],
+                    body,
+                )
+                    .into_response();
+            }
             AdminError::Internal(e) => {
                 tracing::error!(error = %e, "admin api");
                 (StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError")

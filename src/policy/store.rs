@@ -65,6 +65,25 @@ pub enum SaveError {
     NoChange,
     #[error("store: {0}")]
     Store(String),
+    /// The bucket didn't answer in time or the request failed on the way:
+    /// the same save may well work in a moment.
+    #[error("the bucket is unavailable: {0}")]
+    Unavailable(String),
+}
+
+impl SaveError {
+    pub(crate) fn from_store(e: object_store::Error) -> SaveError {
+        use object_store::Error as E;
+        let config = matches!(
+            e,
+            E::PermissionDenied { .. }
+                | E::Unauthenticated { .. }
+                | E::NotSupported { .. }
+                | E::NotImplemented { .. }
+                | E::InvalidPath { .. }
+        );
+        if config { SaveError::Store(e.to_string()) } else { SaveError::Unavailable(e.to_string()) }
+    }
 }
 
 pub enum Fetched<T> {
@@ -187,7 +206,7 @@ impl Versioned {
         if note.chars().count() > 280 {
             return Err(SaveError::Invalid(vec!["note: longer than 280 characters".into()]));
         }
-        let st = |e: object_store::Error| SaveError::Store(e.to_string());
+        let st = SaveError::from_store;
         let cur = get(&self.store, &self.path, None).await.map_err(st)?;
         // An unreadable object can still be replaced: its version (if any)
         // is what the caller must have seen.

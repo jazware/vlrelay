@@ -34,6 +34,7 @@ fn save_err(e: SaveError) -> AdminError {
         SaveError::NoChange => AdminError::BadRequest("nothing changed".into()),
         c @ SaveError::Conflict { .. } => AdminError::Conflict(c.to_string()),
         SaveError::Store(s) => AdminError::Internal(anyhow::anyhow!(s)),
+        u @ SaveError::Unavailable(_) => AdminError::Unavailable(u.to_string()),
     }
 }
 

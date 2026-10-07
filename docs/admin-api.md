@@ -37,7 +37,8 @@ so `curl -u admin:$TOKEN` works, or a proxy that names the operator on the admin
 next section). A bad or missing token is a 401. Errors come back as
 `{"error": "...", "message": "..."}` with 400 (`InvalidRequest`), 403 (`OperatorRefused`, a
 proxy's sign-in that was refused), 404 (`NotFound`) or 409 (`VersionConflict`, or `TierSetByRule`:
-a `set-tier` a domain rule overrides). Without
+a `set-tier` a domain rule overrides). A save the bucket didn't take (a timeout, a failed
+request) is a 503 (`Unavailable`) with `Retry-After: 5`: the same save can be sent again. Without
 `--admin-token` the console and its API are off (404), and the public page at `/`, its stats
 (`/api/public/stats`, below) and `/docs` are still served.
 
