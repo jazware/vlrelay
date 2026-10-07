@@ -204,6 +204,8 @@ vlRelay serves plain HTTP. Put a TLS proxy (Caddy, nginx, a cloud load balancer)
   `/qlog/` at all.
 - `/admin` is behind the admin token (HTTP basic, user `admin`). It's fine to expose, but there's
   no reason to. `/docs` is public and static, and it's served even without `--admin-token`.
+  Operators can sign in through a proxy instead, on a separate `--admin-listen` that's never
+  public ([Admin API](../admin-api.md#sign-in-through-a-proxy)).
 - Proxy the websocket without buffering, and with an idle timeout of a minute or more.
 - The peer port (`--qlog-listen`, 2978) belongs on the private network only.
 - Name the proxy with `--trusted-proxy <CIDR,...>` (or `VLRELAY_TRUSTED_PROXIES`), and have it

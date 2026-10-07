@@ -934,7 +934,7 @@ impl AdminSource for NodeAdmin {
                         "consumer {id} is on {n}: kicking it from here needs --qlog-admin-token on the nodes"
                     ))
                 })?;
-                let body = serde_json::json!({ "token": token, "id": id, "by": by });
+                let body = kick_body(token, id, by);
                 let b = self
                     .node
                     .quorum
@@ -1385,24 +1385,38 @@ impl crate::node::quorum::LocalAsk for NodeAdmin {
                     let q: admin::RejectTopQuery = serde_json::from_slice(&body).ok()?;
                     serde_json::to_value(self.local_rejects_top(q.reason, q.limit.unwrap_or(10))).ok()?
                 }
-                "node:kick" => {
-                    let req: serde_json::Value = serde_json::from_slice(&body).ok()?;
-                    let ok = self.node.quorum.admin_token().is_some_and(|t| req["token"].as_str() == Some(t));
-                    if !ok {
-                        serde_json::json!({"error": "unauthorized"})
-                    } else {
-                        let by = req["by"].as_str().unwrap_or("admin");
-                        match self.local_kick(req["id"].as_u64()?, by) {
-                            Ok(()) => serde_json::json!({}),
-                            Err(e) => serde_json::json!({"error": e.to_string()}),
-                        }
-                    }
-                }
+                "node:kick" => match kick_request(&body, self.node.quorum.admin_token()) {
+                    Err(e) => serde_json::json!({"error": e}),
+                    Ok((id, by)) => match self.local_kick(id, &by) {
+                        Ok(()) => serde_json::json!({}),
+                        Err(e) => serde_json::json!({"error": e.to_string()}),
+                    },
+                },
                 _ => return None,
             };
             serde_json::to_vec(&v).ok().map(Bytes::from)
         })
     }
+}
+
+/// A kick sent on to the member serving the consumer. `by` is the audit
+/// label ([`admin::Actor::label`]), so an operator a proxy named stays named
+/// there; the qlog admin token is what makes the member believe it.
+fn kick_body(token: &str, id: u64, by: &str) -> serde_json::Value {
+    serde_json::json!({ "token": token, "id": id, "by": by })
+}
+
+/// The member's side of [`kick_body`]: the consumer and the label, only
+/// with this node's qlog admin token.
+fn kick_request(body: &[u8], token: Option<&str>) -> Result<(u64, String), &'static str> {
+    let req: serde_json::Value = serde_json::from_slice(body).map_err(|_| "bad request")?;
+    let given = req["token"].as_str().unwrap_or("");
+    if !token.is_some_and(|t| vlpds::auth::token_eq(t, given)) {
+        return Err("unauthorized");
+    }
+    let id = req["id"].as_u64().ok_or("bad request")?;
+    let by = req["by"].as_str().filter(|b| !b.is_empty()).unwrap_or("admin (token)");
+    Ok((id, by.to_string()))
 }
 
 /// Rejects older than this don't count toward a host's top reason.
@@ -1519,6 +1533,20 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!((v[0].host.as_str(), v[0].rejects_per_sec, v[0].total, v[0].last_at_ms), ("a", 3.5, 14, Some(9)));
         assert_eq!(v[1].host, "b");
+    }
+
+    #[test]
+    fn a_kick_sent_on_keeps_the_operator_only_with_the_qlog_token() {
+        let by = admin::Actor::Operator("alice@example.com".into()).label();
+        let body = serde_json::to_vec(&kick_body("qlog-secret", 7, &by)).unwrap();
+        assert_eq!(kick_request(&body, Some("qlog-secret")), Ok((7, "alice@example.com (proxy)".into())));
+        // without the token the label means nothing, as for any peer ask
+        assert_eq!(kick_request(&body, Some("other")), Err("unauthorized"));
+        assert_eq!(kick_request(&body, None), Err("unauthorized"));
+        let forged = serde_json::to_vec(&serde_json::json!({"id": 7, "by": by})).unwrap();
+        assert_eq!(kick_request(&forged, Some("qlog-secret")), Err("unauthorized"));
+        let bare = serde_json::to_vec(&serde_json::json!({"token": "qlog-secret", "id": 7})).unwrap();
+        assert_eq!(kick_request(&bare, Some("qlog-secret")), Ok((7, "admin (token)".into())));
     }
 
     #[test]

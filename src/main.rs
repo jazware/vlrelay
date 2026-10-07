@@ -100,6 +100,26 @@ struct Args {
     /// --admin-token from a file, less one trailing newline.
     #[arg(long, env = "VLRELAY_ADMIN_TOKEN_FILE", conflicts_with = "admin_token")]
     admin_token_file: Option<PathBuf>,
+    /// The admin listener: everything --listen serves, and the only listener
+    /// that reads --admin-proxy-header. For operators only: never route
+    /// public traffic to it. Unset: none.
+    #[arg(long, env = "VLRELAY_ADMIN_LISTEN")]
+    admin_listen: Option<SocketAddr>,
+    /// Header naming the operator, set by the proxy in front of
+    /// --admin-listen (e.g. Tailscale-User-Login). Taken only from
+    /// --admin-proxy-from peers, only for --admin-operators logins, and never
+    /// on --listen; the admin token works as before. Unset: token only.
+    #[arg(long, env = "VLRELAY_ADMIN_PROXY_HEADER", requires_all = ["admin_listen", "admin_proxy_from", "admin_operators"])]
+    admin_proxy_header: Option<String>,
+    /// The proxy's addresses as --admin-listen sees them (the TCP peer, never
+    /// X-Forwarded-For; IPs or CIDRs, comma-separated; name the proxy's own
+    /// /32). --admin-proxy-header from anywhere else is ignored.
+    #[arg(long, env = "VLRELAY_ADMIN_PROXY_FROM", value_delimiter = ',', requires = "admin_proxy_header")]
+    admin_proxy_from: Vec<vlrelay::serve::Cidr>,
+    /// Logins (comma-separated, exactly as the proxy sends them) let in by
+    /// --admin-proxy-header; the audit trail names them.
+    #[arg(long, env = "VLRELAY_ADMIN_OPERATORS", value_delimiter = ',', requires = "admin_proxy_header")]
+    admin_operators: Vec<String>,
     /// A built dashboard (`ui/dist`); default: this tree's, if built.
     #[arg(long)]
     ui_dir: Option<PathBuf>,
@@ -349,6 +369,7 @@ fn main() {
 
 async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<()> {
     read_secret_files(&mut a)?;
+    let admin_proxy = admin_proxy(&a)?;
     let loopback_plc = a.plc_url.contains("://127.") || a.plc_url.contains("://localhost");
     let dev_mode = a.dev_mode || a.hosts.iter().any(|h| h.starts_with("http://")) || loopback_plc;
     let store = if a.memory {
@@ -444,11 +465,28 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
 
     let listener = tokio::net::TcpListener::bind(a.listen).await?;
     tracing::info!(addr = %a.listen, node = %a.node_id, dev_mode, "vlrelay listening");
+    let admin_listener = match a.admin_listen {
+        Some(addr) => {
+            let l = tokio::net::TcpListener::bind(addr).await?;
+            let proxy = admin_proxy.as_ref().map(|p| p.header.to_string());
+            tracing::info!(%addr, proxy_header = proxy.as_deref().unwrap_or("(token only)"), "admin listener");
+            Some(l.into_std()?)
+        }
+        None => None,
+    };
     // Consumers (a reconnect storm's accepts and upgrades) are served on the
     // subscriber runtime, so they can't starve the pipeline and the quorum
     // log on this one. The tokio listener must be registered there too.
+    let rt = vlpds::firehose::runtime(node.cfg.serve_threads);
+    let admin_server = admin_listener.map(|l| {
+        let app = vlrelay::admin::proxy::admin_listener(app.clone(), admin_proxy);
+        rt.spawn(async move {
+            let l = tokio::net::TcpListener::from_std(l)?;
+            axum::serve(l, app.into_make_service_with_connect_info::<SocketAddr>()).await
+        })
+    });
     let listener = listener.into_std()?;
-    let server = vlpds::firehose::runtime(node.cfg.serve_threads).spawn(async move {
+    let server = rt.spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener)?;
         axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
     });
@@ -456,7 +494,21 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
     tracing::info!("shutting down");
     let r = node.shutdown().await;
     server.abort();
+    if let Some(s) = admin_server {
+        s.abort();
+    }
     r
+}
+
+/// `--admin-proxy-header` and its company, checked before anything starts.
+fn admin_proxy(a: &Args) -> anyhow::Result<Option<Arc<vlrelay::admin::proxy::Settings>>> {
+    let Some(h) = &a.admin_proxy_header else { return Ok(None) };
+    anyhow::ensure!(
+        a.admin_token.as_deref().is_some_and(|t| !t.is_empty()),
+        "--admin-proxy-header needs --admin-token: without it /admin is off"
+    );
+    let s = vlrelay::admin::proxy::Settings::parse(h, &a.admin_proxy_from, &a.admin_operators)?;
+    Ok(Some(Arc::new(s)))
 }
 
 async fn signal() {
@@ -593,6 +645,41 @@ mod tests {
         for p in paths {
             std::fs::remove_file(p).unwrap();
         }
+    }
+
+    #[test]
+    fn proxy_sign_in_needs_its_listener_peers_operators_and_the_token() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let full = [
+            "vlrelay",
+            "--admin-token",
+            "t",
+            "--admin-listen",
+            "127.0.0.1:2985",
+            "--admin-proxy-header",
+            "Tailscale-User-Login",
+            "--admin-proxy-from",
+            "100.64.0.1/32",
+            "--admin-operators",
+            "alice@example.com,bob@example.com",
+        ];
+        let a = Args::try_parse_from(full).unwrap();
+        let s = admin_proxy(&a).unwrap().expect("on");
+        assert_eq!(s.operators, ["alice@example.com", "bob@example.com"]);
+        // off unless asked for
+        let a = Args::try_parse_from(["vlrelay", "--admin-listen", "127.0.0.1:2985"]).unwrap();
+        assert!(admin_proxy(&a).unwrap().is_none());
+        // each of the header's companions is required, and none means anything alone
+        let without = |skip: &[usize]| -> Vec<&str> {
+            full.iter().enumerate().filter(|(j, _)| !skip.contains(j)).map(|(_, f)| *f).collect()
+        };
+        for skip in ["--admin-listen", "--admin-proxy-from", "--admin-operators"] {
+            let i = full.iter().position(|f| *f == skip).unwrap();
+            assert!(Args::try_parse_from(without(&[i, i + 1])).is_err(), "without {skip}");
+        }
+        assert!(Args::try_parse_from(["vlrelay", "--admin-operators", "alice@example.com"]).is_err());
+        assert!(Args::try_parse_from(["vlrelay", "--admin-proxy-from", "100.64.0.1"]).is_err());
+        assert!(admin_proxy(&Args::try_parse_from(without(&[1, 2])).unwrap()).is_err());
     }
 
     #[test]

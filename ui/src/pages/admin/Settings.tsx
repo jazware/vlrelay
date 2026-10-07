@@ -10,6 +10,7 @@ import { ago, dt, dur, fmtNum, fmtSi, plural } from '../../lib/console/fmt'
 import { useLiveState, toggleSources, useLivePoll } from '../../lib/console/live'
 import { publicPoll, settingsPoll } from '../../lib/console/polls'
 import { useRelay } from '../../lib/console/relay'
+import { useAdminOperator } from '../../lib/hooks'
 import { navigate, useSearch } from '../../lib/router'
 import { NodeTag } from './relayUi'
 import '../../console-rules.css'
@@ -263,6 +264,7 @@ export function Settings() {
   const s = settingsPoll.use()
   const pub = publicPoll.use().data
   const live = useLiveState()
+  const operator = useAdminOperator()
   const { view } = useRelay()
   const e = s.data?.entries ?? []
   const count = (src: Src) => e.filter((x) => x.source === src).length
@@ -313,16 +315,18 @@ export function Settings() {
           <Panel
             title="Console"
             foot={
-              <button
-                type="button"
-                className="cx-btn sm"
-                onClick={() => {
-                  setAdminToken(null)
-                  navigate('/admin')
-                }}
-              >
-                Lock console
-              </button>
+              operator ? undefined : (
+                <button
+                  type="button"
+                  className="cx-btn sm"
+                  onClick={() => {
+                    setAdminToken(null)
+                    navigate('/admin')
+                  }}
+                >
+                  Lock console
+                </button>
+              )
             }
           >
             <KV
@@ -330,7 +334,9 @@ export function Settings() {
               rows={[
                 ['Answered by', view?.self ? <NodeTag key="n" view={view} id={view.self} /> : location.host],
                 ['Other nodes', view && !view.single ? 'asked over the peer admin RPC; one slower than 1.5 s shows dashes' : 'none'],
-                ['Admin token', 'kept in this tab only'],
+                operator
+                  ? ['Signed in', <span key="o">as <span className="mono">{operator}</span>, by the proxy in front of the admin listener</span>]
+                  : ['Admin token', 'kept in this tab only'],
                 [
                   'Data sources',
                   <span key="s" className="cx-form-row" style={{ gap: 6 }}>

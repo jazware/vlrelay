@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
-import { getAdminToken, subscribeAdmin } from './api'
+import { getAdminOperator, getAdminUnlock, subscribeAdmin } from './api'
 
 
-export const useAdminToken = () => useSyncExternalStore(subscribeAdmin, getAdminToken)
+/** The token or a proxy's sign-in; null while the console is locked. */
+export const useAdminUnlock = () => useSyncExternalStore(subscribeAdmin, getAdminUnlock)
+/** The operator a proxy signed in, if that's how the console is unlocked. */
+export const useAdminOperator = () => useSyncExternalStore(subscribeAdmin, getAdminOperator)
 
 export type Load<T> = { data?: T; error?: unknown; loading: boolean; reload: () => void }
 

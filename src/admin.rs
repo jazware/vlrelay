@@ -8,12 +8,13 @@
 pub mod demo;
 mod diff;
 pub mod fleet;
+pub mod proxy;
 pub mod public;
 pub mod settings;
 mod ui;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
@@ -1086,8 +1087,7 @@ impl IntoResponse for AdminError {
 pub type AdminResult<T> = Result<T, AdminError>;
 
 /// What the dashboard needs from a relay. `by` is the operator label the
-/// audit trail records (the admin token has no user, so it's "admin" plus
-/// the client IP).
+/// audit trail records ([`Actor::label`]).
 pub trait AdminSource: Send + Sync + 'static {
     fn overview(&self) -> impl Future<Output = AdminResult<Overview>> + Send;
     fn hosts(&self, q: HostQuery) -> impl Future<Output = AdminResult<HostList>> + Send;
@@ -1249,10 +1249,12 @@ struct Ctx<S> {
 }
 
 /// `/admin/api/...`, behind `Authorization: Basic admin:<token>` (the same
-/// scheme as vlpds's console, so the UI's token handling carries over).
+/// scheme as vlpds's console, so the UI's token handling carries over), or
+/// an operator a proxy named on the admin listener ([`proxy`]).
 pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
     let ctx = Arc::new(Ctx { src, token: admin_token });
     Router::new()
+        .route("/admin/api/session", get(session))
         .route("/admin/api/overview", get(overview::<S>))
         .route("/admin/api/hosts", get(hosts::<S>))
         .route("/admin/api/hosts/{host}", get(host::<S>))
@@ -1295,28 +1297,77 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
         .with_state(ctx)
 }
 
-async fn auth<S: AdminSource>(State(ctx): State<Arc<Ctx<S>>>, req: Request, next: Next) -> Response {
-    let ok = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Basic "))
-        .is_some_and(|b| vlpds::auth::basic_admin_ok(b, &ctx.token));
-    if !ok {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "AuthenticationRequired", "message": "Admin token required" })),
-        )
-            .into_response();
-    }
+async fn auth<S: AdminSource>(State(ctx): State<Arc<Ctx<S>>>, mut req: Request, next: Next) -> Response {
+    let actor = match authenticate(&ctx.token, &req) {
+        Ok(a) => a,
+        Err((status, error, message)) => {
+            let body = Json(serde_json::json!({ "error": error, "message": message }));
+            return (status, [(header::CACHE_CONTROL, "no-store")], body).into_response();
+        }
+    };
+    req.extensions_mut().insert(actor);
     let mut res = next.run(req).await;
     res.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
     res
 }
 
-/// The audit label. The token is shared, so the best we can record is that
-/// an admin did it (a forwarded-for IP is the client's claim, so it's left out).
-const BY: &str = "admin";
+/// The token whenever the request brings an `Authorization` header (a wrong
+/// one is a 401 whatever a proxy said), else the operator the admin
+/// listener's proxy named ([`proxy`]).
+fn authenticate(token: &str, req: &Request) -> Result<Actor, (StatusCode, &'static str, String)> {
+    let unauthorized = || (StatusCode::UNAUTHORIZED, "AuthenticationRequired", "Admin token required".to_string());
+    if let Some(h) = req.headers().get(header::AUTHORIZATION) {
+        let ok = h
+            .to_str()
+            .ok()
+            .and_then(|h| h.strip_prefix("Basic "))
+            .is_some_and(|b| vlpds::auth::basic_admin_ok(b, token));
+        return if ok { Ok(Actor::Token) } else { Err(unauthorized()) };
+    }
+    match req.extensions().get::<proxy::ProxyIdentity>() {
+        Some(proxy::ProxyIdentity::Operator(login)) => Ok(Actor::Operator(login.clone())),
+        Some(proxy::ProxyIdentity::Refused(why)) => Err((StatusCode::FORBIDDEN, "OperatorRefused", why.clone())),
+        None => Err(unauthorized()),
+    }
+}
+
+/// Who an operator call came from, as the audit trail records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Actor {
+    /// The admin token: shared, so it names no one.
+    Token,
+    /// A login the admin listener's proxy named.
+    Operator(Arc<str>),
+}
+
+impl Actor {
+    /// How the caller got in: `token` or `proxy`.
+    pub fn auth(&self) -> &'static str {
+        match self {
+            Actor::Token => "token",
+            Actor::Operator(_) => "proxy",
+        }
+    }
+
+    /// The audit trail's `by`: `admin (token)`, or `<login> (proxy)`. The
+    /// server writes both halves, so a token caller can't pass as an operator.
+    pub fn label(&self) -> String {
+        match self {
+            Actor::Token => "admin (token)".into(),
+            Actor::Operator(login) => format!("{login} (proxy)"),
+        }
+    }
+}
+
+/// How the caller got in: `{"auth": "token"}`, or `{"auth": "proxy",
+/// "operator": <login>}`. The console asks first, without a token, to skip
+/// its token form.
+async fn session(Extension(a): Extension<Actor>) -> Json<serde_json::Value> {
+    Json(match &a {
+        Actor::Token => serde_json::json!({ "auth": "token" }),
+        Actor::Operator(login) => serde_json::json!({ "auth": "proxy", "operator": login.as_ref() }),
+    })
+}
 
 type Ax<S> = State<Arc<Ctx<S>>>;
 
@@ -1334,34 +1385,48 @@ async fn host<S: AdminSource>(State(c): Ax<S>, Path(h): Path<String>) -> AdminRe
 }
 async fn host_action<S: AdminSource>(
     State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
     Path(h): Path<String>,
-    Json(a): Json<HostAction>,
+    Json(action): Json<HostAction>,
 ) -> AdminResult<Json<HostRow>> {
-    Ok(Json(c.src.host_action(&h, a, BY).await?))
+    Ok(Json(c.src.host_action(&h, action, &a.label()).await?))
 }
 async fn rules<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Vec<DomainRule>>> {
     Ok(Json(c.src.domain_rules().await?))
 }
-async fn create_rule<S: AdminSource>(State(c): Ax<S>, Json(r): Json<DomainRuleInput>) -> AdminResult<Json<DomainRule>> {
-    Ok(Json(c.src.create_domain_rule(r, BY).await?))
+async fn create_rule<S: AdminSource>(
+    State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
+    Json(r): Json<DomainRuleInput>,
+) -> AdminResult<Json<DomainRule>> {
+    Ok(Json(c.src.create_domain_rule(r, &a.label()).await?))
 }
 async fn update_rule<S: AdminSource>(
     State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
     Path(id): Path<u64>,
     Json(r): Json<DomainRuleInput>,
 ) -> AdminResult<Json<DomainRule>> {
-    Ok(Json(c.src.update_domain_rule(id, r, BY).await?))
+    Ok(Json(c.src.update_domain_rule(id, r, &a.label()).await?))
 }
-async fn delete_rule<S: AdminSource>(State(c): Ax<S>, Path(id): Path<u64>) -> AdminResult<StatusCode> {
-    c.src.delete_domain_rule(id, BY).await?;
+async fn delete_rule<S: AdminSource>(
+    State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
+    Path(id): Path<u64>,
+) -> AdminResult<StatusCode> {
+    c.src.delete_domain_rule(id, &a.label()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn policy<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<PolicyDoc>> {
     Ok(Json(c.src.policy().await?))
 }
-async fn update_policy<S: AdminSource>(State(c): Ax<S>, Json(u): Json<PolicyUpdate>) -> AdminResult<Json<PolicyDoc>> {
+async fn update_policy<S: AdminSource>(
+    State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
+    Json(u): Json<PolicyUpdate>,
+) -> AdminResult<Json<PolicyDoc>> {
     validate_policy(&u.policy).map_err(AdminError::BadRequest)?;
-    Ok(Json(c.src.update_policy(u, BY).await?))
+    Ok(Json(c.src.update_policy(u, &a.label()).await?))
 }
 async fn policy_audit<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Vec<PolicyAudit>>> {
     Ok(Json(c.src.policy_audit().await?))
@@ -1371,9 +1436,10 @@ async fn full_policy<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<FullPo
 }
 async fn update_full_policy<S: AdminSource>(
     State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
     Json(u): Json<FullPolicyUpdate>,
 ) -> AdminResult<Json<FullPolicyDoc>> {
-    Ok(Json(c.src.update_full_policy(u, BY).await?))
+    Ok(Json(c.src.update_full_policy(u, &a.label()).await?))
 }
 async fn rules_audit<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Vec<PolicyAudit>>> {
     Ok(Json(c.src.domain_rules_audit().await?))
@@ -1386,11 +1452,12 @@ async fn consumers<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Vec<Cons
 }
 async fn kick<S: AdminSource>(
     State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
     Path(id): Path<u64>,
     Query(q): Query<KickQuery>,
 ) -> AdminResult<StatusCode> {
     let node = q.node.as_deref().filter(|n| !n.is_empty());
-    c.src.kick_consumer_on(node, id, BY).await?;
+    c.src.kick_consumer_on(node, id, &a.label()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn admissions<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<AdmissionLog>> {
@@ -1402,9 +1469,13 @@ async fn tail<S: AdminSource>(State(c): Ax<S>, Query(q): Query<TailQuery>) -> Ad
     }
     Ok(Json(c.src.tail(q).await?))
 }
-async fn release_throttled<S: AdminSource>(State(c): Ax<S>, Path(h): Path<String>) -> AdminResult<Json<Released>> {
-    tracing::info!(target: "vlrelay::audit", host = %h, by = BY, "release throttled accounts");
-    Ok(Json(c.src.release_throttled(&h, BY).await?))
+async fn release_throttled<S: AdminSource>(
+    State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
+    Path(h): Path<String>,
+) -> AdminResult<Json<Released>> {
+    tracing::info!(target: "vlrelay::audit", host = %h, by = %a.label(), auth = a.auth(), "release throttled accounts");
+    Ok(Json(c.src.release_throttled(&h, &a.label()).await?))
 }
 async fn policy_usage<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<PolicyUsage>> {
     Ok(Json(c.src.policy_usage().await?))
@@ -1418,9 +1489,12 @@ async fn takedowns<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Vec<crat
 async fn quorum_history<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<QuorumHistory>> {
     Ok(Json(c.src.quorum_history().await?))
 }
-async fn flush_now<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<serde_json::Value>> {
-    tracing::info!(target: "vlrelay::audit", by = BY, "flush now");
-    Ok(Json(c.src.flush_now(BY).await?))
+async fn flush_now<S: AdminSource>(
+    State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
+) -> AdminResult<Json<serde_json::Value>> {
+    tracing::info!(target: "vlrelay::audit", by = %a.label(), auth = a.auth(), "flush now");
+    Ok(Json(c.src.flush_now(&a.label()).await?))
 }
 async fn rejects_top<S: AdminSource>(
     State(c): Ax<S>,
@@ -1433,11 +1507,12 @@ async fn discovery<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Discover
 }
 async fn discovery_run<S: AdminSource>(
     State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
     body: Option<Json<DiscoveryRun>>,
 ) -> AdminResult<Json<DiscoveryView>> {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    tracing::info!(target: "vlrelay::audit", source = ?req.source, by = BY, "discovery run");
-    Ok(Json(c.src.discovery_run(req, BY).await?))
+    tracing::info!(target: "vlrelay::audit", source = ?req.source, by = %a.label(), auth = a.auth(), "discovery run");
+    Ok(Json(c.src.discovery_run(req, &a.label()).await?))
 }
 async fn store<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<StoreView>> {
     Ok(Json(c.src.store().await?))
@@ -1456,13 +1531,14 @@ async fn quorum<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<QuorumView>
 }
 async fn quorum_members<S: AdminSource>(
     State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
     Json(req): Json<QuorumMembersChange>,
 ) -> AdminResult<Json<serde_json::Value>> {
     if req.members.is_empty() || req.members.iter().any(|m| m.trim().is_empty()) {
         return Err(AdminError::BadRequest("members must be a non-empty list of node ids".into()));
     }
-    tracing::info!(target: "vlrelay::audit", members = ?req.members, by = BY, "quorum members");
-    Ok(Json(c.src.change_quorum_members(req, BY).await?))
+    tracing::info!(target: "vlrelay::audit", members = ?req.members, by = %a.label(), auth = a.auth(), "quorum members");
+    Ok(Json(c.src.change_quorum_members(req, &a.label()).await?))
 }
 async fn settings<S: AdminSource>(State(c): Ax<S>, Query(q): Query<NodeQuery>) -> AdminResult<Json<SettingsView>> {
     Ok(Json(c.src.settings_of(q.node.as_deref().filter(|n| !n.is_empty())).await?))
@@ -1479,16 +1555,21 @@ async fn account<S: AdminSource>(State(c): Ax<S>, Path(did): Path<String>) -> Ad
 }
 async fn takedown<S: AdminSource>(
     State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
     Path(did): Path<String>,
     Json(b): Json<ReasonBody>,
 ) -> AdminResult<Json<Account>> {
     if b.reason.trim().is_empty() {
         return Err(AdminError::BadRequest("a takedown needs a reason".into()));
     }
-    Ok(Json(c.src.takedown(&did, b.reason, BY).await?))
+    Ok(Json(c.src.takedown(&did, b.reason, &a.label()).await?))
 }
-async fn untakedown<S: AdminSource>(State(c): Ax<S>, Path(did): Path<String>) -> AdminResult<Json<Account>> {
-    Ok(Json(c.src.untakedown(&did, BY).await?))
+async fn untakedown<S: AdminSource>(
+    State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
+    Path(did): Path<String>,
+) -> AdminResult<Json<Account>> {
+    Ok(Json(c.src.untakedown(&did, &a.label()).await?))
 }
 async fn cases<S: AdminSource>(State(c): Ax<S>, Query(q): Query<CaseQuery>) -> AdminResult<Json<Vec<Case>>> {
     Ok(Json(c.src.cases(q).await?))
@@ -1498,10 +1579,11 @@ async fn case<S: AdminSource>(State(c): Ax<S>, Path(id): Path<u64>) -> AdminResu
 }
 async fn update_case<S: AdminSource>(
     State(c): Ax<S>,
+    Extension(a): Extension<Actor>,
     Path(id): Path<u64>,
     Json(u): Json<CaseUpdate>,
 ) -> AdminResult<Json<Case>> {
-    Ok(Json(c.src.update_case(id, u, BY).await?))
+    Ok(Json(c.src.update_case(id, u, &a.label()).await?))
 }
 
 /// Checks every implementation would otherwise repeat; the UI runs the same

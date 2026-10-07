@@ -49,6 +49,10 @@ entrypoint ([Deploy](deploy.md#the-image)).
 | `--trusted-proxy <TRUSTED_PROXIES>` | `VLRELAY_TRUSTED_PROXIES` |  | Proxies whose `X-Forwarded-For` names the client (CIDRs, repeatable or comma-separated): per-IP limits key on its rightmost address that isn't one of these. Other peers' headers are ignored |
 | `--admin-token <ADMIN_TOKEN>` | `VLRELAY_ADMIN_TOKEN` |  | Turns on /admin (dashboard and API) with this token |
 | `--admin-token-file <ADMIN_TOKEN_FILE>` | `VLRELAY_ADMIN_TOKEN_FILE` |  | --admin-token from a file, less one trailing newline |
+| `--admin-listen <ADMIN_LISTEN>` | `VLRELAY_ADMIN_LISTEN` |  | The admin listener: everything --listen serves, and the only listener that reads --admin-proxy-header. For operators only: never route public traffic to it. Unset: none |
+| `--admin-proxy-header <ADMIN_PROXY_HEADER>` | `VLRELAY_ADMIN_PROXY_HEADER` |  | Header naming the operator, set by the proxy in front of --admin-listen (e.g. Tailscale-User-Login). Taken only from --admin-proxy-from peers, only for --admin-operators logins, and never on --listen; the admin token works as before. Unset: token only |
+| `--admin-proxy-from <ADMIN_PROXY_FROM>` | `VLRELAY_ADMIN_PROXY_FROM` |  | The proxy's addresses as --admin-listen sees them (the TCP peer, never X-Forwarded-For; IPs or CIDRs, comma-separated; name the proxy's own /32). --admin-proxy-header from anywhere else is ignored |
+| `--admin-operators <ADMIN_OPERATORS>` | `VLRELAY_ADMIN_OPERATORS` |  | Logins (comma-separated, exactly as the proxy sends them) let in by --admin-proxy-header; the audit trail names them |
 | `--ui-dir <UI_DIR>` |  |  | A built dashboard (`ui/dist`); default: this tree's, if built |
 
 ## Bucket

@@ -33,15 +33,140 @@ The dashboard (`ui/`) talks to JSON endpoints under `/admin/api/`. The wire type
 unix milliseconds (`...Ms`) unless a field says seconds.
 
 Every endpoint needs `Authorization: Basic admin:<token>`, the same scheme as the vlpds console,
-so `curl -u admin:$TOKEN` works. A bad or missing token is a 401. Errors come back as
-`{"error": "...", "message": "..."}` with 400 (`InvalidRequest`), 404 (`NotFound`) or 409
-(`VersionConflict`). Without `--admin-token` the console and its API are off (404), and the
-public page at `/`, its stats (`/api/public/stats`, below) and `/docs` are still served.
+so `curl -u admin:$TOKEN` works, or a proxy that names the operator on the admin listener (the
+next section). A bad or missing token is a 401. Errors come back as
+`{"error": "...", "message": "..."}` with 400 (`InvalidRequest`), 403 (`OperatorRefused`, a
+proxy's sign-in that was refused), 404 (`NotFound`) or 409 (`VersionConflict`). Without
+`--admin-token` the console and its API are off (404), and the public page at `/`, its stats
+(`/api/public/stats`, below) and `/docs` are still served.
+
+## Sign-in through a proxy
+
+A proxy that already knows who you are can sign you in to the console. The relay reads the
+operator's login from one header the proxy sets, so the console opens without the token form and
+the audit trail names the person (`alice@example.com (proxy)`) where it would say
+`admin (token)`. The token keeps working alongside it, for curl, scripts and anyone the proxy
+can't name.
+
+Four flags turn it on, and they come together. Each has a `VLRELAY_` env twin
+([Configuration](operations/configuration.md)), and all of them are off by default.
+
+| Flag | Example | What it does |
+|---|---|---|
+| `--admin-listen` | `0.0.0.0:2985` | A second listener, for operators. It serves what `--listen` serves, and it's the only listener that reads the header. Never route public traffic to it. |
+| `--admin-proxy-header` | `Tailscale-User-Login` | The header that names the operator. It needs `--admin-token` too, since `/admin` is off without it. |
+| `--admin-proxy-from` | `100.64.0.10/32` | The proxy's own address, as `--admin-listen` sees the connection (the TCP peer, never `X-Forwarded-For`). The header from any other address is ignored. |
+| `--admin-operators` | `alice@example.com,bob@example.com` | The logins that may sign in, compared exactly. Anyone else gets a 403 and the token form. |
+
+Every address in `--admin-proxy-from` can claim any login, so name the proxy's own address (a
+`/32`) and nothing around it. A subnet takes in its neighbors, and on a Docker network it takes in
+the gateway, which is every process on the host.
+
+What the relay does with the header:
+
+- It reads the header only on `--admin-listen`, and only from `--admin-proxy-from`. Sent to
+  `--listen`, or from anywhere else, it means nothing. So the proxy must remove any copy the
+  client sent and set its own (the examples below do).
+- One header with one login. Two copies of the header, an empty one or a login off the list is
+  a 403.
+- A request with an `Authorization` header is token auth, whatever else it carries. A wrong token
+  is a 401 even when the proxy named an operator.
+- The login is ambient, like a cookie. So a call signed in this way must come from the console's
+  own page. A write needs `Sec-Fetch-Site: same-origin` or an `Origin` with this scheme and host,
+  which every browser sends from the console. A read is refused when the browser marks it
+  cross-site or same-site, or `Sec-Fetch-Site: none` (a link opened from mail or chat). That
+  means another site, or a link, can't act through your browser, and `curl` through the proxy can
+  still make reads. Scripts that write use the token.
+- The scheme comes from the proxy's `X-Forwarded-Proto` (only a `--admin-proxy-from` peer gets
+  that far), and it's plain `http` without one.
+- Every audit entry says how its actor got in: `alice@example.com (proxy)` for a login the proxy
+  named, `admin (token)` for the token. The relay writes both halves, so a token caller can't pass
+  as an operator. The `vlrelay::audit` log lines carry `by` and `auth` the same way.
+- A kick of a consumer on another member carries the label there in the peer ask, which members
+  take only with `--qlog-admin-token`. No client listener reads it.
+
+On load the console calls `GET /admin/api/session` without a token. If the answer is
+`{"auth": "proxy", "operator": "alice@example.com"}` it opens straight away and shows who you are
+in the top bar. A 403 (a login that isn't an operator, or a cross-site request) shows its reason
+above the token form.
+
+### Tailscale
+
+Tailscale is the worked example because it knows every device's user already. One Caddy on the
+tailnet can front several admin UIs. Put the console at `https://relay-admin.example.com`, with an
+A record pointing at that Caddy host's tailnet address (DNS-only, not proxied by a CDN). Caddy with
+the [caddy-tailscale](https://github.com/tailscale/caddy-tailscale) module asks the local
+tailscaled who each connection is (`tailscale_auth`), and passes the login on to the node's admin
+listener over the tailnet.
+
+```caddyfile
+relay-admin.example.com {
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+	}
+	@tailnet remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48
+	handle @tailnet {
+		route {
+			# tagged devices and failed lookups get a 401 here
+			tailscale_auth
+			reverse_proxy relay-node.tailnet-name.ts.net:2985 {
+				# replaces any copy the client sent
+				header_up Tailscale-User-Login {http.auth.user.id}
+				header_up -Tailscale-User-Name
+				header_up -Tailscale-User-Profile-Pic
+				# the console's live tail is a websocket
+				flush_interval -1
+			}
+		}
+	}
+	handle {
+		respond 403
+	}
+}
+```
+
+Caddy needs the module (`xcaddy build --with github.com/tailscale/caddy-tailscale`) and
+tailscaled's socket (`/var/run/tailscale/tailscaled.sock`) mounted. The node then runs with:
+
+```bash
+VLRELAY_ADMIN_LISTEN=0.0.0.0:2985
+VLRELAY_ADMIN_PROXY_HEADER=Tailscale-User-Login
+VLRELAY_ADMIN_PROXY_FROM=100.64.0.10/32   # the Caddy host's tailnet address
+VLRELAY_ADMIN_OPERATORS=alice@example.com
+```
+
+Two things trip this up on a Docker host. The relay must see the proxy's real address, so check
+what a connection to the published admin port looks like from inside the container. If
+tailscaled masquerades what it forwards into containers (`tailscale set
+--snat-subnet-routes=false` turns that off), every tailnet client arrives from the bridge
+gateway, and the header is ignored. And don't publish `--admin-listen` anywhere the tailnet ACL
+doesn't limit to the proxy.
+
+`tailscale serve` works too, with no Caddy at all. It sets `Tailscale-User-Login` for devices that
+belong to a user, drops the copy a client sent, and sets `X-Forwarded-Proto: https`. Point it at
+the admin listener on loopback and trust only loopback:
+
+```bash
+tailscale serve --bg --https=8443 http://127.0.0.1:2985
+# VLRELAY_ADMIN_LISTEN=127.0.0.1:2985  VLRELAY_ADMIN_PROXY_FROM=127.0.0.1/32
+```
+
+Trusting loopback trusts every process on the host, so use it only where nothing else runs that
+you wouldn't hand the admin token.
+
+### Other proxies
+
+Anything that authenticates the user and sets a header works the same way. Cloudflare Access
+(`Cf-Access-Authenticated-User-Email`, behind a tunnel so that only `cloudflared` reaches the
+listener), oauth2-proxy (`X-Auth-Request-Email`) and Pomerium are common choices. Set
+`--admin-proxy-header` to that header and `--admin-proxy-from` to the proxy's address, and make
+sure the proxy overwrites the header on every request.
 
 ## Endpoints
 
 | Method | Path | Body / query | Returns |
 |---|---|---|---|
+| GET | `session` | | How the caller got in: `{"auth": "token"}`, or `{"auth": "proxy", "operator": <login>}` ([Sign-in through a proxy](#sign-in-through-a-proxy)) |
 | GET | `overview` | | `Overview` for this node: events/s in and out, bytes/s, consumers, hosts connected/total and by status, rejects/s by reason, time to firehose p50/p99, commit lag, open cases, the busiest hosts (each with `history`, its last 60 s of events/s) and 5 min of 1 s history for the charts. `byNode` has this node's row, and `streamEventsPerSec` is the stream's own rate |
 | GET | `hosts` | `q`, `tier`, `status`, `source` (exact, a prefix ending in `:` or `*`, or `none`: not recorded), `throttled` (`true`: hosts with throttled accounts), `flag` (`atCap`; `lagging`: connected or throttled and over a minute behind; `erroring`: over 10% of frames rejected; `throttledOrAtCap`), `sort` (`host`, `tier`, `status`, `events`, `errors`, `accounts`, `seq`, `since`, `lag`, `throttled`, `source`), `desc`, `limit` (default 10,000), `offset` | `{total, hosts: HostRow[]}`: every host in the leader's table, each with the `node` reading it `source` (how the relay found it: `requestCrawl`, `bootstrap:<relay>`, `plc` or `cli`), `topReason` (the reject reason with the most of its rejects in the last five minutes on the node reading it, or null) and `throttledAccounts` (accounts it created that the relay throttled past its cap and nobody released, the leader's count). Only this node's hosts carry live numbers |
 | GET | `hosts/admissions` | | `AdmissionLog`: `{newHostsToday, newHostsPerDay, entries}`, the cluster's new-host budget and the last 500 `requestCrawl`s this node answered, newest first: `{atMs, host, outcome, tier?, reason, source}`, with `outcome` one of `admitted` (a new host, or a known one woken), `refused`, `banned` or `rate-limited` |
@@ -58,7 +183,7 @@ public page at `/`, its stats (`/api/public/stats`, below) and `/docs` are still
 | GET | `policy/defaults` | | the full policy document as a fresh relay has it (`PolicyBody::default()`), for the Tuning page's defaults |
 | GET | `domain-rules/audit` | | `PolicyAudit[]` of the domain rules, newest first |
 | GET | `consumers` | | `Consumer[]` of every member, each with its `node`, asked over the peer protocol (a member that doesn't answer is left out). `readTier` is where its next events come from: `ring` (the firehose's memory, every live consumer), `disk` (the node's own log) or `bucket` |
-| POST | `consumers/{id}/kick` | `node` (ids are per node; default this node) | 204. A consumer on another node is kicked there over the peer protocol, with `--qlog-admin-token` |
+| POST | `consumers/{id}/kick` | `node` (ids are per node; default this node) | 204. A consumer on another node is kicked there over the peer protocol, with `--qlog-admin-token`, and its audit line names the same operator |
 | GET | `cluster` | | `ClusterView`: `{nodes, leader, epoch, hosts, unownedHosts, lastSeq}`. Each node comes from its quorum status: `role` (`leader`, `follower`, `candidate` or `unreachable`), `healthy` (answering, a member, its log intact), `learner`, `ownedHosts` (what the leader's table gives it), `hosts` (sockets open), consumers, rates, `commitLagMs`, CPU, memory, stream seq and `stale`. `memBytes` is null where the platform doesn't report it. `hosts` and `unownedHosts` count the leader's table and the hosts no healthy member owns, and `lastSeq` is the commit index |
 | GET | `cluster/quorum` | | `QuorumView`: `{nodes: [{node, addr, stale, error, reportedMs, status}]}`, one per member or learner. `status` is the node's `/qlog/status` as it serialized it (snake_case: role, epoch, leader, last, commit, emitted, flushed F, reserve R, flush (with `last_at_ms` and `recent`, the leader's last 32 flushes: F, entries, segments, bytes, took), members, learners, switches, recovered, `history` (its leadership changes), `requests` (bucket requests by class and purpose), counters, `commit_us`, disk), passed through so new fields show up |
 | POST | `cluster/quorum/members` | `{members: [...], addrs?: {node: "host:port"}}`: the whole member set wanted, and addresses for nodes the leader can't dial yet | the leader's status after the change. Sent to the leader with `--qlog-admin-token`, and a 400 when the node has none. A new node joins as a learner, and a removed one retires |

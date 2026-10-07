@@ -4,8 +4,8 @@ import { Empty } from '../../components/console/kit'
 import { Mark, Shell } from '../../components/console/Shell'
 import { SECTION, sectionOf, type Section } from '../../components/console/sections'
 import { ErrorNotice, Field, Spinner } from '../../components/ui'
-import { api, setAdminToken } from '../../lib/api'
-import { useAdminToken } from '../../lib/hooks'
+import { api, ApiError, proxySession, setAdminOperator, setAdminToken } from '../../lib/api'
+import { useAdminUnlock } from '../../lib/hooks'
 import { Link, match } from '../../lib/router'
 import { Consumers } from './Consumers'
 import { Discovery } from './Discovery'
@@ -19,7 +19,7 @@ import { Quorum } from './Quorum'
 import { Settings } from './Settings'
 import { Store } from './Store'
 
-// The operator console: the token gate, then the shell around one page per route. The classic
+// The operator console: the gate (a proxy's sign-in, else the token), then the shell around one page per route. The classic
 // console's paths (/admin/cluster, /admin/ops, /admin/tuning, /admin/rules, /admin/cases/<id>,
 // /admin/accounts/<did>) still land on the section that took them over.
 
@@ -76,13 +76,13 @@ function route(p: string): Route {
 }
 
 export function AdminApp({ path }: { path: string }) {
-  const token = useAdminToken()
+  const unlocked = useAdminUnlock()
   const p = path.replace(/\/+$/, '') || '/admin'
-  const r = token ? route(p) : undefined
+  const r = unlocked ? route(p) : undefined
   useEffect(() => {
     document.title = r ? `${r.section.label} · vlRelay` : 'Console · vlRelay'
   }, [r?.section.label])
-  if (!token || !r) return <Login />
+  if (!unlocked || !r) return <Login />
   return (
     <Shell section={r.section} crumbs={r.crumbs}>
       {r.page}
@@ -90,10 +90,31 @@ export function AdminApp({ path }: { path: string }) {
   )
 }
 
+// Asked without a token: a proxy in front of the admin listener may already have named the
+// operator (docs/admin-api.md "Sign-in through a proxy"). A 403 is a proxy sign-in that was
+// refused (not an operator, or a cross-site request): shown above the token form.
+function useProxySignIn() {
+  const [state, setState] = useState<{ checking: boolean; refused?: unknown }>({ checking: true })
+  useEffect(() => {
+    let live = true
+    proxySession()
+      .then((s) => {
+        if (s.auth === 'proxy' && s.operator) setAdminOperator(s.operator)
+        else if (live) setState({ checking: false })
+      })
+      .catch((e) => live && setState({ checking: false, refused: e instanceof ApiError && e.status === 403 ? e : undefined }))
+    return () => {
+      live = false
+    }
+  }, [])
+  return state
+}
+
 function Login() {
   const [token, setToken] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>()
+  const proxy = useProxySignIn()
   return (
     <div className="cx cx-pubroot">
       <header className="cx-pub-top">
@@ -103,6 +124,9 @@ function Login() {
         </Link>
       </header>
       <main className="cx-signin">
+        {proxy.checking ? (
+          <Spinner />
+        ) : (
         <form
           className="cx-pn"
           onSubmit={async (e) => {
@@ -121,7 +145,7 @@ function Login() {
         >
           <h1>Relay console</h1>
           <p className="t2">Hosts, consumers, the quorum log, policy and moderation for this relay. The token stays in this tab only.</p>
-          <ErrorNotice error={error} />
+          <ErrorNotice error={error ?? proxy.refused} />
           <Field label="Admin token" hint="The relay's --admin-token (VLRELAY_ADMIN_TOKEN).">
             <input className="cx-inp" type="password" value={token} onChange={(e) => setToken(e.target.value)} autoComplete="off" required autoFocus />
           </Field>
@@ -132,6 +156,7 @@ function Login() {
             </button>
           </div>
         </form>
+        )}
       </main>
     </div>
   )
