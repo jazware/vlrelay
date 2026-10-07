@@ -1,8 +1,10 @@
 import { StrictMode, Suspense, lazy, useEffect } from 'react'
+import { QueryClientProvider } from '@tanstack/react-query'
 import { createRoot } from 'react-dom/client'
 import './styles.css'
 import './relay.css'
 import './console.css'
+import { queryClient } from './lib/console/cache'
 import { navigate, usePath } from './lib/router'
 import { AdminApp } from './pages/admin/AdminApp'
 import { Public } from './pages/Public'
@@ -30,6 +32,8 @@ function App() {
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    <QueryClientProvider client={queryClient}>
+      <App />
+    </QueryClientProvider>
   </StrictMode>,
 )

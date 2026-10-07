@@ -765,7 +765,11 @@ Every node keeps its upstream sockets, verify and lanes.
   with the highest rendezvous hash, and only a dead owner's hosts move. A changed row rides the next
   appended entry as a state write (`h/{host}`), so a new leader starts from the old table with no
   reshuffle. Members read the table from the leader every `--qlog-host-poll-ms` (500 ms), with each
-  host's newest committed cursor, so a node that gains a host resumes it from there.
+  host's newest committed cursor, so a node that gains a host resumes it from there. The row also
+  carries the host's policy fields (operator throttle, account cap, the tier a ban restores, the
+  action trail), so every member enforces the same ones. A member re-applies a host at once when a
+  new table moves its tier or policy, and an operator's action sends its row at once and waits to
+  read it back ([Admin API](admin-api.md#host-actions)).
 - The leader admits a host's events only from the member its table names. Without that, a moved
   host's old owner (reading until its next poll) and the new one interleaved a DID's events at the
   leader in testing.

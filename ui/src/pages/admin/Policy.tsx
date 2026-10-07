@@ -5,12 +5,13 @@ import { registerDetail } from '../../components/console/Drawer'
 import { openPanel } from '../../components/console/nav'
 import { registerPalette } from '../../components/console/Palette'
 import { toast } from '../../components/console/toast'
-import { Banners, Chip, Empty, ErrorState, KV, Loaded, Meter, PageHead, Panel, Src, TierTag, type BannerSpec } from '../../components/console/kit'
-import { ApiError, errText, type Case, type Policy as WirePolicy, type PolicyAudit, type PolicyUsage } from '../../lib/api'
+import { Banners, Chip, Empty, ErrorState, KV, Loaded, Meter, PageHead, Panel, Src, TierTag, Updated, type BannerSpec } from '../../components/console/kit'
+import { ApiError, errText, type Case, type PolicyAudit, type PolicyUsage } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, dt, dur, fmtNum, fmtSi, plural } from '../../lib/console/fmt'
-import { createPoller, useLivePoll } from '../../lib/console/live'
-import { capPoll, consumersPoll, openCasesPoll, overviewPoll, policyFullPoll, policyPoll } from '../../lib/console/polls'
+import { cached, keys } from '../../lib/console/cache'
+import { readPolicySource, useCapHosts, useConsumers, useHostList, useOpenCases, useOverview, usePolicyAudit, usePolicyDefaults, usePolicySource, usePolicyUsage, useSignals, useTierCounts } from '../../lib/console/queries'
+import * as W from '../../lib/console/writes'
 import {
   applyUndo,
   changesOf,
@@ -19,7 +20,6 @@ import {
   getIn,
   rebase,
   saved,
-  serverSaw,
   setBody,
   setField,
   showVal,
@@ -38,38 +38,6 @@ import '../../console-rules.css'
 // threshold) goes into one draft; Review shows the diff and the exact PUT with the version it was
 // edited from, and a 409 is handled in the dialog by moving the draft onto the newer version.
 // History lists every saved version; undo saves a new version with the old values put back.
-
-// ---------------------------------------------------------------- data
-
-async function fetchSource(): Promise<PolicyBase> {
-  const full = await A.policyFullOptional()
-  if (full.supported) {
-    const d = full.data
-    return { mode: 'full', version: d.version, updatedAtMs: d.updatedAtMs, updatedBy: d.updatedBy, note: d.note, body: d.policy }
-  }
-  const d = await A.policy()
-  return { mode: 'wire', version: d.version, updatedAtMs: d.updatedAtMs, updatedBy: d.updatedBy, body: d.policy as unknown as Json }
-}
-
-export const policySourcePoll = createPoller(fetchSource, 10_000, { onData: serverSaw })
-export const policyAuditPoll = createPoller(A.policyAudit, 15_000)
-const defaultsPoll = createPoller(A.policyDefaults, 300_000)
-
-function afterSave() {
-  policyAuditPoll.refresh()
-  policySourcePoll.refresh()
-  policyPoll.refresh()
-  policyFullPoll.refresh()
-}
-
-async function save(base: PolicyBase, body: Json, note: string): Promise<PolicyBase> {
-  if (base.mode === 'full') {
-    const d = await A.savePolicyFull({ baseVersion: base.version, policy: body, note })
-    return { mode: 'full', version: d.version, updatedAtMs: d.updatedAtMs, updatedBy: d.updatedBy, note: d.note, body: d.policy }
-  }
-  const d = await A.savePolicy({ baseVersion: base.version, policy: body as unknown as WirePolicy, note })
-  return { mode: 'wire', version: d.version, updatedAtMs: d.updatedAtMs, updatedBy: d.updatedBy, note, body: d.policy as unknown as Json }
-}
 
 // ---------------------------------------------------------------- what the page knows about the document
 
@@ -278,7 +246,7 @@ const fmtDef = (v: unknown, unit?: string) => (v === undefined ? '—' : typeof 
 /** The default a fresh relay has, magenta when the draft is off it. */
 function Def({ path, unit, ratio, quiet }: { path: string; unit?: string; ratio?: boolean; quiet?: boolean }) {
   const d = useDraft()
-  const defs = defaultsPoll.use().data
+  const defs = usePolicyDefaults().data
   if (!defs) return null
   const def = getIn(defs, path)
   if (def === undefined) return null
@@ -340,15 +308,10 @@ function Use({ v, max, label }: { v: number; max: number; label: ReactNode }) {
 function TierMatrix() {
   const d = useDraft()
   const errs = useErrors()
-  const ov = overviewPoll.use().data
-  const cap = capPoll.use().data
+  const ov = useOverview().data
+  const cap = useCapHosts().data
   const tiers = tiersOf(d.body)
-  const counts = useLivePoll(
-    () => Promise.all(tiers.map((t) => A.hosts({ tier: t, sort: 'host', desc: false, limit: 0 }).then((r) => [t, r.total] as const))),
-    tiers.join(','),
-    30_000,
-    { keep: true },
-  )
+  const counts = useTierCounts(tiers)
   const n = new Map(counts.data ?? [])
   const wire = d.base?.mode === 'wire'
   const rows = TIER_ROWS.filter((r) => tiers.some((t) => getIn(d.body, `tiers.${t}.${r.k}`) !== undefined))
@@ -418,9 +381,9 @@ function TierMatrix() {
 
 function SpamTable() {
   const d = useDraft()
-  const defs = defaultsPoll.use().data
-  const cases = openCasesPoll.use().data ?? []
-  const sig = useLivePoll(A.spamSignals, 'signals', 10_000).data
+  const defs = usePolicyDefaults().data
+  const cases = useOpenCases().data ?? []
+  const sig = useSignals().data
   const sigs = SIGNALS.filter((s) => getIn(d.body, `spam.${s.k}`) !== undefined)
   const worst = (s: Signal): Case | undefined =>
     cases.filter((c) => s.kinds.includes(c.kind) && c.threshold > 0).sort((a, b) => b.observed / b.threshold - a.observed / a.threshold)[0]
@@ -493,7 +456,7 @@ function SpamTable() {
 }
 
 function ConsumerKnobs() {
-  const cs = consumersPoll.use().data
+  const cs = useConsumers().data
   const max = (m: Map<string, number>) => Math.max(0, ...m.values())
   const count = (key: (c: NonNullable<typeof cs>[number]) => string) => {
     const m = new Map<string, number>()
@@ -521,7 +484,7 @@ function ConsumerKnobs() {
 function ErrorBudget() {
   const d = useDraft()
   const ratio = num(getIn(d.body, 'transitions.errorRatio'))
-  const l = useLivePoll(() => A.hosts({ sort: 'errors', desc: true, limit: 200 }), 'errs', 15_000)
+  const l = useHostList({ sort: 'errors', desc: true, limit: 200 }, { poll: 15_000 })
   const over = (l.data?.hosts ?? []).filter((h) => (h.status === 'connected' || h.status === 'throttled' || h.status === 'backpressure') && h.errorRate > ratio).length
   return (
     <Knob
@@ -732,7 +695,7 @@ function WireForm() {
 }
 
 function History() {
-  const a = policyAuditPoll.use()
+  const a = usePolicyAudit()
   const d = useDraft()
   const cols: Col<PolicyAudit>[] = [
     {
@@ -817,16 +780,14 @@ function ReviewDialog({ close }: { close: () => void }) {
     setBusy(true)
     setError(undefined)
     try {
-      const doc = await save(base, d.body!, note.trim())
+      const doc = await W.savePolicy(base, d.body!, note.trim())
       saved(doc)
-      afterSave()
       close()
       toast(`Saved version ${doc.version}. Every node picks it up within 10 s.`)
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         try {
-          setConflict({ latest: await fetchSource(), message: e.message })
-          policyAuditPoll.refresh()
+          setConflict({ latest: await readPolicySource(), message: e.message })
         } catch (e2) {
           setError(e2)
         }
@@ -835,7 +796,7 @@ function ReviewDialog({ close }: { close: () => void }) {
       setBusy(false)
     }
   }
-  const latestAudit = conflict && policyAuditPoll.get().data?.find((a) => a.version === conflict.latest.version)
+  const latestAudit = conflict && cached<PolicyAudit[]>(keys.policyAudit())?.find((a) => a.version === conflict.latest.version)
   return (
     <FormDialog
       title={`Save policy version ${base.version + 1}?`}
@@ -963,7 +924,7 @@ export function DraftBar() {
 }
 
 export function Policy() {
-  const src = policySourcePoll.use()
+  const src = usePolicySource()
   const d = useDraft()
   const full = d.base?.mode === 'full'
   const banners: BannerSpec[] = []
@@ -1006,6 +967,7 @@ export function Policy() {
                 <span>the defaults: never saved</span>
               )}
               <span>every node reloads within 10 s</span>
+              <Updated l={src} />
             </>
           ) : (
             <span>…</span>
@@ -1023,7 +985,7 @@ export function Policy() {
         }
       />
       <Banners items={banners} />
-      <Loaded load={{ data: d.base, error: src.error, loading: src.loading, reload: policySourcePoll.refresh }}>
+      <Loaded load={{ data: d.base, error: src.error, loading: src.loading, reload: src.reload }}>
         {() => (
           <div className="cx-stack">
             <Panel title="Host tiers" src={<Src>{full ? 'policy/full · tiers' : 'policy · tiers'}</Src>} right={<span className="muted sm">edits stay a draft until you save</span>}>
@@ -1083,7 +1045,7 @@ export function Policy() {
 }
 
 function Budgets() {
-  const use = useLivePoll(A.budgetUse, 'budget', 10_000)
+  const use = usePolicyUsage()
   const u = use.data
   return (
     <Panel
@@ -1100,7 +1062,7 @@ function Budgets() {
 // ---------------------------------------------------------------- a version: its diff and undo
 
 function undoDialog(a: PolicyAudit) {
-  const cur = policySourcePoll.get().data
+  const cur = cached<PolicyBase>(keys.policySource())
   if (!cur) return
   const undo = undoOf(a.changes, cur.body)
   const ok = undo.filter((u) => u.ok)
@@ -1119,11 +1081,10 @@ function undoDialog(a: PolicyAudit) {
     action: 'Save undo',
     call: A.savePolicyCall(cur.mode === 'full', cur.version, note),
     run: async () => {
-      const latest = await fetchSource()
-      const doc = await save(latest, applyUndo(latest.body, undoOf(a.changes, latest.body)), note)
+      const latest = await readPolicySource()
+      const doc = await W.savePolicy(latest, applyUndo(latest.body, undoOf(a.changes, latest.body)), note)
       const s = getDraft()
       if (!changesOf(s).length) saved(doc)
-      afterSave()
       return doc
     },
     done: (r) => `Saved version ${(r as PolicyBase).version}`,
@@ -1134,7 +1095,7 @@ registerDetail('ver', {
   kind: 'Policy version',
   section: 'policy',
   use: (id) => {
-    const a = policyAuditPoll.use()
+    const a = usePolicyAudit()
     const d = useDraft()
     const v = Number(id)
     const x = a.data?.find((r) => r.version === v)
@@ -1191,7 +1152,7 @@ registerPalette({
           { group: 'Actions', glyph: '○', title: 'Discard the policy draft', run: discard },
         ]
       : []
-    const vers = (policyAuditPoll.get().data ?? []).slice(0, 12).map((a) => ({ group: 'Policy', glyph: 'v', title: `Policy v${a.version}`, desc: a.note || a.changes.slice(0, 2).join(' · '), run: () => openPanel('ver', String(a.version)) }))
+    const vers = (cached<PolicyAudit[]>(keys.policyAudit()) ?? []).slice(0, 12).map((a) => ({ group: 'Policy', glyph: 'v', title: `Policy v${a.version}`, desc: a.note || a.changes.slice(0, 2).join(' · '), run: () => openPanel('ver', String(a.version)) }))
     return [...out, ...vers]
   },
 })

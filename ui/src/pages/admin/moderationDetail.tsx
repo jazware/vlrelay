@@ -1,52 +1,27 @@
-import { useState, useSyncExternalStore, type ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { confirmAction, FormDialog, openDialog } from '../../components/console/dialogs'
 import { registerDetail } from '../../components/console/Drawer'
-import { hostActionDialog, hostsChanged, useHostsVersion, type HostVerb } from '../../components/console/hostActions'
+import { hostActionDialog, type HostVerb } from '../../components/console/hostActions'
 import { closePanel, openPanel } from '../../components/console/nav'
 import { toast } from '../../components/console/toast'
-import { Chip, Copy, Empty, HostStatusChip, KV, Over, Sec, Strip, TierTag, type ChipKind } from '../../components/console/kit'
+import { Chip, Copy, Empty, HostStatusChip, KV, Over, Sec, Strip, TierTag } from '../../components/console/kit'
 import { errText, type Account, type Case, type CaseStatus, type DomainRule, type DomainRuleInput, type RuleEffect, type Severity, type SignalKey } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, dt, fmtNum, plural, shortDid } from '../../lib/console/fmt'
-import { createPoller, useLivePoll } from '../../lib/console/live'
-import { openCasesPoll, policyPoll } from '../../lib/console/polls'
+import { useAccount, useCase, useCaseEvidence, useHostList, usePolicy, useRules } from '../../lib/console/queries'
+import { accountTone, caseTone, sevTone } from '../../lib/console/tone'
+import * as W from '../../lib/console/writes'
 import '../../console-rules.css'
 
 // The moderation detail kinds (case, account, domain rule) and every moderation write behind a
 // confirm that shows the exact call: case status and notes, takedowns, domain rules.
 
-export const rulesPoll = createPoller(A.domainRules, 10_000)
-export const rulesAuditPoll = createPoller(A.domainRulesAudit, 30_000)
-/** Every case, for the status counts; open ones also come from openCasesPoll. */
-export const casesPoll = createPoller(() => A.cases(), 10_000)
 /** Opens what a spam signal's key names: the host, or the account (a per-account signal's key is the DID). */
 export const signalKeyRef = (per: string, k: SignalKey) => (per === 'account' && k.key.startsWith('did:') ? { type: 'acct', id: k.key } : { type: 'host', id: k.host || k.key })
 export const openSignalKey = (per: string, k: SignalKey) => {
   const r = signalKeyRef(per, k)
   openPanel(r.type, r.id)
 }
-
-/** Every account under a takedown, newest first. */
-export const takedownsPoll = createPoller(A.takedowns, 30_000)
-
-// accounts re-read after a takedown lands
-let acctVersion = 0
-const acctSubs = new Set<() => void>()
-const acctChanged = () => {
-  acctVersion++
-  takedownsPoll.refresh()
-  acctSubs.forEach((l) => l())
-}
-export const useAcctVersion = () =>
-  useSyncExternalStore(
-    (l) => {
-      acctSubs.add(l)
-      return () => {
-        acctSubs.delete(l)
-      }
-    },
-    () => acctVersion,
-  )
 
 // ---------------------------------------------------------------- shared bits
 
@@ -74,13 +49,10 @@ export const Act = ({ title, desc, children }: { title: string; desc?: ReactNode
   </div>
 )
 
-export const SEV_TONE: Record<Severity, ChipKind> = { critical: 'err', high: 'err', warn: 'warn', info: 'info' }
 export const SEV_RANK: Record<Severity, number> = { critical: 3, high: 2, warn: 1, info: 0 }
 
 export function CaseStatusChip({ c }: { c: Pick<Case, 'status' | 'severity'> }) {
-  if (c.status === 'open') return <Chip k={SEV_TONE[c.severity] === 'err' ? 'err' : 'warn'}>open</Chip>
-  if (c.status === 'acknowledged') return <Chip k="info">ack</Chip>
-  return <Chip k="idle">{c.status}</Chip>
+  return <Chip k={caseTone(c)}>{c.status === 'acknowledged' ? 'ack' : c.status}</Chip>
 }
 
 /** Observed against threshold, in the threshold's own unit. */
@@ -93,10 +65,7 @@ export function caseObs(c: Pick<Case, 'kind' | 'observed' | 'threshold'>): strin
 const kindLabel = (k: string) => k.replace(/-/g, ' ')
 
 export function AccountChip({ s }: { s: string }) {
-  if (s === 'active') return <Chip k="ok">active</Chip>
-  if (s === 'takendown') return <Chip k="err">taken down</Chip>
-  if (s === 'throttled') return <Chip k="warn">throttled</Chip>
-  return <Chip k="idle">{s}</Chip>
+  return <Chip k={accountTone(s)}>{s === 'takendown' ? 'taken down' : s}</Chip>
 }
 
 /** The same check the server makes: a hostname, or `*.` plus a domain (an IPv4 or localhost with a port for dev hosts). */
@@ -126,11 +95,6 @@ export function EffectChip({ e }: { e: RuleEffect }) {
 
 // ---------------------------------------------------------------- writes
 
-const changedCases = () => {
-  casesPoll.refresh()
-  openCasesPoll.refresh()
-}
-
 const VERB: Record<CaseStatus, string> = { acknowledged: 'Acknowledge', resolved: 'Resolve', dismissed: 'Dismiss', open: 'Reopen' }
 
 export function caseStatusDialog(c: Case, to: CaseStatus) {
@@ -152,7 +116,7 @@ export function caseStatusDialog(c: Case, to: CaseStatus) {
     fields: [{ id: 'note', label: needNote ? 'Note (required, kept on the case)' : 'Note (optional)', type: 'textarea', required: needNote, placeholder: to === 'dismissed' ? 'Real users: a migration wave' : 'Banned the domain' }],
     action: VERB[to],
     call: (v) => A.updateCaseCall(c.id, { status: to, note: String(v.note ?? '').trim() }),
-    run: (v) => A.updateCase(c.id, { status: to, note: String(v.note ?? '').trim() }).then((r) => (changedCases(), r)),
+    run: (v) => W.updateCase(c.id, { status: to, note: String(v.note ?? '').trim() }),
     done: `Case ${c.id} ${to}`,
   })
 }
@@ -166,7 +130,7 @@ function noteDialog(c: Case) {
     fields: [{ id: 'note', label: 'Note', type: 'textarea', required: true }],
     action: 'Add note',
     call: (v) => A.updateCaseCall(c.id, { status: null, note: String(v.note ?? '').trim() }),
-    run: (v) => A.updateCase(c.id, { status: null, note: String(v.note).trim() }).then((r) => (changedCases(), r)),
+    run: (v) => W.updateCase(c.id, { status: null, note: String(v.note).trim() }),
     done: 'Note added',
   })
 }
@@ -185,7 +149,7 @@ export function takedownDialog(a: Pick<Account, 'did' | 'handle' | 'host'>) {
     word: a.handle ?? a.did,
     action: 'Take down',
     call: () => `POST /admin/api/accounts/${a.did}/takedown {"reason":…}`,
-    run: (v) => A.takedown(a.did, String(v.reason).trim()).then((r) => (acctChanged(), r)),
+    run: (v) => W.takedown(a.did, String(v.reason).trim()),
     done: `Took down ${name}`,
   })
 }
@@ -200,7 +164,7 @@ export function untakedownDialog(a: Pick<Account, 'did' | 'handle' | 'status'>) 
     items: ['Emits #account active; its next commits are accepted.', lift ? 'If its host is still at its cap, its next new accounts arrive throttled too.' : 'Events dropped while it was down aren’t replayed.'],
     action: lift ? 'Lift' : 'Reverse',
     call: `POST /admin/api/accounts/${a.did}/untakedown`,
-    run: () => A.untakedown(a.did).then((r) => (acctChanged(), r)),
+    run: () => W.untakedown(a.did),
     done: lift ? `Lifted ${name}` : `Restored ${name}`,
   })
 }
@@ -217,7 +181,7 @@ export function releaseDialog(host: string, atCap: boolean) {
     ],
     action: 'Lift accounts',
     call: `POST /admin/api/hosts/${host}/release-throttled`,
-    run: () => A.releaseThrottled(host).then((r) => (hostsChanged(), r)),
+    run: () => W.releaseThrottled(host),
     done: (r) => `Lifted ${plural((r as { released: number }).released, 'account')}`,
   })
 }
@@ -242,7 +206,7 @@ function draftError(d: Draft): string | undefined {
 }
 
 function RuleDialog({ rule, pattern, close }: { rule?: DomainRule; pattern?: string; close: () => void }) {
-  const pol = policyPoll.use().data
+  const pol = usePolicy().data
   const tiers = Object.keys(pol?.policy.tiers ?? {})
   const [d, setD] = useState<Draft>(() => draftOf(rule, pattern, tiers.includes('new') ? 'new' : (tiers[tiers.length - 1] ?? 'new')))
   const [tried, setTried] = useState(false)
@@ -265,9 +229,7 @@ function RuleDialog({ rule, pattern, close }: { rule?: DomainRule; pattern?: str
         setBusy(true)
         setError(undefined)
         try {
-          const r = rule ? await A.updateRule(rule.id, body) : await A.createRule(body)
-          rulesPoll.refresh()
-          rulesAuditPoll.refresh()
+          const r = await W.saveRule(rule?.id, body)
           close()
           openPanel('rule', String(r.id))
         } catch (e) {
@@ -378,10 +340,7 @@ export async function deleteRuleDialog(r: DomainRule, opts: { stay?: boolean } =
     action: 'Delete rule',
     call: `DELETE /admin/api/domain-rules/${r.id}`,
     run: async () => {
-      await A.deleteRule(r.id)
-      rulesPoll.refresh()
-      rulesAuditPoll.refresh()
-      hostsChanged()
+      await W.deleteRule(r.id)
       if (!opts.stay) closePanel()
     },
     done: `Deleted rule ${r.id}`,
@@ -401,7 +360,7 @@ async function onHost(host: string, verb: HostVerb, arg?: string) {
 // ---------------------------------------------------------------- case
 
 function CaseBody({ c, page }: { c: Case; page: boolean }) {
-  const ev = useLivePoll(() => A.caseEvidence(c.id), String(c.id), 10_000)
+  const ev = useCaseEvidence(c.id)
   const d = ev.data?.supported ? ev.data.data : undefined
   const trips = d ? [...d.evidence].reverse() : []
   const dom = domainOf(c.host)
@@ -539,19 +498,18 @@ registerDetail('case', {
   kind: 'Case',
   section: 'moderation',
   use: (id, mode) => {
-    const all = casesPoll.use()
-    const l = useLivePoll(() => A.caseOf(Number(id)), id, 5000)
-    const fromAll = all.data?.find((x) => String(x.id) === id)
-    // the list refreshes right after an action; the case's own poll may be a tick behind
-    const c = l.data && fromAll ? (fromAll.updatedAtMs > l.data.updatedAtMs ? fromAll : l.data) : (l.data ?? fromAll)
+    // the case lists hydrate this key and a write patches it: newest updatedAtMs wins
+    const l = useCase(id)
+    const c = l.data
     if (!c) return { title: `Case ${id}`, body: null, loading: !l.error, missing: l.error ? `Couldn't load case ${id}: ${l.error instanceof Error ? l.error.message : String(l.error)}` : undefined }
     return {
       title: `Case ${c.id} · ${kindLabel(c.kind)}`,
       chip: (
         <>
-          <Chip k={SEV_TONE[c.severity]}>{c.severity}</Chip> <CaseStatusChip c={c} />
+          <Chip k={sevTone(c.severity)}>{c.severity}</Chip> <CaseStatusChip c={c} />
         </>
       ),
+      fresh: l,
       foot: <>GET /admin/api/cases/{'{id}'} · cases/{'{id}'}/evidence</>,
       body: <CaseBody c={c} page={mode === 'page'} />,
     }
@@ -632,13 +590,13 @@ registerDetail('acct', {
   kind: 'Account',
   section: 'moderation',
   use: (did, mode) => {
-    const v = useAcctVersion()
-    const l = useLivePoll(() => A.account(did), `${did}#${v}`, 10_000, { keep: true })
+    const l = useAccount(did)
     const a = l.data
     if (!a) return { title: shortDid(did), body: null, loading: !l.error, missing: l.error ? `Couldn't load ${did}: ${l.error instanceof Error ? l.error.message : String(l.error)}` : undefined }
     return {
       title: a.handle ?? shortDid(a.did),
       chip: <AccountChip s={a.status} />,
+      fresh: l,
       foot: <>state on the DID shard's owner ({a.node || 'this node'}) · GET /admin/api/accounts/{'{did}'}</>,
       body: <AcctBody a={a} page={mode === 'page'} />,
     }
@@ -648,8 +606,7 @@ registerDetail('acct', {
 // ---------------------------------------------------------------- domain rule
 
 function RuleBody({ r }: { r: DomainRule }) {
-  const hv = useHostsVersion()
-  const hosts = useLivePoll(() => A.hosts({ q: baseDomain(r.pattern), sort: 'events', desc: true, limit: 200 }), `${r.id}#${r.pattern}#${hv}`, 15_000)
+  const hosts = useHostList({ q: baseDomain(r.pattern), sort: 'events', desc: true, limit: 200 }, { poll: 15_000 })
   const m = (hosts.data?.hosts ?? []).filter((h) => h.rule === r.id)
   return (
     <>
@@ -691,9 +648,9 @@ registerDetail('rule', {
   kind: 'Domain rule',
   section: 'moderation',
   use: (id) => {
-    const l = rulesPoll.use()
+    const l = useRules()
     const r = l.data?.find((x) => String(x.id) === id)
     if (!r) return { title: `Rule ${id}`, body: null, loading: l.loading, missing: l.data ? `There's no rule ${id} (deleted?).` : l.error ? String(l.error) : undefined }
-    return { title: r.pattern, chip: <EffectChip e={r.effect} />, foot: <>GET /admin/api/domain-rules</>, body: <RuleBody r={r} /> }
+    return { title: r.pattern, chip: <EffectChip e={r.effect} />, foot: <>GET /admin/api/domain-rules</>, fresh: l, body: <RuleBody r={r} /> }
   },
 })

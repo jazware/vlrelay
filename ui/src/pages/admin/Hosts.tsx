@@ -1,14 +1,12 @@
 import { useEffect, useMemo } from 'react'
 import { DataTable, type Col } from '../../components/console/DataTable'
-import { useHostsVersion } from '../../components/console/hostActions'
-import { Banners, Chip, Empty, Glyph, HostName, Kbd, Loaded, LiveVal, Meter, NeedsVersion, PageHead, Panel, SearchInput, Seg, Src, Tiles, TierTag, hostTone, type TileSpec } from '../../components/console/kit'
+import { Banners, Empty, Glyph, HostName, HostStatusChip, Kbd, Loaded, LiveVal, Meter, NeedsVersion, PageHead, Panel, SearchInput, Seg, Src, Tiles, TierTag, Updated, hostTone, type TileSpec } from '../../components/console/kit'
 import { openPanel } from '../../components/console/nav'
 import { HOST_STATUSES } from '../../components/relay'
 import type { HostRow, HostStatus, RejectReason } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, dt, fmtMs, fmtNum, fmtRatio, fmtSi } from '../../lib/console/fmt'
-import { useLivePoll } from '../../lib/console/live'
-import { capPoll, discoveryPoll, overviewPoll, policyFullPoll, policyPoll, slowLagMs, throttledPoll } from '../../lib/console/polls'
+import { slowLagMs, useAdmissions, useCapHosts, useDiscovery, useHostList, useOverview, usePolicy, usePolicyFull, useRejectsTop, useThrottledHosts, useTierCounts } from '../../lib/console/queries'
 import { useRelay } from '../../lib/console/relay'
 import { Link, useSearch } from '../../lib/router'
 import { AdmissionTable } from './Admissions'
@@ -65,42 +63,36 @@ function setUrl(p: Partial<UrlState>, cur: UrlState) {
 
 export function Hosts() {
   const u = useUrlState()
-  const ov = overviewPoll.use()
-  const pol = policyPoll.use()
-  const polFull = policyFullPoll.use()
-  const thr = throttledPoll.use()
-  const cap = capPoll.use()
+  const ov = useOverview()
+  const pol = usePolicy()
+  const polFull = usePolicyFull()
+  const thr = useThrottledHosts()
+  const cap = useCapHosts()
   const { view } = useRelay()
-  const v = useHostsVersion()
   const byStatus = ov.data?.hostsByStatus ?? {}
   const total = ov.data?.hostsTotal
 
-  const key = JSON.stringify({ ...u, v })
-  const list = useLivePoll(
-    () =>
-      A.hosts({
-        q: u.q.trim().toLowerCase() || undefined,
-        tier: u.tier,
-        status: u.status,
-        source: sourceParam(u.source),
-        flag: u.flag ? FLAG[u.flag] : undefined,
-        sort: u.sort,
-        desc: !u.asc,
-        limit: PAGE,
-        offset: u.page * PAGE,
-      }),
-    key,
-    5000,
+  const list = useHostList(
+    {
+      q: u.q.trim().toLowerCase() || undefined,
+      tier: u.tier,
+      status: u.status,
+      source: sourceParam(u.source),
+      flag: u.flag ? FLAG[u.flag] : undefined,
+      sort: u.sort,
+      desc: !u.asc,
+      limit: PAGE,
+      offset: u.page * PAGE,
+    },
     { keep: true },
   )
   const rows = list.data?.hosts ?? []
   const matched = list.data?.total ?? 0
-  const disc = discoveryPoll.use()
+  const disc = useDiscovery()
   const pages = Math.max(1, Math.ceil(matched / PAGE))
 
-  // a tier's host count is one cheap call each (limit 0 still returns the total)
   const tiers = Object.keys(pol.data?.policy.tiers ?? {})
-  const tierCounts = useLivePoll(() => Promise.all(tiers.map((t) => A.hosts({ tier: t, sort: 'host', desc: false, limit: 0 }).then((r) => [t, r.total] as const))), `${tiers.join(',')}#${v}`, 30_000, { keep: true })
+  const tierCounts = useTierCounts(tiers)
   const counts = useMemo(() => new Map(tierCounts.data ?? []), [tierCounts.data])
 
   useEffect(() => {
@@ -139,7 +131,7 @@ export function Hosts() {
       label: 'Status',
       render: (h) => (
         <>
-          <Chip k={hostTone(h.status)}>{h.status}</Chip>
+          <HostStatusChip s={h.status} />
           {h.throttle != null && <span className="mono sm muted"> ≤{fmtNum(h.throttle)}/s</span>}
         </>
       ),
@@ -189,6 +181,7 @@ export function Hosts() {
             <span>{total !== undefined ? `${fmtNum(total)} known PDSes` : '…'}</span>
             {ov.data && <span>{fmtNum(ov.data.hostsConnected)} connected</span>}
             {thr.data && thr.data.total > 0 && <span>{fmtNum(thr.data.total)} throttled</span>}
+            <Updated l={list} />
           </>
         }
         actions={
@@ -296,7 +289,7 @@ function sampleText(s: unknown): string | undefined {
 
 /** The hosts sending the most of one reject reason, cluster-wide (GET ops/rejects/top). */
 function ReasonTop({ reason, clear }: { reason: RejectReason; clear: () => void }) {
-  const top = useLivePoll(() => A.rejectsTop(reason, 10), `top:${reason}`, 5000)
+  const top = useRejectsTop(reason)
   const d = top.data
   const label = reasonLabel(reason)
   return (
@@ -360,7 +353,7 @@ const HOSTNAME = /^[a-z0-9-]+(\.[a-z0-9-]+)+(:\d+)?$/
 
 /** No known host matches the search: what this node's admissions say about the name, and a crawl request. */
 function NoMatch({ q }: { q: string }) {
-  const l = useLivePoll(A.admissions, 'admissions', 10_000)
+  const l = useAdmissions()
   const name = q.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '')
   const hits = (l.data?.entries ?? []).filter((a) => a.host.toLowerCase().includes(name)).slice(0, 12)
   return (

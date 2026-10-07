@@ -402,6 +402,45 @@ body:has(.cx) {
   width: 9px;
   height: 9px;
 }
+/* the change feed dropped: polls stand in until it's back */
+.cx-stream.recon {
+  color: var(--warn);
+  border-color: color-mix(in oklab, var(--warn) 40%, var(--rule));
+}
+.cx-stream.recon .dot {
+  background: var(--warn);
+  animation: cx-blink 1.2s steps(2, jump-none) infinite;
+}
+/* no feed on this relay: every panel polls */
+.cx-stream.poll .dot {
+  animation: none;
+  background: var(--ink3);
+}
+@keyframes cx-blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+/* "updated 4s ago", the same on every page */
+.cx-upd {
+  font-size: 11.5px;
+  color: var(--ink3);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.cx-upd .cx-g {
+  font-size: 9px;
+  margin-right: 3px;
+}
+.cx-upd.live .cx-g {
+  color: var(--ok);
+}
+.cx-upd.warn {
+  color: var(--warn);
+}
+.cx-upd.paused {
+  color: var(--accent);
+}
 @keyframes cx-pulse {
   0% {
     box-shadow: 0 0 0 0 color-mix(in oklab, var(--signal) 55%, transparent);
@@ -3122,4 +3161,12 @@ a.cx-rrow:hover {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* a host action the cluster hadn't confirmed when it answered */
+.cx-pending {
+  font-size: 11.5px;
+  color: var(--ink3);
+  font-style: italic;
+  white-space: nowrap;
+  animation: cx-blink 1.6s steps(2, jump-none) infinite;
 }

@@ -1,7 +1,7 @@
 import type { ClusterView, Health, QStatus, QuorumView, SettingsView } from '../api'
 import type { Optional } from './adminAdapter'
 import { useMemo } from 'react'
-import { clusterPoll, overviewPoll, publicPoll, quorumPoll, settingsPoll } from './polls'
+import { useCluster, useOverview, usePublicStats, useQuorum, useSettings } from './queries'
 
 // The relay as the console draws it: its nodes (cluster), the quorum log (cluster/quorum) and
 // which node is answering (settings' --node-id). Colours go to nodes in name order so a node
@@ -144,13 +144,13 @@ export function buildView(c?: ClusterView, q?: Optional<QuorumView>, s?: Setting
   }
 }
 
-/** The relay's nodes and quorum, from the shared polls. */
+/** The relay's nodes and quorum, from the shared queries. */
 export function useRelay(): { view?: RelayView; loading: boolean } {
-  const c = clusterPoll.use()
-  const q = quorumPoll.use()
-  const s = settingsPoll.use()
-  const p = publicPoll.use()
-  const o = overviewPoll.use()
+  const c = useCluster()
+  const q = useQuorum()
+  const s = useSettings()
+  const p = usePublicStats()
+  const o = useOverview()
   const view = useMemo(() => buildView(c.data, q.data, s.data, p.data?.nodes, o.data?.topHosts[0]?.node), [c.data, q.data, s.data, p.data?.nodes, o.data?.topHosts])
   return { view, loading: c.loading && q.loading }
 }

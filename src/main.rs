@@ -463,6 +463,7 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
         let policy = node.policy.clone().expect("the relay always runs the policy engine");
         Arc::new(NodeAdmin::new(node.clone(), policy).with_settings(settings))
     };
+    admin_src.start_changes();
     let _ = node.quorum.hooks.answers.set(admin_src.clone());
     if !a.bootstrap_relays.is_empty() {
         seed_discovery(admin_src.as_ref(), &a.bootstrap_relays).await;

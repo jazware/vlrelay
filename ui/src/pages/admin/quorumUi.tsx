@@ -5,7 +5,8 @@ import { toast } from '../../components/console/toast'
 import { errText, type QDurability, type QRecovery, type QStatus, type QSwitch, type QuorumEvent, type QuorumView, type SettingsView } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, fmtBytes, fmtMs, fmtNum, seqS } from '../../lib/console/fmt'
-import { quorumPoll, type SeenEpoch } from '../../lib/console/polls'
+import type { SeenEpoch } from '../../lib/console/queries'
+import * as W from '../../lib/console/writes'
 import type { RelayView } from '../../lib/console/relay'
 
 // What the Quorum page, the node and epoch details and the membership dialog share: each
@@ -339,9 +340,8 @@ function MembersForm({ current, leader, known, remove, on }: { current: string[]
         setBusy(true)
         setError(undefined)
         try {
-          await A.changeMembers(req)
+          await W.changeMembers(req)
           toast(`Members now ${req.members.join(', ')}`)
-          quorumPoll.refresh()
           closeDialog()
         } catch (err) {
           setError(err)

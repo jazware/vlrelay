@@ -331,6 +331,10 @@ mod tests {
             throttled_accounts: 0,
             source: None,
             top_reason: None,
+            version: None,
+            updated_at_ms: None,
+            owner_version: None,
+            pending: false,
         }
     }
 

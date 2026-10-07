@@ -3,7 +3,7 @@ import { registerDetail } from '../../components/console/Drawer'
 import { Bars, Chip, Empty, HostName, KV, RRow, Sec, Strip } from '../../components/console/kit'
 import { openPanel } from '../../components/console/nav'
 import { ago, dt, fmtBytes, fmtMs, fmtNum, fmtSi, fmtUs, plural, seqS } from '../../lib/console/fmt'
-import { clusterPoll, historyPoll, overviewPoll, quorumPoll, seenEpochs, settingsPoll } from '../../lib/console/polls'
+import { seenEpochs, useCluster, useOverview, useQuorum, useQuorumHistory, useSettings } from '../../lib/console/queries'
 import { useRelay } from '../../lib/console/relay'
 import { Durability, EpochChip, epochEvents, memberRows, membersDialog, membershipOn, refStatus, RoleChip, SetDiff } from './quorumUi'
 import { NodeTag } from './relayUi'
@@ -38,10 +38,10 @@ registerDetail('node', {
   section: 'quorum',
   use: (id, mode) => {
     const { view } = useRelay()
-    const qp = quorumPoll.use()
-    const cp = clusterPoll.use()
-    const ov = overviewPoll.use()
-    const sp = settingsPoll.use()
+    const qp = useQuorum()
+    const cp = useCluster()
+    const ov = useOverview()
+    const sp = useSettings()
     const qv = qp.data?.supported ? qp.data.data : undefined
     const rows = qv ? memberRows(qv, view) : []
     const row = rows.find((r) => r.id === id)
@@ -179,8 +179,8 @@ registerDetail('epoch', {
   section: 'quorum',
   use: (id) => {
     const { view } = useRelay()
-    const qp = quorumPoll.use()
-    const hp = historyPoll.use()
+    const qp = useQuorum()
+    const hp = useQuorumHistory()
     const qv = qp.data?.supported ? qp.data.data : undefined
     const e = epochEvents(qv, hp.data?.events ?? [], seenEpochs()).find((x) => x.id === id)
     const loading = qp.loading || (hp.loading && !hp.data)

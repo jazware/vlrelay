@@ -2,9 +2,8 @@ import { useState, type ReactNode } from 'react'
 import { Chip, Empty, Loaded, Meter, Panel, Src, TierTag } from '../../components/console/kit'
 import { openPanel } from '../../components/console/nav'
 import type { CrawlAdmission } from '../../lib/api'
-import * as A from '../../lib/console/adminAdapter'
 import { ago, dt, fmtNum } from '../../lib/console/fmt'
-import { useLivePoll } from '../../lib/console/live'
+import { useAdmissions } from '../../lib/console/queries'
 import { SourceSelect, SourceTag, sourceOk } from './hostSource'
 
 // Admission outcomes on the node answering (its last 500: requestCrawls, and discovery's when it
@@ -44,7 +43,7 @@ export function AdmissionTable({ entries, maxHeight }: { entries: CrawlAdmission
 }
 
 export function Admissions() {
-  const l = useLivePoll(A.admissions, 'admissions', 10_000)
+  const l = useAdmissions()
   const d = l.data
   const [src, setSrc] = useState('')
   const keys = [...new Set((d?.entries ?? []).map((a) => a.source).filter((s) => s?.startsWith('bootstrap:')))]

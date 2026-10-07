@@ -276,6 +276,24 @@ impl Ext {
     }
 }
 
+/// What an operator's committed entry changed, for the admin change feed:
+/// a takedown or its reversal, or a lifted relay throttle.
+fn logged_change(x: &Ext, m: &Meta) -> Option<(crate::admin::changes::ChangeKind, String, serde_json::Value)> {
+    use crate::admin::changes::ChangeKind;
+    match x.kind {
+        KIND_TAKEDOWN => {
+            let key = state::record::did_key(&x.did);
+            let rec = m.writes.iter().find(|(k, _)| k[..] == key[..]).and_then(|(_, v)| Record::decode(v).ok())?;
+            Some((ChangeKind::Takedown, x.did.clone(), serde_json::json!({ "takedown": rec.relay_takedown })))
+        }
+        KIND_RELEASE => {
+            let host = m.writes.iter().find_map(|(k, _)| throttled_from_key(k)).map(|(h, _)| h);
+            Some((ChangeKind::Account, x.did.clone(), serde_json::json!({ "host": host })))
+        }
+        _ => None,
+    }
+}
+
 /// The host table's state key.
 pub const HOST_PREFIX: &[u8] = b"h/";
 
@@ -321,11 +339,18 @@ pub struct HostRow {
     /// How it was found: `requestCrawl`, `bootstrap:<relay>`, `plc`, `cli`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// The record's fields the log doesn't name (the policy's operator
+    /// throttle, account cap, restore tier and action trail), so every
+    /// member enforces and shows the same ones, and they outlive a restart.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl HostRow {
     fn record(&self) -> state::HostRecord {
-        state::HostRecord::new(&self.hostname, self.tier, self.first_seen)
+        let mut r = state::HostRecord::new(&self.hostname, self.tier, self.first_seen);
+        r.extra = self.extra.clone();
+        r
     }
 }
 
@@ -439,6 +464,8 @@ pub struct RelayHooks {
     /// The node's own answers (`node:*`: its consumers, settings, kicks),
     /// from its admin source.
     pub answers: std::sync::OnceLock<Arc<dyn LocalAsk>>,
+    /// The admin change feed: committed takedowns and throttle lifts.
+    pub changes: std::sync::OnceLock<Arc<crate::admin::changes::ChangeFeed>>,
     /// Tests: each decision of every other batch (at random) takes this
     /// long (µs), as a batch with slow identity lookups does.
     #[cfg(test)]
@@ -487,6 +514,7 @@ impl RelayHooks {
             plc: std::sync::OnceLock::new(),
             discovery: std::sync::OnceLock::new(),
             answers: std::sync::OnceLock::new(),
+            changes: std::sync::OnceLock::new(),
             #[cfg(test)]
             slow_us: AtomicU64::new(0),
         })
@@ -729,8 +757,10 @@ impl RelayHooks {
         for r in rows {
             let cur = i.hosts.rows.get(&r.hostname).cloned();
             let next = match cur {
-                Some(c) if c.tier == r.tier && (c.source.is_some() || r.source.is_none()) => continue,
-                Some(c) => HostRow { tier: r.tier, source: c.source.clone().or(r.source), ..c },
+                Some(c) if c.tier == r.tier && c.extra == r.extra && (c.source.is_some() || r.source.is_none()) => {
+                    continue;
+                }
+                Some(c) => HostRow { tier: r.tier, extra: r.extra, source: c.source.clone().or(r.source), ..c },
                 None => HostRow { owner: None, ..r },
             };
             i.hosts.rows.insert(next.hostname.clone(), next.clone());
@@ -1114,6 +1144,11 @@ impl Hooks for RelayHooks {
             {
                 id.invalidate(&x.did);
             }
+            if let Some(f) = self.changes.get()
+                && let Some((kind, id, hint)) = logged_change(&x, &m)
+            {
+                f.publish_versioned(kind, id, e.seq.to_string(), Some(hint), false);
+            }
         }
     }
 
@@ -1315,6 +1350,9 @@ pub struct Shared {
     /// Submit to answer, for the dashboard's durable lag.
     lat_us: AtomicU64,
     lat_n: AtomicU64,
+    /// Tests: host rows stay in the outbox, as if the leader never got them.
+    #[cfg(test)]
+    pub(crate) hold_rows: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
@@ -1325,16 +1363,28 @@ impl Shared {
         let guard = self.rewind.try_read();
         let mut o = self.outbox.lock();
         o.since = None;
-        let rows = std::mem::take(&mut o.rows);
-        let control = if rows.is_empty() {
-            Bytes::new()
-        } else {
-            serde_json::to_vec(&Control { rows }).map(Bytes::from).unwrap_or_default()
-        };
+        let control = self.rows_control(&mut o);
         match guard {
             Ok(_g) => (encode_cursors(&std::mem::take(&mut o.cursors)), control, self.client.generation()),
             Err(_) => (Bytes::new(), control, self.client.generation()),
         }
+    }
+
+    fn rows_control(&self, o: &mut Outbox) -> Bytes {
+        #[cfg(test)]
+        if self.hold_rows.load(Ordering::Relaxed) {
+            return Bytes::new();
+        }
+        let rows = std::mem::take(&mut o.rows);
+        if rows.is_empty() {
+            return Bytes::new();
+        }
+        serde_json::to_vec(&Control { rows }).map(Bytes::from).unwrap_or_default()
+    }
+
+    /// The outbox's host rows alone, as a submit's control.
+    fn take_rows(&self) -> Bytes {
+        self.rows_control(&mut self.outbox.lock())
     }
 }
 
@@ -1494,6 +1544,8 @@ pub struct QuorumHosts {
     shared: Arc<Shared>,
     /// Sources of hosts this node admitted, until the table has them.
     sources: Mutex<HashMap<String, String>>,
+    /// Told each host whose row a new table moved (the policy's sync loop).
+    changed: std::sync::OnceLock<mpsc::UnboundedSender<String>>,
 }
 
 impl QuorumHosts {
@@ -1522,6 +1574,7 @@ impl QuorumHosts {
         match (row, local) {
             (Some(r), Some(mut l)) => {
                 l.tier = r.tier;
+                l.extra = r.extra;
                 l.cursor = self.table.read().cursors.get(h).map_or(l.cursor, |c| *c as i64);
                 Some(l)
             }
@@ -1540,12 +1593,18 @@ impl QuorumHosts {
         names.iter().filter_map(|h| self.record(h)).collect()
     }
 
-    /// A row the table doesn't have yet, or a new tier: rides the next
-    /// submit to the leader (again on every poll until the table has it).
+    /// A row the table doesn't have yet, or a new tier or policy: rides
+    /// the next submit to the leader (a missing row again on every poll
+    /// until the table has it).
     fn propose(&self, rec: &state::HostRecord) {
-        let cur = self.table.read().rows.get(&rec.hostname).map(|r| (r.tier, r.source.is_some()));
+        let cur = self
+            .table
+            .read()
+            .rows
+            .get(&rec.hostname)
+            .map(|r| (r.tier == rec.tier && r.extra == rec.extra, r.source.is_some()));
         let source = self.sources.lock().get(&rec.hostname).cloned();
-        if cur.is_some_and(|(t, has)| t == rec.tier && (has || source.is_none())) {
+        if cur.is_some_and(|(same, has)| same && (has || source.is_none())) {
             if cur.is_some_and(|(_, has)| has) {
                 self.sources.lock().remove(&rec.hostname);
             }
@@ -1559,6 +1618,7 @@ impl QuorumHosts {
             first_seen: rec.first_seen,
             owner: None,
             source,
+            extra: rec.extra.clone(),
         });
         o.since.get_or_insert_with(Instant::now);
     }
@@ -1747,48 +1807,124 @@ impl Glue {
         });
     }
 
-    /// Reads the leader's host table every `host_poll` and follows it:
-    /// the hosts it gives this node are the manager's.
+    /// Reads the leader's host table every `host_poll` and follows it.
     async fn poll_hosts(self: Arc<Self>) {
         let mut tick = tokio::time::interval(self.setup.host_poll);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let t = match self.client.ask_leader("leader:hosts", Bytes::new(), Duration::from_secs(1)).await {
-                Ok(b) => match serde_json::from_slice::<HostTable>(&b) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!("quorum: a bad host table: {e}");
-                        continue;
-                    }
-                },
-                Err(_) => continue,
-            };
-            let changed = {
-                let cur = self.hosts.table.read();
-                (cur.epoch, cur.version) != (t.epoch, t.version) || cur.cursors != t.cursors
-            };
-            if !changed {
-                continue;
+            if let Some(t) = self.read_table(Duration::from_secs(1)).await {
+                self.install_table(t);
             }
-            // what the leader doesn't have yet goes again
-            {
-                let local: Vec<state::HostRecord> = self.hosts.local.read().values().cloned().collect();
-                *self.hosts.table.write() = t;
-                for r in local {
-                    if !self.hosts.table.read().rows.contains_key(&r.hostname) {
-                        self.hosts.propose(&r);
-                    }
+        }
+    }
+
+    async fn read_table(&self, patience: Duration) -> Option<HostTable> {
+        let b = self.client.ask_leader("leader:hosts", Bytes::new(), patience).await.ok()?;
+        serde_json::from_slice::<HostTable>(&b).map_err(|e| tracing::warn!("quorum: a bad host table: {e}")).ok()
+    }
+
+    /// Follows a table read from the leader: the hosts it gives this node
+    /// are the manager's, and each host whose tier or policy it moved is
+    /// re-applied to its socket and limits now. An older table than the
+    /// one held (a settle and the poll read concurrently) is dropped.
+    fn install_table(&self, t: HostTable) {
+        let moved: Vec<String> = {
+            let mut cur = self.hosts.table.write();
+            let (new, old) = ((t.epoch, t.version), (cur.epoch, cur.version));
+            if new < old || (new == old && cur.cursors == t.cursors && cur.throttled == t.throttled) {
+                return;
+            }
+            let moved = t
+                .rows
+                .values()
+                .filter(|r| cur.rows.get(&r.hostname).is_none_or(|c| c.tier != r.tier || c.extra != r.extra))
+                .map(|r| r.hostname.clone())
+                .collect();
+            *cur = t;
+            moved
+        };
+        // what the leader doesn't have yet goes again
+        let local: Vec<state::HostRecord> = self.hosts.local.read().values().cloned().collect();
+        for r in local {
+            if !self.hosts.table.read().rows.contains_key(&r.hostname) {
+                self.hosts.propose(&r);
+            }
+        }
+        let tx = self.hosts.changed.get().cloned();
+        let notify = move |moved: Vec<String>| {
+            for h in moved {
+                if let Some(tx) = &tx {
+                    let _ = tx.send(h);
                 }
             }
-            let owned = self.hosts.owned(&self.id);
-            let mut cur = self.owned.lock();
-            if *cur != owned {
-                let gained: Vec<&Host> = owned.difference(&cur).collect();
-                tracing::info!(id = %self.id, owned = owned.len(), gained = gained.len(), "quorum: hosts owned");
-                let set = Arc::new(owned.clone());
-                let _ = self.filter.send(Arc::new(move |h: &Host| set.contains(h)));
-                *cur = owned;
+        };
+        let m = self.manager.get().cloned();
+        match m {
+            // a host another member admitted is in this node's registry,
+            // and so its listings, before its row is applied
+            Some(m) if moved.iter().any(|h| m.registry().get(&Host(h.clone())).is_none()) => {
+                tokio::spawn(async move {
+                    if let Err(e) = m.registry().load().await {
+                        tracing::warn!("quorum: loading new hosts: {e:#}");
+                    }
+                    notify(moved);
+                });
+            }
+            _ => notify(moved),
+        }
+        let owned = self.hosts.owned(&self.id);
+        let mut cur = self.owned.lock();
+        if *cur != owned {
+            let gained: Vec<&Host> = owned.difference(&cur).collect();
+            tracing::info!(id = %self.id, owned = owned.len(), gained = gained.len(), "quorum: hosts owned");
+            let set = Arc::new(owned.clone());
+            let _ = self.filter.send(Arc::new(move |h: &Host| set.contains(h)));
+            *cur = owned;
+        }
+    }
+
+    /// Reads the leader's table now rather than at the next poll.
+    pub async fn refresh_table(&self) {
+        if let Some(t) = self.read_table(Duration::from_secs(1)).await {
+            self.install_table(t);
+        }
+    }
+
+    /// Sees a write to `host`'s record through (docs/admin-api.md, "Host
+    /// actions"): sends the row to the leader now, not with the next
+    /// submit, and reads the leader's table until this node's copy holds
+    /// the record as this node last wrote it. False if it didn't within
+    /// `within`: no leader answered, or another write to the host won.
+    pub async fn settle_host(&self, host: &str, within: Duration) -> bool {
+        let until = Instant::now() + within;
+        loop {
+            let Some(want) = self.hosts.local.read().get(host).cloned() else { return true };
+            let held = |t: &HostTable| t.rows.get(host).is_some_and(|r| r.tier == want.tier && r.extra == want.extra);
+            if held(&self.hosts.table.read()) {
+                return true;
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            // again each pass: a submit that took it may have gone to a
+            // leader that lost its term
+            self.hosts.propose(&want);
+            let rows = self.shared.take_rows();
+            if !rows.is_empty() {
+                let submit = self.client.submit_events(Vec::new(), Bytes::new(), rows, self.client.generation());
+                let _ = tokio::time::timeout(left, submit).await;
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if !left.is_zero()
+                && let Some(t) = self.read_table(left.min(Duration::from_secs(1))).await
+            {
+                self.install_table(t);
+            }
+            if !held(&self.hosts.table.read()) {
+                tokio::time::sleep(Duration::from_millis(50).min(until.saturating_duration_since(Instant::now())))
+                    .await;
             }
         }
     }
@@ -2247,12 +2383,15 @@ impl Node {
             pending_rewind: Mutex::new(HashMap::new()),
             lat_us: AtomicU64::new(0),
             lat_n: AtomicU64::new(0),
+            #[cfg(test)]
+            hold_rows: Default::default(),
         });
         let hosts = Arc::new(QuorumHosts {
             table: RwLock::new(HostTable::default()),
             local: RwLock::new(BTreeMap::new()),
             shared: shared.clone(),
             sources: Mutex::new(HashMap::new()),
+            changed: std::sync::OnceLock::new(),
         });
         let cursors =
             Arc::new(QuorumCursors { shared: shared.clone(), hosts: hosts.clone(), registry: Default::default() });
@@ -2273,6 +2412,7 @@ impl Node {
             super::policy::PolicyHooks::new(p.0.clone(), state.clone(), raw, cfg.dev_mode)
         });
         if let Some(h) = &policy {
+            let _ = hosts.changed.set(h.changed_sender());
             h.install(&manager, &crawler, &identity);
             h.load().await?;
         }
@@ -2415,6 +2555,16 @@ mod tests {
         gate: Option<Arc<dyn state::AccountGate>>,
         tweak: impl Fn(&mut QuorumSetup) + Send + Sync + 'static,
     ) -> ConfigFn {
+        cluster_cfg_hooked(ident, slow_us, gate, tweak, |_, _| {})
+    }
+
+    fn cluster_cfg_hooked(
+        ident: Arc<MapIdentity>,
+        slow_us: u64,
+        gate: Option<Arc<dyn state::AccountGate>>,
+        tweak: impl Fn(&mut QuorumSetup) + Send + Sync + 'static,
+        on_hooks: impl Fn(&str, &Arc<RelayHooks>) + Send + Sync + 'static,
+    ) -> ConfigFn {
         Arc::new(move |id: &str, addrs: &HashMap<String, String>| {
             let mut c = config(id, addrs);
             c.flush = Some(crate::qlog::flush::Options {
@@ -2438,14 +2588,21 @@ mod tests {
             tweak(&mut q);
             let h = RelayHooks::new(state, None, q);
             h.slow_us.store(slow_us, Ordering::Relaxed);
+            on_hooks(id, &h);
             c.hooks = crate::qlog::node::HooksSlot(Some(h));
             c
         })
     }
 
     async fn owner(client: &Client) -> String {
-        let row =
-            HostRow { hostname: HOST.into(), tier: state::Tier::Trusted, first_seen: 1, owner: None, source: None };
+        let row = HostRow {
+            hostname: HOST.into(),
+            tier: state::Tier::Trusted,
+            first_seen: 1,
+            owner: None,
+            source: None,
+            extra: Default::default(),
+        };
         let control: Bytes = serde_json::to_vec(&Control { rows: vec![row] }).unwrap().into();
         let t = Instant::now();
         loop {
@@ -2532,6 +2689,97 @@ mod tests {
     /// the leader lists the host's throttled accounts across a takeover
     /// (the logged ones), a release lifts each through the log with an
     /// `#account`, and their commits are taken again.
+
+    #[test]
+    fn operator_entries_name_their_change() {
+        use crate::admin::changes::ChangeKind;
+        let did = crate::state::tests::plc(3);
+        let ext = |kind| Ext { kind, key_changed: false, host: String::new(), useq: 0, did: did.clone() };
+        let mut rec = Record::new(state::HostKey::of("pds.example.com"), 1);
+        rec.relay_takedown = true;
+        let m = Meta { writes: vec![(Bytes::from(state::record::did_key(&did)), rec.encode())], ext: Bytes::new() };
+        let (k, id, hint) = logged_change(&ext(KIND_TAKEDOWN), &m).unwrap();
+        assert_eq!((k, id.as_str(), &hint["takedown"]), (ChangeKind::Takedown, did.as_str(), &serde_json::json!(true)));
+        let m = Meta {
+            writes: vec![(throttled_key("pds.example.com", &did), Bytes::from_static(b"0"))],
+            ext: Bytes::new(),
+        };
+        let (k, _, hint) = logged_change(&ext(KIND_RELEASE), &m).unwrap();
+        assert_eq!((k, &hint["host"]), (ChangeKind::Account, &serde_json::json!("pds.example.com")));
+        assert!(logged_change(&ext(KIND_COMMIT), &m).is_none());
+    }
+
+    /// A takedown made through one node reaches every member's change feed
+    /// as its entry commits there, versioned by the entry's seq.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn committed_takedowns_reach_every_members_change_feed() {
+        use crate::admin::changes::{ChangeFeed, ChangeKind};
+        let ident = MapIdentity::new();
+        let did = crate::state::tests::plc(1);
+        ident.set(&did, HOST, 1);
+        let feeds: Arc<Mutex<HashMap<String, Arc<ChangeFeed>>>> = Default::default();
+        let f2 = feeds.clone();
+        let cfg = cluster_cfg_hooked(
+            ident,
+            0,
+            None,
+            |_| {},
+            move |id, h| {
+                let f = ChangeFeed::new(id);
+                let _ = h.changes.set(f.clone());
+                f2.lock().insert(id.to_string(), f);
+            },
+        );
+        let c = Cluster::with_cfg(3, None, Some(cfg), 64 << 20).await;
+        c.wait_leader(Duration::from_secs(5)).await;
+        let client = c.client();
+        let from = owner(&client).await;
+        assert!(matches!(submit_one(&client, identity(&did, &from)).await, Outcome::Appended(_)));
+        let operator = |takedown: bool| {
+            let frame = vlpds::events::account_frame(
+                &did,
+                !takedown,
+                takedown.then_some("takendown"),
+                &vlpds::events::now_rfc3339(),
+            );
+            Item {
+                prefix: frame.prefix.into(),
+                suffix: frame.suffix.into(),
+                meta: encode_item(&did, &Host(String::new()), &from, 0, &[0xff, takedown as u8]),
+            }
+        };
+        let mut seqs = Vec::new();
+        for takedown in [true, false] {
+            match submit_one(&client, operator(takedown)).await {
+                Outcome::Appended(s) => seqs.push((s, takedown)),
+                o => panic!("{o:?}"),
+            }
+        }
+        let t = Instant::now();
+        loop {
+            let got: Vec<(String, Vec<(String, serde_json::Value)>)> = feeds
+                .lock()
+                .iter()
+                .map(|(id, f)| {
+                    let es = f
+                        .recent()
+                        .into_iter()
+                        .filter(|e| e.kind == ChangeKind::Takedown && e.id == did)
+                        .map(|e| (e.version, e.hint.unwrap()["takedown"].clone()))
+                        .collect();
+                    (id.clone(), es)
+                })
+                .collect();
+            let want: Vec<(String, serde_json::Value)> =
+                seqs.iter().map(|(s, t)| (s.to_string(), serde_json::json!(t))).collect();
+            if got.len() == 3 && got.iter().all(|(_, es)| *es == want) {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "{got:?}, want {want:?} on each");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        c.shutdown();
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn release_throttled_lifts_a_hosts_throttled_accounts_through_the_log() {
         let ident = MapIdentity::new();

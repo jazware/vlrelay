@@ -1,11 +1,14 @@
 import { useEffect, useRef, type ReactNode } from 'react'
-import { getAdminOperator, setAdminToken } from '../../lib/api'
+import { getAdminOperator, setAdminToken, type Case, type Consumer, type FullPolicyDoc, type HostList, type QuorumHistory, type QuorumView } from '../../lib/api'
 import { releaseHeld } from '../../lib/console/firehose'
 import { ago, clock, dur, fmtSi } from '../../lib/console/fmt'
 import { getLive, togglePaused, toggleSources, useLiveState } from '../../lib/console/live'
-import { capPoll, consumersPoll, historyPoll, isSlow, openCasesPoll, overviewPoll, policyFullPoll, quorumPoll, seenEpochs, slowLagMs, throttledPoll } from '../../lib/console/polls'
+import type { Optional } from '../../lib/console/adminAdapter'
+import { applyChange, cached, feedLost, keys, refresh, resumeLive } from '../../lib/console/cache'
+import { useChangeFeed, useFeed } from '../../lib/console/feed'
+import { isSlow, seenEpochs, slowLagMs, useCapHosts, useConsumers, useOpenCases, useOverview, usePolicyFull, useQuorumHistory, useThrottledHosts } from '../../lib/console/queries'
 import { useRelay, type RelayView } from '../../lib/console/relay'
-import { setTheme, useAdminOperator, useResolvedTheme } from '../../lib/hooks'
+import { setTheme, useAdminOperator, useAdminUnlock, useResolvedTheme } from '../../lib/hooks'
 import { Link, navigate, usePath } from '../../lib/router'
 import { closeDialog, DialogHost, isDialogOpen, openDialog } from './dialogs'
 import { detailPath, Drawer } from './Drawer'
@@ -94,10 +97,10 @@ type Badge = { k: 'warn' | 'err' | 'plain'; t: string; title?: string }
 
 function useBadges(): Partial<Record<SectionId, Badge>> {
   const { view } = useRelay()
-  const cases = openCasesPoll.use()
-  const subs = consumersPoll.use()
-  const thr = throttledPoll.use()
-  const pol = policyFullPoll.use()
+  const cases = useOpenCases()
+  const subs = useConsumers()
+  const thr = useThrottledHosts()
+  const pol = usePolicyFull()
   const cut = slowLagMs(pol.data)
   const slow = subs.data?.filter((c) => isSlow(c, cut)).length ?? 0
   const crit = cases.data?.some((c) => c.severity === 'critical')
@@ -182,20 +185,24 @@ function Side({ current }: { current: Section }) {
   )
 }
 
+const FEED_TITLE = {
+  live: 'Changes arrive on the admin change feed as they happen; rates poll every 2 s',
+  reconnecting: 'The change feed dropped: every panel polls until it reconnects',
+  polling: 'This relay has no change feed: every panel polls',
+}
+
+/** The one live indicator: the change feed (live, reconnecting, polling), unless the console is stale, paused or the firehose held. */
 function StreamChip({ held }: { held: boolean }) {
   const live = useLiveState()
-  const ov = overviewPoll.use()
-  const cls = live.stale ? ' stale' : held ? ' held' : live.paused ? ' paused' : ''
-  const text = live.stale ? 'not updating' : held ? 'firehose held' : live.paused ? 'paused' : 'live'
+  const feed = useFeed()
+  const ov = useOverview()
+  const cls = live.stale ? ' stale' : held ? ' held' : live.paused ? ' paused' : feed.status === 'reconnecting' ? ' recon' : feed.status === 'polling' ? ' poll' : ''
+  const text = live.stale ? 'not updating' : held ? 'firehose held' : live.paused ? 'paused' : feed.status
   const rate = ov.data ? (ov.data.streamEventsPerSec ?? ov.data.eventsOutPerSec) : undefined
-  const det = live.stale ? `· last data ${live.lastOkAt ? dur(Date.now() - live.lastOkAt) : '—'} ago` : live.paused ? '· space to resume' : rate !== undefined ? `· 2 s · ${fmtSi(rate)} ev/s` : '· every 2 s'
+  const det = live.stale ? `· last data ${live.lastOkAt ? dur(Date.now() - live.lastOkAt) : '—'} ago` : live.paused ? '· space to resume' : rate !== undefined ? `· ${fmtSi(rate)} ev/s` : ''
+  const title = live.stale ? 'Retry now' : `${FEED_TITLE[feed.status]}${feed.why && feed.status === 'reconnecting' ? ` (${feed.why})` : ''}${feed.node && feed.status === 'live' ? `, served by ${feed.node}` : ''}. Click or press space to pause.`
   return (
-    <button
-      type="button"
-      className={`cx-stream${cls}`}
-      title={live.stale ? 'Retry now' : 'Live updates: click or press space to pause'}
-      onClick={() => (live.stale ? overviewPoll.refresh() : togglePaused())}
-    >
+    <button type="button" className={`cx-stream${cls}`} title={title} onClick={() => (live.stale ? refresh(keys.overview()) : togglePaused())}>
       <span className="dot" />
       <span>{text}</span>
       <span className="det muted mono">{det}</span>
@@ -213,16 +220,17 @@ function Keep({ use }: { use: () => unknown }) {
 
 /** ⌘K's inbox for an empty query: the banners' notices (each opening its row), then the details opened in this tab. */
 function inboxItems(view: RelayView | undefined): PalItem[] {
-  const qd = quorumPoll.get().data
-  const events = view?.quorum ? epochEvents(qd?.supported ? qd.data : undefined, historyPoll.get().data?.events ?? [], seenEpochs()) : []
+  const qd = cached<Optional<QuorumView>>(keys.quorum())
+  const events = view?.quorum ? epochEvents(qd?.supported ? qd.data : undefined, cached<QuorumHistory>(keys.quorumHistory())?.events ?? [], seenEpochs()) : []
+  const hostList = (q: object) => cached<HostList>(keys.hosts(q))
   const att = attention({
     view,
     events,
-    throttled: throttledPoll.get().data?.hosts,
-    capped: capPoll.get().data,
-    consumers: consumersPoll.get().data,
-    slowCutMs: slowLagMs(policyFullPoll.get().data),
-    cases: openCasesPoll.get().data,
+    throttled: hostList({ status: 'throttled', sort: 'lag', desc: true, limit: 200 })?.hosts,
+    capped: hostList({ flag: 'atCap', sort: 'accounts', desc: true, limit: 400 }),
+    consumers: cached<Consumer[]>(keys.consumers()),
+    slowCutMs: slowLagMs(cached<FullPolicyDoc>(keys.policyFull())),
+    cases: cached<Case[]>(keys.cases('open')),
   }).map(
     (a): PalItem => ({
       group: 'Needs attention',
@@ -391,11 +399,16 @@ export function Shell({ section, crumbs, children }: { section: Section; crumbs?
   const { view } = useRelay()
   const { theme, toggle } = useThemeToggle()
   const operator = useAdminOperator()
+  const unlock = useAdminUnlock()
   useKeyboard(path)
   useCorePalette()
+  useChangeFeed(unlock, { onChange: applyChange, onLost: feedLost })
   const wasPaused = useRef(live.paused)
   useEffect(() => {
-    if (wasPaused.current && !live.paused) releaseHeld()
+    if (wasPaused.current && !live.paused) {
+      releaseHeld()
+      void resumeLive()
+    }
     wasPaused.current = live.paused
   }, [live.paused])
   // a dialog belongs to the page it was opened on
@@ -476,8 +489,8 @@ export function Shell({ section, crumbs, children }: { section: Section; crumbs?
       <Drawer />
       <Palette />
       {/* the palette's inbox reads these when it opens */}
-      <Keep use={capPoll.use} />
-      {view?.quorum && <Keep use={historyPoll.use} />}
+      <Keep use={useCapHosts} />
+      {view?.quorum && <Keep use={useQuorumHistory} />}
       <DialogHost />
       <Toasts />
     </div>
