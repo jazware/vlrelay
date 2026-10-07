@@ -1,6 +1,6 @@
 import { keepPreviousData, QueryClient, replaceEqualDeep, skipToken, useQuery, type QueryKey } from '@tanstack/react-query'
 import { compareVersions, type Case, type Change, type ChangeKind, type HostDetail, type HostList, type HostRow } from '../api'
-import { useFeedLive } from './feed'
+import { getFeed, useFeedLive } from './feed'
 import { getLive, useLiveState } from './live'
 
 // The console's one cache (TanStack Query). Every panel reads a query by its key, so the drawer,
@@ -135,17 +135,17 @@ export const olderRow = (next: HostRow, cur: HostRow) => olderVersion(next.versi
 export const olderCase = (next: Case, cur: Case) => next.updatedAtMs < cur.updatedAtMs
 
 /**
- * A host's status as the node reading it last reported it on the feed. Every `host` event comes
- * from that node, while a fetch answers with the serving node's view, which can lag it; when
- * the two versions don't compare, whichever was seen later wins.
+ * A host's status as its owner (the node reading it) last reported it on the feed. A fetch
+ * answers with the serving node's view, which can trail the owner's: the row's `ownerVersion`
+ * says how much of the owner it has heard, in the owner's own counter, so the two compare.
  */
-type OwnerStatus = Pick<HostRow, 'status' | 'backpressureReason'> & { node: string; atMs: number }
+type OwnerStatus = Pick<HostRow, 'status' | 'backpressureReason'> & { node: string; version: string }
 const ownerKey = (host: string) => ['host', host, 'owner']
-const versionNode = (v?: string | null) => (v && v.includes(':') ? v.slice(0, v.lastIndexOf(':')) : undefined)
 
 function withOwnerStatus(row: HostRow): HostRow {
   const o = qc.getQueryData<OwnerStatus>(ownerKey(row.host))
-  if (!o || versionNode(row.version) === o.node || o.atMs <= (row.updatedAtMs ?? 0)) return row
+  // only the owner's own events speak for its status, and a row that has heard them wins
+  if (!o || o.node !== row.node || (row.ownerVersion != null && (compareVersions(row.ownerVersion, o.version) ?? 1) >= 0)) return row
   return o.status === row.status && o.backpressureReason === row.backpressureReason ? row : { ...row, status: o.status, backpressureReason: o.backpressureReason }
 }
 
@@ -161,7 +161,10 @@ export function reconcileRow(answer: HostRow, hydrate = true): HostRow {
   const k = keys.hostRow(answer.host)
   const cur = qc.getQueryData<HostRow>(k)
   if (cur && olderRow(answer, cur)) return cur
-  const row = withOwnerStatus(answer)
+  let row = withOwnerStatus(answer)
+  // a listing never says `pending`: the same version read back hasn't landed either
+  if (cur?.pending && !row.pending && row.version != null && cur.version != null && compareVersions(row.version, cur.version) === 0) row = { ...row, pending: true }
+  if (row.pending && cur && unsettled.has(cur)) unsettled.add(row)
   if (hydrate || cur) qc.setQueryData(k, row)
   if (cur && stateOf(cur) !== stateOf(row)) spread(row)
   return row
@@ -271,22 +274,38 @@ export const invalidateAll = () => qc.invalidateQueries({ refetchType: getLive()
 // ---------------------------------------------------------------- the feed
 
 type Versioned = { version?: string | number | null }
-/** Rows a change's hint patched, until a fetch replaces them. */
-const hinted = new WeakSet<HostRow>()
+/**
+ * Rows not yet settled where the console reads: patched from another node's hint (the serving
+ * node may not have applied the change yet), or a host action answered `pending`. The next
+ * change to such a host refetches the lists and counts even if it moves nothing.
+ */
+const unsettled = new WeakSet<HostRow>()
+export const markUnsettled = (r: HostRow) => void unsettled.add(r)
 /** The cached copy is already at (or past) the change's version: a replay, or a second node's copy of it. */
 const seen = (c: Change, cur: Versioned | undefined) => cur?.version != null && (compareVersions(c.version, String(cur.version)) ?? 1) <= 0
+/** The owner's change the cached row has already heard (`ownerVersion` is in the owner's counter). */
+const heard = (c: Change, cur: HostRow | undefined) => !!cur && cur.node === c.node && cur.ownerVersion != null && (compareVersions(c.version, cur.ownerVersion) ?? 1) <= 0
 
 /** One change from the feed: patch what its hint says, then invalidate what it touches. Applying one twice changes nothing. */
 export function applyChange(c: Change) {
   if (c.kind === 'host' && c.id !== '*') {
     const cur = qc.getQueryData<HostRow>(keys.hostRow(c.id))
-    if (seen(c, cur)) return
+    if (seen(c, cur) || heard(c, cur)) return
     const h = c.hint
-    if (h?.status) qc.setQueryData<OwnerStatus>(ownerKey(c.id), { status: h.status, backpressureReason: h.backpressureReason ?? null, node: c.node, atMs: c.atMs })
+    const byOwner = !cur || cur.node === c.node
+    if (h?.status && byOwner) qc.setQueryData<OwnerStatus>(ownerKey(c.id), { status: h.status, backpressureReason: h.backpressureReason ?? null, node: c.node, version: c.version })
     if (cur && h && (h.status || h.tier)) {
-      const patched: HostRow = { ...cur, status: h.status ?? cur.status, tier: h.tier ?? cur.tier, backpressureReason: h.status ? (h.backpressureReason ?? null) : cur.backpressureReason, version: c.version }
-      hinted.add(patched)
-      writeHostRow(patched)
+      const patched: HostRow = {
+        ...cur,
+        status: h.status ?? cur.status,
+        tier: h.tier ?? cur.tier,
+        backpressureReason: h.status ? (h.backpressureReason ?? null) : cur.backpressureReason,
+        version: c.version,
+        ownerVersion: byOwner ? c.version : cur.ownerVersion,
+        pending: undefined,
+      }
+      const won = writeHostRow(patched)
+      if (c.node !== getFeed().node) unsettled.add(won)
     }
     return invalidate(hostKeys(c.id, cur, h))
   }
@@ -303,8 +322,7 @@ export function applyChange(c: Change) {
  */
 function hostKeys(host: string, prev: HostRow | undefined, h: Change['hint']): QueryKey[] {
   const out: QueryKey[] = [keys.host(host)]
-  // a row a hint patched isn't the server's yet: the lists and counts may still be behind it
-  const moved = !prev || !h || hinted.has(prev) || (h.status !== undefined && h.status !== prev.status) || (h.tier !== undefined && h.tier !== prev.tier) || (h.status !== undefined && (h.backpressureReason ?? null) !== (prev.backpressureReason ?? null))
+    const moved = !prev || !h || unsettled.has(prev) || (h.status !== undefined && h.status !== prev.status) || (h.tier !== undefined && h.tier !== prev.tier) || (h.status !== undefined && (h.backpressureReason ?? null) !== (prev.backpressureReason ?? null))
   if (!moved) return out
   out.push(keys.overview())
   for (const [k, d] of qc.getQueriesData<unknown>({ queryKey: ['hosts'] })) {

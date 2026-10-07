@@ -1,6 +1,6 @@
 import type { Account, Consumer, DiscoveryView, DomainRule, DomainRuleInput, HostAction, Policy, QStatus } from '../api'
 import * as A from './adminAdapter'
-import { invalidate, keys, keysFor, queryClient as qc, writeCase, writeHostRow } from './cache'
+import { invalidate, keys, keysFor, markUnsettled, queryClient as qc, writeCase, writeHostRow } from './cache'
 import type { Json, PolicyBase } from './policyDraft'
 
 // Every write the console makes. Each puts its answer into the cache at once (the row an action
@@ -8,10 +8,12 @@ import type { Json, PolicyBase } from './policyDraft'
 // keys a change event for it would (cache.ts `keysFor`), so every panel agrees without waiting
 // for a poll.
 
-/** A host action; its answer is the host's row as it is now. */
+/** A host action; its answer is the host's row after the write (docs/admin-api.md, "Host actions"), or one marked `pending`. */
 export async function hostAction(name: string, a: HostAction) {
   const row = await A.hostAction(name, a)
-  writeHostRow(row)
+  const won = writeHostRow(row)
+  // pending: the cluster hadn't confirmed it in time, and a later change says when it lands
+  if (row.pending) markUnsettled(won)
   invalidate(keysFor('host', name), true)
   return row
 }

@@ -606,6 +606,11 @@ registerDetail('host', {
     const chip = row && (
       <>
         <HostStatusChip s={row.status} /> <TierTag t={row.tier} labeled />
+        {row.pending && (
+          <span className="cx-pending" title="The cluster hadn't confirmed the last action when it answered. A change says when it lands: reload the host before acting on it again.">
+            applying…
+          </span>
+        )}
       </>
     )
     if (!d)

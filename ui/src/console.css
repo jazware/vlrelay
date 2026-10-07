@@ -3162,3 +3162,11 @@ a.cx-rrow:hover {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* a host action the cluster hadn't confirmed when it answered */
+.cx-pending {
+  font-size: 11.5px;
+  color: var(--ink3);
+  font-style: italic;
+  white-space: nowrap;
+  animation: cx-blink 1.6s steps(2, jump-none) infinite;
+}
