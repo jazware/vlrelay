@@ -11,9 +11,12 @@
 //! lookup or a takedown answers on any node only through the leader's log
 //! (takedowns) or on the leader itself (lookups).
 
+mod changes;
+
 use super::Node;
 use super::metrics::HostSeries as Series;
 use super::policy::PolicyHooks;
+use crate::admin::changes::ChangeKind;
 use crate::admin::fleet::{self, Member, NodeReport};
 use crate::admin::{self, AdminError, AdminResult, AdminSource, RejectReason};
 use crate::policy::admin::PolicyAdmin;
@@ -43,6 +46,8 @@ pub struct NodeAdmin {
     usage_prev: Mutex<(Instant, u64, u64, u64)>,
     /// Rejects per (host, reason) at the last sample, and the rates then.
     rejects_prev: Mutex<RejectSample>,
+    feed: Arc<crate::admin::changes::ChangeFeed>,
+    watch: Mutex<changes::Watch>,
 }
 
 #[derive(Default)]
@@ -123,6 +128,8 @@ impl NodeAdmin {
                 let (f, s, a) = usage_counts(&node);
                 (Instant::now(), f, s, a)
             }),
+            feed: crate::admin::changes::ChangeFeed::new(&node.cfg.node_id),
+            watch: Mutex::new(changes::Watch::default()),
             node,
         }
     }
@@ -267,13 +274,16 @@ impl NodeAdmin {
         let hosts = self.node.manager.hosts();
         let dash = self.node.dash.lock();
         let rejects = self.node.rejects.lock();
-        hosts
+        let mut rows: Vec<admin::HostRow> = hosts
             .iter()
             .map(|h| {
                 let k = Host(h.record.hostname.clone());
                 self.row(h, dash.hosts.get(&k), rejects.get(&k))
             })
-            .collect()
+            .collect();
+        drop((dash, rejects));
+        self.stamp(&mut rows);
+        rows
     }
 
     /// The hosts this node reads.
@@ -286,9 +296,13 @@ impl NodeAdmin {
     fn host_row(&self, host: &str) -> AdminResult<admin::HostRow> {
         let k = Host(host.to_string());
         let h = self.node.manager.host(&k).ok_or_else(|| AdminError::NotFound(format!("unknown host {host}")))?;
-        let dash = self.node.dash.lock();
-        let rejects = self.node.rejects.lock();
-        Ok(self.row(&h, dash.hosts.get(&k), rejects.get(&k)))
+        let mut row = {
+            let dash = self.node.dash.lock();
+            let rejects = self.node.rejects.lock();
+            self.row(&h, dash.hosts.get(&k), rejects.get(&k))
+        };
+        self.stamp(std::slice::from_mut(&mut row));
+        Ok(row)
     }
 
     async fn open_case_count(&self) -> u32 {
@@ -651,6 +665,7 @@ impl NodeAdmin {
             return Err(AdminError::NotFound(format!("no connected consumer {id}")));
         }
         tracing::info!(target: "vlrelay::audit", consumer = id, by, "consumer kicked");
+        self.consumer_left(id);
         Ok(())
     }
 
@@ -807,6 +822,10 @@ impl NodeAdmin {
 }
 
 impl AdminSource for NodeAdmin {
+    fn changes(&self) -> Option<Arc<crate::admin::changes::ChangeFeed>> {
+        Some(self.feed.clone())
+    }
+
     async fn overview(&self) -> AdminResult<admin::Overview> {
         let open_cases = self.open_case_count().await;
         let members = self.members().await;
@@ -846,14 +865,21 @@ impl AdminSource for NodeAdmin {
                 self.policy.refresh_host(host).await?;
             }
         }
-        self.host_row(host)
+        let mut row = self.host_row(host)?;
+        if let Some(o) = self.node.quorum.hosts.owners().get(host) {
+            row.node = o.clone();
+        }
+        self.host_acted(&mut row);
+        Ok(row)
     }
 
     async fn domain_rules(&self) -> AdminResult<Vec<admin::DomainRule>> {
         self.admin().domain_rules().await
     }
     async fn create_domain_rule(&self, rule: admin::DomainRuleInput, by: &str) -> AdminResult<admin::DomainRule> {
-        self.admin().create_domain_rule(rule, by).await
+        let r = self.admin().create_domain_rule(rule, by).await?;
+        self.policy_saved(ChangeKind::Rules, r.version);
+        Ok(r)
     }
     async fn update_domain_rule(
         &self,
@@ -861,16 +887,22 @@ impl AdminSource for NodeAdmin {
         rule: admin::DomainRuleInput,
         by: &str,
     ) -> AdminResult<admin::DomainRule> {
-        self.admin().update_domain_rule(id, rule, by).await
+        let r = self.admin().update_domain_rule(id, rule, by).await?;
+        self.policy_saved(ChangeKind::Rules, r.version);
+        Ok(r)
     }
     async fn delete_domain_rule(&self, id: u64, by: &str) -> AdminResult<()> {
-        self.admin().delete_domain_rule(id, by).await
+        self.admin().delete_domain_rule(id, by).await?;
+        self.policy_saved(ChangeKind::Rules, self.policy.engine.rules().0);
+        Ok(())
     }
     async fn policy(&self) -> AdminResult<admin::PolicyDoc> {
         self.admin().policy().await
     }
     async fn update_policy(&self, update: admin::PolicyUpdate, by: &str) -> AdminResult<admin::PolicyDoc> {
-        self.admin().update_policy(update, by).await
+        let d = self.admin().update_policy(update, by).await?;
+        self.policy_saved(ChangeKind::Policy, d.version);
+        Ok(d)
     }
     async fn policy_audit(&self) -> AdminResult<Vec<admin::PolicyAudit>> {
         self.admin().policy_audit().await
@@ -882,6 +914,7 @@ impl AdminSource for NodeAdmin {
         let body: crate::policy::PolicyBody =
             serde_json::from_value(u.policy).map_err(|e| AdminError::BadRequest(format!("policy: {e}")))?;
         let d = self.admin().update_full_policy(u.base_version, body, &u.note, by).await?;
+        self.policy_saved(ChangeKind::Policy, d.version);
         Ok(full_doc(&d))
     }
     async fn domain_rules_audit(&self) -> AdminResult<Vec<admin::PolicyAudit>> {
@@ -1213,7 +1246,9 @@ impl AdminSource for NodeAdmin {
         self.admin().case(id).await
     }
     async fn update_case(&self, id: u64, update: admin::CaseUpdate, by: &str) -> AdminResult<admin::Case> {
-        self.admin().update_case(id, update, by).await
+        let c = self.admin().update_case(id, update, by).await?;
+        self.case_changed(&c);
+        Ok(c)
     }
 }
 
@@ -1398,6 +1433,7 @@ impl crate::node::quorum::LocalAsk for NodeAdmin {
         Box::pin(async move {
             let v = match topic {
                 "node:consumers" => serde_json::to_value(self.local_consumers()).ok()?,
+                "node:changes" => self.answer_pull(&body)?,
                 "node:settings" => serde_json::to_value(self.settings.as_ref()?).ok()?,
                 "node:usage" => serde_json::to_value(self.local_usage().await.ok()?).ok()?,
                 "node:rejects-top" => {

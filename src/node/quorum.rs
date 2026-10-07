@@ -276,6 +276,24 @@ impl Ext {
     }
 }
 
+/// What an operator's committed entry changed, for the admin change feed:
+/// a takedown or its reversal, or a lifted relay throttle.
+fn logged_change(x: &Ext, m: &Meta) -> Option<(crate::admin::changes::ChangeKind, String, serde_json::Value)> {
+    use crate::admin::changes::ChangeKind;
+    match x.kind {
+        KIND_TAKEDOWN => {
+            let key = state::record::did_key(&x.did);
+            let rec = m.writes.iter().find(|(k, _)| k[..] == key[..]).and_then(|(_, v)| Record::decode(v).ok())?;
+            Some((ChangeKind::Takedown, x.did.clone(), serde_json::json!({ "takedown": rec.relay_takedown })))
+        }
+        KIND_RELEASE => {
+            let host = m.writes.iter().find_map(|(k, _)| throttled_from_key(k)).map(|(h, _)| h);
+            Some((ChangeKind::Account, x.did.clone(), serde_json::json!({ "host": host })))
+        }
+        _ => None,
+    }
+}
+
 /// The host table's state key.
 pub const HOST_PREFIX: &[u8] = b"h/";
 
@@ -439,6 +457,8 @@ pub struct RelayHooks {
     /// The node's own answers (`node:*`: its consumers, settings, kicks),
     /// from its admin source.
     pub answers: std::sync::OnceLock<Arc<dyn LocalAsk>>,
+    /// The admin change feed: committed takedowns and throttle lifts.
+    pub changes: std::sync::OnceLock<Arc<crate::admin::changes::ChangeFeed>>,
     /// Tests: each decision of every other batch (at random) takes this
     /// long (µs), as a batch with slow identity lookups does.
     #[cfg(test)]
@@ -487,6 +507,7 @@ impl RelayHooks {
             plc: std::sync::OnceLock::new(),
             discovery: std::sync::OnceLock::new(),
             answers: std::sync::OnceLock::new(),
+            changes: std::sync::OnceLock::new(),
             #[cfg(test)]
             slow_us: AtomicU64::new(0),
         })
@@ -1113,6 +1134,11 @@ impl Hooks for RelayHooks {
                 && let Some(id) = &self.identity
             {
                 id.invalidate(&x.did);
+            }
+            if let Some(f) = self.changes.get()
+                && let Some((kind, id, hint)) = logged_change(&x, &m)
+            {
+                f.publish_versioned(kind, id, e.seq.to_string(), Some(hint), false);
             }
         }
     }
@@ -2415,6 +2441,16 @@ mod tests {
         gate: Option<Arc<dyn state::AccountGate>>,
         tweak: impl Fn(&mut QuorumSetup) + Send + Sync + 'static,
     ) -> ConfigFn {
+        cluster_cfg_hooked(ident, slow_us, gate, tweak, |_, _| {})
+    }
+
+    fn cluster_cfg_hooked(
+        ident: Arc<MapIdentity>,
+        slow_us: u64,
+        gate: Option<Arc<dyn state::AccountGate>>,
+        tweak: impl Fn(&mut QuorumSetup) + Send + Sync + 'static,
+        on_hooks: impl Fn(&str, &Arc<RelayHooks>) + Send + Sync + 'static,
+    ) -> ConfigFn {
         Arc::new(move |id: &str, addrs: &HashMap<String, String>| {
             let mut c = config(id, addrs);
             c.flush = Some(crate::qlog::flush::Options {
@@ -2438,6 +2474,7 @@ mod tests {
             tweak(&mut q);
             let h = RelayHooks::new(state, None, q);
             h.slow_us.store(slow_us, Ordering::Relaxed);
+            on_hooks(id, &h);
             c.hooks = crate::qlog::node::HooksSlot(Some(h));
             c
         })
@@ -2532,6 +2569,97 @@ mod tests {
     /// the leader lists the host's throttled accounts across a takeover
     /// (the logged ones), a release lifts each through the log with an
     /// `#account`, and their commits are taken again.
+
+    #[test]
+    fn operator_entries_name_their_change() {
+        use crate::admin::changes::ChangeKind;
+        let did = crate::state::tests::plc(3);
+        let ext = |kind| Ext { kind, key_changed: false, host: String::new(), useq: 0, did: did.clone() };
+        let mut rec = Record::new(state::HostKey::of("pds.example.com"), 1);
+        rec.relay_takedown = true;
+        let m = Meta { writes: vec![(Bytes::from(state::record::did_key(&did)), rec.encode())], ext: Bytes::new() };
+        let (k, id, hint) = logged_change(&ext(KIND_TAKEDOWN), &m).unwrap();
+        assert_eq!((k, id.as_str(), &hint["takedown"]), (ChangeKind::Takedown, did.as_str(), &serde_json::json!(true)));
+        let m = Meta {
+            writes: vec![(throttled_key("pds.example.com", &did), Bytes::from_static(b"0"))],
+            ext: Bytes::new(),
+        };
+        let (k, _, hint) = logged_change(&ext(KIND_RELEASE), &m).unwrap();
+        assert_eq!((k, &hint["host"]), (ChangeKind::Account, &serde_json::json!("pds.example.com")));
+        assert!(logged_change(&ext(KIND_COMMIT), &m).is_none());
+    }
+
+    /// A takedown made through one node reaches every member's change feed
+    /// as its entry commits there, versioned by the entry's seq.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn committed_takedowns_reach_every_members_change_feed() {
+        use crate::admin::changes::{ChangeFeed, ChangeKind};
+        let ident = MapIdentity::new();
+        let did = crate::state::tests::plc(1);
+        ident.set(&did, HOST, 1);
+        let feeds: Arc<Mutex<HashMap<String, Arc<ChangeFeed>>>> = Default::default();
+        let f2 = feeds.clone();
+        let cfg = cluster_cfg_hooked(
+            ident,
+            0,
+            None,
+            |_| {},
+            move |id, h| {
+                let f = ChangeFeed::new(id);
+                let _ = h.changes.set(f.clone());
+                f2.lock().insert(id.to_string(), f);
+            },
+        );
+        let c = Cluster::with_cfg(3, None, Some(cfg), 64 << 20).await;
+        c.wait_leader(Duration::from_secs(5)).await;
+        let client = c.client();
+        let from = owner(&client).await;
+        assert!(matches!(submit_one(&client, identity(&did, &from)).await, Outcome::Appended(_)));
+        let operator = |takedown: bool| {
+            let frame = vlpds::events::account_frame(
+                &did,
+                !takedown,
+                takedown.then_some("takendown"),
+                &vlpds::events::now_rfc3339(),
+            );
+            Item {
+                prefix: frame.prefix.into(),
+                suffix: frame.suffix.into(),
+                meta: encode_item(&did, &Host(String::new()), &from, 0, &[0xff, takedown as u8]),
+            }
+        };
+        let mut seqs = Vec::new();
+        for takedown in [true, false] {
+            match submit_one(&client, operator(takedown)).await {
+                Outcome::Appended(s) => seqs.push((s, takedown)),
+                o => panic!("{o:?}"),
+            }
+        }
+        let t = Instant::now();
+        loop {
+            let got: Vec<(String, Vec<(String, serde_json::Value)>)> = feeds
+                .lock()
+                .iter()
+                .map(|(id, f)| {
+                    let es = f
+                        .recent()
+                        .into_iter()
+                        .filter(|e| e.kind == ChangeKind::Takedown && e.id == did)
+                        .map(|e| (e.version, e.hint.unwrap()["takedown"].clone()))
+                        .collect();
+                    (id.clone(), es)
+                })
+                .collect();
+            let want: Vec<(String, serde_json::Value)> =
+                seqs.iter().map(|(s, t)| (s.to_string(), serde_json::json!(t))).collect();
+            if got.len() == 3 && got.iter().all(|(_, es)| *es == want) {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "{got:?}, want {want:?} on each");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        c.shutdown();
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn release_throttled_lifts_a_hosts_throttled_accounts_through_the_log() {
         let ident = MapIdentity::new();

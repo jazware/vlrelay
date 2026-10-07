@@ -207,6 +207,11 @@ impl ChangeFeed {
         self.feeds.load(Ordering::Relaxed)
     }
 
+    /// What the ring holds, oldest first.
+    pub fn recent(&self) -> Vec<Change> {
+        self.inner.lock().ring.iter().map(|s| s.change.clone()).collect()
+    }
+
     /// The newest event number.
     pub fn last(&self) -> u64 {
         self.inner.lock().next - 1

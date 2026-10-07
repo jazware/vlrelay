@@ -65,7 +65,7 @@ impl Demo {
         let cases = s.cases.iter().map(|c| (c.id, c.updated_at_ms)).collect::<HashMap<_, _>>();
         s.tick(now);
         // a host flapping in and out of backpressure every few seconds
-        if n % 3 == 0 {
+        if n.is_multiple_of(3) {
             let i = s.rng.below(s.hosts.len().min(400));
             let reason = *s.rng.pick(&[
                 BackpressureReason::InflightFull,
@@ -106,9 +106,9 @@ impl Demo {
             let hint = serde_json::json!({ "caughtUp": n % 40 >= 20 });
             self.feed.touch_as(NODES[0], changes::ChangeKind::Plc, "export", Some(hint), true);
         }
-        for i in 0..s.hosts.len() {
-            if sig(&s.hosts[i]) != before[i] {
-                self.host_changed(&mut s.hosts[i], now, false);
+        for (h, was) in s.hosts.iter_mut().zip(&before) {
+            if sig(h) != *was {
+                self.host_changed(h, now, false);
             }
         }
         let opened: Vec<(u64, CaseStatus)> =

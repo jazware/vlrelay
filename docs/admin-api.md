@@ -257,7 +257,7 @@ from.
 | `consumer` | `<node>/<consumer id>` | node-scoped | A `subscribeRepos` consumer connected or left (a kick included) | `{event}`: `connect` or `disconnect` | `consumers` |
 | `discovery` | the source's key (`plc`, `bootstrap:<relay host>`) | node-scoped (the leader's) | A run started, finished or moved on | `{inProgress}` | `discovery` |
 | `plc` | `export` | node-scoped (the leader's) | The PLC export read on, or caught up | `{caughtUp}` | `ops/plc` |
-| `case` | the case id | node-scoped | A case opened, tripped again or changed through the API | `{status}` | `cases`, `cases/{id}` |
+| `case` | the case id | node-scoped | A case changed through the API (at once), or opened or tripped again (the serving node compares the cases every 10 s) | `{status}` | `cases`, `cases/{id}` |
 
 An `id` of `*` means more than 256 of that kind changed within one window: refetch the kind's list
 rather than each row. A `*` with a `node` is about that node's view only.
@@ -314,13 +314,13 @@ Any member serves the feed, and it covers the whole cluster:
   (`policy`, `rules`) are made by the node that saw them. While it has a feed open, the serving
   node asks every other member for its new events once a second over the peer port (as
   `consumers` does), so they arrive within about two seconds. A member forwards a `host` event
-  only for a host it reads, since its status is live only there.
+  for a host it reads, since its status is live only there, and for an operator's action it ran.
 - A member that restarted, or that the serving node lost track of, gets a `*` event for each of
   those kinds with its `node`, so the console refetches what it shows of that member. A member
   that doesn't answer sends nothing, and the `cluster` event says why.
-- A tier change rides the host table, which members read from the leader, so a node shows it a
-  few seconds later than the node that made it. The node that ran the action makes its `host`
-  event at once.
+- A tier change rides the host table, which members read from the leader, and a node's rows take
+  it up within half a minute. The node that ran the action makes its `host` event at once, and
+  each node makes another when its own row shows the new tier.
 
 ### admin_demo
 
