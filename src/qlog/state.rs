@@ -166,7 +166,12 @@ impl State {
     /// upload on their own between seals).
     pub async fn open_with(store: &Store, rel: &str, l0_bytes: usize) -> anyhow::Result<State> {
         let path = db_path(store, rel);
-        let db = Db::builder(path.clone(), store.raw.clone()).with_settings(settings(l0_bytes)).build().await?;
+        let (cache, id) = super::cache::for_db(path.as_ref());
+        let db = Db::builder(path.clone(), store.raw.clone())
+            .with_settings(settings(l0_bytes))
+            .with_db_cache(cache, id)
+            .build()
+            .await?;
         let applied = match db.get(APPLIED).await? {
             Some(v) => u64::from_be_bytes(v.as_ref().try_into()?),
             None => 0,
@@ -346,7 +351,10 @@ pub async fn read_checkpoint(store: &Store, r: &StateRef) -> anyhow::Result<(BTr
         .read_manifest(Some(r.manifest_id))
         .await?
         .ok_or_else(|| anyhow::anyhow!("checkpoint manifest {} is gone", r.manifest_id))?;
-    let reader = DbReader::builder(db_path(store, &r.path), store.raw.clone())
+    let path = db_path(store, &r.path);
+    let (cache, id) = super::cache::for_db(path.as_ref());
+    let reader = DbReader::builder(path, store.raw.clone())
+        .with_db_cache(cache, id)
         .with_reader_mode(DbReaderMode::Checkpoint(r.checkpoint.parse()?))
         .build()
         .await?;

@@ -205,6 +205,10 @@ pub struct HostRow {
     /// or `cli` (None: before sources were recorded).
     #[serde(default)]
     pub source: Option<String>,
+    /// The reject reason with the most of its recent rejects (the last
+    /// five minutes), if any.
+    #[serde(default)]
+    pub top_reason: Option<RejectReason>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -215,10 +219,14 @@ pub struct HostQuery {
     pub tier: Option<String>,
     pub status: Option<HostStatus>,
     /// A source (`requestCrawl`, `plc`, `cli`, `bootstrap:<relay>`), or a
-    /// prefix of one ending in `:` or `*` (`bootstrap:` is every relay).
+    /// prefix of one ending in `:` or `*` (`bootstrap:` is every relay), or
+    /// `none` (not recorded).
     pub source: Option<String>,
     /// Only hosts with (true) or without (false) throttled accounts.
     pub throttled: Option<bool>,
+    /// `atCap`, `lagging`, `erroring` or `throttledOrAtCap`, as
+    /// [`HostQuery::keeps`] reads them.
+    pub flag: Option<String>,
     /// `host`, `tier`, `status`, `events`, `errors`, `accounts`, `seq`,
     /// `since`, `lag`, `throttled`, `source`.
     pub sort: Option<String>,
@@ -770,6 +778,28 @@ pub struct PipelineHost {
     pub events_per_sec: f64,
 }
 
+/// One host's rejects, for `ops/rejects/top`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectTop {
+    pub host: String,
+    /// Over the answering nodes' last sample windows (~10 s or more).
+    pub rejects_per_sec: f64,
+    /// Since each node's start.
+    pub total: u64,
+    pub last_at_ms: Option<i64>,
+    /// The newest one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample: Option<RejectSample>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct RejectTopQuery {
+    /// A reason (`bad-signature`, `prev-data-mismatch` ...); none: all.
+    pub reason: Option<RejectReason>,
+    pub limit: Option<usize>,
+}
+
 /// Host discovery as the leader runs it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -994,6 +1024,11 @@ pub struct NodeQuery {
 }
 
 impl HostQuery {
+    /// A `flag` this query can't filter by.
+    pub fn bad_flag(&self) -> Option<&str> {
+        self.flag.as_deref().filter(|f| !matches!(*f, "" | "atCap" | "lagging" | "erroring" | "throttledOrAtCap"))
+    }
+
     /// The filters past the name, tier and status ones.
     pub fn keeps(&self, r: &HostRow) -> bool {
         let src = self.source.as_deref().filter(|s| !s.is_empty()).is_none_or(|want| {
@@ -1001,10 +1036,20 @@ impl HostQuery {
             match want.strip_suffix('*') {
                 Some(p) => have.starts_with(p),
                 None if want.ends_with(':') => have.starts_with(want),
+                None if want == "none" => have.is_empty(),
                 None => have == want,
             }
         });
-        src && self.throttled.is_none_or(|t| (r.throttled_accounts > 0) == t)
+        let live = matches!(r.status, HostStatus::Connected | HostStatus::Throttled);
+        let at_cap = r.max_accounts > 0 && r.accounts >= r.max_accounts;
+        let flag = match self.flag.as_deref() {
+            Some("atCap") => at_cap,
+            Some("lagging") => live && r.lag_ms > 60_000.0,
+            Some("erroring") => r.error_rate > 0.1,
+            Some("throttledOrAtCap") => r.throttled_accounts > 0 || at_cap,
+            _ => true,
+        };
+        src && flag && self.throttled.is_none_or(|t| (r.throttled_accounts > 0) == t)
     }
 }
 
@@ -1134,6 +1179,10 @@ pub trait AdminSource: Send + Sync + 'static {
     fn flush_now(&self, _by: &str) -> impl Future<Output = AdminResult<serde_json::Value>> + Send {
         async { Err(AdminError::NotFound("this relay doesn't run the quorum log".into())) }
     }
+    /// The hosts with the most rejects (of `reason`), across the members.
+    fn rejects_top(&self, _q: RejectTopQuery) -> impl Future<Output = AdminResult<Vec<RejectTop>>> + Send {
+        async { Err(AdminError::NotFound("this relay doesn't rank its rejects".into())) }
+    }
     fn discovery(&self) -> impl Future<Output = AdminResult<DiscoveryView>> + Send {
         async { Err(AdminError::NotFound("this relay doesn't run host discovery".into())) }
     }
@@ -1213,6 +1262,7 @@ pub fn api_routes<S: AdminSource>(src: Arc<S>, admin_token: String) -> Router {
         .route("/admin/api/ops/tail", get(tail::<S>))
         .route("/admin/api/store", get(store::<S>))
         .route("/admin/api/discovery", get(discovery::<S>))
+        .route("/admin/api/ops/rejects/top", get(rejects_top::<S>))
         .route("/admin/api/discovery/run", post(discovery_run::<S>))
         .route("/admin/api/policy/usage", get(policy_usage::<S>))
         .route("/admin/api/policy/signals", get(policy_signals::<S>))
@@ -1274,6 +1324,9 @@ async fn overview<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Overview>
     Ok(Json(c.src.overview().await?))
 }
 async fn hosts<S: AdminSource>(State(c): Ax<S>, Query(q): Query<HostQuery>) -> AdminResult<Json<HostList>> {
+    if let Some(f) = q.bad_flag() {
+        return Err(AdminError::BadRequest(format!("unknown flag {f}")));
+    }
     Ok(Json(c.src.hosts(q).await?))
 }
 async fn host<S: AdminSource>(State(c): Ax<S>, Path(h): Path<String>) -> AdminResult<Json<HostDetail>> {
@@ -1368,6 +1421,12 @@ async fn quorum_history<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Quo
 async fn flush_now<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<serde_json::Value>> {
     tracing::info!(target: "vlrelay::audit", by = BY, "flush now");
     Ok(Json(c.src.flush_now(BY).await?))
+}
+async fn rejects_top<S: AdminSource>(
+    State(c): Ax<S>,
+    Query(q): Query<RejectTopQuery>,
+) -> AdminResult<Json<Vec<RejectTop>>> {
+    Ok(Json(c.src.rejects_top(q).await?))
 }
 async fn discovery<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<DiscoveryView>> {
     Ok(Json(c.src.discovery().await?))

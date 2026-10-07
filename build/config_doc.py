@@ -29,7 +29,7 @@ SECTIONS = [
         ["node-id", "qlog-listen", "qlog-peer", "qlog-members", "qlog-dir", "qlog-flush-ms", "qlog-headroom",
          "qlog-admin-token", "qlog-retain-hours", "qlog-retain-secs", "qlog-retain-every-secs",
          "qlog-host-failover-ms", "qlog-host-poll-ms", "qlog-election-ms", "qlog-heartbeat-ms",
-         "qlog-state-compactor-poll-ms", "qlog-no-auto-recover", "qlog-segment-mb", "qlog-disk-retain-mb", "durability", "durability-sync-ms",
+         "qlog-state-compactor-poll-ms", "qlog-no-auto-recover", "qlog-segment-mb", "qlog-disk-retain-mb", "durability", "durability-sync-ms", "slatedb-cache-mb",
          "qlog-memory-mb"],
     ),
     (

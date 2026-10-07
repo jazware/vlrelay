@@ -8,13 +8,39 @@ import { useLivePoll } from '../../lib/console/live'
 import { SourceSelect, SourceTag, sourceOk } from './hostSource'
 
 // Admission outcomes on the node answering (its last 500: requestCrawls, and discovery's when it
-// leads), with each one's source, and today's new-host budget.
+// leads), with each one's source, and today's new-host budget. Discovery shows the panel; Hosts
+// shows a name's entries when its search finds no host.
 
 const OUT: Record<CrawlAdmission['outcome'], ReactNode> = {
   admitted: <Chip k="ok">admitted</Chip>,
   'rate-limited': <Chip k="warn">429</Chip>,
   refused: <Chip k="err">refused</Chip>,
   banned: <Chip k="err">banned</Chip>,
+}
+
+export function AdmissionTable({ entries, maxHeight }: { entries: CrawlAdmission[]; maxHeight?: number }) {
+  return (
+    <div className="cx-tw" style={maxHeight ? { maxHeight } : undefined}>
+      <table className="cx-t compact">
+        <tbody>
+          {entries.map((a, i) => (
+            <tr key={`${a.atMs}-${a.host}-${i}`} data-open={a.outcome === 'admitted' ? `host:${a.host}` : undefined} onClick={a.outcome === 'admitted' ? () => openPanel('host', a.host) : undefined}>
+              <td className="sm muted" title={dt(a.atMs)}>
+                {ago(a.atMs)}
+              </td>
+              <td>{OUT[a.outcome] ?? <Chip k="idle">{a.outcome}</Chip>}</td>
+              <td className="mono sm">{a.host}</td>
+              <td>{a.tier && <TierTag t={a.tier} />}</td>
+              <td className="wrap sm t2">{a.reason}</td>
+              <td>
+                <SourceTag s={a.source} />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
 }
 
 export function Admissions() {
@@ -42,34 +68,7 @@ export function Admissions() {
       <div className="cx-toolbar">
         <SourceSelect value={src} onChange={setSrc} keys={keys} />
       </div>
-      <Loaded load={l}>
-        {() =>
-          shown.length ? (
-            <div className="cx-tw" style={{ maxHeight: 320 }}>
-              <table className="cx-t compact">
-                <tbody>
-                  {shown.map((a, i) => (
-                    <tr key={`${a.atMs}-${a.host}-${i}`} data-open={a.outcome === 'admitted' ? `host:${a.host}` : undefined} onClick={a.outcome === 'admitted' ? () => openPanel('host', a.host) : undefined}>
-                      <td className="sm muted" title={dt(a.atMs)}>
-                        {ago(a.atMs)}
-                      </td>
-                      <td>{OUT[a.outcome] ?? <Chip k="idle">{a.outcome}</Chip>}</td>
-                      <td className="mono sm">{a.host}</td>
-                      <td>{a.tier && <TierTag t={a.tier} />}</td>
-                      <td className="wrap sm t2">{a.reason}</td>
-                      <td>
-                        <SourceTag s={a.source} />
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <Empty>{src ? 'No admission from this source in the last 500.' : 'No admission since this node started.'}</Empty>
-          )
-        }
-      </Loaded>
+      <Loaded load={l}>{() => (shown.length ? <AdmissionTable entries={shown} maxHeight={320} /> : <Empty>{src ? 'No admission from this source in the last 500.' : 'No admission since this node started.'}</Empty>)}</Loaded>
     </Panel>
   )
 }

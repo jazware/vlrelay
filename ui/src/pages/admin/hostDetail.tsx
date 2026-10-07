@@ -3,14 +3,14 @@ import { registerDetail } from '../../components/console/Drawer'
 import { openPanel } from '../../components/console/nav'
 import { BIG_HOST_CAP, hostActionDialog, useHostsVersion } from '../../components/console/hostActions'
 import { Bars, Copy, Empty, Glyph, HostStatusChip, KV, Meter, Mini, Minis, Sec, Seg, Spark, Strip, TierTag } from '../../components/console/kit'
-import type { HostAction, HostDetail, RejectReason } from '../../lib/api'
+import type { Case, DomainRule, HostAction, HostDetail, Policy, RejectReason } from '../../lib/api'
 import { host as fetchHost } from '../../lib/console/adminAdapter'
 import { ago, dt, fmtMs, fmtNum, fmtRatio, fmtSi, plural, shortDid } from '../../lib/console/fmt'
 import { useLivePoll } from '../../lib/console/live'
 import { policyPoll } from '../../lib/console/polls'
 import { useRelay } from '../../lib/console/relay'
 import { SourceTag } from './hostSource'
-import { releaseDialog } from './moderationDetail'
+import { casesPoll, releaseDialog, rulesPoll } from './moderationDetail'
 import { NodeTag, REASON_WHAT, reasonLabel } from './relayUi'
 
 // A PDS host in the slide-over or on its own page: its rates and limits, why its frames are
@@ -48,6 +48,157 @@ const cols = (page: boolean, a: ReactNode, b: ReactNode) =>
     </>
   )
 
+type Acted = HostDetail['actions'][number]
+const HELD = new Set(['throttled', 'backoff', 'suspended', 'banned'])
+
+const by = (a: Acted) => `${a.by}, ${ago(a.atMs)}`
+const ruleName = (r: DomainRule) => (
+  <button type="button" className="cx-linklike" onClick={() => openPanel('rule', String(r.id))}>
+    rule {r.id} <span className="mono">{r.pattern}</span>
+  </button>
+)
+
+/**
+ * Why a throttled, backing-off, suspended or banned host is held, in one place: the limit that
+ * binds, where its tier came from, who set an operator throttle, and the way out.
+ */
+function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; rules?: DomainRule[]; cases?: Case[] }) {
+  const r = d.row
+  if (!HELD.has(r.status)) return null
+  const lim = d.limits
+  const acts = [...d.actions].sort((a, b) => b.atMs - a.atMs)
+  const last = (k: HostAction['action']) => acts.find((a) => a.action.action === k)
+  const rule = r.rule != null ? rules?.find((x) => x.id === r.rule) : undefined
+  const thrSet = r.throttle != null ? acts.find((a) => a.action.action === 'throttle' && a.action.eventsPerSec != null) : undefined
+  const hourUse = d.series.events.length ? (d.series.events.reduce((a, b) => a + b, 0) / d.series.events.length) * 3600 : r.eventsPerSec * 3600
+  const binding: [string, number, number][] = (
+    [
+      ['events/s', r.eventsPerSec, lim.eventsPerSec],
+      ['events/h', hourUse, lim.eventsPerHour],
+    ] as [string, number, number][]
+  ).filter(([, u, v]) => v > 0 && u >= v * 0.8)
+  const tiers = Object.entries(policy?.tiers ?? {}).sort((a, b) => a[1].eventsPerSec - b[1].eventsPerSec)
+  const here = policy?.tiers[r.tier]?.eventsPerSec ?? lim.eventsPerSec
+  const roomier = tiers.find(([t, l]) => t !== r.tier && l.eventsPerSec > here)
+
+  let tone: 'warn' | 'err' = 'warn'
+  let title: ReactNode
+  const lines: ReactNode[] = []
+  const outs: ReactNode[] = []
+  const ruleOut = rule && (
+    <button key="rule" type="button" className="cx-btn sm" onClick={() => openPanel('rule', String(rule.id))}>
+      Edit rule {rule.id} ›
+    </button>
+  )
+  if (r.status === 'banned' || r.status === 'suspended') {
+    tone = 'err'
+    const act = last(r.status === 'banned' ? 'ban' : 'suspend')
+    const byRule = r.status === 'banned' && rule?.effect.kind === 'ban'
+    title = byRule ? <>Banned by domain rule {rule.id}</> : r.status === 'banned' ? 'Banned' : 'Suspended'
+    if (byRule) lines.push(<>Matched {ruleName(rule)}{rule.note ? <> “{rule.note}”</> : null} · {rule.createdBy}, {ago(rule.createdAtMs)}</>)
+    if (act && (act.action.action === 'ban' || act.action.action === 'suspend')) lines.push(<>By {by(act)}: {act.action.reason}</>)
+    else if (!byRule) lines.push(<span className="muted">No operator action on record says who.</span>)
+    lines.push(r.status === 'banned' ? 'Its socket stays closed and its requestCrawl is refused.' : 'Its socket is closed and its cursor kept: resuming loses nothing.')
+    if (!byRule)
+      outs.push(
+        <button key="unban" type="button" className="cx-btn sm primary" onClick={() => hostActionDialog('unban', r)}>
+          {r.status === 'banned' ? 'Unban…' : 'Resume…'}
+        </button>,
+      )
+    if (ruleOut) outs.push(ruleOut)
+  } else if (r.status === 'backoff') {
+    title = 'Backing off: its last connect failed'
+    lines.push(`The reader retries on its own, waiting longer each time${r.connectedSinceMs ? `; it was last connected ${ago(r.connectedSinceMs)}` : ''}.`)
+    outs.push(
+      <button key="re" type="button" className="cx-btn sm" onClick={() => hostActionDialog('reconnect', r)}>
+        Reconnect now…
+      </button>,
+    )
+  } else {
+    // a domain rule's throttle shows on the row as `throttle` too; it's the operator's when an action set it or the rates differ
+    const ruleThr = rule?.effect.kind === 'throttle' ? rule.effect.eventsPerSec : undefined
+    const opThr = r.throttle != null && (!!thrSet || ruleThr === undefined || r.throttle !== ruleThr)
+    const byRule = r.throttle != null && !opThr
+    // the spam policy's auto-throttle sets the same host throttle, and its case says so
+    const auto = opThr && !thrSet ? cases?.find((c) => c.host === r.host && /throttl/i.test(c.autoAction ?? '')) : undefined
+    title = auto ? (
+      <>
+        Held at {fmtNum(r.throttle!)} events/s by case {auto.id}'s auto-throttle
+      </>
+    ) : opThr ? (
+      <>Held at {fmtNum(r.throttle!)} events/s by an operator throttle</>
+    ) : byRule || ruleThr !== undefined ? (
+      <>
+        Held at {fmtNum(ruleThr ?? r.throttle!)} events/s by domain rule {rule!.id}
+      </>
+    ) : binding.length ? (
+      <>
+        Held at {binding[0][0] === 'events/s' ? `${fmtNum(lim.eventsPerSec)} events/s` : `${fmtNum(lim.eventsPerHour)} events/h`} by the {r.tier} tier
+      </>
+    ) : (
+      <>Throttled in the {r.tier} tier</>
+    )
+    if (binding.length) lines.push(<>Binding: {binding.map(([l, u, v]) => `${l} ${fmtSi(u)} of ${fmtNum(v)}`).join(' · ')}</>)
+    if (rule && (rule.effect.kind === 'tier' || rule.effect.kind === 'throttle'))
+      lines.push(
+        <>
+          {rule.effect.kind === 'tier' ? 'Tier from' : 'Throttle from'} {ruleName(rule)}
+          {rule.note ? <> “{rule.note}”</> : null} · {rule.createdBy}, {ago(rule.createdAtMs)}
+        </>,
+      )
+    if (!rule || rule.effect.kind !== 'tier') {
+      const set = last('set-tier')
+      lines.push(
+        set && set.action.action === 'set-tier' && set.action.tier === r.tier ? (
+          <>Tier {r.tier} set by {by(set)}</>
+        ) : r.tier === policy?.defaultTier ? (
+          <>The {r.tier} tier is the default for a new host: no rule or operator moved it.</>
+        ) : (
+          <>No rule or operator action on record set the {r.tier} tier.</>
+        ),
+      )
+    }
+    lines.push(
+      auto ? (
+        <>
+          <button type="button" className="cx-linklike" onClick={() => openPanel('case', String(auto.id))}>
+            Case {auto.id}
+          </button>{' '}
+          ({auto.kind.replace(/-/g, ' ')}, opened {ago(auto.openedAtMs)}) {auto.autoAction}. No operator has changed it since.
+        </>
+      ) : !opThr ? 'No operator throttle.' : thrSet && thrSet.action.action === 'throttle' ? <>Operator throttle {fmtNum(thrSet.action.eventsPerSec ?? 0)}/s set by {by(thrSet)}</> : <>Operator throttle {fmtNum(r.throttle!)}/s; no action on record says who set it.</>,
+    )
+    if (opThr)
+      outs.push(
+        <button key="lift" type="button" className="cx-btn sm primary" onClick={() => hostActionDialog('unthrottle', r)}>
+          Lift throttle…
+        </button>,
+      )
+    // a tier change only helps when the tier is what binds
+    if (roomier && r.throttle == null && ruleThr === undefined)
+      outs.push(
+        <button key="tier" type="button" className="cx-btn sm primary" onClick={() => hostActionDialog('settier', r, roomier[0])}>
+          Set tier {roomier[0]} ({fmtNum(roomier[1].eventsPerSec)}/s)…
+        </button>,
+      )
+    if (ruleOut) outs.push(ruleOut)
+  }
+  return (
+    <div className={`cx-banner ${tone} cx-why`} role="note" aria-label="Why it's held">
+      <div className="bh">
+        <Glyph k={tone} />
+        <span className="bt">{title}</span>
+      </div>
+      <div className="bb">
+        {lines.map((l, i) => (
+          <div key={i}>{l}</div>
+        ))}
+        {outs.length > 0 && <div className="cx-form-row">{outs}</div>}
+      </div>
+    </div>
+  )
+}
+
 /** An action row: what it does on the left, the control on the right. */
 const Act = ({ title, desc, children }: { title: string; desc: ReactNode; children: ReactNode }) => (
   <div className="cx-act">
@@ -62,6 +213,8 @@ const Act = ({ title, desc, children }: { title: string; desc: ReactNode; childr
 function Body({ d, page }: { d: HostDetail; page: boolean }) {
   const { view } = useRelay()
   const pol = policyPoll.use()
+  const rules = rulesPoll.use()
+  const cases = casesPoll.use()
   const r = d.row
   const live = r.status === 'connected' || r.status === 'throttled'
   const blocked = r.status === 'banned' || r.status === 'suspended'
@@ -90,6 +243,7 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
           ['upstream seq', fmtNum(r.lastUpstreamSeq)],
         ]}
       />
+      <WhyHeld d={d} policy={pol.data?.policy} rules={rules.data} cases={cases.data} />
       {atCap && cap < BIG_HOST_CAP && (
         <div className="cx-banner warn">
           <div className="bh">

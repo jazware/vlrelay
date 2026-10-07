@@ -31,6 +31,7 @@
 
 pub mod bucket;
 pub mod budget;
+pub mod cache;
 pub mod check;
 pub mod client;
 pub mod commitlog;

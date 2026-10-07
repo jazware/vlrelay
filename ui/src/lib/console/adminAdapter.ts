@@ -1,6 +1,7 @@
 import {
   api,
   ApiError,
+  type RejectTop,
   enc,
   publicStats,
   type Account,
@@ -68,17 +69,21 @@ export type HostQuery = {
   q?: string
   tier?: string
   status?: HostStatus | ''
-  /** a source, or a prefix ending in `:` or `*` (`bootstrap:` is every seed relay) */
+  /** a source, a prefix ending in `:` or `*` (`bootstrap:` is every seed relay), or `none` (not recorded) */
   source?: string
   /** only hosts with (true) or without (false) throttled accounts */
   throttled?: boolean
+  flag?: HostFlag
   sort: HostSort
   desc: boolean
   limit?: number
   offset?: number
 }
+/** `lagging`: connected or throttled and over a minute behind; `erroring`: over 10% of frames rejected. */
+export type HostFlag = 'atCap' | 'lagging' | 'erroring' | 'throttledOrAtCap'
 /** Server-side filter, sort and page (`limit` default 10,000 on the server). */
-export const hosts = (q: HostQuery) => api<HostList>('hosts', { params: { q: q.q || undefined, tier: q.tier || undefined, status: q.status || undefined, source: q.source || undefined, throttled: q.throttled, sort: q.sort, desc: q.desc, limit: q.limit, offset: q.offset } })
+export const hosts = (q: HostQuery) =>
+  api<HostList>('hosts', { params: { q: q.q || undefined, tier: q.tier || undefined, status: q.status || undefined, source: q.source || undefined, throttled: q.throttled, flag: q.flag, sort: q.sort, desc: q.desc, limit: q.limit, offset: q.offset } })
 export const host = (h: string) => api<HostDetail>(`hosts/${enc(h)}`)
 export const hostAction = (h: string, a: HostAction) => api<HostRow>(`hosts/${enc(h)}/action`, { body: a })
 /** What hostAction sends, for the confirm dialog's footer. */
@@ -264,6 +269,20 @@ export const takedowns = () => api<TakedownEntry[]>('takedowns')
 export const settingsOf = (node: string) => api<SettingsView>('settings', { params: { node: node || undefined } })
 
 // ---------------------------------------------------------------- what the console wants next
+
+export type RejectTopHost = RejectTop
+
+let hasRejectsTop: boolean | undefined
+/**
+ * The hosts sending the most rejects for one reason, cluster-wide. A relay that doesn't serve it
+ * answers 404 once; after that the console stops asking until the page reloads.
+ */
+export async function rejectsTop(reason: string, limit = 10): Promise<Optional<RejectTopHost[]>> {
+  if (hasRejectsTop === false) return { supported: false, endpoint: 'GET ops/rejects/top', why: '' }
+  const r = await optional('GET ops/rejects/top', () => api<RejectTopHost[]>('ops/rejects/top', { params: { reason, limit } }))
+  hasRejectsTop = r.supported
+  return r
+}
 
 /** Endpoints the design assumes but the relay doesn't serve: answer with `missing(endpoint, why)` and list them here (CONSOLE.md has the table). */
 export const MISSING: readonly (readonly [endpoint: string, feeds: string])[] = []

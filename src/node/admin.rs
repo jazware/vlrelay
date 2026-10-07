@@ -41,6 +41,15 @@ pub struct NodeAdmin {
     /// (when, PLC fetches, seeded misses, new accounts) at the last usage
     /// sample, for its rates.
     usage_prev: Mutex<(Instant, u64, u64, u64)>,
+    /// Rejects per (host, reason) at the last sample, and the rates then.
+    rejects_prev: Mutex<RejectSample>,
+}
+
+#[derive(Default)]
+struct RejectSample {
+    at: Option<Instant>,
+    counts: HashMap<(String, RejectReason), u64>,
+    rates: HashMap<(String, RejectReason), f64>,
 }
 
 fn usage_counts(n: &Node) -> (u64, u64, u64) {
@@ -109,6 +118,7 @@ impl NodeAdmin {
             // primed now, so the first answer has a window
             store_prev: Mutex::new(Some((Instant::now(), crate::qlog::bucket::requests()))),
             retain: tokio::sync::Mutex::new(None),
+            rejects_prev: Mutex::new(RejectSample { at: Some(Instant::now()), ..Default::default() }),
             usage_prev: Mutex::new({
                 let (f, s, a) = usage_counts(&node);
                 (Instant::now(), f, s, a)
@@ -202,9 +212,13 @@ pub fn reject_class(reason: &str) -> RejectReason {
 const TOP_HISTORY: usize = 60;
 
 impl NodeAdmin {
-    fn row(&self, h: &HostView, series: Option<&Series>, rejects: u64) -> admin::HostRow {
+    fn row(
+        &self,
+        h: &HostView,
+        series: Option<&Series>,
+        rejects: Option<&super::metrics::HostRejects>,
+    ) -> admin::HostRow {
         let (rate, ratio) = series.map_or((0.0, 0.0), |s| (s.rate(), s.reject_ratio()));
-        let _ = rejects;
         admin::HostRow {
             host: h.record.hostname.clone(),
             tier: h.record.tier.as_str().into(),
@@ -224,6 +238,7 @@ impl NodeAdmin {
             history: Vec::new(),
             throttled_accounts: self.node.quorum.hosts.throttled(&h.record.hostname),
             source: self.node.quorum.hosts.source(&h.record.hostname),
+            top_reason: rejects.and_then(top_reason),
         }
     }
 
@@ -237,7 +252,7 @@ impl NodeAdmin {
             .iter()
             .map(|h| {
                 let k = Host(h.record.hostname.clone());
-                self.row(h, dash.hosts.get(&k), rejects.get(&k).map_or(0, |r| r.total))
+                self.row(h, dash.hosts.get(&k), rejects.get(&k))
             })
             .collect()
     }
@@ -254,7 +269,7 @@ impl NodeAdmin {
         let h = self.node.manager.host(&k).ok_or_else(|| AdminError::NotFound(format!("unknown host {host}")))?;
         let dash = self.node.dash.lock();
         let rejects = self.node.rejects.lock();
-        Ok(self.row(&h, dash.hosts.get(&k), rejects.get(&k).map_or(0, |r| r.total)))
+        Ok(self.row(&h, dash.hosts.get(&k), rejects.get(&k)))
     }
 
     async fn open_case_count(&self) -> u32 {
@@ -691,6 +706,60 @@ impl NodeAdmin {
         })
     }
 
+    /// This node's hosts with the most rejects of `reason` (all: None).
+    fn local_rejects_top(&self, reason: Option<RejectReason>, limit: usize) -> Vec<admin::RejectTop> {
+        let r = self.node.rejects.lock();
+        let mut counts: HashMap<(String, RejectReason), u64> = HashMap::new();
+        for (h, x) in r.iter() {
+            for (raw, n) in &x.by_reason {
+                *counts.entry((h.0.clone(), reject_class(raw))).or_default() += n;
+            }
+        }
+        let rates = {
+            let mut p = self.rejects_prev.lock();
+            let secs = p.at.map_or(0.0, |t| t.elapsed().as_secs_f64());
+            if secs >= STORE_WINDOW.as_secs_f64() || p.rates.is_empty() {
+                p.rates = counts
+                    .iter()
+                    .map(|(k, n)| {
+                        (k.clone(), n.saturating_sub(p.counts.get(k).copied().unwrap_or(0)) as f64 / secs.max(1.0))
+                    })
+                    .collect();
+                p.counts = counts.clone();
+                p.at = Some(Instant::now());
+            }
+            p.rates.clone()
+        };
+        let mut out: Vec<admin::RejectTop> = r
+            .iter()
+            .filter_map(|(h, x)| {
+                let keep = |c: RejectReason| reason.is_none_or(|w| w == c);
+                let total: u64 = x.by_reason.iter().filter(|(raw, _)| keep(reject_class(raw))).map(|(_, n)| n).sum();
+                if total == 0 {
+                    return None;
+                }
+                let per_sec =
+                    rates.iter().filter(|((host, c), _)| *host == h.0 && keep(*c)).map(|(_, v)| v).sum::<f64>();
+                let newest = x.recent.iter().rev().find(|n| keep(reject_class(n.reason)));
+                Some(admin::RejectTop {
+                    host: h.0.clone(),
+                    rejects_per_sec: per_sec,
+                    total,
+                    last_at_ms: newest.map(|n| n.at_ms),
+                    sample: newest.map(|n| admin::RejectSample {
+                        at_ms: n.at_ms,
+                        did: n.did.clone(),
+                        reason: reject_class(n.reason),
+                        upstream_seq: n.upstream_seq,
+                        detail: format!("{}: {}", n.reason, n.detail),
+                    }),
+                })
+            })
+            .collect();
+        rank_rejects(&mut out, limit);
+        out
+    }
+
     fn sort_page(mut rows: Vec<admin::HostRow>, q: &admin::HostQuery) -> admin::HostList {
         rows.retain(|r| q.q.as_deref().is_none_or(|s| r.host.contains(s)));
         rows.retain(|r| q.tier.as_deref().is_none_or(|t| r.tier == t));
@@ -966,6 +1035,24 @@ impl AdminSource for NodeAdmin {
         }
         h.events.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then_with(|| a.node.cmp(&b.node)));
         Ok(h)
+    }
+
+    /// Every member's ranking, merged by host.
+    async fn rejects_top(&self, q: admin::RejectTopQuery) -> AdminResult<Vec<admin::RejectTop>> {
+        let limit = q.limit.unwrap_or(10).clamp(1, 500);
+        let body = serde_json::json!({ "reason": q.reason, "limit": limit });
+        let mut all = self.local_rejects_top(q.reason, limit);
+        for (id, r) in
+            self.node.quorum.ask_all("node:rejects-top", serde_json::to_vec(&body).unwrap_or_default().into()).await
+        {
+            if id == self.id() {
+                continue;
+            }
+            if let Some(v) = r.ok().and_then(|b| serde_json::from_slice::<Vec<admin::RejectTop>>(&b).ok()) {
+                all.extend(v);
+            }
+        }
+        Ok(merge_rejects(all, limit))
     }
 
     async fn discovery(&self) -> AdminResult<admin::DiscoveryView> {
@@ -1294,6 +1381,10 @@ impl crate::node::quorum::LocalAsk for NodeAdmin {
                 "node:consumers" => serde_json::to_value(self.local_consumers()).ok()?,
                 "node:settings" => serde_json::to_value(self.settings.as_ref()?).ok()?,
                 "node:usage" => serde_json::to_value(self.local_usage().await.ok()?).ok()?,
+                "node:rejects-top" => {
+                    let q: admin::RejectTopQuery = serde_json::from_slice(&body).ok()?;
+                    serde_json::to_value(self.local_rejects_top(q.reason, q.limit.unwrap_or(10))).ok()?
+                }
                 "node:kick" => {
                     let req: serde_json::Value = serde_json::from_slice(&body).ok()?;
                     let ok = self.node.quorum.admin_token().is_some_and(|t| req["token"].as_str() == Some(t));
@@ -1312,6 +1403,52 @@ impl crate::node::quorum::LocalAsk for NodeAdmin {
             serde_json::to_vec(&v).ok().map(Bytes::from)
         })
     }
+}
+
+/// Rejects older than this don't count toward a host's top reason.
+const TOP_REASON_WINDOW_MS: i64 = 5 * 60_000;
+
+/// The reason with the most of a host's recent rejects (its last 50, in
+/// the last five minutes).
+fn top_reason(r: &super::metrics::HostRejects) -> Option<RejectReason> {
+    let since = now_ms() - TOP_REASON_WINDOW_MS;
+    let mut by: BTreeMap<RejectReason, usize> = BTreeMap::new();
+    for n in r.recent.iter().filter(|n| n.at_ms >= since) {
+        *by.entry(reject_class(n.reason)).or_default() += 1;
+    }
+    by.into_iter().max_by_key(|(_, n)| *n).map(|(c, _)| c)
+}
+
+/// Most rejects a second first, then most in all.
+fn rank_rejects(v: &mut Vec<admin::RejectTop>, limit: usize) {
+    v.sort_by(|a, b| {
+        b.rejects_per_sec.total_cmp(&a.rejects_per_sec).then(b.total.cmp(&a.total)).then(a.host.cmp(&b.host))
+    });
+    v.truncate(limit);
+}
+
+/// Members' rankings as one: a host read by two members over time (it
+/// moved) sums, keeping the newest sample.
+pub(crate) fn merge_rejects(all: Vec<admin::RejectTop>, limit: usize) -> Vec<admin::RejectTop> {
+    let mut by: BTreeMap<String, admin::RejectTop> = BTreeMap::new();
+    for t in all {
+        match by.get_mut(&t.host) {
+            None => {
+                by.insert(t.host.clone(), t);
+            }
+            Some(e) => {
+                e.rejects_per_sec += t.rejects_per_sec;
+                e.total += t.total;
+                if t.last_at_ms > e.last_at_ms {
+                    e.last_at_ms = t.last_at_ms;
+                    e.sample = t.sample;
+                }
+            }
+        }
+    }
+    let mut v: Vec<admin::RejectTop> = by.into_values().collect();
+    rank_rejects(&mut v, limit);
+    v
 }
 
 #[cfg(test)]
@@ -1344,6 +1481,44 @@ mod tests {
         assert_eq!(v.purposes.iter().map(|p| p.per_sec.b).sum::<f64>(), v.total.per_sec.b);
         let first = store_view("n1", &now, None, Duration::ZERO, None);
         assert_eq!(first.total.per_sec.a, 0.0, "no rate without a previous sample");
+    }
+
+    #[test]
+    fn a_hosts_top_reason_is_its_most_frequent_recent_one() {
+        use super::super::metrics::{HostRejects, RejectNote};
+        let note = |reason: &'static str, ago_ms: i64| RejectNote {
+            at_ms: now_ms() - ago_ms,
+            did: "did:plc:x".into(),
+            reason,
+            upstream_seq: 1,
+            detail: String::new(),
+        };
+        let mut r = HostRejects::default();
+        // many old ones don't count, only the last five minutes'
+        for _ in 0..10 {
+            r.recent.push_back(note("bad_signature", 10 * 60_000));
+        }
+        for _ in 0..2 {
+            r.recent.push_back(note("prev_data_mismatch", 1_000));
+        }
+        r.recent.push_back(note("bad_signature", 2_000));
+        assert_eq!(top_reason(&r), Some(RejectReason::PrevDataMismatch));
+        assert_eq!(top_reason(&HostRejects::default()), None);
+    }
+
+    #[test]
+    fn members_rankings_merge_by_host() {
+        let t = |h: &str, r: f64, n: u64, at: i64| admin::RejectTop {
+            host: h.into(),
+            rejects_per_sec: r,
+            total: n,
+            last_at_ms: Some(at),
+            sample: None,
+        };
+        let v = merge_rejects(vec![t("a", 1.0, 10, 5), t("b", 3.0, 7, 1), t("a", 2.5, 4, 9), t("c", 0.0, 99, 2)], 2);
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].host.as_str(), v[0].rejects_per_sec, v[0].total, v[0].last_at_ms), ("a", 3.5, 14, Some(9)));
+        assert_eq!(v[1].host, "b");
     }
 
     #[test]

@@ -121,6 +121,7 @@ Every member uses the same bucket and `--prefix`. A node with no `--qlog-peer` i
 | `--qlog-disk-retain-mb <QLOG_DISK_RETAIN_MB>` |  | `4096` | Flushed commitlog kept on the local disk, for followers catching up |
 | `--durability <DURABILITY>` | `VLRELAY_DURABILITY` |  | When an entry counts on this node: `fsync` (after its fdatasync), `page-cache` (once written to the commitlog, fdatasync'd every --durability-sync-ms; a power cut on a majority within that window is a bucket recovery) or `memory` (no commitlog). Default: page-cache for three members or more, fsync below; a single node only runs fsync |
 | `--durability-sync-ms <DURABILITY_SYNC_MS>` |  | `100` | Page-cache mode's background fdatasync interval |
+| `--slatedb-cache-mb <SLATEDB_CACHE_MB>` | `VLRELAY_SLATEDB_CACHE_MB` | `320` | SlateDB's block and metadata cache, shared by every database this node opens (the quorum log's state, the PLC seeds): the total in MiB, four parts blocks to one of indexes and filters |
 | `--qlog-memory-mb <QLOG_MEMORY_MB>` |  |  | Committed log kept in memory (default 64 with --qlog-dir, else 512) |
 
 ## Chaos

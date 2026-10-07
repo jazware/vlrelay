@@ -48,6 +48,8 @@ export type HostRow = {
   throttledAccounts: number
   /** How the relay found it: requestCrawl, bootstrap:<relay>, plc or cli. */
   source: string | null
+  /** The reject reason with the most of its recent rejects (last 5 min), or null. */
+  topReason: RejectReason | null
   /** Events/s, 1 s apart, oldest first: only on the overview's top hosts. */
   history?: number[]
 }
@@ -656,4 +658,16 @@ export type DiscoverySource = {
   lastError: string | null
 }
 export type DiscoveryView = { leader: string | null; leading: boolean; connectsPerMin: number; requestsPerSec: number; sources: DiscoverySource[] }
+
+/** GET ops/rejects/top?reason=&limit=: the hosts with the most rejects (of one reason), across the members. */
+export type RejectTop = {
+  host: string
+  /** over each member's last sample window (~10 s) */
+  rejectsPerSec: number
+  /** since each member's start */
+  total: number
+  lastAtMs: number | null
+  /** the newest one */
+  sample?: { atMs: number; did: string; reason: string; upstreamSeq: number; detail: string }
+}
 

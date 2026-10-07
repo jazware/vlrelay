@@ -3,13 +3,13 @@ import { DataTable, type Col } from '../../components/console/DataTable'
 import { hostActionDialog, BIG_HOST_CAP } from '../../components/console/hostActions'
 import { openPanel } from '../../components/console/nav'
 import { registerPalette, type PalItem } from '../../components/console/Palette'
-import { Chip, Empty, Glyph, HostName, Kbd, Loaded, Meter, PageHead, Panel, Sec, Seg, Src, TierTag } from '../../components/console/kit'
+import { Chip, Empty, Glyph, HostName, Kbd, Loaded, Meter, Over, PageHead, Panel, Sec, Seg, Src, TierTag } from '../../components/console/kit'
 import type { Account, Case, CaseStatus, DomainRule, HostRow, PolicyAudit, SignalKey, SignalTop, TakedownEntry } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, dt, fmtNum, fmtSi, plural, shortDid } from '../../lib/console/fmt'
 import { useLivePoll } from '../../lib/console/live'
 import { overviewPoll } from '../../lib/console/polls'
-import { useSearch } from '../../lib/router'
+import { Link, useSearch } from '../../lib/router'
 import { signalOfKind } from './Policy'
 import {
   AccountChip,
@@ -85,13 +85,11 @@ function Cases() {
     },
     {
       id: 'obs',
-      label: 'Observed',
+      label: 'Over threshold',
+      r: true,
+      title: 'How far past its threshold it was when it tripped: observed / threshold. The bar is logarithmic, 0.1× to 10×, with a tick at the threshold',
       sort: (a, b) => a.observed / (a.threshold || 1) - b.observed / (b.threshold || 1),
-      render: (c) => (
-        <span className="sm">
-          <Meter v={c.observed} max={c.threshold * 2} k={c.observed >= c.threshold ? 'err' : 'warn'} title="the threshold is half way" /> <span className="mono">{caseObs(c)}</span>
-        </span>
-      ),
+      render: (c) => <Over r={c.threshold > 0 ? c.observed / c.threshold : NaN} detail={caseObs(c)} />,
     },
     { id: 'auto', label: 'Auto action', render: (c) => (c.autoAction ? <span className="mono sm">{c.autoAction}</span> : <span className="muted sm">none</span>) },
     { id: 'status', label: 'Status', render: (c) => <CaseStatusChip c={c} /> },
@@ -153,12 +151,10 @@ function Signals() {
       label: 'vs threshold',
       r: true,
       sort: (a, b) => a.r - b.r,
-      title: 'Its estimate against the threshold over the window (Space-Saving: it may overcount down to its lower bound)',
+      title: 'Its estimate against the threshold over the window (Space-Saving: it may overcount down to its lower bound). 1× trips it; the bar is logarithmic, 0.1× to 10×',
       render: ({ s, k, r }) =>
         k ? (
-          <span className="mono sm nowrap" title={`~${fmtNum(k.estimate)} (at least ${fmtNum(k.lower)}) of ${fmtNum(s.limit)} in ${s.windowSecs} s`}>
-            <Meter v={k.estimate} max={s.limit} k={r >= 1 ? 'err' : r > 0.7 ? 'warn' : 'ok'} /> {Math.round(r * 100)}%
-          </span>
+          <Over r={r} title={`~${fmtNum(k.estimate)} (at least ${fmtNum(k.lower)}) of ${fmtNum(s.limit)} in ${s.windowSecs} s`} />
         ) : (
           <span className="muted">—</span>
         ),
@@ -170,7 +166,7 @@ function Signals() {
       to="/admin/policy"
       src={<Src>policy/signals</Src>}
       right={v ? <span className="muted sm">on {v.node}</span> : undefined}
-      foot={<span>Each signal's heaviest key against its threshold; 100% trips it. Open a row for the host or account.{off ? ` ${plural(off, 'signal')} off (threshold 0).` : ''}</span>}
+      foot={<span>Each signal's heaviest key against its threshold; 1× trips it. Open a row for the host or account.{off ? ` ${plural(off, 'signal')} off (threshold 0).` : ''}</span>}
     >
       <Loaded load={sig}>
         {() => (
@@ -346,16 +342,15 @@ function Rules() {
   )
 }
 
-const SHOWN = 25
+const SHOWN = 10
 
 /** The hosts with accounts created throttled, or at their cap (the next ones will be). */
 function Throttled() {
-  const list = useLivePoll(() => A.hosts({ sort: 'accounts', desc: true }), 'throttled-accounts', 30_000, { keep: true })
+  const list = useLivePoll(() => A.hosts({ flag: 'throttledOrAtCap', sort: 'accounts', desc: true }), 'throttled-accounts', 30_000, { keep: true })
   const atCap = (h: HostRow) => h.maxAccounts > 0 && h.accounts >= h.maxAccounts
-  const rows = (list.data?.hosts ?? []).filter((h) => h.throttledAccounts > 0 || atCap(h)).sort((a, b) => b.throttledAccounts - a.throttledAccounts || b.accounts - a.accounts)
+  const rows = [...(list.data?.hosts ?? [])].sort((a, b) => b.throttledAccounts - a.throttledAccounts || b.accounts - a.accounts)
   const total = rows.reduce((a, h) => a + h.throttledAccounts, 0)
   const capped = rows.filter(atCap).length
-  const [all, setAll] = useState(false)
   const cols: Col<HostRow>[] = [
     {
       id: 'host',
@@ -414,14 +409,15 @@ function Throttled() {
     >
       <Loaded load={list}>
         {() => (
-          <DataTable rows={all ? rows : rows.slice(0, SHOWN)} cols={cols} rowKey={(h) => h.host} open={(h) => ({ type: 'host', id: h.host })} compact label="Hosts with throttled accounts" empty={<Empty>No host has accounts created throttled, and none is at its account cap.</Empty>} />
+          <DataTable rows={rows.slice(0, SHOWN)} cols={cols} rowKey={(h) => h.host} open={(h) => ({ type: 'host', id: h.host })} compact label="Hosts with throttled accounts" empty={<Empty>No host has accounts created throttled, and none is at its account cap.</Empty>} />
         )}
       </Loaded>
       {rows.length > SHOWN && (
         <div className="cx-pn-b">
-          <button type="button" className="cx-btn sm quiet" onClick={() => setAll(!all)}>
-            {all ? `Show the first ${SHOWN}` : `Show all ${fmtNum(rows.length)}`}
-          </button>
+          <Link className="cx-btn sm quiet" to="/admin/hosts?flag=thr&sort=throttled">
+            All {fmtNum(rows.length)} in Hosts ›
+          </Link>{' '}
+          <span className="muted sm">the {SHOWN} with the most throttled accounts are here</span>
         </div>
       )}
     </Panel>
