@@ -115,6 +115,11 @@ docker-build tag="vlrelay:local" tools="":
 docker-build-benchbox tag="":
     build/benchbox-image.sh {{tag}}
 
+# Build the production amd64 image on this Mac from the committed tree and push it
+# (build/mac-image.sh, build/Dockerfile.cross; PUSH=0 to only load it)
+docker-push tag=`git rev-parse --short=12 HEAD`:
+    build/mac-image.sh {{tag}}
+
 # Regenerate docs/operations/configuration.md from `vlrelay --help` (run after changing a flag)
 config-doc:
     cargo build --quiet --bin vlrelay
