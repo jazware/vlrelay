@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
-import { Mark, ThemeIcon, useThemeToggle } from '../components/console/Shell'
+import { PubFoot, PubTop, useConsoleReachable } from '../components/console/PubTop'
+import { useThemeToggle } from '../components/console/Shell'
 import { Copy, Glyph } from '../components/console/kit'
 import { Toasts } from '../components/console/toast'
 import type { Health, PublicStats } from '../lib/api'
@@ -107,25 +108,10 @@ const Fig = ({ v, unit, label, em }: { v: ReactNode; unit?: string; label: strin
   </div>
 )
 
-/** Whether /admin answers from here: a proxy in front of a public relay usually hides it. */
-function useConsoleReachable() {
-  const [ok, setOk] = useState(false)
-  useEffect(() => {
-    let live = true
-    fetch('/admin', { method: 'HEAD' })
-      .then((r) => live && setOk(r.ok))
-      .catch(() => {})
-    return () => {
-      live = false
-    }
-  }, [])
-  return ok
-}
-
 export function Public() {
   const l = publicPoll.use()
   const s = l.data
-  const { theme, toggle } = useThemeToggle()
+  const { theme } = useThemeToggle()
   const host = location.host
   const dot = /^\d+(\.\d+){3}(:\d+)?$/.test(host) ? -1 : host.indexOf('.')
   const ws = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${host}/xrpc/com.atproto.sync.subscribeRepos`
@@ -137,24 +123,7 @@ export function Public() {
   const quorum = s?.quorum ?? null
   return (
     <div className="cx cx-pubroot" data-theme-resolved={theme}>
-      <header className="cx-pub-top">
-        <Link to="/" className="cx-wordmark" aria-label="vlRelay">
-          <Mark />
-          vlRelay
-        </Link>
-        <Link to="/docs" className="l hide-sm">
-          Docs
-        </Link>
-        {consoleHere && (
-          <Link to="/admin" className="l">
-            Console
-          </Link>
-        )}
-        <span className="cx-spacer" />
-        <button type="button" className="cx-iconbtn" onClick={toggle} title="Toggle theme" aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>
-          <ThemeIcon />
-        </button>
-      </header>
+      <PubTop consoleHere={consoleHere} />
       <main className="cx-pub-in">
         <section className="cx-hero">
           <div>
@@ -300,15 +269,7 @@ export function Public() {
             </div>
           </div>
         </section>
-        <footer className="cx-pubfoot">
-          <span>
-            vlRelay <span className="mono">{s?.version ?? ''}</span>
-          </span>
-          <Link to="/docs">Docs</Link>
-          <a href="/api/public/stats">Stats JSON</a>
-          <a href="/xrpc/_health">Health</a>
-          {consoleHere && <Link to="/admin">Operator console</Link>}
-        </footer>
+        <PubFoot version={s?.version} consoleHere={consoleHere} />
       </main>
       <Toasts />
     </div>

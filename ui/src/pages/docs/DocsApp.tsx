@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent, type RefObject } from 'react'
 import { loaders, nav, pages, type DocMeta } from 'virtual:vlrelay-docs'
-import { Topbar } from '../../components/ui'
+import { PubFoot, PubTop, useConsoleReachable } from '../../components/console/PubTop'
+import { useThemeToggle } from '../../components/console/Shell'
+import { toast, Toasts } from '../../components/console/toast'
 import { Link, navigate } from '../../lib/router'
 import '../../docs.css'
 import { Lightbox, diagramOf, type Diagram } from './Lightbox'
@@ -22,6 +24,8 @@ export function DocsApp({ path }: { path: string }) {
   const [navOpen, setNavOpen] = useState(false)
   const [diagram, setDiagram] = useState<Diagram | null>(null)
   const article = useRef<HTMLDivElement>(null)
+  const { theme } = useThemeToggle()
+  const consoleHere = useConsoleReachable()
 
   useEffect(() => {
     document.title = page ? `${page.title} · vlRelay docs` : 'Not found · vlRelay docs'
@@ -52,6 +56,15 @@ export function DocsApp({ path }: { path: string }) {
 
   const onClick = (e: MouseEvent<HTMLDivElement>) => {
     const t = e.target as Element
+    const copy = t.closest('.code-copy')
+    if (copy) {
+      const code = copy.parentElement?.querySelector('pre')?.textContent ?? ''
+      navigator.clipboard.writeText(code.replace(/\n$/, '')).then(
+        () => toast('Copied'),
+        () => toast('Select the text to copy it'),
+      )
+      return
+    }
     const fig = t.closest<HTMLElement>('.figure')
     if (fig && (t.closest('.dg-expand') || t.closest('svg.dg'))) {
       const d = diagramOf(fig)
@@ -76,11 +89,11 @@ export function DocsApp({ path }: { path: string }) {
   const next = i >= 0 && i < order.length - 1 ? bySlug.get(order[i + 1]) : undefined
 
   return (
-    <>
-      <Topbar where="docs" />
+    <div className="cx cx-pubroot cx-docsroot" data-theme-resolved={theme}>
+      <PubTop here="docs" consoleHere={consoleHere} />
       <div className="docs">
         <aside className={`docs-nav${navOpen ? ' open' : ''}`} aria-label="Documentation">
-          <button className="docs-nav-toggle btn sm" aria-expanded={navOpen} onClick={() => setNavOpen((o) => !o)}>
+          <button type="button" className="docs-nav-toggle cx-btn" aria-expanded={navOpen} onClick={() => setNavOpen((o) => !o)}>
             {page ? page.title : 'Contents'} <span aria-hidden="true">{navOpen ? '▴' : '▾'}</span>
           </button>
           <nav>
@@ -91,6 +104,7 @@ export function DocsApp({ path }: { path: string }) {
                   const m = bySlug.get(p)!
                   return (
                     <Link key={p} to={`/docs/${p}`} className={p.includes('/') ? 'sub' : undefined} aria-current={p === slug ? 'page' : undefined}>
+                      <span className="cx-jack" aria-hidden="true" />
                       {m.title}
                       {m.status === 'stub' && <span className="dot" title="Not written yet" />}
                     </Link>
@@ -115,13 +129,18 @@ export function DocsApp({ path }: { path: string }) {
                   <Link to="/docs">Docs</Link>
                   <span aria-hidden="true">/</span>
                   <span>{page.section}</span>
-                  {page.status !== 'ready' && <span className={`badge badge-${page.status}`}>{page.status === 'stub' ? 'Outline' : 'Draft'}</span>}
+                  {page.status !== 'ready' && <span className="badge">{page.status === 'stub' ? 'Outline' : 'Draft'}</span>}
                 </div>
                 <h1>{page.title}</h1>
                 <p className="doc-summary">{page.summary}</p>
               </header>
               {failed ? (
-                <p className="notice err">This page didn't load. Reload to try again.</p>
+                <div className="cx-banner err" role="alert">
+                  <div className="bh">
+                    <span className="cx-g s-err" aria-hidden="true">■</span>
+                    <span className="bt">This page didn't load. Reload to try again.</span>
+                  </div>
+                </div>
               ) : body === null ? (
                 <div className="doc-loading" aria-busy="true" />
               ) : (
@@ -133,8 +152,12 @@ export function DocsApp({ path }: { path: string }) {
         </main>
         {page && body !== null && <Toc page={page} root={article} />}
       </div>
+      <div className="docs-foot">
+        <PubFoot consoleHere={consoleHere} />
+      </div>
       {diagram && <Lightbox diagram={diagram} onClose={() => setDiagram(null)} />}
-    </>
+      <Toasts />
+    </div>
   )
 }
 

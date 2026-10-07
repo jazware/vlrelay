@@ -1,6 +1,5 @@
-import { useEffect, useRef, useState, type JSX, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { errText } from '../lib/api'
-import { setTheme, useTheme, type Theme } from '../lib/hooks'
 import { Link } from '../lib/router'
 import * as I from './icons'
 
@@ -225,47 +224,6 @@ export function Confirm({
         </div>
       </form>
     </dialog>
-  )
-}
-
-export function ThemeToggle() {
-  const t = useTheme()
-  const opts: { v: Theme; label: string; Icon: (p: any) => JSX.Element }[] = [
-    { v: 'light', label: 'Light', Icon: I.Sun },
-    { v: 'dark', label: 'Dark', Icon: I.Moon },
-    { v: 'system', label: 'Match system', Icon: I.Auto },
-  ]
-  return (
-    <div className="seg" role="group" aria-label="Theme">
-      {opts.map(({ v, label, Icon }) => (
-        <button key={v} type="button" aria-pressed={t === v} onClick={() => setTheme(v)} title={label} aria-label={label}>
-          <Icon />
-        </button>
-      ))}
-    </div>
-  )
-}
-
-/** `console`: the operator console's bar, which has its own tabs instead of the public links. */
-export function Topbar({ where, console, children }: { where?: string; console?: boolean; children?: ReactNode }) {
-  return (
-    <>
-      <header className="topbar">
-        <Link to="/" className="wordmark" aria-label="vlRelay home">
-          <I.Mark />
-          vlRelay
-          {where && <span className="where">{where}</span>}
-        </Link>
-        <nav className="topnav" aria-label="Site">
-          <Link to="/docs">Docs</Link>
-          {!console && <Link to="/admin">Console</Link>}
-        </nav>
-        <div className="spacer" />
-        {children}
-        <ThemeToggle />
-      </header>
-      <div className="strata" aria-hidden="true" />
-    </>
   )
 }
 

@@ -183,7 +183,11 @@ function makeMd(ctx) {
     }
     const lang = LANG_ALIASES[info] ?? info
     const code = lang && hljs.getLanguage(lang) ? hljs.highlight(t.content, { language: lang, ignoreIllegals: true }).value : esc(t.content)
-    return `<pre class="code"><code class="hljs${lang ? ` language-${esc(lang)}` : ''}">${code}</code></pre>`
+    // DocsApp copies the block from this button
+    return (
+      `<div class="code-block"><pre class="code"><code class="hljs${lang ? ` language-${esc(lang)}` : ''}">${code}</code></pre>` +
+      `<button type="button" class="code-copy" aria-label="Copy code">Copy</button></div>`
+    )
   }
 
   // Heading ids (and the page's table of contents).

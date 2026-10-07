@@ -198,47 +198,6 @@ code,
 
 /* ------------------------------------------------------------ chrome */
 
-.topbar {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 0 20px;
-  height: 56px;
-  background: var(--sheet);
-  border-bottom: 1px solid var(--rule);
-  position: sticky;
-  top: 0;
-  z-index: 20;
-}
-.wordmark {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  font-weight: 800;
-  font-size: 18px;
-  letter-spacing: -0.02em;
-  color: var(--ink);
-  text-decoration: none;
-}
-.wordmark svg {
-  color: var(--accent);
-}
-.wordmark .where {
-  font-weight: 500;
-  color: var(--ink2);
-  font-size: 14px;
-  letter-spacing: 0;
-}
-.topbar .spacer {
-  flex: 1;
-}
-/* The signature: two thin strata under the bar (segment written, state applied). */
-.strata {
-  height: 4px;
-  background: linear-gradient(var(--accent) 0 2px, transparent 2px 3px, var(--amber) 3px 4px);
-  opacity: 0.9;
-}
-
 .seg {
   display: inline-flex;
   border: 1px solid var(--rule);

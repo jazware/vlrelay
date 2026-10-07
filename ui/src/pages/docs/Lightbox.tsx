@@ -215,7 +215,8 @@ export function Lightbox({ diagram, onClose }: { diagram: Diagram; onClose: () =
             : 'Scroll to zoom · drag to pan · Esc to close'}
       </p>
     </div>,
-    document.body,
+    // inside the docs root, where the theme tokens live
+    document.querySelector('.cx-docsroot') ?? document.body,
   )
 }
 

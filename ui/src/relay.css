@@ -606,42 +606,6 @@ input.invalid {
   box-shadow: inset 3px 0 0 var(--danger);
 }
 
-/* ------------------------------------------------------------ top nav */
-
-.topnav {
-  display: flex;
-  gap: 4px;
-  margin-left: 8px;
-}
-.topnav a {
-  padding: 6px 10px;
-  border-radius: 5px;
-  color: var(--ink2);
-  font-weight: 600;
-  font-size: 14px;
-  text-decoration: none;
-}
-.topnav a:hover {
-  color: var(--ink);
-  background: var(--sunk);
-}
-@media (max-width: 520px) {
-  .wordmark .where {
-    display: none;
-  }
-  .topbar {
-    gap: 8px;
-    padding: 0 16px;
-  }
-  .topnav {
-    margin-left: 0;
-    gap: 0;
-  }
-  .topnav a {
-    padding: 6px;
-  }
-}
-
 /* ------------------------------------------------------------ tab groups */
 
 .tabs .tab-group {
