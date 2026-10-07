@@ -242,6 +242,10 @@ pub fn reject_class(reason: &str) -> RejectReason {
     }
 }
 
+/// A host this far ahead of real time on its own timeline is shown
+/// catching up.
+const CATCHING_UP: f64 = 1.5;
+
 /// Seconds of rate history on each of the overview's top hosts.
 const TOP_HISTORY: usize = 60;
 
@@ -269,6 +273,7 @@ impl NodeAdmin {
             .then_some(h.record.last_connected_ms.map(|m| m as i64))
             .flatten(),
             lag_ms: h.read_lag_ms.unwrap_or(0) as f64,
+            catch_up_pace: (h.pace >= CATCHING_UP).then_some((h.pace * 10.0).round() / 10.0),
             throttle: self.policy.throttle(&h.record.hostname),
             rule: self.policy.limits(&h.record.hostname).and_then(|l| l.rule),
             node: self.node.cfg.node_id.clone(),
@@ -1285,6 +1290,23 @@ impl AdminSource for NodeAdmin {
         self.case_changed(&c);
         Ok(c)
     }
+    async fn bulk_update_cases(&self, b: admin::CaseBulkUpdate, by: &str) -> AdminResult<admin::CaseBulkResult> {
+        let all = self.admin().cases(admin::CaseQuery::default()).await?;
+        let (targets, update) = admin::bulk_targets(&all, &b)?;
+        let mut ids = Vec::with_capacity(targets.len());
+        for id in targets {
+            let c = match self.admin().update_case(id, update.clone(), by).await {
+                Ok(c) => c,
+                Err(AdminError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            // coalesced: past the feed's bound they go out as one `*`
+            let hint = serde_json::json!({ "status": c.status });
+            self.feed.touch(ChangeKind::Case, c.id.to_string(), Some(hint), true);
+            ids.push(c.id);
+        }
+        Ok(admin::CaseBulkResult { updated: ids.len(), ids })
+    }
 }
 
 fn full_doc(d: &crate::policy::Stored<crate::policy::PolicyBody>) -> admin::FullPolicyDoc {
@@ -1413,13 +1435,31 @@ fn store_latency() -> Vec<admin::StoreLatency> {
     by.into_iter()
         .filter(|(_, (n, _, _))| *n > 0)
         .map(|(op, (n, sum, buckets))| {
-            let q = |p: f64| {
-                let want = (n as f64 * p).ceil() as u64;
-                buckets.iter().find(|(_, c)| *c >= want).map_or(f64::INFINITY, |(ub, _)| *ub) * 1000.0
-            };
+            let q = |p: f64| bucket_quantile(&buckets, n, p) * 1000.0;
             admin::StoreLatency { op, count: n, mean_ms: sum / n as f64 * 1000.0, p50_ms: q(0.5), p99_ms: q(0.99) }
         })
         .collect()
+}
+
+/// The `p` quantile of a histogram (`(upper bound, cumulative count)`,
+/// ascending) of `n` samples, interpolated linearly within its bucket as
+/// Prometheus's `histogram_quantile` does; past the last finite bound, that
+/// bound.
+fn bucket_quantile(buckets: &[(f64, u64)], n: u64, p: f64) -> f64 {
+    let want = n as f64 * p;
+    let mut lower = (0.0, 0u64);
+    for &(ub, c) in buckets {
+        if c as f64 >= want {
+            if !ub.is_finite() {
+                return lower.0;
+            }
+            let span = (c - lower.1) as f64;
+            let into = if span > 0.0 { (want - lower.1 as f64) / span } else { 1.0 };
+            return lower.0 + (ub - lower.0) * into.clamp(0.0, 1.0);
+        }
+        lower = (ub, c);
+    }
+    lower.0
 }
 
 pub(crate) fn store_view(
@@ -1569,6 +1609,9 @@ mod tests {
             bytes: 0,
             connects: 1,
             read_lag_ms: None,
+            host_lag_ms: None,
+            backpressure_at_ms: None,
+            pace: 1.0,
             inflight_events: 0,
             inflight_bytes: 0,
             paused: false,
@@ -1588,6 +1631,7 @@ mod tests {
             last_upstream_seq: 1,
             connected_since_ms: None,
             lag_ms: 120_000.0,
+            catch_up_pace: None,
             throttle: None,
             rule: None,
             node: "n1".into(),
@@ -1601,6 +1645,16 @@ mod tests {
             owner_version: None,
             pending: false,
         }
+    }
+
+    #[test]
+    fn store_latency_quantiles_interpolate_within_their_bucket() {
+        let b = [(0.01, 0), (0.1, 50), (1.0, 100), (f64::INFINITY, 100)];
+        assert!((bucket_quantile(&b, 100, 0.5) - 0.1).abs() < 1e-9);
+        assert!((bucket_quantile(&b, 100, 0.25) - 0.055).abs() < 1e-9);
+        assert!((bucket_quantile(&b, 100, 0.99) - 0.982).abs() < 1e-9);
+        let tail = [(0.1, 10), (f64::INFINITY, 20)];
+        assert_eq!(bucket_quantile(&tail, 20, 0.99), 0.1);
     }
 
     #[test]

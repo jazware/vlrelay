@@ -1039,6 +1039,7 @@ impl Sim {
             last_upstream_seq: h.seq,
             connected_since_ms: h.connected_since,
             lag_ms: round2(h.lag),
+            catch_up_pace: (h.lag > 60_000.0).then_some(12.0),
             throttle: h.throttle,
             max_accounts: if h.tier == "trusted" { 10_000_000 } else { 100 },
             history: Vec::new(),
@@ -2227,6 +2228,25 @@ impl AdminSource for Demo {
         self.feed.emit(changes::ChangeKind::Case, id.to_string(), Some(hint), true);
         Ok(c.clone())
     }
+
+    async fn bulk_update_cases(&self, b: CaseBulkUpdate, by: &str) -> AdminResult<CaseBulkResult> {
+        let mut s = self.sim.lock();
+        let now = s.now_ms;
+        let (targets, u) = bulk_targets(&s.cases, &b)?;
+        let targets: std::collections::HashSet<u64> = targets.into_iter().collect();
+        let mut ids = Vec::new();
+        for c in s.cases.iter_mut().filter(|c| targets.contains(&c.id)) {
+            if let Some(st) = u.status {
+                c.status = st;
+            }
+            c.notes.push(CaseNote { at_ms: now, by: by.into(), text: u.note.clone() });
+            c.updated_at_ms = now;
+            let hint = serde_json::json!({ "status": c.status });
+            self.feed.touch(changes::ChangeKind::Case, c.id.to_string(), Some(hint), true);
+            ids.push(c.id);
+        }
+        Ok(CaseBulkResult { updated: ids.len(), ids })
+    }
 }
 
 fn check_effect(s: &Sim, e: &RuleEffect) -> AdminResult<()> {
@@ -2279,6 +2299,51 @@ mod tests {
             d.update_policy(PolicyUpdate { base_version: p.version, policy: np, note: String::new() }, "admin").await;
         assert!(matches!(stale, Err(AdminError::Conflict(_))));
         assert_eq!(d.policy_audit().await.unwrap()[0].changes, vec!["spam.rejectRatio: 0.5 → 0.3".to_string()]);
+    }
+
+    /// `POST cases/bulk` through the router: scoped by a filter, every matched case gets the
+    /// status and a note naming the caller, and an unscoped one is refused.
+    #[tokio::test]
+    async fn bulk_case_updates() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        let d = Demo::start(7);
+        let app = crate::admin::api_routes(d.clone(), "t".into());
+        let post = |body: serde_json::Value| {
+            let req = Request::post("/admin/api/cases/bulk")
+                .header("authorization", "Basic YWRtaW46dA==")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            app.clone().oneshot(req)
+        };
+        let open = d.cases(CaseQuery { status: Some(CaseStatus::Open) }).await.unwrap();
+        let kind = open[0].kind.clone();
+        let want: Vec<u64> = open.iter().filter(|c| c.kind == kind).map(|c| c.id).collect();
+        let r =
+            post(serde_json::json!({"filter": {"kind": kind, "status": "open"}, "status": "resolved"})).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let res: CaseBulkResult = serde_json::from_slice(&b).unwrap();
+        let mut got = res.ids.clone();
+        got.sort();
+        let mut want = want;
+        want.sort();
+        assert_eq!((res.updated, got), (want.len(), want.clone()));
+        for id in &want {
+            let c = d.case(*id).await.unwrap();
+            assert_eq!(c.status, CaseStatus::Resolved);
+            let n = c.notes.last().unwrap();
+            assert_eq!((n.by.as_str(), n.text.as_str()), ("admin (token)", "bulk: resolved"));
+        }
+        // ids narrow the filter, and nothing left open of that kind matches
+        let r =
+            post(serde_json::json!({"ids": want, "filter": {"status": "open"}, "status": "dismissed"})).await.unwrap();
+        let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(serde_json::from_slice::<CaseBulkResult>(&b).unwrap().updated, 0);
+        assert_eq!(post(serde_json::json!({"status": "resolved"})).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(post(serde_json::json!({"ids": [1]})).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
     /// A tier a domain rule decides can't be set on the host: a 409 naming the rule, and no

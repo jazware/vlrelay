@@ -157,6 +157,11 @@ impl HostTask {
         let mut ping = tokio::time::interval_at(Instant::now() + cfg.ping_interval, cfg.ping_interval);
         let mut got_frames = false;
         let mut last_seq = self.entry.received_seq();
+        let horizon_ms = cfg.event_horizon.as_millis() as i64;
+        // the limiter's buckets run on the host's clock (`super::clock`),
+        // as an Instant this far along from where this socket's first frame
+        // put it
+        let mut origin: Option<(std::time::Instant, i64)> = None;
         let end = loop {
             if let Some(why) = self.flow.backpressure(&self.entry.flow) {
                 self.entry.set_backpressure(why);
@@ -208,12 +213,9 @@ impl HostTask {
                     break End::Failed;
                 }
             };
-            let seq = match peek(&data) {
+            let (seq, clock_ms) = match peek(&data) {
                 Ok(Peek::Message { seq, time, .. }) => {
-                    if let Some(t) = time.and_then(event_time_ms) {
-                        self.entry.note_event_time(t);
-                    }
-                    seq
+                    (seq, self.entry.note_frame(time.and_then(event_time_ms), horizon_ms))
                 }
                 Ok(Peek::Info { name, message }) => {
                     if name == "OutdatedCursor" {
@@ -277,9 +279,11 @@ impl HostTask {
             self.entry.frames.fetch_add(1, Ordering::Relaxed);
             self.entry.bytes.fetch_add(len as u64, Ordering::Relaxed);
             let permit = Some(self.flow.acquire(&self.entry.flow, len));
-            let frame = UpstreamFrame { host: self.entry.host.clone(), upstream_seq, frame: data, epoch, permit };
+            let frame =
+                UpstreamFrame { host: self.entry.host.clone(), upstream_seq, frame: data, epoch, permit, clock_ms };
 
-            let now = std::time::Instant::now();
+            let (o_at, o_clock) = *origin.get_or_insert_with(|| (std::time::Instant::now(), clock_ms));
+            let now = o_at + Duration::from_millis((clock_ms - o_clock).max(0) as u64);
             let g = self.entry.limits_gen();
             if g != limiter.generation() {
                 limiter.retune(&self.entry.limits(&cfg.limits), g, now);
@@ -298,6 +302,7 @@ impl HostTask {
                     if pause > Duration::ZERO {
                         self.entry.set_status(HostStatus::Throttled);
                         tokio::time::sleep(pause).await;
+                        self.entry.clock_paused(pause);
                     }
                 } => {}
             }

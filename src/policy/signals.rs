@@ -108,11 +108,15 @@ pub struct Signal<'a> {
     pub count: u32,
     /// Shown in a case's evidence (a reject reason, a frame size).
     pub detail: Option<&'a str>,
+    /// What each of `count` weighs: 1 for an event read live, 1/pace for
+    /// one read while its host catches up (`upstream::clock`), so a window
+    /// holds about what the host sent in that much of its own time.
+    pub weight: f64,
 }
 
 impl<'a> Signal<'a> {
     pub fn new(kind: SignalKind, host: &'a str, did: Option<&'a str>) -> Signal<'a> {
-        Signal { kind, host, did, count: 1, detail: None }
+        Signal { kind, host, did, count: 1, detail: None, weight: 1.0 }
     }
 }
 
@@ -139,19 +143,19 @@ struct Entry {
     host: Box<str>,
     detail: Option<Box<str>>,
     hash: u64,
-    cur: u64,
-    cur_err: u64,
-    prev: u64,
-    prev_err: u64,
+    cur: f64,
+    cur_err: f64,
+    prev: f64,
+    prev_err: f64,
     tripped_window: u64,
 }
 
 impl Entry {
     fn estimate(&self, keep_prev: f64) -> f64 {
-        self.cur as f64 + self.prev as f64 * keep_prev
+        self.cur + self.prev * keep_prev
     }
     fn lower(&self, keep_prev: f64) -> f64 {
-        (self.cur - self.cur_err) as f64 + (self.prev - self.prev_err) as f64 * keep_prev
+        (self.cur - self.cur_err) + (self.prev - self.prev_err) * keep_prev
     }
 }
 
@@ -231,11 +235,11 @@ impl TopK {
                 e.prev = e.cur;
                 e.prev_err = e.cur_err;
             } else {
-                e.prev = 0;
-                e.prev_err = 0;
+                e.prev = 0.0;
+                e.prev_err = 0.0;
             }
-            e.cur = 0;
-            e.cur_err = 0;
+            e.cur = 0.0;
+            e.cur_err = 0.0;
         }
         self.window = w;
     }
@@ -248,7 +252,7 @@ impl TopK {
         key: &str,
         hash: u64,
         host: &str,
-        n: u64,
+        n: f64,
         detail: Option<&str>,
         limit: f64,
         now_s: u64,
@@ -283,10 +287,10 @@ impl TopK {
             host: trunc(host, KEY_MAX).into(),
             detail: None,
             hash,
-            cur: 0,
-            cur_err: 0,
-            prev: 0,
-            prev_err: 0,
+            cur: 0.0,
+            cur_err: 0.0,
+            prev: 0.0,
+            prev_err: 0.0,
             tripped_window: 0,
         };
         if self.entries.len() < self.capacity {
@@ -339,7 +343,7 @@ impl TopK {
         if w == self.window {
             e.lower(keep)
         } else if w == self.window + 1 {
-            (e.cur - e.cur_err) as f64 * keep
+            (e.cur - e.cur_err) * keep
         } else {
             0.0
         }
@@ -356,7 +360,7 @@ impl TopK {
                 let (est, low) = if w == self.window {
                     (e.estimate(keep), e.lower(keep))
                 } else if w == self.window + 1 {
-                    (e.cur as f64 * keep, (e.cur - e.cur_err) as f64 * keep)
+                    (e.cur * keep, (e.cur - e.cur_err) * keep)
                 } else {
                     return None;
                 };
@@ -423,8 +427,15 @@ impl Tracker {
         let h = self.hash(key);
         let now_s = (now_ms / 1000) as u64;
         let limit = if self.threshold.enabled() { self.threshold.limit } else { 0.0 };
-        let a =
-            self.shards[(h >> 60) as usize % SHARDS].lock().add(key, h, s.host, s.count as u64, s.detail, limit, now_s);
+        let a = self.shards[(h >> 60) as usize % SHARDS].lock().add(
+            key,
+            h,
+            s.host,
+            s.count as f64 * s.weight,
+            s.detail,
+            limit,
+            now_s,
+        );
         a.newly_tripped.then(|| Trip {
             rule: self.rule,
             host: s.host.to_string(),

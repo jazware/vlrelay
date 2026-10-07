@@ -72,7 +72,7 @@ it reads, the events it submits and its own consumers.
 | `vlrelay_stage_busy_us_total` | counter | `stage` | Microseconds spent in a stage, summed over events |
 | `vlrelay_durable_lag_ms` | gauge | | Mean time from submitting an event to the leader to its commit, over the last second |
 | `vlrelay_hosts` | gauge | `status` | Upstream hosts by status: `connected`, `idle`, `backoff`, `throttled` (held at its own limits), `backpressure` (paused because the relay is behind), `suspended`, `banned` |
-| `vlrelay_host_read_lag_max_seconds` | gauge | | The furthest any host reader on this node is behind its host's stream: the newest frame's age when it was read (read time minus the event's `time`), plus the time since while the reader is held back by its limits |
+| `vlrelay_host_read_lag_max_seconds` | gauge | | The furthest any host reader on this node is behind its host's stream: the newest frame's age when it was read (read time minus the event's `time`; 0 once the reader has waited 10 s on an empty socket), plus the time since while the reader is held back (by its limits or the relay) |
 | `vlrelay_hosts_lagging` | gauge | | Hosts whose reader is more than a minute behind. Hosts and host detail on the dashboard show each host's lag |
 | `vlrelay_consumers` | gauge | | Connected `subscribeRepos` consumers |
 | `vlrelay_identity_cache_entries` | gauge | | DID documents in the identity cache |

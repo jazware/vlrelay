@@ -309,6 +309,29 @@ impl CaseStore {
         anyhow::bail!("case {id} still contended after {CAS_RETRIES} tries")
     }
 
+    /// Resolves case `id` with `note` if it's still open (open or
+    /// acknowledged); None if it's gone or someone closed it first.
+    pub async fn resolve_open(&self, id: u64, note: &str, by: &str) -> anyhow::Result<Option<StoredCase>> {
+        for _ in 0..CAS_RETRIES {
+            let Some((mut c, etag)) = self.read(id).await? else { return Ok(None) };
+            if !c.is_open() {
+                return Ok(None);
+            }
+            let now = now_ms();
+            c.status = CaseStatus::Resolved;
+            c.notes.push(CaseNote { at_ms: now, by: by.to_string(), text: note.to_string() });
+            c.updated_at_ms = now;
+            match self.write(&c, if_match(etag)).await {
+                Ok(_) => {}
+                Err(e) if is_conflict(&e) => continue,
+                Err(e) => return Err(e.into()),
+            }
+            self.release_key(&c).await?;
+            return Ok(Some(c));
+        }
+        anyhow::bail!("case {id} still contended after {CAS_RETRIES} tries")
+    }
+
     async fn release_key(&self, c: &StoredCase) -> anyhow::Result<()> {
         let ip = self.index_path(&c.key);
         if let Some((b, _)) = get(&self.store, &ip, None).await?

@@ -43,6 +43,10 @@ pub const RESYNC_EVERY: Duration = Duration::from_secs(30);
 const DEFERRED_MAX: usize = 100_000;
 const DEFERRED_FOR: Duration = Duration::from_secs(3_600);
 
+fn wall_ms() -> i64 {
+    upstream::host::now_ms() as i64
+}
+
 /// The engine as a `NodeConfig` field.
 #[derive(Clone)]
 pub struct PolicyEngine(pub Arc<Engine>);
@@ -71,24 +75,27 @@ struct HostState {
 }
 
 /// A per-hour limit with an hour's allowance as its depth, the way the
-/// tier limit reads (the cluster budgets' buckets hold one second).
+/// tier limit reads (the cluster budgets' buckets hold one second). It
+/// runs on whichever clock the caller passes (unix ms): the wall clock, or
+/// a host's own (`upstream::clock`), which lanes hand it slightly out of
+/// order, so it never steps back.
 struct Hourly {
     tokens: f64,
-    at: Instant,
+    at_ms: i64,
 }
 
 impl Hourly {
     fn new() -> Hourly {
-        Hourly { tokens: f64::MAX, at: Instant::now() }
+        Hourly { tokens: f64::MAX, at_ms: 0 }
     }
 
-    fn try_take(&mut self, per_hour: f64, now: Instant) -> bool {
-        self.try_take_depth(per_hour, per_hour, now)
+    fn try_take(&mut self, per_hour: f64, now_ms: i64) -> bool {
+        self.try_take_depth(per_hour, per_hour, now_ms)
     }
 
-    fn try_take_depth(&mut self, per_hour: f64, depth: f64, now: Instant) -> bool {
-        let dt = now.saturating_duration_since(self.at).as_secs_f64();
-        self.at = now;
+    fn try_take_depth(&mut self, per_hour: f64, depth: f64, now_ms: i64) -> bool {
+        let dt = (now_ms - self.at_ms).max(0) as f64 / 1000.0;
+        self.at_ms = self.at_ms.max(now_ms);
         self.tokens = (self.tokens + dt * per_hour / 3_600.0).min(depth);
         let ok = self.tokens >= 1.0;
         if ok {
@@ -323,12 +330,13 @@ impl PolicyHooks {
     }
 
     /// Takes one `#identity` from the host's `identityEventsPerHour` (0:
-    /// unlimited). False: drop it.
-    pub fn take_identity_event(&self, host: &str) -> bool {
+    /// unlimited), counted at `clock_ms` on the host's own timeline, so a
+    /// replayed hour costs an hour's allowance. False: drop it.
+    pub fn take_identity_event(&self, host: &str, clock_ms: i64) -> bool {
         let mut c = self.cache.lock();
         let Some(st) = c.get_mut(host) else { return true };
         let Some(per_hour) = st.limits.limits.as_ref().map(|l| l.identity_events_per_hour) else { return true };
-        per_hour == 0 || st.identity_events.try_take(per_hour as f64, Instant::now())
+        per_hour == 0 || st.identity_events.try_take(per_hour as f64, clock_ms)
     }
 
     /// Takes one fresh DID document fetch from the host's budget: its
@@ -340,7 +348,8 @@ impl PolicyHooks {
         if per_hour == 0 {
             return true;
         }
-        let ok = st.forced_lookups.try_take_depth(per_hour as f64, (per_hour as f64 / 60.0).max(10.0), Instant::now());
+        // the wall clock: these fetches are the PLC budget's, spent now
+        let ok = st.forced_lookups.try_take_depth(per_hour as f64, (per_hour as f64 / 60.0).max(10.0), wall_ms());
         if !ok {
             super::metrics::FORCED_LOOKUPS_REFUSED.inc();
         }
@@ -448,6 +457,7 @@ impl PolicyHooks {
         let mut s = Signal::new(kind, host, did);
         let d = format!("{reason}: {detail}");
         s.detail = Some(&d);
+        s.weight = self.event_weight(host);
         self.engine.record_signal(s);
         if !STATE_REASONS.contains(&reason) {
             let k = HostKey::of(host);
@@ -463,7 +473,18 @@ impl PolicyHooks {
             "identity" => SignalKind::IdentityChange,
             _ => return,
         };
-        self.engine.record_signal(Signal::new(kind, host, Some(did)));
+        let mut s = Signal::new(kind, host, Some(did));
+        s.weight = self.event_weight(host);
+        self.engine.record_signal(s);
+    }
+
+    /// What one of the host's events weighs in the spam windows: 1/pace of
+    /// its own timeline, so a backlog read at 60× its pace fills a window
+    /// as the original hour did, not 60 times over. New accounts aren't
+    /// weighed: a farm replayed is still a farm.
+    fn event_weight(&self, host: &str) -> f64 {
+        let Some(m) = self.manager.get().and_then(Weak::upgrade) else { return 1.0 };
+        m.registry().get(&Host(host.to_string())).map_or(1.0, |e| 1.0 / e.pace())
     }
 }
 
@@ -522,7 +543,7 @@ impl state::AccountGate for PolicyHooks {
                 }
                 if rated
                     && l.new_accounts_per_hour > 0
-                    && !st.new_accounts.try_take(l.new_accounts_per_hour as f64, now)
+                    && !st.new_accounts.try_take(l.new_accounts_per_hour as f64, wall_ms())
                 {
                     super::metrics::ACCOUNTS_DEFERRED.with_label_values(&["host_rate"]).inc();
                     break 'v NewAccount::Defer;
@@ -615,9 +636,19 @@ mod tests {
         add_host(&*hooks.hosts, "quiet.example", Tier::Throttled).await;
         hooks.load().await.unwrap();
         let per_hour = policy::TierLimits::throttled().identity_events_per_hour;
-        let taken = (0..per_hour + 50).filter(|_| hooks.take_identity_event("noisy.example")).count() as u64;
+        let t0 = wall_ms();
+        let taken = (0..per_hour + 50).filter(|_| hooks.take_identity_event("noisy.example", t0)).count() as u64;
         assert_eq!(taken, per_hour);
-        assert!(hooks.take_identity_event("quiet.example"));
+        assert!(hooks.take_identity_event("quiet.example", t0));
+        // on the host's timeline: an hour of twice the allowance, replayed in
+        // no wall time at all, gets that hour's allowance and no more
+        let step = 3_600_000 / (2 * per_hour as i64);
+        let replayed = (1..=2 * per_hour as i64)
+            .filter(|i| hooks.take_identity_event("noisy.example", t0 + i * step))
+            .count() as u64;
+        assert!(replayed.abs_diff(per_hour) <= 1, "{replayed} of {per_hour}");
+        // and an event dated before the last doesn't refill anything
+        assert!(!hooks.take_identity_event("noisy.example", t0));
         // forced lookups: a minute's depth (at least 10), not an hour's
         let forced = (0..per_hour).filter(|_| hooks.take_forced_lookup("noisy.example")).count();
         assert_eq!(forced, 10);

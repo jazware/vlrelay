@@ -44,7 +44,10 @@ export type HostRow = {
   accounts: number
   lastUpstreamSeq: number
   connectedSinceMs: number | null
+  /** How far the reader is behind the host's stream; 0 once it waits on an empty socket. */
   lagMs: number
+  /** Set while it's catching up on a backlog: host seconds per wall second. Its limits and spam signals count on its own timeline meanwhile. */
+  catchUpPace?: number | null
   throttle: number | null
   rule: number | null
   node: string
@@ -361,6 +364,14 @@ export type CaseEvidence = {
   signals: Record<string, number>
 }
 export type CaseDetail = Case & { trips: number; evidence: CaseEvidence[] }
+/** `POST cases/bulk`: the cases in `ids`, or matching `filter` (both: those in `ids` that match). */
+export type CaseBulkUpdate = {
+  ids?: number[]
+  filter?: { kind?: string; status?: CaseStatus; host?: string }
+  status?: CaseStatus | null
+  note: string
+}
+export type CaseBulkResult = { updated: number; ids: number[] }
 
 // ---------------------------------------------------------------- quorum log
 

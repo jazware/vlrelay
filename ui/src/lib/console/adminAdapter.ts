@@ -7,6 +7,8 @@ import {
   type Account,
   type AdmissionLog,
   type Case,
+  type CaseBulkResult,
+  type CaseBulkUpdate,
   type CaseDetail,
   type CaseStatus,
   type ClusterView,
@@ -158,6 +160,7 @@ export const caseOf = (id: number) => api<Case>(`cases/${id}`)
 export const caseEvidence = (id: number) => optional('cases/{id}/evidence', () => api<CaseDetail>(`cases/${id}/evidence`))
 export const updateCase = (id: number, u: { status?: CaseStatus | null; note: string }) => api<Case>(`cases/${id}`, { body: u })
 export const updateCaseCall = (id: number, u: { status?: CaseStatus | null; note: string }) => `POST /admin/api/cases/${id} ${JSON.stringify(u)}`
+export const bulkUpdateCases = (u: CaseBulkUpdate) => api<CaseBulkResult>('cases/bulk', { body: u })
 
 /** A DID, a handle or a handle prefix ending in `*`; up to 100. */
 export const accounts = (q: string) => api<Account[]>('accounts', { params: { q } })

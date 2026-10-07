@@ -178,6 +178,9 @@ pub struct HostFaults {
     /// Every seconds: the host's sequence starts over at 1 (a restored or
     /// reset PDS), so a cursor from before is in its future.
     pub restart: Option<f64>,
+    /// Seconds behind: every event's `time` is this far in the past, a PDS
+    /// whose stream runs late however fast the relay reads it.
+    pub lag: Option<f64>,
 }
 
 /// `kind:hosts[:k=v,...]`, hosts as `all` or `0,3-5` (global indexes).
@@ -225,8 +228,9 @@ pub fn parse_fault(spec: &str, host_base: u32, hosts: u32, out: &mut [HostFaults
             "disconnect" => f.disconnect = Some((get("every", 30.0), get("down", 5.0))),
             "replay" => f.replay = Some((get("every", 20.0), get("count", 100.0) as usize)),
             "restart" => f.restart = Some(get("every", 60.0)),
+            "lag" => f.lag = Some(get("secs", 900.0)),
             _ => anyhow::bail!(
-                "unknown fault kind {kind} (badsig, gap, foreign, spam, stall, disconnect, replay, restart)"
+                "unknown fault kind {kind} (badsig, gap, foreign, spam, stall, disconnect, replay, restart, lag)"
             ),
         }
     }

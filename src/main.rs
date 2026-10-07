@@ -159,6 +159,31 @@ struct Args {
     /// The same cap over every host, in bytes.
     #[arg(long, default_value_t = 384)]
     inflight_mb: usize,
+    /// Per-host limits and spam signals count a host's events by the time
+    /// it stamped on them, so a replayed backlog costs what the traffic
+    /// did; a time older than this counts at this horizon.
+    #[arg(long, default_value_t = 86_400)]
+    event_horizon_secs: u64,
+    /// A host's reader this far behind its stream (in minutes) opens a
+    /// read-lag case, once it has stayed there --lag-case-sustain-secs
+    /// while the relay had room for it.
+    #[arg(long, default_value_t = 10)]
+    lag_case_minutes: u64,
+    #[arg(long, default_value_t = 120)]
+    lag_case_sustain_secs: u64,
+    /// After the relay held a host back (backpressure), or this node was
+    /// over --lag-case-pressure-pct, its lag doesn't open a case for this
+    /// long.
+    #[arg(long, default_value_t = 180)]
+    lag_case_grace_secs: u64,
+    /// This node's in-flight caps or busiest lane this full (percent)
+    /// count as the relay's own lag.
+    #[arg(long, default_value_t = 50)]
+    lag_case_pressure_pct: u32,
+    /// An open read-lag case resolves itself once its host's lag has been
+    /// under the threshold this long.
+    #[arg(long, default_value_t = 600)]
+    lag_case_resolve_secs: u64,
     /// DID document fetches per second, all DIDs together.
     #[arg(long, default_value_t = 50.0)]
     did_lookups_per_sec: f64,
@@ -416,6 +441,14 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
         host_bytes: a.host_inflight_mb.max(1) << 20,
         events: a.inflight_events.max(1),
         bytes: a.inflight_mb.max(1) << 20,
+    };
+    cfg.event_horizon = Duration::from_secs(a.event_horizon_secs);
+    cfg.lag_cases = vlrelay::node::lag::LagCaseConfig {
+        threshold: Duration::from_secs(a.lag_case_minutes.max(1) * 60),
+        sustain: Duration::from_secs(a.lag_case_sustain_secs),
+        grace: Duration::from_secs(a.lag_case_grace_secs),
+        pressure: a.lag_case_pressure_pct.min(100) as f64 / 100.0,
+        resolve_after: Duration::from_secs(a.lag_case_resolve_secs),
     };
     cfg.hosts = a.hosts.clone();
     cfg.cli_host_tier = vlrelay::upstream::Tier::parse(&a.host_tier)

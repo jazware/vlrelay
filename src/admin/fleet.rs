@@ -323,6 +323,7 @@ mod tests {
             last_upstream_seq: 1,
             connected_since_ms: None,
             lag_ms: 0.0,
+            catch_up_pace: None,
             throttle: None,
             rule: None,
             node: String::new(),

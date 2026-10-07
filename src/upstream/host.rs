@@ -221,7 +221,16 @@ pub struct HostEntry {
     read_event_ms: AtomicI64,
     /// A [`Backpressure`] as u8; read only while the status says so.
     backpressure: AtomicU8,
+    /// When the status last left `backpressure` (unix ms, 0 for never).
+    backpressure_left_ms: AtomicI64,
+    /// The host's own timeline (`super::clock`), across its sockets.
+    clock: Mutex<super::clock::EventClock>,
 }
+
+/// A reader that has waited this long on its socket with nothing to read
+/// has everything the host has sent: it isn't behind, whatever the age of
+/// the last frame it read.
+pub const CAUGHT_UP_MS: i64 = 10_000;
 
 impl HostEntry {
     fn from_record(r: &HostRecord) -> HostEntry {
@@ -246,29 +255,84 @@ impl HostEntry {
             read_at_ms: AtomicI64::new(0),
             read_event_ms: AtomicI64::new(0),
             backpressure: AtomicU8::new(0),
+            backpressure_left_ms: AtomicI64::new(0),
+            clock: Mutex::new(Default::default()),
         }
     }
 
-    pub(crate) fn note_event_time(&self, event_ms: i64) {
-        self.read_event_ms.store(event_ms, Ordering::Relaxed);
-        self.read_at_ms.store(now_ms() as i64, Ordering::Relaxed);
+    /// A frame read off the socket, stamped `event_ms` by the host (None:
+    /// no usable `time`). Returns the host's clock after it.
+    pub(crate) fn note_frame(&self, event_ms: Option<i64>, horizon_ms: i64) -> i64 {
+        let now = now_ms() as i64;
+        if let Some(ev) = event_ms {
+            self.read_event_ms.store(ev, Ordering::Relaxed);
+            self.read_at_ms.store(now, Ordering::Relaxed);
+        }
+        self.clock.lock().on_frame(event_ms, now, horizon_ms)
+    }
+
+    /// A limiter pause the reader sat out, which moves the host's clock.
+    pub(crate) fn clock_paused(&self, pause: std::time::Duration) {
+        self.clock.lock().paused(pause.as_millis() as i64, now_ms() as i64);
+    }
+
+    /// The host's own timeline, unix ms (0 before its first frame).
+    pub fn clock_ms(&self) -> i64 {
+        self.clock.lock().clock_ms()
+    }
+
+    /// Host seconds per wall second: 1 when live, more while catching up.
+    pub fn pace(&self) -> f64 {
+        self.clock.lock().pace(now_ms() as i64)
+    }
+
+    /// The newest frame's age when it was read, or 0 once the reader has
+    /// sat on an empty socket for [`CAUGHT_UP_MS`]. None while not live.
+    fn frame_lag(&self, now: i64) -> Option<(i64, i64)> {
+        let status = self.status();
+        if !matches!(status, HostStatus::Active | HostStatus::Throttled | HostStatus::Backpressure) {
+            return None;
+        }
+        let (at, ev) = (self.read_at_ms.load(Ordering::Relaxed), self.read_event_ms.load(Ordering::Relaxed));
+        if at == 0 || (status == HostStatus::Active && now - at >= CAUGHT_UP_MS) {
+            return Some((0, at));
+        }
+        Some(((at - ev).max(0), at))
     }
 
     /// How far behind the host's own stream the reader is: the newest
-    /// frame's age when it was read, plus the time since, while the reader
-    /// is held back by its limits (a quiet host isn't behind). PDS clock
-    /// skew is in it too, so read it in seconds and minutes, not ms.
+    /// frame's age when it was read, plus the time since while the reader
+    /// is held back (by its limits or by the relay). A reader that is
+    /// waiting on its socket is caught up, so a quiet host reads 0, not the
+    /// age of its last frame. PDS clock skew is in it too, so read it in
+    /// seconds and minutes, not ms.
     pub fn read_lag_ms(&self) -> Option<i64> {
-        let (at, ev) = (self.read_at_ms.load(Ordering::Relaxed), self.read_event_ms.load(Ordering::Relaxed));
-        if at == 0 {
-            return None;
-        }
-        let held = if matches!(self.status(), HostStatus::Throttled | HostStatus::Backpressure) {
-            now_ms() as i64 - at
-        } else {
-            0
+        let now = now_ms() as i64;
+        let (lag, at) = self.frame_lag(now)?;
+        let held = match self.status() {
+            HostStatus::Throttled | HostStatus::Backpressure if at != 0 => now - at,
+            _ => 0,
         };
-        Some((at - ev + held).max(0))
+        Some((lag + held).max(0))
+    }
+
+    /// The lag the host answers for (read-lag cases): [`Self::read_lag_ms`]
+    /// without the time the relay held the reader back. Time held by the
+    /// host's own limits still counts.
+    pub fn host_lag_ms(&self) -> Option<i64> {
+        let now = now_ms() as i64;
+        let (lag, at) = self.frame_lag(now)?;
+        let held = if self.status() == HostStatus::Throttled && at != 0 { now - at } else { 0 };
+        Some((lag + held).max(0))
+    }
+
+    /// When the relay last held this host back (now, while it does).
+    pub fn backpressure_at_ms(&self) -> Option<i64> {
+        if self.status() == HostStatus::Backpressure {
+            return Some(now_ms() as i64);
+        }
+        let left = self.backpressure_left_ms.load(Ordering::Relaxed);
+        (left != 0).then_some(left)
     }
 
     /// The limits the host task enforces.
@@ -304,7 +368,11 @@ impl HostEntry {
     }
 
     pub(crate) fn set_status(&self, s: HostStatus) {
-        if self.status.swap(s as u8, Ordering::Relaxed) != s as u8 {
+        let was = self.status.swap(s as u8, Ordering::Relaxed);
+        if was != s as u8 {
+            if was == HostStatus::Backpressure as u8 {
+                self.backpressure_left_ms.store(now_ms() as i64, Ordering::Relaxed);
+            }
             self.dirty.store(true, Ordering::Relaxed);
         }
     }
@@ -410,6 +478,9 @@ impl HostEntry {
             bytes: self.bytes.load(Ordering::Relaxed),
             connects: self.connects.load(Ordering::Relaxed),
             read_lag_ms: self.read_lag_ms(),
+            host_lag_ms: self.host_lag_ms(),
+            backpressure_at_ms: self.backpressure_at_ms(),
+            pace: self.pace(),
             inflight_events: self.flow.events() as u64,
             inflight_bytes: self.flow.bytes() as u64,
             paused: self.flow.paused(),
@@ -429,6 +500,12 @@ pub struct HostView {
     pub bytes: u64,
     pub connects: u64,
     pub read_lag_ms: Option<i64>,
+    /// [`HostEntry::host_lag_ms`].
+    pub host_lag_ms: Option<i64>,
+    /// [`HostEntry::backpressure_at_ms`].
+    pub backpressure_at_ms: Option<i64>,
+    /// [`HostEntry::pace`].
+    pub pace: f64,
     /// Frames (and their bytes) read and not yet durable, rejected or dropped.
     pub inflight_events: u64,
     pub inflight_bytes: u64,
@@ -643,19 +720,54 @@ pub fn normalize_hostname(input: &str, dev_mode: bool) -> Result<Host, HostnameE
 mod tests {
     use super::*;
 
+    const H: i64 = 24 * 3_600_000;
+
     #[test]
-    fn read_lag_counts_held_time_only_while_throttled() {
+    fn read_lag_counts_held_time_only_while_held() {
         let e = HostEntry::from_record(&HostRecord::new(&Host("pds.example.com".into()), Tier::Default));
+        e.note_frame(Some(now_ms() as i64 - 30_000), H);
+        // not live: no lag to speak of
         assert_eq!(e.read_lag_ms(), None);
-        e.note_event_time(now_ms() as i64 - 30_000);
+        e.set_status(HostStatus::Active);
         let lag = e.read_lag_ms().unwrap();
         assert!((30_000..31_000).contains(&lag), "{lag}");
         // a reader held back by its limits keeps falling behind between frames
         e.read_at_ms.fetch_sub(60_000, Ordering::Relaxed);
         e.read_event_ms.fetch_sub(60_000, Ordering::Relaxed);
-        assert!(e.read_lag_ms().unwrap() < 31_000);
         e.set_status(HostStatus::Throttled);
         assert!(e.read_lag_ms().unwrap() >= 90_000);
+        assert!(e.host_lag_ms().unwrap() >= 90_000);
+    }
+
+    #[test]
+    fn a_reader_waiting_on_its_socket_is_caught_up() {
+        let e = HostEntry::from_record(&HostRecord::new(&Host("pds.example.com".into()), Tier::Default));
+        e.set_status(HostStatus::Active);
+        // connected, nothing read yet
+        assert_eq!(e.read_lag_ms(), Some(0));
+        // a replayed frame nine days old, then nothing more from the host
+        e.note_frame(Some(now_ms() as i64 - 9 * H), H);
+        assert!(e.read_lag_ms().unwrap() >= 9 * H - 1_000);
+        e.read_at_ms.fetch_sub(CAUGHT_UP_MS, Ordering::Relaxed);
+        e.read_event_ms.fetch_sub(CAUGHT_UP_MS, Ordering::Relaxed);
+        assert_eq!((e.read_lag_ms(), e.host_lag_ms()), (Some(0), Some(0)));
+    }
+
+    #[test]
+    fn the_relay_holding_a_reader_is_not_the_hosts_lag() {
+        let e = HostEntry::from_record(&HostRecord::new(&Host("pds.example.com".into()), Tier::Default));
+        e.set_status(HostStatus::Active);
+        assert_eq!(e.backpressure_at_ms(), None);
+        e.note_frame(Some(now_ms() as i64 - 1_000), H);
+        e.read_at_ms.fetch_sub(60_000, Ordering::Relaxed);
+        e.read_event_ms.fetch_sub(60_000, Ordering::Relaxed);
+        e.set_backpressure(Backpressure::QueueFull);
+        assert!(e.read_lag_ms().unwrap() >= 60_000);
+        assert!(e.host_lag_ms().unwrap() < 2_000);
+        assert!(e.backpressure_at_ms().is_some_and(|t| t >= now_ms() as i64 - 1_000));
+        e.set_status(HostStatus::Active);
+        let left = e.backpressure_at_ms().unwrap();
+        assert!(left > now_ms() as i64 - 1_000 && left <= now_ms() as i64);
     }
 
     #[test]
@@ -678,16 +790,6 @@ mod tests {
         assert_eq!(serde_json::to_value(HostStatus::Backpressure).unwrap(), "backpressure");
         assert_eq!(serde_json::to_value(Backpressure::NodeInflightFull).unwrap(), "node_inflight_full");
         assert_eq!(serde_json::from_value::<HostRecord>(serde_json::to_value(&r).unwrap()).unwrap(), r);
-    }
-
-    #[test]
-    fn read_lag_counts_held_time_under_backpressure_too() {
-        let e = HostEntry::from_record(&HostRecord::new(&Host("pds.example.com".into()), Tier::Default));
-        e.note_event_time(now_ms() as i64 - 1_000);
-        e.read_at_ms.fetch_sub(60_000, Ordering::Relaxed);
-        e.read_event_ms.fetch_sub(60_000, Ordering::Relaxed);
-        e.set_backpressure(Backpressure::QueueFull);
-        assert!(e.read_lag_ms().unwrap() >= 60_000);
     }
 
     fn ok(s: &str) -> String {

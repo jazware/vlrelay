@@ -177,6 +177,7 @@ mod tests {
             frame: Bytes::from(vec![0u8; len]),
             epoch: 0,
             permit: None,
+            clock_ms: 0,
         }
     }
 
