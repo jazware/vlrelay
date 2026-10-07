@@ -299,7 +299,8 @@ struct CheckArgs {
     /// The load generator's summary (`load --out`): every event it sent
     /// must be emitted outside the recovery gaps.
     #[arg(long)]
-    load_summary: Option<String>,    #[command(flatten)]
+    load_summary: Option<String>,
+    #[command(flatten)]
     budget: vlrelay::qlog::budget::BudgetArgs,
 }
 
@@ -1128,10 +1129,7 @@ async fn check(a: CheckArgs) -> anyhow::Result<()> {
             };
             let store = vlrelay::qlog::bucket::counted(&s3.store()?, "tool");
             vlrelay::qlog::budget::start(&a.budget, store.clone())?;
-            vlrelay::qlog::flush::read_manifest(&store)
-                .await?
-                .map(|(m, _)| m.gaps)
-                .unwrap_or_default()
+            vlrelay::qlog::flush::read_manifest(&store).await?.map(|(m, _)| m.gaps).unwrap_or_default()
         }
         _ => Vec::new(),
     };
