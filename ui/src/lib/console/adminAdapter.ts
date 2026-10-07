@@ -1,6 +1,7 @@
 import {
   api,
   ApiError,
+  type RejectTop,
   enc,
   publicStats,
   type Account,
@@ -265,8 +266,7 @@ export const settingsOf = (node: string) => api<SettingsView>('settings', { para
 
 // ---------------------------------------------------------------- what the console wants next
 
-/** One host in a reason's top list: its rejects a second now, the total counted and when the last was. */
-export type RejectTopHost = { host: string; rejectsPerSec: number; total: number; lastAtMs: number; sample?: unknown }
+export type RejectTopHost = RejectTop
 
 let hasRejectsTop: boolean | undefined
 /**
@@ -281,5 +281,5 @@ export async function rejectsTop(reason: string, limit = 10): Promise<Optional<R
 }
 
 /** Endpoints the design assumes but the relay doesn't serve: answer with `missing(endpoint, why)` and list them here (CONSOLE.md has the table). */
-export const MISSING: readonly (readonly [endpoint: string, feeds: string])[] = [['GET ops/rejects/top?reason&limit', 'top hosts per reject reason (Hosts with ?reason=)']]
+export const MISSING: readonly (readonly [endpoint: string, feeds: string])[] = []
 export { missing }

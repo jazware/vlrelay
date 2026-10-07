@@ -38,11 +38,11 @@ The kit's parts are documented in the vlpds CONSOLE.md. What differs here:
 
 ## The adapter and what the backend lane owes
 
-`lib/console/adminAdapter.ts` is the one place the console calls the admin API. An endpoint the design assumes but the relay doesn't serve answers `{ supported: false, endpoint }` through `missing(...)` without a request, so the browser console stays clean and the page shows a "needs a newer vlRelay" placeholder; `MISSING` in the same file lists them. One endpoint is asked for once instead, because the backend lane is adding it now: a relay without it answers that first request with a 404 (one line in the network log per page load) and the console doesn't ask again until a reload.
+`lib/console/adminAdapter.ts` is the one place the console calls the admin API. An endpoint the design assumes but the relay doesn't serve answers `{ supported: false, endpoint }` through `missing(...)` without a request, so the browser console stays clean and the page shows a "needs a newer vlRelay" placeholder; `MISSING` in the same file lists them. `ops/rejects/top` is served now; a relay older than it answers the first request with a 404 (one line in the network log per page load) and the console doesn't ask again until a reload.
 
 | Endpoint | Feeds | State |
 | --- | --- | --- |
-| `GET ops/rejects/top?reason=<reason>&limit=10` → `[{host, rejectsPerSec, total, lastAtMs, sample?}]`, cluster-wide | Hosts with `?reason=` (the Overview's reject bars): the hosts sending that reject | `rejectsTop` in the adapter; "needs a newer vlRelay" until it's served |
+| `GET ops/rejects/top?reason=<reason>&limit=10` → `[{host, rejectsPerSec, total, lastAtMs, sample?}]`, cluster-wide | Hosts with `?reason=` (the Overview's reject bars): the hosts sending that reject | Served. `rejectsTop` in the adapter; "needs a newer vlRelay" on an older relay |
 
 Found while building this, for the backend lane:
 

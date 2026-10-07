@@ -346,7 +346,7 @@ function ReasonTop({ reason, clear }: { reason: RejectReason; clear: () => void 
                   </td>
                   <td className="r mono sm t2">{fmtNum(h.total)}</td>
                   <td className="r sm muted nowrap" title={h.lastAtMs ? dt(h.lastAtMs) : undefined}>
-                    {ago(h.lastAtMs)}
+                    {h.lastAtMs ? ago(h.lastAtMs) : '—'}
                   </td>
                   <td className="sm t2 trunc" style={{ maxWidth: 320 }} title={sampleText(h.sample)}>
                     {sampleText(h.sample) ?? <span className="muted">—</span>}
