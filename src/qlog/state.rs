@@ -84,7 +84,7 @@ fn compactor_poll() -> Duration {
 
 /// How much memory a SlateDB's memtables and compactor may hold, as
 /// `--qlog-state-slatedb` / `--plc-seeds-slatedb` spell it
-/// (`compactions=1,subcompactions=1,fetch-tasks=2,fetch-kb=1024,sst-mb=64,memtable-mb=128`;
+/// (`compactions=1,subcompactions=1,fetch-tasks=2,fetch-kb=1024,sst-mb=64,memtable-mb=128,codec=zstd`;
 /// a key left out keeps its default).
 ///
 /// SlateDB's own defaults are sized for a big box: 4 compactions of 4
@@ -110,6 +110,38 @@ pub struct Bounds {
     /// Memtables, frozen ones included, not yet in the bucket: past it
     /// writes wait (the WAL is off).
     pub memtable_bytes: usize,
+    /// SST compression for new SSTs. Each SST records its own codec, so a
+    /// change applies as SSTs are rewritten and old ones stay readable.
+    pub codec: Codec,
+}
+
+/// zstd over lz4: a point read decompresses one ~4 KiB block, microseconds
+/// either way, so on a small box the cost that matters is compaction's
+/// compress (level 3: a few seconds of CPU per GB rewritten), and zstd's
+/// better ratio cuts the bucket bytes the seeds' readers fetch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Codec {
+    None,
+    Lz4,
+    Zstd,
+}
+
+impl Codec {
+    fn slatedb(self) -> Option<slatedb::config::CompressionCodec> {
+        match self {
+            Codec::None => None,
+            Codec::Lz4 => Some(slatedb::config::CompressionCodec::Lz4),
+            Codec::Zstd => Some(slatedb::config::CompressionCodec::Zstd),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Codec::None => "none",
+            Codec::Lz4 => "lz4",
+            Codec::Zstd => "zstd",
+        }
+    }
 }
 
 impl Bounds {
@@ -125,6 +157,7 @@ impl Bounds {
         fetch_bytes: 1 << 20,
         sst_bytes: 256 << 20,
         memtable_bytes: 256 << 20,
+        codec: Codec::Zstd,
     };
 
     /// The seeds are a cache filled in the background: one compaction at a
@@ -136,6 +169,7 @@ impl Bounds {
         fetch_bytes: 1 << 20,
         sst_bytes: 64 << 20,
         memtable_bytes: 128 << 20,
+        codec: Codec::Zstd,
     };
 
     /// SlateDB's own, as every database ran before the bounds (benches).
@@ -146,6 +180,7 @@ impl Bounds {
         fetch_bytes: 2 << 20,
         sst_bytes: 256 << 20,
         memtable_bytes: 256 << 20,
+        codec: Codec::None,
     };
 
     /// `self` with the keys `spec` names changed.
@@ -153,6 +188,15 @@ impl Bounds {
         let mut b = self;
         for kv in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let (k, v) = kv.split_once('=').ok_or_else(|| format!("{kv}: want key=value"))?;
+            if k.trim() == "codec" {
+                b.codec = match v.trim() {
+                    "none" => Codec::None,
+                    "lz4" => Codec::Lz4,
+                    "zstd" => Codec::Zstd,
+                    _ => return Err(format!("{kv}: want none, lz4 or zstd")),
+                };
+                continue;
+            }
             let n: usize = v.trim().parse().map_err(|e| format!("{kv}: {e}"))?;
             if n == 0 {
                 return Err(format!("{kv}: must be at least 1"));
@@ -166,7 +210,7 @@ impl Bounds {
                 "memtable-mb" => b.memtable_bytes = n << 20,
                 k => {
                     return Err(format!(
-                        "unknown key {k} (compactions, subcompactions, fetch-tasks, fetch-kb, sst-mb, memtable-mb)"
+                        "unknown key {k} (compactions, subcompactions, fetch-tasks, fetch-kb, sst-mb, memtable-mb, codec)"
                     ));
                 }
             }
@@ -179,13 +223,14 @@ impl std::fmt::Display for Bounds {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "compactions={},subcompactions={},fetch-tasks={},fetch-kb={},sst-mb={},memtable-mb={}",
+            "compactions={},subcompactions={},fetch-tasks={},fetch-kb={},sst-mb={},memtable-mb={},codec={}",
             self.compactions,
             self.subcompactions,
             self.fetch_tasks,
             self.fetch_bytes >> 10,
             self.sst_bytes >> 20,
-            self.memtable_bytes >> 20
+            self.memtable_bytes >> 20,
+            self.codec.name()
         )
     }
 }
@@ -218,6 +263,7 @@ pub(crate) fn settings(l0_bytes: usize, b: Bounds) -> slatedb::Settings {
         l0_sst_size_bytes: l0_bytes,
         // above the L0 size: with the WAL off, a cap below it stalls writes
         max_unflushed_bytes: b.memtable_bytes.max(l0_bytes * 2),
+        compression_codec: b.codec.slatedb(),
         // every seal uploads an L0, and an upload past this many waits for
         // the compactor (seen as 1-5 s seals at 2 s flushes with the
         // default 8); 32 is minutes of flushes at any interval used here
@@ -539,7 +585,12 @@ mod tests {
         assert_eq!(b, Bounds { compactions: 3, fetch_bytes: 512 << 10, memtable_bytes: 96 << 20, ..Bounds::SEEDS });
         assert_eq!(Bounds::STATE.parse(&Bounds::SEEDS.to_string()).unwrap(), Bounds::SEEDS);
         assert_eq!(Bounds::SEEDS.parse("").unwrap(), Bounds::SEEDS);
-        for bad in ["compactions", "compactions=0", "compactions=x", "zstd=1"] {
+        let lz4 = Bounds::SEEDS.parse("codec=lz4").unwrap();
+        assert_eq!(lz4.codec, Codec::Lz4);
+        assert_eq!(Bounds::SEEDS.parse(&lz4.to_string()).unwrap(), lz4);
+        assert_eq!(settings(64 << 20, Bounds::SEEDS).compression_codec, Some(slatedb::config::CompressionCodec::Zstd));
+        assert_eq!(settings(64 << 20, Bounds::SEEDS.parse("codec=none").unwrap()).compression_codec, None);
+        for bad in ["compactions", "compactions=0", "compactions=x", "zstd=1", "codec=snappy"] {
             assert!(Bounds::SEEDS.parse(bad).is_err(), "{bad}");
         }
         let s = settings(64 << 20, Bounds::SEEDS);

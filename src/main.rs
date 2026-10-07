@@ -75,9 +75,11 @@ struct Args {
     /// Memory bounds of the PLC seeds' SlateDB on the leader, as
     /// `key=value,...`: compactions at once, subcompactions each,
     /// fetch-tasks and fetch-kb of read-ahead per input SST, sst-mb per
-    /// output SST, memtable-mb unflushed. Keys left out keep the defaults
-    /// shown. A compaction holds about subcompactions x 8 x fetch-tasks x
-    /// fetch-kb, plus its output's upload buffers.
+    /// output SST, memtable-mb unflushed, and codec (zstd, lz4 or none) for
+    /// new SSTs (each SST records its own, so changing it needs no wipe).
+    /// Keys left out keep the defaults shown. A compaction holds about
+    /// subcompactions x 8 x fetch-tasks x fetch-kb, plus its output's
+    /// upload buffers.
     #[arg(long, env = "VLRELAY_PLC_SEEDS_SLATEDB", default_value_t = vlrelay::qlog::state::Bounds::SEEDS.to_string())]
     plc_seeds_slatedb: String,
     /// A relay whose com.atproto.sync.listHosts seeds host discovery (read
