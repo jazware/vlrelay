@@ -1,43 +1,21 @@
-import { useSyncExternalStore } from 'react'
 import type { HostAction, HostRow } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
+import * as W from '../../lib/console/writes'
 import { fmtNum } from '../../lib/console/fmt'
 import { confirmAction, type ConfirmSpec } from './dialogs'
 
 // The host actions (POST hosts/{host}/action), each behind a confirm that lists what happens and
-// shows the exact call. Every action is audited on the host record by the relay.
+// shows the exact call. Every action is audited on the host record by the relay; its answer (the
+// host's row) goes into the cache at once (writes.ts).
 
 /** The one-click account cap for a real PDS: above every independent PDS today, below what a trusted tier usually allows. */
 export const BIG_HOST_CAP = 1_000_000
 
 export type HostVerb = 'settier' | 'throttle' | 'unthrottle' | 'suspend' | 'ban' | 'unban' | 'reconnect' | 'raisecap' | 'tiercap'
 
-// pages re-read a host (and the lists) after an action lands
-let version = 0
-let acted: { row: HostRow; at: number } | undefined
-/** The row the last host action answered with, if it was this host's (and when it landed). */
-export const actedRow = (host: string) => (acted?.row.host === host ? acted : undefined)
-const subs = new Set<() => void>()
-export const useHostsVersion = () =>
-  useSyncExternalStore(
-    (l) => {
-      subs.add(l)
-      return () => {
-        subs.delete(l)
-      }
-    },
-    () => version,
-  )
-/** Re-reads the hosts on screen: after a host action (with the row it answered), or a rule change that moves hosts. */
-export const hostsChanged = (row?: HostRow) => {
-  if (row) acted = { row, at: Date.now() }
-  version++
-  subs.forEach((l) => l())
-}
-
 function spec(verb: HostVerb, h: HostRow, arg?: string): ConfirmSpec | undefined {
   const name = h.host
-  const run = (a: HostAction) => A.hostAction(name, a).then((r) => (hostsChanged(r), r))
+  const run = (a: HostAction) => W.hostAction(name, a)
   const call = (a: HostAction) => A.hostActionCall(name, a)
   switch (verb) {
     case 'settier': {

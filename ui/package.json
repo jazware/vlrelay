@@ -12,6 +12,7 @@
     "check-docs": "node docs-build/check.mjs && node scripts/check-docs-private.mjs"
   },
   "dependencies": {
+    "@tanstack/react-query": "^5.104.1",
     "cborg": "^6.1.3",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",

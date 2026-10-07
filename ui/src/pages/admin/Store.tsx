@@ -1,9 +1,9 @@
 import type { ReactNode } from 'react'
-import { Chip, Empty, KV, Loaded, Meter, PageHead, Panel, Spark, Src, Tiles, type TileSpec } from '../../components/console/kit'
+import { Chip, Empty, KV, Loaded, Meter, PageHead, Panel, Spark, Src, Tiles, Updated, type TileSpec } from '../../components/console/kit'
 import type { QCounts, QuorumView, SettingsView } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, dur, fmtBytes, fmtNum, fmtSi, fmtUs, seqS } from '../../lib/console/fmt'
-import { quorumPoll, requestRates, seriesOf, settingsPoll, storePoll } from '../../lib/console/polls'
+import { requestRates, seriesOf, useQuorum, useSettings, useStore } from '../../lib/console/queries'
 import { useRelay } from '../../lib/console/relay'
 import './logPages.css'
 import { memberRows } from './quorumUi'
@@ -53,9 +53,9 @@ const cnt = (n: number) => (n < 10_000 ? fmtNum(n) : fmtSi(n))
 const rate = (v: number | undefined) => (v === undefined ? '—' : v === 0 ? '0' : v < 0.01 ? '<0.01' : v < 10 ? v.toFixed(2) : fmtSi(v))
 
 export function Store() {
-  const st = storePoll.use()
-  const qp = quorumPoll.use()
-  const sp = settingsPoll.use()
+  const st = useStore()
+  const qp = useQuorum()
+  const sp = useSettings()
   const { view } = useRelay()
   const leader = view?.quorum?.leader
   const s = sp.data
@@ -74,6 +74,7 @@ export function Store() {
       )}
       {v && <span>answered by {v.node}</span>}
       {v && leader && leader !== v.node && <span>{leader} leads and sends most of the requests: its console answers for it</span>}
+      <Updated l={st} />
     </>
   )
   if (!v)

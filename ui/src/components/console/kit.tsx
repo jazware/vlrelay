@@ -1,5 +1,7 @@
-import { useState, type CSSProperties, type ReactNode } from 'react'
+import { useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react'
+import { ago, clock } from '../../lib/console/fmt'
 import { useLiveState } from '../../lib/console/live'
+import { GLYPH, HOST_TITLE, hostTone, type Tone } from '../../lib/console/tone'
 import { Link } from '../../lib/router'
 import { errText } from '../../lib/api'
 import { toast } from './toast'
@@ -8,8 +10,7 @@ import { toast } from './toast'
 // Status always pairs a colour with a glyph (● ok, ▲ warn, ■ err, ◆ info, ○ idle) so it reads
 // without colour too.
 
-export type Tone = 'ok' | 'warn' | 'err' | 'info' | 'idle'
-export const GLYPH: Record<Tone, string> = { ok: '●', warn: '▲', err: '■', info: '◆', idle: '○' }
+export { GLYPH, hostTone, type Tone }
 
 export function Glyph({ k, title }: { k: Tone; title?: string }) {
   return (
@@ -280,6 +281,58 @@ export function Src({ children, isNew }: { children: ReactNode; isNew?: boolean 
   )
 }
 
+// one clock for every "updated … ago": a tick a second while any is on screen
+let now = Date.now()
+const ticks = new Set<() => void>()
+let ticker: ReturnType<typeof setInterval> | undefined
+function subscribeNow(l: () => void) {
+  ticks.add(l)
+  ticker ??= setInterval(() => {
+    now = Date.now()
+    ticks.forEach((t) => t())
+  }, 1000)
+  return () => {
+    ticks.delete(l)
+    if (!ticks.size) ticker = (clearInterval(ticker), undefined)
+  }
+}
+export const useNow = () => useSyncExternalStore(subscribeNow, () => now)
+
+/**
+ * How fresh a panel's data is, the same on every page: "live" while the change feed keeps it
+ * current, else "updated 4s ago"; paused while space holds the console; a warning when the last
+ * fetch failed and what's shown is older.
+ */
+export function Updated({ l }: { l: { at?: number; live?: boolean; error?: unknown } }) {
+  const { paused } = useLiveState()
+  useNow()
+  if (!l.at) return null
+  const title = `Fetched at ${clock(l.at)}`
+  if (paused)
+    return (
+      <span className="cx-upd paused" title={title}>
+        paused · as of {clock(l.at)}
+      </span>
+    )
+  if (l.error)
+    return (
+      <span className="cx-upd warn" title={`${title}. The last refresh failed: ${errText(l.error)}`}>
+        <span className="cx-g">{GLYPH.warn}</span> not updating · {ago(l.at)}
+      </span>
+    )
+  if (l.live)
+    return (
+      <span className="cx-upd live" title={`${title}; the change feed says when it changes`}>
+        <span className="cx-g">{GLYPH.ok}</span> live
+      </span>
+    )
+  return (
+    <span className="cx-upd" title={title}>
+      updated {Date.now() - l.at < 1500 ? 'just now' : ago(l.at)}
+    </span>
+  )
+}
+
 export function Panel({
   title,
   to,
@@ -509,15 +562,9 @@ export function NeedsVersion({ what, endpoint, children }: { what: ReactNode; en
 
 // ---------------------------------------------------------------- relay parts
 
-// backpressure is the relay's own state, not the host's: info, so it never reads as a throttle
-const HOST_TONE: Record<string, Tone> = { connected: 'ok', idle: 'idle', backoff: 'warn', offline: 'err', throttled: 'warn', backpressure: 'info', suspended: 'err', banned: 'err' }
-const HOST_TITLE: Record<string, string> = {
-  throttled: 'Held at its own limits: its tier, a domain rule or an operator throttle',
-  backpressure: 'Paused by the relay, which is behind: not this host’s limits',
-}
-export const hostTone = (s: string): Tone => HOST_TONE[s] ?? 'idle'
+/** A host's status word with its tone, and what holds it for throttled and backpressure. */
 export const HostStatusChip = ({ s }: { s: string }) => (
-  <Chip k={hostTone(s)} title={HOST_TITLE[s]}>
+  <Chip k={hostTone(s)} title={HOST_TITLE[s as keyof typeof HOST_TITLE]}>
     {s}
   </Chip>
 )

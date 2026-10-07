@@ -3,12 +3,13 @@ import { DataTable, type Col } from '../../components/console/DataTable'
 import { registerDetail } from '../../components/console/Drawer'
 import { openPanel } from '../../components/console/nav'
 import { registerPalette } from '../../components/console/Palette'
-import { Chip, Empty, KV, Loaded, Meter, PageHead, Panel, SearchInput, Sec, Seg, Src, Strip, Tiles, Toggle } from '../../components/console/kit'
+import { Chip, Empty, KV, Loaded, Meter, PageHead, Panel, SearchInput, Sec, Seg, Src, Strip, Tiles, Toggle, Updated } from '../../components/console/kit'
 import { errText, setAdminToken, type ConfigEntry, type SettingsView } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, dt, dur, fmtNum, fmtSi, plural } from '../../lib/console/fmt'
-import { useLiveState, toggleSources, useLivePoll } from '../../lib/console/live'
-import { publicPoll, settingsPoll } from '../../lib/console/polls'
+import { cached, keys, useLive } from '../../lib/console/cache'
+import { useLiveState, toggleSources } from '../../lib/console/live'
+import { usePlc, usePublicStats, useSettings } from '../../lib/console/queries'
 import { useRelay } from '../../lib/console/relay'
 import { useAdminOperator } from '../../lib/hooks'
 import { navigate, useSearch } from '../../lib/router'
@@ -22,12 +23,13 @@ import '../../console-rules.css'
 type Src = ConfigEntry['source']
 const changed = (e: ConfigEntry) => !e.secret && (e.source === 'flag' || e.source === 'env') && e.value !== e.default
 
-/** Each node's flags: the answering node's from the shared poll, every other member's asked through it. */
+/** Each node's flags: the answering node's from the shared query, every other member's asked through it. */
 function useNodes() {
   const { view } = useRelay()
-  const self = settingsPoll.use()
+  const self = useSettings()
   const ids = (view?.nodes ?? []).map((n) => n.id).filter((id) => id !== view?.self)
-  const others = useLivePoll(
+  const others = useLive(
+    keys.settings(`others:${ids.join(',')}`),
     () =>
       Promise.all(
         ids.map((id) =>
@@ -37,9 +39,7 @@ function useNodes() {
           ),
         ),
       ),
-    ids.join(','),
-    60_000,
-    { keep: true },
+    { poll: 60_000, keep: true },
   )
   const per = new Map<string, SettingsView>()
   if (self.data) per.set(view?.self ?? 'this node', self.data)
@@ -164,7 +164,7 @@ const day = (ms: number) => new Date(ms).toLocaleDateString('en-US', { year: 'nu
 
 /** PLC export seeding: the leader reads the export into seeds every node resolves from. Any node answers ops/plc. */
 function Plc() {
-  const l = useLivePoll(A.plc, 'plc', 5000)
+  const l = usePlc()
   const { view } = useRelay()
   const v = l.data
   const done = v ? v.windows.filter((w) => w.done).length : 0
@@ -262,8 +262,8 @@ function Plc() {
 }
 
 export function Settings() {
-  const s = settingsPoll.use()
-  const pub = publicPoll.use().data
+  const s = useSettings()
+  const pub = usePublicStats().data
   const live = useLiveState()
   const operator = useAdminOperator()
   const { view } = useRelay()
@@ -281,6 +281,7 @@ export function Settings() {
                 <span className="mono">{s.data.binary}</span> {s.data.version}
               </span>
               <span>the flags each node was started with</span>
+              <Updated l={s} />
             </>
           ) : (
             <span>…</span>
@@ -410,7 +411,7 @@ registerDetail('flag', {
 
 registerPalette({
   items: () =>
-    (settingsPoll.get().data?.entries ?? []).map((e) => ({
+    (cached<SettingsView>(keys.settings())?.entries ?? []).map((e) => ({
       group: 'Flags',
       glyph: '⚑',
       title: e.flag,

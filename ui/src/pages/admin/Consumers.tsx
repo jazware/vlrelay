@@ -2,13 +2,16 @@ import { useMemo, type ReactNode } from 'react'
 import { DataTable, type Col } from '../../components/console/DataTable'
 import { confirmAction } from '../../components/console/dialogs'
 import { registerDetail } from '../../components/console/Drawer'
-import { Banners, Bars, Chip, Copy, Empty, Glyph, KV, LiveVal, Loaded, Meter, Mini, PageHead, Panel, SearchInput, Sec, Seg, Spark, Src, Strip, Tiles, type BannerSpec, type TileSpec } from '../../components/console/kit'
+import { Banners, Bars, Chip, Copy, Empty, Glyph, KV, LiveVal, Loaded, Meter, Mini, PageHead, Panel, SearchInput, Sec, Seg, Spark, Src, Strip, Tiles, Updated, type BannerSpec, type TileSpec } from '../../components/console/kit'
 import { openPanel } from '../../components/console/nav'
 import { registerPalette } from '../../components/console/Palette'
-import type { Consumer, Overview } from '../../lib/api'
+import type { Consumer, Overview, SettingsView } from '../../lib/api'
+import { cached, keys } from '../../lib/console/cache'
 import * as A from '../../lib/console/adminAdapter'
 import { dt, dur, fmtBytes, fmtMs, fmtNum, fmtSi, plural, seqS } from '../../lib/console/fmt'
-import { consumersPoll, isSlow, overviewPoll, policyFullPoll, quorumPoll, seqSeenAt, seriesOf, settingsPoll, slowLagMs } from '../../lib/console/polls'
+import { isSlow, seqSeenAt, seriesOf, slowLagMs, useConsumers, useOverview, usePolicyFull, useQuorum } from '../../lib/console/queries'
+import { consumerState } from '../../lib/console/tone'
+import * as W from '../../lib/console/writes'
 import { useRelay } from '../../lib/console/relay'
 import { Link, navigate, useSearch } from '../../lib/router'
 import './logPages.css'
@@ -25,7 +28,7 @@ const TIERS: Tier[] = ['ring', 'disk', 'bucket']
 const TIER_LABEL: Record<Tier, string> = { ring: 'ring', disk: 'local disk', bucket: 'bucket' }
 
 export function kickDialog(c: Consumer) {
-  const flags = settingsPoll.get().data
+  const flags = cached<SettingsView>(keys.settings())
   const self = flags?.entries.find((e) => e.flag === '--node-id')?.value
   const relayed = !!self && c.node !== self
   const on = membershipOn(flags)
@@ -55,11 +58,8 @@ export function kickDialog(c: Consumer) {
     word: `#${c.id}`,
     action: 'Kick',
     call: A.kickCall(c.id, c.node),
-    run: () => A.kickConsumer(c.id, c.node),
+    run: () => W.kickConsumer(c),
     done: `Kicked #${c.id} on ${c.node}`,
-  }).then((ok) => {
-    if (ok) consumersPoll.refresh()
-    return ok
   })
 }
 
@@ -126,10 +126,10 @@ function TierChip({ c }: { c: Consumer }) {
 }
 
 export function Consumers() {
-  const subs = consumersPoll.use()
-  const ov = overviewPoll.use()
-  const pol = policyFullPoll.use()
-  const qp = quorumPoll.use()
+  const subs = useConsumers()
+  const ov = useOverview()
+  const pol = usePolicyFull()
+  const qp = useQuorum()
   const { view } = useRelay()
   const s = useSearch()
   const node = s.get('node') ?? ''
@@ -258,6 +258,7 @@ export function Consumers() {
           <>
             <span>{all ? `${plural(all.length, 'subscribeRepos socket')}${nodes.length > 1 ? ` on ${nodes.length} nodes` : ''}` : '…'}</span>
             {o && <span>{fmtBytes(o.bytesOutPerSec)}/s out</span>}
+            <Updated l={subs} />
           </>
         }
         actions={
@@ -395,10 +396,10 @@ registerDetail('consumer', {
   kind: 'Consumer',
   section: 'consumers',
   use: (id, mode) => {
-    const subs = consumersPoll.use()
-    const ov = overviewPoll.use()
-    const pol = policyFullPoll.use()
-    const qp = quorumPoll.use()
+    const subs = useConsumers()
+    const ov = useOverview()
+    const pol = usePolicyFull()
+    const qp = useQuorum()
     const { view } = useRelay()
     const c = subs.data?.find((x) => keyOf(x) === id)
     if (!c) return { title: `#${id.split('/').pop()}`, body: null, loading: subs.loading, missing: subs.loading ? undefined : 'It disconnected: consumer ids are per connection.' }
@@ -411,7 +412,7 @@ registerDetail('consumer', {
     const line = verdict(c, cut, behind)
     const main = (
       <>
-        <div className={`cx-verdict ${isSlow(c, cut) || (behind ?? 0) > BEHIND_WARN ? 'warn' : c.backfilling ? 'info' : 'ok'}`}>
+        <div className={`cx-verdict ${(behind ?? 0) > BEHIND_WARN ? 'warn' : consumerState(c, isSlow(c, cut)).tone}`}>
           <Copy text={line} mono={false} />
         </div>
         <Strip
@@ -479,7 +480,8 @@ registerDetail('consumer', {
       )
     return {
       title: `#${c.id} · ${c.userAgent || 'no user agent'}`,
-      chip: isSlow(c, cut) ? <Chip k="warn">slow</Chip> : c.backfilling ? <Chip k="info">replaying</Chip> : <Chip k="ok">live</Chip>,
+      chip: <Chip k={consumerState(c, isSlow(c, cut)).tone}>{consumerState(c, isSlow(c, cut)).label}</Chip>,
+      fresh: subs,
       foot: <>ids are per node · GET /admin/api/consumers</>,
       body,
     }
@@ -489,7 +491,7 @@ registerDetail('consumer', {
 registerPalette({
   items: (q) => {
     if (!q) return []
-    return (consumersPoll.get().data ?? []).slice(0, 400).map((c) => ({
+    return (cached<Consumer[]>(keys.consumers()) ?? []).slice(0, 400).map((c) => ({
       group: 'Consumers',
       glyph: '◆',
       title: `#${c.id} ${c.userAgent || 'no user agent'}`,

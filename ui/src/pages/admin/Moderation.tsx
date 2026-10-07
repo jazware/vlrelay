@@ -3,12 +3,12 @@ import { DataTable, type Col } from '../../components/console/DataTable'
 import { hostActionDialog, BIG_HOST_CAP } from '../../components/console/hostActions'
 import { openPanel } from '../../components/console/nav'
 import { registerPalette, type PalItem } from '../../components/console/Palette'
-import { Chip, Empty, Glyph, HostName, Kbd, Loaded, Meter, Over, PageHead, Panel, Sec, Seg, Src, TierTag } from '../../components/console/kit'
+import { Chip, Empty, Glyph, HostName, Kbd, Loaded, Meter, Over, PageHead, Panel, Sec, Seg, Src, TierTag, Updated } from '../../components/console/kit'
 import type { Account, Case, CaseStatus, DomainRule, HostRow, PolicyAudit, SignalKey, SignalTop, TakedownEntry } from '../../lib/api'
-import * as A from '../../lib/console/adminAdapter'
+import { cached, keys } from '../../lib/console/cache'
 import { ago, dt, fmtNum, fmtSi, plural, shortDid } from '../../lib/console/fmt'
-import { useLivePoll } from '../../lib/console/live'
-import { overviewPoll } from '../../lib/console/polls'
+import { useAccountSearch, useCases, useHostList, useOverview, useRules, useRulesAudit, useSignals, useTakedowns } from '../../lib/console/queries'
+import { sevTone } from '../../lib/console/tone'
 import { Link, useSearch } from '../../lib/router'
 import { signalOfKind } from './Policy'
 import {
@@ -16,16 +16,11 @@ import {
   CaseStatusChip,
   EffectChip,
   SEV_RANK,
-  SEV_TONE,
   caseObs,
-  casesPoll,
   signalKeyRef,
   releaseDialog,
   ruleDialog,
-  rulesAuditPoll,
-  rulesPoll,
   takedownDialog,
-  takedownsPoll,
 } from './moderationDetail'
 
 // Cases, the spam signals' heaviest keys, accounts and every takedown, domain rules and the
@@ -46,7 +41,7 @@ function setParam(k: string, v: string) {
 }
 
 function Cases() {
-  const all = casesPoll.use()
+  const all = useCases()
   const search = useSearch()
   const f = (search.get('cases') as Filter | null) ?? 'open'
   const counts = useMemo(() => {
@@ -68,7 +63,7 @@ function Cases() {
       sort: (a, b) => a.id - b.id,
       render: (c) => (
         <span className="mono">
-          <Glyph k={SEV_TONE[c.severity] === 'err' ? 'err' : SEV_TONE[c.severity] === 'warn' ? 'warn' : 'info'} title={c.severity} /> {c.id}
+          <Glyph k={sevTone(c.severity)} title={c.severity} /> {c.id}
         </span>
       ),
     },
@@ -123,7 +118,7 @@ function Cases() {
 type SignalRow = { s: SignalTop; k?: SignalKey; r: number }
 
 function Signals() {
-  const sig = useLivePoll(A.spamSignals, 'signals', 10_000)
+  const sig = useSignals()
   const v = sig.data
   const rows: SignalRow[] = (v?.signals ?? [])
     .filter((s) => s.enabled && s.limit > 0)
@@ -186,7 +181,7 @@ function Signals() {
 }
 
 function Takedowns() {
-  const l = takedownsPoll.use()
+  const l = useTakedowns()
   const cols: Col<TakedownEntry>[] = [
     { id: 'did', label: 'Account', render: (t) => <span className="cx-did" title={t.did}>{shortDid(t.did)}</span> },
     { id: 'reason', label: 'Reason', className: 'wrap sm t2', render: (t) => t.reason || <span className="muted">—</span> },
@@ -224,7 +219,7 @@ function Lookup() {
   const q = (search.get('q') ?? '').trim()
   const [text, setText] = useState(q)
   useEffect(() => setText(q), [q])
-  const l = useLivePoll(() => (q ? A.accounts(q) : Promise.resolve([] as Account[])), q, q ? 15_000 : 0)
+  const l = useAccountSearch(q)
   const cols: Col<Account>[] = [
     { id: 'who', label: 'Account', render: (a) => (a.handle ? <span className="mono sm">{a.handle}</span> : <span className="cx-did">{shortDid(a.did)}</span>) },
     { id: 'host', label: 'Host', render: (a) => <span className="mono sm t2 trunc" style={{ display: 'inline-block', maxWidth: 160 }}>{a.host}</span> },
@@ -270,8 +265,8 @@ function Lookup() {
 }
 
 function Rules() {
-  const l = rulesPoll.use()
-  const audit = rulesAuditPoll.use()
+  const l = useRules()
+  const audit = useRulesAudit()
   const [f, setF] = useState('')
   const rq = f.trim().toLowerCase()
   const rows = (l.data ?? []).filter((r) => !rq || r.pattern.includes(rq) || r.note.toLowerCase().includes(rq))
@@ -346,7 +341,7 @@ const SHOWN = 10
 
 /** The hosts with accounts created throttled, or at their cap (the next ones will be). */
 function Throttled() {
-  const list = useLivePoll(() => A.hosts({ flag: 'throttledOrAtCap', sort: 'accounts', desc: true }), 'throttled-accounts', 30_000, { keep: true })
+  const list = useHostList({ flag: 'throttledOrAtCap', sort: 'accounts', desc: true }, { poll: 30_000, keep: true })
   const atCap = (h: HostRow) => h.maxAccounts > 0 && h.accounts >= h.maxAccounts
   const rows = [...(list.data?.hosts ?? [])].sort((a, b) => b.throttledAccounts - a.throttledAccounts || b.accounts - a.accounts)
   const total = rows.reduce((a, h) => a + h.throttledAccounts, 0)
@@ -425,9 +420,10 @@ function Throttled() {
 }
 
 export function Moderation() {
-  const all = casesPoll.use().data
-  const rules = rulesPoll.use().data
-  const ov = overviewPoll.use().data
+  const cases = useCases()
+  const all = cases.data
+  const rules = useRules().data
+  const ov = useOverview().data
   const open = (all ?? []).filter((c) => c.status === 'open').length
   const by = ov?.hostsByStatus ?? {}
   useEffect(() => {
@@ -446,6 +442,7 @@ export function Moderation() {
                 {fmtNum(by.throttled ?? 0)} throttled · {fmtNum(by.suspended ?? 0)} suspended · {fmtNum(by.banned ?? 0)} banned hosts
               </span>
             )}
+            <Updated l={cases} />
           </>
         }
         actions={
@@ -476,10 +473,10 @@ export function Moderation() {
 registerPalette({
   items: (q) => {
     const out: PalItem[] = []
-    const cs = casesPoll.get().data ?? []
+    const cs = cached<Case[]>(keys.cases('all')) ?? []
     for (const c of cs.filter((x) => x.status === 'open' || x.status === 'acknowledged').slice(0, 30))
       out.push({ group: 'Cases', glyph: '◇', title: `Case ${c.id} ${c.kind.replace(/-/g, ' ')}`, desc: `${c.host} · ${c.status}`, hay: c.did ?? '', run: () => openPanel('case', String(c.id)) })
-    for (const r of (rulesPoll.get().data ?? []).slice(0, 50)) out.push({ group: 'Rules', glyph: '§', title: r.pattern, desc: `${r.effect.kind} · rule ${r.id}`, run: () => openPanel('rule', String(r.id)) })
+    for (const r of (cached<DomainRule[]>(keys.rules()) ?? []).slice(0, 50)) out.push({ group: 'Rules', glyph: '§', title: r.pattern, desc: `${r.effect.kind} · rule ${r.id}`, run: () => openPanel('rule', String(r.id)) })
     const m = q.match(/^take ?down\s+(did:\S+)$/i)
     if (m) out.push({ group: 'Actions', glyph: <span className="cx-g s-err">■</span>, title: `Take down ${shortDid(m[1])}…`, desc: 'accounts/{did}/takedown', hay: q, run: () => (openPanel('acct', m[1]), takedownDialog({ did: m[1], handle: null, host: '' })) })
     else if (/^add rule|^domain rule/i.test(q) || q === 'rule') out.push({ group: 'Actions', glyph: '+', title: 'Add a domain rule…', run: () => ruleDialog() })

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
-import * as A from '../../lib/console/adminAdapter'
+import { fetchHosts } from '../../lib/console/queries'
 import { fmtSi } from '../../lib/console/fmt'
 import { navigate } from '../../lib/router'
 import { hostActionDialog, type HostVerb } from './hostActions'
@@ -93,7 +93,7 @@ export const lookupProvider: PalProvider = {
     const m = q.match(VERB)
     const needle = (m ? m[2] : q).trim().toLowerCase()
     if (needle.length < 2 || /\s/.test(needle) || needle.startsWith('did:')) return []
-    const r = await A.hosts({ q: needle, sort: 'events', desc: true, limit: 8 })
+    const r = await fetchHosts({ q: needle, sort: 'events', desc: true, limit: 8 })
     if (m) {
       const verb = verbOf(m[1].toLowerCase())
       return r.hosts

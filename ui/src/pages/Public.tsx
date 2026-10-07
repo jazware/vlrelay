@@ -5,7 +5,7 @@ import { Copy, Glyph } from '../components/console/kit'
 import { Toasts } from '../components/console/toast'
 import type { Health, PublicStats } from '../lib/api'
 import { dur, fmtMs, fmtNum, fmtSi, seqS } from '../lib/console/fmt'
-import { publicPoll } from '../lib/console/polls'
+import { usePublicStats } from '../lib/console/queries'
 import { Link } from '../lib/router'
 
 // The page anyone sees at /: what this relay is, how to subscribe, and its live numbers. Only
@@ -109,7 +109,7 @@ const Fig = ({ v, unit, label, em }: { v: ReactNode; unit?: string; label: strin
 )
 
 export function Public() {
-  const l = publicPoll.use()
+  const l = usePublicStats()
   const s = l.data
   const { theme } = useThemeToggle()
   const host = location.host

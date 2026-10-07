@@ -1,15 +1,16 @@
 import { useEffect, useState } from 'react'
 import { openDialog, FormDialog } from '../../components/console/dialogs'
 import { Exchange } from '../../components/console/Exchange'
-import { Banners, Bars, Empty, Glyph, HealthLine, HostName, Kbd, Loaded, LiveVal, PageHead, Panel, RRow, Seg, Spark, Src, Swatch, Tiles, type BannerSpec, type HealthCell, type TileSpec, type Tone } from '../../components/console/kit'
+import { Banners, Bars, Empty, Glyph, HealthLine, HostName, Kbd, Loaded, LiveVal, PageHead, Panel, RRow, Seg, Spark, Src, Swatch, Tiles, Updated, type BannerSpec, type HealthCell, type TileSpec, type Tone } from '../../components/console/kit'
 import { LiveTail } from '../../components/console/LiveTail'
 import { openPanel } from '../../components/console/nav'
 import { toast } from '../../components/console/toast'
-import type { HostRow, Overview as O, RejectReason } from '../../lib/api'
-import * as A from '../../lib/console/adminAdapter'
+import type { Overview as O, RejectReason } from '../../lib/api'
+import * as W from '../../lib/console/writes'
 import { ago, dur, fmtBytes, fmtMs, fmtNum, fmtRatio, fmtSi, plural, seqS, since } from '../../lib/console/fmt'
-import { togglePaused, useLiveState, useLivePoll } from '../../lib/console/live'
-import { capPoll, consumersPoll, historyPoll, isSlow, openCasesPoll, overviewPoll, policyFullPoll, publicPoll, quorumPoll, seenEpochs, seriesOf, slowLagMs, throttledPoll } from '../../lib/console/polls'
+import { togglePaused, useLiveState } from '../../lib/console/live'
+import { isSlow, seenEpochs, seriesOf, slowLagMs, useCapHosts, useConsumers, useHostList, useOpenCases, useOverview, usePolicyFull, usePublicStats, useQuorum, useQuorumHistory, useThrottledHosts } from '../../lib/console/queries'
+import { consumerState, sevTone } from '../../lib/console/tone'
 import { useRelay, type RelayView } from '../../lib/console/relay'
 import { navigate } from '../../lib/router'
 import { currentLead, epochEvents, leaderChangeText, recentLeaderChange, type EpochEvent } from './quorumUi'
@@ -44,7 +45,7 @@ function CrawlForm({ close, initial }: { close: () => void; initial: string }) {
         setBusy(true)
         setError(undefined)
         try {
-          await A.requestCrawl(v)
+          await W.requestCrawl(v)
           toast(`Requested a crawl of ${v}`)
           close()
         } catch (e) {
@@ -143,14 +144,14 @@ function healthCells(o: O, view: RelayView | undefined, cases: number, crit: num
 }
 
 export function Overview() {
-  const ov = overviewPoll.use()
+  const ov = useOverview()
   const { view } = useRelay()
-  const pub = publicPoll.use()
-  const cases = openCasesPoll.use()
-  const subs = consumersPoll.use()
-  const thr = throttledPoll.use()
-  const cap = capPoll.use()
-  const pol = policyFullPoll.use()
+  const pub = usePublicStats()
+  const cases = useOpenCases()
+  const subs = useConsumers()
+  const thr = useThrottledHosts()
+  const cap = useCapHosts()
+  const pol = usePolicyFull()
   const live = useLiveState()
   const o = ov.data
   const stream = o ? (o.streamEventsPerSec ?? o.eventsOutPerSec) : 0
@@ -158,13 +159,13 @@ export function Overview() {
   const cut = slowLagMs(pol.data)
   const q = view?.quorum
   const cores = view?.nodes.filter((n) => n.core) ?? []
-  const qp = quorumPoll.use()
-  // the shell keeps the history poll running on a quorum relay
-  const hist = historyPoll.get()
+  const qp = useQuorum()
+  const hist = useQuorumHistory(!!q)
   const events = q ? epochEvents(qp.data?.supported ? qp.data.data : undefined, hist.data?.events ?? [], seenEpochs()) : []
   const lead = currentLead(events)
   const [busy, setBusy] = useState<Busy>('events')
-  const rej = useLivePoll(() => (busy === 'rejects' ? A.hosts({ sort: 'errors', desc: true, limit: 8 }).then((r) => r.hosts) : Promise.resolve([] as HostRow[])), `busy:${busy}`, 5000)
+  const rejList = useHostList({ sort: 'errors', desc: true, limit: 8 }, { enabled: busy === 'rejects' })
+  const rej = { ...rejList, data: rejList.data?.hosts }
   const rejNames = (rej.data ?? []).filter((h) => h.errorRate > 0).map((h) => h.host)
 
   const sub = (
@@ -172,6 +173,7 @@ export function Overview() {
       <span className="mono">{location.host}</span>
       {view && <span>{q ? `${q.members.length} quorum members${q.learners.length ? ` + ${q.learners.length} learning` : ''}` : view.single ? 'a single node' : `${view.nodes.length} nodes`}</span>}
       {pub.data && <span>up {dur(pub.data.uptimeSecs * 1000)}</span>}
+      <Updated l={ov} />
     </>
   )
   const actions = (
@@ -409,7 +411,7 @@ export function Overview() {
               .slice(0, 5)
               .map((c) => (
                 <RRow key={`${c.node}/${c.id}`} to="/admin/consumers" x={c.backfilling ? 'backfill' : fmtMs(c.lagMs)}>
-                  <Glyph k={isSlow(c, cut) ? 'warn' : c.backfilling ? 'info' : 'ok'} />
+                  <Glyph k={consumerState(c, isSlow(c, cut)).tone} />
                   <span className="nm">
                     <span className="mono">#{c.id}</span> {(c.userAgent || 'no user agent').split('/')[0]}
                   </span>
@@ -420,7 +422,7 @@ export function Overview() {
           <Panel title="Open cases" to="/admin/moderation" src={<Src>cases?status=open</Src>}>
             {(cases.data ?? []).slice(0, 5).map((c) => (
               <RRow key={c.id} onClick={() => openPanel('case', String(c.id))} x={ago(c.openedAtMs)}>
-                <Glyph k={c.severity === 'critical' ? 'err' : c.severity === 'high' ? 'warn' : c.severity === 'warn' ? 'warn' : 'info'} />
+                <Glyph k={sevTone(c.severity)} />
                 <span className="mono sm">{c.id}</span>
                 <span className="nm">
                   {c.kind} · {c.host}
@@ -430,7 +432,7 @@ export function Overview() {
             {cases.data && !cases.data.length && <Empty>No open cases.</Empty>}
           </Panel>
           <div className="muted sm" style={{ padding: '0 2px' }}>
-            {plural(o.hostsConnected, 'host')} connected · {plural(o.consumers, 'consumer')} · as of {ov.at ? ago(ov.at) : '—'}
+            {plural(o.hostsConnected, 'host')} connected · {plural(o.consumers, 'consumer')}
           </div>
         </div>
       </div>

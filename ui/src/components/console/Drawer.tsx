@@ -1,6 +1,6 @@
 import { useEffect, useRef, type ReactNode } from 'react'
 import { Link, navigate } from '../../lib/router'
-import { Empty, Kbd, Loading, PageHead } from './kit'
+import { Empty, Kbd, Loading, PageHead, Updated } from './kit'
 import { closePanel, fullPath, openPanel, usePanel } from './nav'
 import { noteRecent } from './recent'
 import { SECTION, type SectionId } from './sections'
@@ -16,6 +16,8 @@ export type DetailView = {
   body: ReactNode
   /** Small print under the body: where the data comes from, which node answered. */
   foot?: ReactNode
+  /** The query the detail reads, for its "updated … ago". */
+  fresh?: { at?: number; live?: boolean; error?: unknown }
   loading?: boolean
   /** Set when the thing is gone (a node left, an event scrolled out). */
   missing?: ReactNode
@@ -74,6 +76,11 @@ function Inner({ type, id, k }: { type: string; id: string; k: DetailKind }) {
       <div className="dfoot">
         <span>{v.foot}</span>
         <span style={{ marginLeft: 'auto' }}>
+          {v.fresh && !v.missing && (
+            <>
+              <Updated l={v.fresh} /> ·{' '}
+            </>
+          )}
           <Kbd k="o" /> full page · <Kbd k="esc" /> close
         </span>
       </div>
@@ -111,6 +118,7 @@ export function DetailPage({ type, id }: { type: string; id: string }) {
           <>
             <span className="cx-eyebrow">{k.kind}</span>
             {v.foot && <span>{v.foot}</span>}
+            {v.fresh && !v.missing && <Updated l={v.fresh} />}
           </>
         }
         actions={

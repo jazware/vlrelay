@@ -1,17 +1,15 @@
-import { useEffect, type ReactNode } from 'react'
+import type { ReactNode } from 'react'
 import { registerDetail } from '../../components/console/Drawer'
 import { openPanel } from '../../components/console/nav'
-import { BIG_HOST_CAP, actedRow, hostActionDialog, useHostsVersion } from '../../components/console/hostActions'
+import { BIG_HOST_CAP, hostActionDialog } from '../../components/console/hostActions'
 import { Bars, Copy, Empty, Glyph, HostStatusChip, KV, Meter, Mini, Minis, Sec, Seg, Spark, Strip, TierTag } from '../../components/console/kit'
 import type { BackpressureReason, Case, DomainRule, HostAction, HostDetail, Policy, RejectReason } from '../../lib/api'
-import { host as fetchHost } from '../../lib/console/adminAdapter'
 import { ago, dt, fmtMs, fmtNum, fmtRatio, fmtSi, plural, shortDid } from '../../lib/console/fmt'
-import { useLivePoll } from '../../lib/console/live'
-import { policyPoll } from '../../lib/console/polls'
+import { useCases, useHostDetail, useHostRow, usePolicy, useRules } from '../../lib/console/queries'
 import { useRelay } from '../../lib/console/relay'
 import { Link } from '../../lib/router'
 import { SourceTag } from './hostSource'
-import { casesPoll, deleteRuleDialog, releaseDialog, rulesPoll } from './moderationDetail'
+import { deleteRuleDialog, releaseDialog } from './moderationDetail'
 import { NodeTag, REASON_WHAT, reasonLabel } from './relayUi'
 
 // A PDS host in the slide-over or on its own page: its rates and limits, why its frames are
@@ -287,9 +285,9 @@ const Act = ({ title, desc, wide, children }: { title: string; desc: ReactNode; 
 
 function Body({ d, page }: { d: HostDetail; page: boolean }) {
   const { view } = useRelay()
-  const pol = policyPoll.use()
-  const rules = rulesPoll.use()
-  const cases = casesPoll.use()
+  const pol = usePolicy()
+  const rules = useRules()
+  const cases = useCases()
   const r = d.row
   const live = r.status === 'connected' || r.status === 'throttled' || r.status === 'backpressure'
   const blocked = r.status === 'banned' || r.status === 'suspended'
@@ -601,29 +599,27 @@ registerDetail('host', {
   kind: 'PDS host',
   section: 'hosts',
   use: (id, mode) => {
-    const v = useHostsVersion()
-    const l = useLivePoll(() => fetchHost(id), id, 2000)
-    const reload = l.reload
-    useEffect(() => {
-      if (v) reload()
-    }, [v, reload])
-    // the action's answer is the host as it is now: show it until a poll newer than it lands
-    const acted = actedRow(id)
-    const d = l.data && acted && acted.at > (l.at ?? 0) ? { ...l.data, row: acted.row } : l.data
+    const l = useHostDetail(id)
+    // the newest row any answer carried (the list, an action, a change's hint): the drawer and the tables show the same one
+    const row = useHostRow(id) ?? l.data?.row
+    const d = l.data && row ? { ...l.data, row } : l.data
+    const chip = row && (
+      <>
+        <HostStatusChip s={row.status} /> <TierTag t={row.tier} labeled />
+      </>
+    )
     if (!d)
       return {
-        title: id,
+        title: row?.host ?? id,
+        chip,
         body: null,
         loading: !l.error,
         missing: l.error ? `Couldn't load ${id}: ${l.error instanceof Error ? l.error.message : String(l.error)}` : undefined,
       }
     return {
       title: d.row.host,
-      chip: (
-        <>
-          <HostStatusChip s={d.row.status} /> <TierTag t={d.row.tier} labeled />
-        </>
-      ),
+      chip,
+      fresh: l,
       foot: (
         <>
           read by <span className="mono">{d.row.node || '—'}</span> · GET /admin/api/hosts/{'{host}'}

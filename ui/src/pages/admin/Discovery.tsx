@@ -2,7 +2,7 @@ import type { ReactNode } from 'react'
 import { DataTable, type Col } from '../../components/console/DataTable'
 import { confirmAction } from '../../components/console/dialogs'
 import { registerDetail } from '../../components/console/Drawer'
-import { Chip, Empty, KV, Loaded, Meter, PageHead, Panel, Sec, Src, Strip, Tiles, type TileSpec } from '../../components/console/kit'
+import { Chip, Empty, KV, Loaded, Meter, PageHead, Panel, Sec, Src, Strip, Tiles, Updated, type TileSpec } from '../../components/console/kit'
 import { openPanel } from '../../components/console/nav'
 import { registerPalette, type PalItem } from '../../components/console/Palette'
 import { toast } from '../../components/console/toast'
@@ -10,12 +10,14 @@ import type { DiscoverySource, DiscoveryView } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, dt, dur, fmtNum } from '../../lib/console/fmt'
 import { getDraft } from '../../lib/console/policyDraft'
-import { discoveryPoll } from '../../lib/console/polls'
+import { keys, queryClient, refresh } from '../../lib/console/cache'
+import { useDiscovery, usePolicySource } from '../../lib/console/queries'
+import * as W from '../../lib/console/writes'
 import { useRelay } from '../../lib/console/relay'
 import { Link, navigate } from '../../lib/router'
 import '../../console-rules.css'
 import { Admissions } from './Admissions'
-import { addSeedRelay, DiscoveryPolicy, DraftBar, normSeedUrl, policySourcePoll, seedUrlError } from './Policy'
+import { addSeedRelay, DiscoveryPolicy, DraftBar, normSeedUrl, seedUrlError } from './Policy'
 import { NodeTag } from './relayUi'
 
 // Host discovery for a cold start, run by the leader: each seed relay's listHosts and the PDS
@@ -62,17 +64,15 @@ export function runDialog(v: DiscoveryView | undefined, s?: DiscoverySource) {
     ],
     action: 'Run now',
     call: A.runDiscoveryCall(s?.key),
-    run: () => A.runDiscovery(s?.key),
-    done: () => {
-      discoveryPoll.refresh()
-      return all ? 'Discovery requested' : `${sourceLabel(s.key)} requested`
-    },
+    run: () => W.runDiscovery(s?.key),
+    done: () => (all ? 'Discovery requested' : `${sourceLabel(s.key)} requested`),
   })
 }
 
 export function Discovery() {
-  const l = discoveryPoll.use()
-  policySourcePoll.use()
+  const l = useDiscovery()
+  // the seed relays are policy fields, edited through the policy's draft
+  usePolicySource()
   const { view } = useRelay()
   const v = l.data
   const src = v?.sources ?? []
@@ -188,6 +188,7 @@ export function Discovery() {
               <span>
                 {fmtNum(v.connectsPerMin)} connects/min · {fmtNum(v.requestsPerSec, 1)} listHosts/s per relay
               </span>
+              <Updated l={l} />
             </>
           ) : (
             <span>…</span>
@@ -245,7 +246,7 @@ registerDetail('dsource', {
   kind: 'Discovery source',
   section: 'discovery',
   use: (id) => {
-    const l = discoveryPoll.use()
+    const l = useDiscovery()
     const v = l.data
     const s = v?.sources.find((x) => x.key === id)
     if (!s) return { title: sourceLabel(id), body: null, loading: l.loading, missing: l.loading ? undefined : 'No such source: it left the policy.' }
@@ -318,7 +319,7 @@ registerDetail('dsource', {
         </div>
       </>
     )
-    return { title: sourceLabel(s.key), chip: <StatusChip s={s} />, foot: <>GET /admin/api/discovery · run by {v?.leader ?? 'the leader'}</>, body }
+    return { title: sourceLabel(s.key), chip: <StatusChip s={s} />, fresh: l, foot: <>GET /admin/api/discovery · run by {v?.leader ?? 'the leader'}</>, body }
   },
 })
 
@@ -327,7 +328,7 @@ registerDetail('dsource', {
 /** Waits for the policy draft (the Discovery page loads it), then adds the relay to it. */
 async function paletteAddSeed(url: string) {
   navigate('/admin/discovery')
-  policySourcePoll.refresh()
+  void refresh(keys.policySource())
   for (let i = 0; i < 50 && !getDraft().body; i++) await new Promise((r) => setTimeout(r, 100))
   if (!getDraft().body) return toast("The policy didn't load", { err: true })
   const u = normSeedUrl(url)
@@ -339,8 +340,7 @@ async function paletteAddSeed(url: string) {
 /** The run dialog from ⌘K: on the Discovery page, once the sources have loaded. */
 async function paletteRun(key?: string) {
   navigate('/admin/discovery')
-  for (let i = 0; i < 50 && !discoveryPoll.get().data; i++) await new Promise((r) => setTimeout(r, 100))
-  const v = discoveryPoll.get().data
+  const v = await queryClient.ensureQueryData({ queryKey: keys.discovery(), queryFn: A.discovery }).catch(() => undefined)
   void runDialog(v, key ? v?.sources.find((s) => s.key === key) : undefined)
 }
 
@@ -351,12 +351,12 @@ registerPalette({
     if (m) out.push({ group: 'Actions', glyph: '+', title: `Add seed relay ${m[1]}…`, desc: 'into the policy draft (discovery.seedRelays)', hay: q, run: () => void paletteAddSeed(m[1]) })
     else if (/^add seed/i.test(q)) out.push({ group: 'Actions', glyph: '+', title: 'Add a seed relay…', desc: 'type its URL after "add seed relay"', hay: q, run: () => navigate('/admin/discovery') })
     if (/^run\b|discover/i.test(q)) {
-      const v = discoveryPoll.get().data
+      const v = queryClient.getQueryData<DiscoveryView>(keys.discovery())
       out.push({ group: 'Actions', glyph: '↻', title: 'Run discovery now…', desc: 'every enabled source · discovery/run', hay: 'run discovery', run: () => void paletteRun() })
       for (const s of v?.sources ?? [])
         if (s.enabled) out.push({ group: 'Actions', glyph: '↻', title: `Run ${sourceLabel(s.key)} now…`, desc: `discovery/run ${s.key}`, hay: `run discovery ${s.key}`, run: () => void paletteRun(s.key) })
     }
-    if (/^disc|seed/i.test(q)) for (const s of discoveryPoll.get().data?.sources ?? []) out.push({ group: 'Discovery', glyph: '◇', title: sourceLabel(s.key), desc: kindOf(s.key), run: () => (navigate('/admin/discovery'), openPanel('dsource', s.key)) })
+    if (/^disc|seed/i.test(q)) for (const s of queryClient.getQueryData<DiscoveryView>(keys.discovery())?.sources ?? []) out.push({ group: 'Discovery', glyph: '◇', title: sourceLabel(s.key), desc: kindOf(s.key), run: () => (navigate('/admin/discovery'), openPanel('dsource', s.key)) })
     return out
   },
 })

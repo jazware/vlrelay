@@ -1,14 +1,14 @@
 import { useState, type ReactNode } from 'react'
 import { DataTable, type Col } from '../../components/console/DataTable'
-import { Banners, Chip, Empty, HostName, KV, LiveVal, Loaded, NeedsVersion, PageHead, Panel, RRow, Spark, Src, Swatch, Tiles, type BannerSpec, type TileSpec } from '../../components/console/kit'
+import { Banners, Chip, Empty, HostName, KV, LiveVal, Loaded, NeedsVersion, PageHead, Panel, RRow, Spark, Src, Swatch, Tiles, Updated, type BannerSpec, type TileSpec } from '../../components/console/kit'
 import { LogRail, type RailData } from '../../components/console/LogRail'
 import { openPanel } from '../../components/console/nav'
 import { confirmAction } from '../../components/console/dialogs'
-import { errText, type ClusterView, type HostRow, type QStatus, type QuorumView } from '../../lib/api'
+import { errText, type ClusterView, type HostRow, type QStatus, type QuorumView, type SettingsView } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, clock, dt, dur, fmtBytes, fmtMs, fmtNum, fmtSi, fmtUs, seqS, since } from '../../lib/console/fmt'
-import { useLivePoll } from '../../lib/console/live'
-import { clusterPoll, flushSeenAt, historyPoll, overviewPoll, quorumPoll, seenEpochs, seriesOf, settingsPoll } from '../../lib/console/polls'
+import { flushSeenAt, seenEpochs, seriesOf, useCluster, useHostList, useOverview, usePipeline, useQuorum, useQuorumHistory, useSettings, type Live } from '../../lib/console/queries'
+import * as W from '../../lib/console/writes'
 import { useRelay, type RelayView } from '../../lib/console/relay'
 import './logPages.css'
 import './quorumDetail'
@@ -19,24 +19,24 @@ import { Lg, NodeTag, relayBanners } from './relayUi'
 // commit), the leadership history, the members, the flushes, which member reads each host, and
 // the counters. On a relay without the quorum log it falls back to the cluster's nodes.
 
-const setting = (s: ReturnType<typeof settingsPoll.use>['data'], flag: string) => s?.entries.find((e) => e.flag === flag)
+const setting = (s: SettingsView | undefined, flag: string) => s?.entries.find((e) => e.flag === flag)
 
 export function Quorum() {
-  const qp = quorumPoll.use()
-  const cp = clusterPoll.use()
+  const qp = useQuorum()
+  const cp = useCluster()
   const { view } = useRelay()
   const q = qp.data
   if (q && !q.supported) return <NoQuorum c={cp.data} view={view} />
   if (!q) return <Loaded load={qp}>{() => null}</Loaded>
-  return <QuorumLog qv={q.data} at={qp.at} c={cp.data} view={view} />
+  return <QuorumLog qv={q.data} at={qp.at} fresh={qp} c={cp.data} view={view} />
 }
 
 // Its own component so its hooks (the history poll among them) run only once the log answered:
 // called after Quorum's early returns, they'd throw on a cold load.
-function QuorumLog({ qv, at, c, view }: { qv: QuorumView; at?: number; c?: ClusterView; view?: RelayView }) {
-  const sp = settingsPoll.use()
-  const ov = overviewPoll.use()
-  const hist = historyPoll.use()
+function QuorumLog({ qv, at, fresh, c, view }: { qv: QuorumView; at?: number; fresh: Live<unknown>; c?: ClusterView; view?: RelayView }) {
+  const sp = useSettings()
+  const ov = useOverview()
+  const hist = useQuorumHistory()
   const rows = memberRows(qv, view)
   const ref = refStatus(qv)
   const lead = rows.find((r) => r.kind === 'leader')?.s ?? undefined
@@ -110,6 +110,7 @@ function QuorumLog({ qv, at, c, view }: { qv: QuorumView; at?: number; c?: Clust
               <span>{lead ? `${lead.id} leads` : `no leader: ${answering} of ${members.length} answering`}</span>
               <span>members since epoch {ref.members_since}</span>
               <span>generation {ref.generation}</span>
+              <Updated l={fresh} />
             </>
           ) : (
             <span>no member answered</span>
@@ -351,9 +352,8 @@ function flushNowDialog(lead: QStatus, on: boolean, flushMs?: number) {
     word: 'flush',
     action: 'Flush now',
     call: A.flushNowCall,
-    run: () => A.flushNow(),
+    run: () => W.flushNow(),
     done: (r) => {
-      quorumPoll.refresh()
       const s = r as QStatus | undefined
       return s && typeof s.flushed === 'number' ? `Flushed: F is ${seqS(s.flushed)}` : 'Flushed'
     },
@@ -471,7 +471,7 @@ function ShardPanel({ c, view }: { c?: ClusterView; view?: RelayView }) {
   const [map, setMap] = useState(false)
   const [q, setQ] = useState('')
   const needle = q.trim().toLowerCase()
-  const found = useLivePoll(() => (needle.length >= 2 ? A.hosts({ q: needle, sort: 'host', desc: false, limit: 6 }) : Promise.resolve(undefined)), `owner:${needle}`, 10_000, { keep: true })
+  const found = useHostList({ q: needle, sort: 'host', desc: false, limit: 6 }, { poll: 10_000, keep: true, enabled: needle.length >= 2 })
   const owners = (c?.nodes ?? []).filter((n) => n.ownedHosts > 0 || !n.stale).sort((a, b) => a.id.localeCompare(b.id))
   const total = owners.reduce((a, n) => a + n.ownedHosts, 0) + (c?.unownedHosts ?? 0)
   const pct = (n: number) => (total ? (n / total) * 100 : 0)
@@ -537,7 +537,7 @@ function ShardPanel({ c, view }: { c?: ClusterView; view?: RelayView }) {
 /** One cell per host in the leader's table, coloured by its owner: behind "Show the map", since it asks for thousands of rows. */
 function OwnerMap({ view, focus }: { view?: RelayView; focus: string | null }) {
   const [hover, setHover] = useState<HostRow | null>(null)
-  const list = useLivePoll(() => A.hosts({ sort: 'host', desc: false, limit: OWNER_CAP }), 'owners', 10_000, { keep: true })
+  const list = useHostList({ sort: 'host', desc: false, limit: OWNER_CAP }, { poll: 10_000, keep: true })
   const hosts = list.data?.hosts ?? []
   const dead = (h: HostRow) => !h.node || !!view?.byId.get(h.node)?.stale
   if (!list.data) return <Loaded load={list}>{() => null}</Loaded>
@@ -624,7 +624,7 @@ function Counters({ rows }: { rows: MemberRow[] }) {
 }
 
 function Pipeline({ view }: { view?: RelayView }) {
-  const p = useLivePoll(A.pipelineOpt, 'pipeline', 5000)
+  const p = usePipeline()
   const d = p.data
   let body: ReactNode
   if (!d) body = <Loaded load={p}>{() => null}</Loaded>
