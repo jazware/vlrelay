@@ -1,11 +1,11 @@
 import { useEffect, useRef, type ReactNode } from 'react'
-import { setAdminToken } from '../../lib/api'
+import { getAdminOperator, setAdminToken } from '../../lib/api'
 import { releaseHeld } from '../../lib/console/firehose'
 import { ago, clock, dur, fmtSi } from '../../lib/console/fmt'
 import { getLive, togglePaused, toggleSources, useLiveState } from '../../lib/console/live'
 import { capPoll, consumersPoll, historyPoll, isSlow, openCasesPoll, overviewPoll, policyFullPoll, quorumPoll, seenEpochs, slowLagMs, throttledPoll } from '../../lib/console/polls'
 import { useRelay, type RelayView } from '../../lib/console/relay'
-import { setTheme, useResolvedTheme } from '../../lib/hooks'
+import { setTheme, useAdminOperator, useResolvedTheme } from '../../lib/hooks'
 import { Link, navigate, usePath } from '../../lib/router'
 import { closeDialog, DialogHost, isDialogOpen, openDialog } from './dialogs'
 import { detailPath, Drawer } from './Drawer'
@@ -117,6 +117,7 @@ function Side({ current }: { current: Section }) {
   const badges = useBadges()
   const { view } = useRelay()
   const live = useLiveState()
+  const operator = useAdminOperator()
   const self = view?.self ? view.byId.get(view.self) : view?.nodes[0]
   let group = ''
   return (
@@ -160,10 +161,19 @@ function Side({ current }: { current: Section }) {
           {live.showSources ? 'Hide' : 'Show'} data sources
         </button>
         <br />
-        <button type="button" className="cx-linklike" onClick={lock}>
-          Lock console
-        </button>{' '}
-        ·{' '}
+        {operator ? (
+          <>
+            Signed in as <span className="mono">{operator}</span> by the proxy.
+            <br />
+          </>
+        ) : (
+          <>
+            <button type="button" className="cx-linklike" onClick={lock}>
+              Lock console
+            </button>{' '}
+            ·{' '}
+          </>
+        )}
         <button type="button" className="cx-linklike" onClick={shortcutsDialog}>
           shortcuts
         </button>
@@ -258,7 +268,7 @@ function useCorePalette() {
           { group: 'Actions', title: 'Toggle light / dark', keys: ['t'], always: true, run: () => toggleRef.current() },
           { group: 'Actions', title: 'Keyboard shortcuts', keys: ['?'], always: true, run: shortcutsDialog },
           { group: 'Actions', title: live.showSources ? 'Hide data sources' : 'Show data sources', desc: 'which endpoint feeds each panel', run: toggleSources },
-          { group: 'Actions', title: 'Lock console', desc: 'forget the admin token in this tab', run: lock },
+          ...(getAdminOperator() ? [] : [{ group: 'Actions', title: 'Lock console', desc: 'forget the admin token in this tab', run: lock }]),
         ]
         const nodes: PalItem[] = (viewRef.current?.nodes ?? []).map((n) => ({
           group: 'Nodes',
@@ -380,6 +390,7 @@ export function Shell({ section, crumbs, children }: { section: Section; crumbs?
   const live = useLiveState()
   const { view } = useRelay()
   const { theme, toggle } = useThemeToggle()
+  const operator = useAdminOperator()
   useKeyboard(path)
   useCorePalette()
   const wasPaused = useRef(live.paused)
@@ -408,6 +419,11 @@ export function Shell({ section, crumbs, children }: { section: Section; crumbs?
             via <Swatch color={self.color} />
             <span className="mono">{self.id}</span>
             {lead === self.id && <span className="muted">(leader)</span>}
+          </div>
+        )}
+        {operator && (
+          <div className="cx-via" title="Signed in by the proxy in front of this node's admin listener">
+            as <span className="mono">{operator}</span>
           </div>
         )}
         <StreamChip held={held} />

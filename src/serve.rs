@@ -259,7 +259,17 @@ impl std::str::FromStr for Cidr {
     }
 }
 
+impl std::fmt::Display for Cidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.net, self.bits)
+    }
+}
+
 impl Cidr {
+    pub fn bits(&self) -> u8 {
+        self.bits
+    }
+
     pub fn contains(&self, ip: IpAddr) -> bool {
         let mask = |bits: u8, width: u32| if bits == 0 { 0 } else { u128::MAX << (width - bits as u32) };
         match (self.net, ip.to_canonical()) {

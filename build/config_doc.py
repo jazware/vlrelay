@@ -8,7 +8,8 @@ import re
 import sys
 
 SECTIONS = [
-    ("Serving", "", ["listen", "trusted-proxy", "admin-token", "admin-token-file", "ui-dir"]),
+    ("Serving", "", ["listen", "trusted-proxy", "admin-token", "admin-token-file", "admin-listen",
+                     "admin-proxy-header", "admin-proxy-from", "admin-operators", "ui-dir"]),
     (
         "Bucket",
         "Without `--memory`, the four `--s3-*` values are required (the keys directly or from their files). "

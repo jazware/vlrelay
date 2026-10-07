@@ -162,7 +162,7 @@ function noteDialog(c: Case) {
     tone: 'warn',
     primary: true,
     title: `Add a note to case ${c.id}`,
-    items: ['Kept on the case with the time and "admin". The status stays ' + c.status + '.'],
+    items: ['Kept on the case with the time and who you signed in as. The status stays ' + c.status + '.'],
     fields: [{ id: 'note', label: 'Note', type: 'textarea', required: true }],
     action: 'Add note',
     call: (v) => A.updateCaseCall(c.id, { status: null, note: String(v.note ?? '').trim() }),

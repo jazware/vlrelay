@@ -1,5 +1,6 @@
 // The operator API (src/admin.rs). Auth is `Basic admin:<token>`, as in the
-// vlpds console; the token lives in sessionStorage (survives a reload, not a
+// vlpds console, or nothing when a proxy in front of the admin listener names
+// the operator; the token lives in sessionStorage (survives a reload, not a
 // closed tab).
 
 export class ApiError extends Error {
@@ -539,9 +540,24 @@ let adminToken: string | null = (() => {
 })()
 const adminListeners = new Set<() => void>()
 
+// The operator a proxy in front of the admin listener signed in (`session` said `proxy`). Memory
+// only: the console asks again on load.
+let adminOperator: string | null = null
+
 export const getAdminToken = () => adminToken
+export const getAdminOperator = () => adminOperator
+/** What unlocks the console: the token, or a proxy's sign-in. */
+export const getAdminUnlock = () => adminToken ?? (adminOperator ? `proxy:${adminOperator}` : null)
+
+export function setAdminOperator(login: string | null) {
+  adminOperator = login
+  adminListeners.forEach((l) => l())
+}
+
+/** null also forgets a proxy's sign-in, so a 401 sends the console back to its gate. */
 export function setAdminToken(t: string | null) {
   adminToken = t
+  if (!t) adminOperator = null
   try {
     if (t) sessionStorage.setItem(AKEY, t)
     else sessionStorage.removeItem(AKEY)
@@ -576,8 +592,9 @@ export async function api<T = unknown>(
   o: { params?: Params; body?: unknown; method?: 'GET' | 'POST' | 'PUT' | 'DELETE'; token?: string } = {},
 ): Promise<T> {
   const token = o.token ?? adminToken
-  if (!token) throw new ApiError(401, 'AuthenticationRequired', 'Enter the admin token')
-  const headers: Record<string, string> = { Authorization: basic(token) }
+  if (!token && !adminOperator) throw new ApiError(401, 'AuthenticationRequired', 'Enter the admin token')
+  // behind a signing proxy the call carries no token: any Authorization header turns the proxy's sign-in off
+  const headers: Record<string, string> = token ? { Authorization: basic(token) } : {}
   if (o.body !== undefined) headers['Content-Type'] = 'application/json'
   const r = await fetch(`/admin/api/${path}${qs(o.params)}`, {
     method: o.method ?? (o.body !== undefined ? 'POST' : 'GET'),
@@ -597,6 +614,16 @@ export async function api<T = unknown>(
     throw new ApiError(r.status, err.error ?? `HTTP ${r.status}`, err.message ?? (typeof body === 'string' ? body : ''))
   }
   return body as T
+}
+
+export type AdminSession = { auth: 'token' | 'proxy'; operator?: string }
+
+/** `GET session` without a token: a proxy in front of the admin listener may already name the operator. */
+export async function proxySession(): Promise<AdminSession> {
+  const r = await fetch('/admin/api/session')
+  const body = await r.json().catch(() => ({}))
+  if (!r.ok) throw new ApiError(r.status, body.error ?? `HTTP ${r.status}`, body.message ?? '')
+  return body
 }
 
 export const enc = encodeURIComponent
