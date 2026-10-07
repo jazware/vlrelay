@@ -235,6 +235,11 @@ struct QuorumArgs {
     /// page-cache mode (the check the chaos must catch it without).
     #[arg(long)]
     qlog_unsafe_trust_log: bool,
+    /// SlateDB's block and metadata cache, shared by every database this
+    /// node opens (the quorum log's state, the PLC seeds): the total in
+    /// MiB, four parts blocks to one of indexes and filters.
+    #[arg(long, env = "VLRELAY_SLATEDB_CACHE_MB", default_value_t = vlrelay::qlog::cache::DEFAULT_MB)]
+    slatedb_cache_mb: u64,
 }
 
 fn quorum_setup(q: &QuorumArgs, node_id: &str) -> anyhow::Result<vlrelay::node::quorum::QuorumSetup> {
@@ -273,6 +278,7 @@ fn quorum_setup(q: &QuorumArgs, node_id: &str) -> anyhow::Result<vlrelay::node::
     s.trust_after_power_loss = q.qlog_unsafe_trust_log;
     s.fsync_delay = q.qlog_fsync_delay_us.map(Duration::from_micros);
     vlrelay::qlog::state::set_compactor_poll(Duration::from_millis(q.qlog_state_compactor_poll_ms));
+    vlrelay::qlog::cache::configure(q.slatedb_cache_mb);
     if let Some(at) = q.qlog_crash_at.clone().filter(|a| !a.is_empty()) {
         use vlrelay::qlog::flush::Step;
         let only: Option<Step> = if at == "any" { None } else { Some(at.parse().map_err(anyhow::Error::msg)?) };

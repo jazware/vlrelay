@@ -308,8 +308,11 @@ impl SeedWriter {
     pub async fn open(store: &Store, ttl: Duration) -> anyhow::Result<SeedWriter> {
         // a few seconds of the tail fit one memtable; the backfill seals
         // 64 MiB L0s as it goes
-        let db = slatedb::Db::builder(db_path(store), store.raw.clone())
+        let path = db_path(store);
+        let (cache, id) = crate::qlog::cache::for_db(path.as_ref());
+        let db = slatedb::Db::builder(path, store.raw.clone())
             .with_settings(crate::qlog::state::settings(64 << 20))
+            .with_db_cache(cache, id)
             .build()
             .await?;
         let recent_after_ms = crate::policy::store::now_ms().saturating_sub(ttl.as_millis() as i64) as u64;
@@ -414,7 +417,10 @@ impl SeedReader {
             skip_wal_replay: true,
             ..Default::default()
         };
-        match slatedb::DbReader::builder(db_path(&self.store), self.store.raw.clone())
+        let path = db_path(&self.store);
+        let (cache, id) = crate::qlog::cache::for_db(path.as_ref());
+        match slatedb::DbReader::builder(path, self.store.raw.clone())
+            .with_db_cache(cache, id)
             .with_options(opts)
             .with_reader_mode(slatedb::DbReaderMode::FollowLatest)
             .build()
