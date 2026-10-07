@@ -15,6 +15,7 @@
 # guards at the hour's numbers: neither may trip).
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
+. "$here/ms.sh"
 crate="$(cd "$here/../.." && pwd)"
 cd "$crate"
 export QLOG_BASE=${QLOG_BASE:-4650} QLOG_NO_BUILD=1
@@ -33,7 +34,7 @@ run() {
   rm -rf "$out"
   mkdir -p "$out"
   local t0
-  t0=$(($(date +%s%N) / 1000000))
+  t0=$(ms)
   env "$@" OUT="$run" BUDGET="$budget" CL_DIR=/dev/shm/vlrq-guard-$B FLUSH_MS="${FLUSH_MS:-30000}" \
     setsid bash "$here/chaos.sh" "$scenario" --duration "$secs" --every 15 >"$out/chaos.log" 2>&1 &
   local harness=$!
@@ -51,7 +52,7 @@ run() {
   wait "$harness"
   local rc=$?
   local t1
-  t1=$(($(date +%s%N) / 1000000))
+  t1=$(ms)
   touch "$out/done"
   [ -n "$watchdog" ] && wait "$watchdog"
   local wrc=$?
