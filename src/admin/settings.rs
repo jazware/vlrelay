@@ -30,9 +30,10 @@ pub struct SettingsView {
     pub entries: Vec<ConfigEntry>,
 }
 
-/// Names that carry credentials whatever clap is told about them.
+/// Names that carry credentials whatever clap is told about them. A
+/// `*_file` twin holds a path, which is shown.
 fn secret_name(id: &str) -> bool {
-    ["token", "secret", "access_key", "password"].iter().any(|s| id.contains(s))
+    !id.ends_with("_file") && ["token", "secret", "access_key", "password"].iter().any(|s| id.contains(s))
 }
 
 /// Every argument of `cmd` as `m` parsed it.
@@ -84,15 +85,25 @@ mod tests {
         let cmd = Command::new("t")
             .arg(Arg::new("listen").long("listen").default_value("127.0.0.1:1"))
             .arg(Arg::new("admin_token").long("admin-token"))
+            .arg(Arg::new("admin_token_file").long("admin-token-file"))
             .arg(Arg::new("s3_secret_key").long("s3-secret-key").hide_env_values(true))
             .arg(Arg::new("memory").long("memory").action(ArgAction::SetTrue));
-        let m = cmd.clone().get_matches_from(["t", "--admin-token", "hunter2", "--memory"]);
+        let m = cmd.clone().get_matches_from([
+            "t",
+            "--admin-token",
+            "hunter2",
+            "--admin-token-file",
+            "/run/secrets/admin-token",
+            "--memory",
+        ]);
         let v = from_clap(&cmd, &m);
         let get = |f: &str| v.entries.iter().find(|e| e.flag == f).unwrap();
         assert_eq!(get("--listen").source, "default");
         assert_eq!(get("--listen").value.as_deref(), Some("127.0.0.1:1"));
         let tok = get("--admin-token");
         assert!(tok.secret && tok.set && tok.value.is_none() && tok.source == "flag");
+        let file = get("--admin-token-file");
+        assert!(!file.secret && file.value.as_deref() == Some("/run/secrets/admin-token"));
         let s3 = get("--s3-secret-key");
         assert!(s3.secret && !s3.set && s3.source == "unset");
         assert_eq!(get("--memory").value.as_deref(), Some("true"));

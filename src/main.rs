@@ -35,10 +35,16 @@ struct Args {
     s3_endpoint: Option<String>,
     #[arg(long, env = "VLRELAY_S3_BUCKET")]
     s3_bucket: Option<String>,
-    #[arg(long, env = "VLRELAY_S3_ACCESS_KEY")]
+    #[arg(long, env = "VLRELAY_S3_ACCESS_KEY", hide_env_values = true)]
     s3_access_key: Option<String>,
+    /// --s3-access-key from a file, less one trailing newline.
+    #[arg(long, env = "VLRELAY_S3_ACCESS_KEY_FILE", conflicts_with = "s3_access_key")]
+    s3_access_key_file: Option<PathBuf>,
     #[arg(long, env = "VLRELAY_S3_SECRET_KEY", hide_env_values = true)]
     s3_secret_key: Option<String>,
+    /// --s3-secret-key from a file, less one trailing newline.
+    #[arg(long, env = "VLRELAY_S3_SECRET_KEY_FILE", conflicts_with = "s3_secret_key")]
+    s3_secret_key_file: Option<PathBuf>,
     #[arg(long, default_value = "auto", env = "VLRELAY_S3_REGION")]
     s3_region: String,
     /// Send PUT bodies as SigV4 UNSIGNED-PAYLOAD instead of hashing each
@@ -91,6 +97,9 @@ struct Args {
     /// Turns on /admin (dashboard and API) with this token.
     #[arg(long, env = "VLRELAY_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
+    /// --admin-token from a file, less one trailing newline.
+    #[arg(long, env = "VLRELAY_ADMIN_TOKEN_FILE", conflicts_with = "admin_token")]
+    admin_token_file: Option<PathBuf>,
     /// A built dashboard (`ui/dist`); default: this tree's, if built.
     #[arg(long)]
     ui_dir: Option<PathBuf>,
@@ -167,6 +176,9 @@ struct QuorumArgs {
     /// Bearer token membership changes need (`qlog member`, the dashboard).
     #[arg(long, env = "QLOG_ADMIN_TOKEN", hide_env_values = true)]
     qlog_admin_token: Option<String>,
+    /// --qlog-admin-token from a file, less one trailing newline.
+    #[arg(long, env = "QLOG_ADMIN_TOKEN_FILE", conflicts_with = "qlog_admin_token")]
+    qlog_admin_token_file: Option<PathBuf>,
     /// Bucket retention, run by the leader: segments older than this go
     /// (0: never).
     #[arg(long, default_value_t = 72)]
@@ -299,6 +311,18 @@ fn quorum_setup(q: &QuorumArgs, node_id: &str) -> anyhow::Result<vlrelay::node::
     Ok(s)
 }
 
+/// Fills each secret given as a file (clap's `conflicts_with` keeps a secret
+/// and its file from both being set). Errors name the flag and the path,
+/// never the contents.
+fn read_secret_files(a: &mut Args) -> anyhow::Result<()> {
+    use vlpds::secret_file::resolve;
+    resolve("s3-access-key-file", &a.s3_access_key_file, &mut a.s3_access_key)?;
+    resolve("s3-secret-key-file", &a.s3_secret_key_file, &mut a.s3_secret_key)?;
+    resolve("admin-token-file", &a.admin_token_file, &mut a.admin_token)?;
+    resolve("qlog-admin-token-file", &a.quorum.qlog_admin_token_file, &mut a.quorum.qlog_admin_token)?;
+    Ok(())
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -323,7 +347,8 @@ fn main() {
     std::process::exit(code);
 }
 
-async fn run(a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<()> {
+async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Result<()> {
+    read_secret_files(&mut a)?;
     let loopback_plc = a.plc_url.contains("://127.") || a.plc_url.contains("://localhost");
     let dev_mode = a.dev_mode || a.hosts.iter().any(|h| h.starts_with("http://")) || loopback_plc;
     let store = if a.memory {
@@ -495,5 +520,96 @@ async fn seed_discovery(admin: &NodeAdmin, urls: &[String]) {
             Err(e) => tracing::info!("--bootstrap-relay: saving the policy ({e}); again"),
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    const SECRETS: [(&str, &str, &str, &str); 4] = [
+        ("--s3-access-key", "VLRELAY_S3_ACCESS_KEY", "--s3-access-key-file", "VLRELAY_S3_ACCESS_KEY_FILE"),
+        ("--s3-secret-key", "VLRELAY_S3_SECRET_KEY", "--s3-secret-key-file", "VLRELAY_S3_SECRET_KEY_FILE"),
+        ("--admin-token", "VLRELAY_ADMIN_TOKEN", "--admin-token-file", "VLRELAY_ADMIN_TOKEN_FILE"),
+        ("--qlog-admin-token", "QLOG_ADMIN_TOKEN", "--qlog-admin-token-file", "QLOG_ADMIN_TOKEN_FILE"),
+    ];
+
+    /// Parsing `Args` reads the process env, which one test sets.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn tmp(contents: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("vlrelay-secret-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+
+    #[test]
+    fn secret_and_its_file_conflict_without_printing_the_secret() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        for (flag, _, file_flag, _) in SECRETS {
+            let e = Args::try_parse_from(["vlrelay", flag, "hunter2", file_flag, "/run/secret"]).unwrap_err();
+            assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict, "{flag}");
+            assert!(!e.render().to_string().contains("hunter2"), "{flag}");
+        }
+    }
+
+    #[test]
+    fn secret_and_its_file_conflict_from_env() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, env, _, file_env) in SECRETS {
+            // SAFETY: every test that reads the env holds ENV
+            unsafe {
+                std::env::set_var(env, "hunter2");
+                std::env::set_var(file_env, "/run/secret");
+            }
+            let r = Args::try_parse_from(["vlrelay"]);
+            unsafe {
+                std::env::remove_var(env);
+                std::env::remove_var(file_env);
+            }
+            let e = r.unwrap_err();
+            assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict, "{env}");
+            assert!(!e.render().to_string().contains("hunter2"), "{env}");
+        }
+    }
+
+    #[test]
+    fn files_fill_the_secrets_less_a_trailing_newline() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let mut argv = vec!["vlrelay".to_string()];
+        let mut paths = Vec::new();
+        for (i, (_, _, file_flag, _)) in SECRETS.iter().enumerate() {
+            let p = tmp(&format!("secret-{i}\n"));
+            argv.extend([file_flag.to_string(), p.display().to_string()]);
+            paths.push(p);
+        }
+        let mut a = Args::try_parse_from(&argv).unwrap();
+        read_secret_files(&mut a).unwrap();
+        assert_eq!(a.s3_access_key.as_deref(), Some("secret-0"));
+        assert_eq!(a.s3_secret_key.as_deref(), Some("secret-1"));
+        assert_eq!(a.admin_token.as_deref(), Some("secret-2"));
+        assert_eq!(a.quorum.qlog_admin_token.as_deref(), Some("secret-3"));
+        for p in paths {
+            std::fs::remove_file(p).unwrap();
+        }
+    }
+
+    #[test]
+    fn unreadable_or_empty_file_is_an_error_naming_the_flag() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let missing = std::env::temp_dir().join("vlrelay-secret-does-not-exist");
+        let mut a =
+            Args::try_parse_from([OsStr::new("vlrelay"), OsStr::new("--admin-token-file"), missing.as_os_str()])
+                .unwrap();
+        let e = read_secret_files(&mut a).unwrap_err().to_string();
+        assert!(e.contains("--admin-token-file") && e.contains("vlrelay-secret-does-not-exist"), "{e}");
+        let empty = tmp("\n");
+        let mut a =
+            Args::try_parse_from([OsStr::new("vlrelay"), OsStr::new("--qlog-admin-token-file"), empty.as_os_str()])
+                .unwrap();
+        let e = read_secret_files(&mut a).unwrap_err().to_string();
+        assert!(e.contains("--qlog-admin-token-file") && e.contains("is empty"), "{e}");
+        std::fs::remove_file(empty).unwrap();
     }
 }
