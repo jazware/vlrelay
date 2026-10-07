@@ -12,23 +12,20 @@ import { capPoll, discoveryPoll, overviewPoll, policyFullPoll, policyPoll, slowL
 import { useRelay } from '../../lib/console/relay'
 import { Link, useSearch } from '../../lib/router'
 import { AdmissionTable } from './Admissions'
-import { SourceSelect, SourceTag, sourceOk } from './hostSource'
+import { SourceSelect, SourceTag, sourceParam } from './hostSource'
 import { crawlDialog } from './Overview'
 import { NodeTag, REASON_WHAT, reasonLabel, relayBanners } from './relayUi'
 
 // Every PDS the relay knows, thousands of them: the server filters, sorts and pages
-// (GET hosts?q&tier&status&sort&desc&limit&offset). The flags (at cap, lagging, erroring, accounts
-// created throttled) and the source have no server filter, so with one on the page asks for every
-// match and filters here. `?reason=` (from the Overview's reject bars) adds the hosts sending
-// that reject, and a search that finds nothing shows the name's admissions.
+// (GET hosts?q&tier&status&source&flag&sort&desc&limit&offset), so the page asks for the rows
+// it shows. `?reason=` (from the Overview's reject bars) adds the hosts sending that reject, and
+// a search that finds nothing shows the name's admissions.
 
 const PAGE = 100
 type Flag = '' | 'cap' | 'lag' | 'err' | 'thr'
-const SORTABLE: A.HostSort[] = ['host', 'status', 'events', 'errors', 'accounts', 'lag', 'seq']
+const FLAG: Record<Exclude<Flag, ''>, A.HostFlag> = { cap: 'atCap', lag: 'lagging', err: 'erroring', thr: 'throttledOrAtCap' }
+const SORTABLE: A.HostSort[] = ['host', 'status', 'events', 'errors', 'accounts', 'throttled', 'lag', 'seq', 'source']
 const live = (h: HostRow) => h.status === 'connected' || h.status === 'throttled'
-const atCap = (h: HostRow) => h.maxAccounts > 0 && h.accounts >= h.maxAccounts
-const flagOk = (f: Flag, h: HostRow) =>
-  f === 'cap' ? atCap(h) : f === 'lag' ? live(h) && h.lagMs > 60_000 : f === 'err' ? h.errorRate > 0.1 : f === 'thr' ? h.throttledAccounts > 0 || atCap(h) : true
 
 function useUrlState() {
   const s = useSearch()
@@ -85,21 +82,19 @@ export function Hosts() {
         q: u.q.trim().toLowerCase() || undefined,
         tier: u.tier,
         status: u.status,
+        source: sourceParam(u.source),
+        flag: u.flag ? FLAG[u.flag] : undefined,
         sort: u.sort,
         desc: !u.asc,
-        ...(u.flag || u.source ? { limit: 10_000 } : { limit: PAGE, offset: u.page * PAGE }),
+        limit: PAGE,
+        offset: u.page * PAGE,
       }),
     key,
     5000,
     { keep: true },
   )
-  const { rows, matched } = useMemo(() => {
-    const d = list.data
-    if (!d) return { rows: [] as HostRow[], matched: 0 }
-    if (!u.flag && !u.source) return { rows: d.hosts, matched: d.total }
-    const f = d.hosts.filter((h) => flagOk(u.flag, h) && sourceOk(u.source, h.source))
-    return { rows: f.slice(u.page * PAGE, u.page * PAGE + PAGE), matched: f.length }
-  }, [list.data, u.flag, u.source, u.page])
+  const rows = list.data?.hosts ?? []
+  const matched = list.data?.total ?? 0
   const disc = discoveryPoll.use()
   const pages = Math.max(1, Math.ceil(matched / PAGE))
 
@@ -215,7 +210,7 @@ export function Hosts() {
       <Panel
         title={u.reason ? <>Every host by its share of rejects</> : 'Every host'}
         className={u.reason ? 'cx-mt' : undefined}
-        src={<Src>hosts?q&amp;tier&amp;status&amp;sort&amp;limit&amp;offset</Src>}
+        src={<Src>hosts?q&amp;tier&amp;status&amp;source&amp;flag&amp;sort&amp;limit&amp;offset</Src>}
         right={
           <span className="muted sm">
             <Kbd k={['j', 'k', '↵']} />

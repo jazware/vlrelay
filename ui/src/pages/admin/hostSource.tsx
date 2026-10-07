@@ -2,7 +2,9 @@
 
 /** A host's source against the filter: `bootstrap` is any seed relay, `none` a host with no source recorded. */
 export const sourceOk = (f: string, s: string | null | undefined) => !f || (f === 'none' ? !s : f === 'bootstrap' ? !!s?.startsWith('bootstrap:') : s === f)
-export const SOURCES = ['requestCrawl', 'bootstrap', 'plc', 'cli']
+/** The filter as `GET hosts?source=` takes it: `bootstrap:` is the prefix of every seed relay's key. */
+export const sourceParam = (f: string) => (f === 'bootstrap' ? 'bootstrap:' : f || undefined)
+export const SOURCES =['requestCrawl', 'bootstrap', 'plc', 'cli']
 
 /** Where a host came from, short: "requestCrawl", "seed relay.example.com", "PLC export", "cli". */
 export function SourceTag({ s }: { s: string | null | undefined }) {

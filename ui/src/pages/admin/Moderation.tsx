@@ -346,9 +346,9 @@ const SHOWN = 10
 
 /** The hosts with accounts created throttled, or at their cap (the next ones will be). */
 function Throttled() {
-  const list = useLivePoll(() => A.hosts({ sort: 'accounts', desc: true }), 'throttled-accounts', 30_000, { keep: true })
+  const list = useLivePoll(() => A.hosts({ flag: 'throttledOrAtCap', sort: 'accounts', desc: true }), 'throttled-accounts', 30_000, { keep: true })
   const atCap = (h: HostRow) => h.maxAccounts > 0 && h.accounts >= h.maxAccounts
-  const rows = (list.data?.hosts ?? []).filter((h) => h.throttledAccounts > 0 || atCap(h)).sort((a, b) => b.throttledAccounts - a.throttledAccounts || b.accounts - a.accounts)
+  const rows = [...(list.data?.hosts ?? [])].sort((a, b) => b.throttledAccounts - a.throttledAccounts || b.accounts - a.accounts)
   const total = rows.reduce((a, h) => a + h.throttledAccounts, 0)
   const capped = rows.filter(atCap).length
   const cols: Col<HostRow>[] = [

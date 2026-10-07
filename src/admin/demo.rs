@@ -2244,6 +2244,14 @@ mod tests {
                 && h["throttledAccounts"].as_u64().unwrap() > 0)
         );
         assert!(hs.windows(2).all(|w| w[0]["throttledAccounts"].as_u64() >= w[1]["throttledAccounts"].as_u64()));
+        let held = json(call("GET", "/admin/api/hosts?flag=throttledOrAtCap", true).await.unwrap()).await;
+        let hs = held["hosts"].as_array().unwrap();
+        assert!(!hs.is_empty());
+        assert!(hs.iter().all(|h| {
+            let (n, cap) = (h["accounts"].as_u64().unwrap(), h["maxAccounts"].as_u64().unwrap());
+            h["throttledAccounts"].as_u64().unwrap() > 0 || (cap > 0 && n >= cap)
+        }));
+        assert_eq!(call("GET", "/admin/api/hosts?flag=nope", true).await.unwrap().status(), StatusCode::BAD_REQUEST);
 
         // the tiers are one set wherever the console reads them
         let tiers = |v: &serde_json::Value| -> std::collections::BTreeSet<String> {

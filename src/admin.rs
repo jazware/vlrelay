@@ -219,10 +219,14 @@ pub struct HostQuery {
     pub tier: Option<String>,
     pub status: Option<HostStatus>,
     /// A source (`requestCrawl`, `plc`, `cli`, `bootstrap:<relay>`), or a
-    /// prefix of one ending in `:` or `*` (`bootstrap:` is every relay).
+    /// prefix of one ending in `:` or `*` (`bootstrap:` is every relay), or
+    /// `none` (not recorded).
     pub source: Option<String>,
     /// Only hosts with (true) or without (false) throttled accounts.
     pub throttled: Option<bool>,
+    /// `atCap`, `lagging`, `erroring` or `throttledOrAtCap`, as
+    /// [`HostQuery::keeps`] reads them.
+    pub flag: Option<String>,
     /// `host`, `tier`, `status`, `events`, `errors`, `accounts`, `seq`,
     /// `since`, `lag`, `throttled`, `source`.
     pub sort: Option<String>,
@@ -1020,6 +1024,11 @@ pub struct NodeQuery {
 }
 
 impl HostQuery {
+    /// A `flag` this query can't filter by.
+    pub fn bad_flag(&self) -> Option<&str> {
+        self.flag.as_deref().filter(|f| !matches!(*f, "" | "atCap" | "lagging" | "erroring" | "throttledOrAtCap"))
+    }
+
     /// The filters past the name, tier and status ones.
     pub fn keeps(&self, r: &HostRow) -> bool {
         let src = self.source.as_deref().filter(|s| !s.is_empty()).is_none_or(|want| {
@@ -1027,10 +1036,20 @@ impl HostQuery {
             match want.strip_suffix('*') {
                 Some(p) => have.starts_with(p),
                 None if want.ends_with(':') => have.starts_with(want),
+                None if want == "none" => have.is_empty(),
                 None => have == want,
             }
         });
-        src && self.throttled.is_none_or(|t| (r.throttled_accounts > 0) == t)
+        let live = matches!(r.status, HostStatus::Connected | HostStatus::Throttled);
+        let at_cap = r.max_accounts > 0 && r.accounts >= r.max_accounts;
+        let flag = match self.flag.as_deref() {
+            Some("atCap") => at_cap,
+            Some("lagging") => live && r.lag_ms > 60_000.0,
+            Some("erroring") => r.error_rate > 0.1,
+            Some("throttledOrAtCap") => r.throttled_accounts > 0 || at_cap,
+            _ => true,
+        };
+        src && flag && self.throttled.is_none_or(|t| (r.throttled_accounts > 0) == t)
     }
 }
 
@@ -1305,6 +1324,9 @@ async fn overview<S: AdminSource>(State(c): Ax<S>) -> AdminResult<Json<Overview>
     Ok(Json(c.src.overview().await?))
 }
 async fn hosts<S: AdminSource>(State(c): Ax<S>, Query(q): Query<HostQuery>) -> AdminResult<Json<HostList>> {
+    if let Some(f) = q.bad_flag() {
+        return Err(AdminError::BadRequest(format!("unknown flag {f}")));
+    }
     Ok(Json(c.src.hosts(q).await?))
 }
 async fn host<S: AdminSource>(State(c): Ax<S>, Path(h): Path<String>) -> AdminResult<Json<HostDetail>> {

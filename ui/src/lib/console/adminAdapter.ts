@@ -69,17 +69,21 @@ export type HostQuery = {
   q?: string
   tier?: string
   status?: HostStatus | ''
-  /** a source, or a prefix ending in `:` or `*` (`bootstrap:` is every seed relay) */
+  /** a source, a prefix ending in `:` or `*` (`bootstrap:` is every seed relay), or `none` (not recorded) */
   source?: string
   /** only hosts with (true) or without (false) throttled accounts */
   throttled?: boolean
+  flag?: HostFlag
   sort: HostSort
   desc: boolean
   limit?: number
   offset?: number
 }
+/** `lagging`: connected or throttled and over a minute behind; `erroring`: over 10% of frames rejected. */
+export type HostFlag = 'atCap' | 'lagging' | 'erroring' | 'throttledOrAtCap'
 /** Server-side filter, sort and page (`limit` default 10,000 on the server). */
-export const hosts = (q: HostQuery) => api<HostList>('hosts', { params: { q: q.q || undefined, tier: q.tier || undefined, status: q.status || undefined, source: q.source || undefined, throttled: q.throttled, sort: q.sort, desc: q.desc, limit: q.limit, offset: q.offset } })
+export const hosts = (q: HostQuery) =>
+  api<HostList>('hosts', { params: { q: q.q || undefined, tier: q.tier || undefined, status: q.status || undefined, source: q.source || undefined, throttled: q.throttled, flag: q.flag, sort: q.sort, desc: q.desc, limit: q.limit, offset: q.offset } })
 export const host = (h: string) => api<HostDetail>(`hosts/${enc(h)}`)
 export const hostAction = (h: string, a: HostAction) => api<HostRow>(`hosts/${enc(h)}/action`, { body: a })
 /** What hostAction sends, for the confirm dialog's footer. */
