@@ -11,10 +11,10 @@ publish = false
 # crypto, MST, CAR and DID resolution. Factored into shared crates once the
 # relay settles which pieces it needs.
 # the public vlpds at the commit this one was exported against
-vlpds = { git = "https://github.com/jazware/vlpds", rev = "89684b8e120dac35b5458ec5204b24b24265e048" }
+vlpds = { git = "https://github.com/jazware/vlpds", rev = "3d048ba07c7a647e142515a3f044d1c913a81768" }
 # SlateDB metrics with a `db` label per database, and each one's shape for
 # GET /admin/api/store
-slate-metrics = { git = "https://github.com/jazware/vlpds", rev = "89684b8e120dac35b5458ec5204b24b24265e048" }
+slate-metrics = { git = "https://github.com/jazware/vlpds", rev = "3d048ba07c7a647e142515a3f044d1c913a81768" }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws", "macros", "http2"] }
@@ -90,8 +90,8 @@ shrike = { version = "=0.7.0", default-features = false, features = ["syntax", "
 
 # the fork rev vlpds pins (vlpds/Cargo.toml lists its patches)
 [patch.crates-io]
-slatedb = { git = "https://github.com/jazware/slatedb", rev = "9bbeb849e6ead04556c831c50078568ca118903c" }
-slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "9bbeb849e6ead04556c831c50078568ca118903c" }
+slatedb = { git = "https://github.com/jazware/slatedb", rev = "87db9e3b3f5ba8d0473deb240990e33cb5e50208" }
+slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "87db9e3b3f5ba8d0473deb240990e33cb5e50208" }
 
 [profile.release]
 opt-level = 3
