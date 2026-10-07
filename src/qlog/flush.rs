@@ -199,6 +199,15 @@ impl Manifest {
         }
         true
     }
+
+    /// Where a stream that has emitted up to `at` goes on: past the gap
+    /// `at` starts or is inside (and any gaps right after it), else `at`.
+    pub fn past_gaps(&self, mut at: u64) -> u64 {
+        while let Some(&(_, u)) = self.gaps.iter().find(|&&(a, u)| a <= at && at < u) {
+            at = u;
+        }
+        at
+    }
 }
 
 fn manifest_path(store: &Store) -> Path {
@@ -829,6 +838,41 @@ pub(crate) async fn read_bucket(
     upto: u64,
     max_bytes: usize,
 ) -> anyhow::Result<Option<(u64, Vec<Entry>)>> {
+    let Some((ord, seg, i)) = locate(store, cache, from, upto).await? else { return Ok(None) };
+    let prev_epoch = if i > 0 {
+        seg[i - 1].epoch
+    } else if from == 1 {
+        0
+    } else {
+        let mut c = None;
+        match load_segment(store, ord - 1, &mut c).await? {
+            Some(p) if p.last().is_some_and(|e| e.seq == from - 1) => p.last().expect("checked").epoch,
+            _ => return Ok(None),
+        }
+    };
+    Ok(Some((prev_epoch, take(&seg[i..], upto, max_bytes))))
+}
+
+/// As `read_bucket`, without the epoch of `from - 1`, so `from` may be the
+/// first seq past a recovery's gap (what an emitter hands its consumers).
+pub(crate) async fn read_bucket_entries(
+    store: &Store,
+    cache: &mut SegCache,
+    from: u64,
+    upto: u64,
+    max_bytes: usize,
+) -> anyhow::Result<Option<Vec<Entry>>> {
+    let Some((_, seg, i)) = locate(store, cache, from, upto).await? else { return Ok(None) };
+    Ok(Some(take(&seg[i..], upto, max_bytes)))
+}
+
+/// The segment holding `from` and its index there.
+async fn locate(
+    store: &Store,
+    cache: &mut SegCache,
+    from: u64,
+    upto: u64,
+) -> anyhow::Result<Option<(u64, Arc<Vec<Entry>>, usize)>> {
     if from == 0 || from > upto {
         return Ok(None);
     }
@@ -843,27 +887,20 @@ pub(crate) async fn read_bucket(
     if i > seg.len() {
         return Ok(None);
     }
-    let prev_epoch = if i > 0 {
-        seg[i - 1].epoch
-    } else if from == 1 {
-        0
-    } else {
-        let mut c = None;
-        match load_segment(store, ord - 1, &mut c).await? {
-            Some(p) if p.last().is_some_and(|e| e.seq == from - 1) => p.last().expect("checked").epoch,
-            _ => return Ok(None),
-        }
-    };
+    Ok(Some((ord, seg, i)))
+}
+
+fn take(es: &[Entry], upto: u64, max_bytes: usize) -> Vec<Entry> {
     let mut n = 0;
     let mut out = Vec::new();
-    for e in seg[i..].iter().take_while(|e| e.seq <= upto) {
+    for e in es.iter().take_while(|e| e.seq <= upto) {
         if !out.is_empty() && n + e.data.len() > max_bytes {
             break;
         }
         n += e.data.len();
         out.push(e.clone());
     }
-    Ok(Some((prev_epoch, out)))
+    out
 }
 
 #[derive(Debug)]

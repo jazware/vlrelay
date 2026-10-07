@@ -2230,18 +2230,21 @@ impl Node {
         let (after, base) = (rec.after, rec.base);
         // This incarnation's live consumers get everything up to S before the
         // jump; S is in the bucket now. A process that hasn't emitted has no
-        // live consumers (reconnecting ones backfill).
+        // live consumers (reconnecting ones backfill). A node that restarted
+        // behind an earlier recovery's gap crosses it: that recovery's log
+        // is in the bucket past it.
         let emitted = self.core.lock().emitted;
         let mut catch_up = Vec::new();
         if self.emit.firehose().is_some() && emitted < after {
             let mut cache: flush::SegCache = None;
-            let mut next = emitted + 1;
+            let mut next = m.past_gaps(emitted) + 1;
             while next <= after {
-                match flush::read_bucket(&self.bucket.backfill, &mut cache, next, after, 8 << 20).await? {
-                    Some((_, es)) if !es.is_empty() => {
+                match flush::read_bucket_entries(&self.bucket.backfill, &mut cache, next, after, 8 << 20).await? {
+                    Some(es) if !es.is_empty() => {
                         next = es.last().expect("non-empty").seq + 1;
                         catch_up.extend(es);
                     }
+                    _ if m.past_gaps(next - 1) >= next => next = m.past_gaps(next - 1) + 1,
                     _ => break,
                 }
             }
@@ -2253,7 +2256,7 @@ impl Node {
             // next reads it
             return Ok(());
         }
-        if !catch_up.is_empty() && catch_up[0].seq == c.emitted + 1 {
+        if !catch_up.is_empty() && catch_up[0].seq == m.past_gaps(c.emitted) + 1 {
             let upto = catch_up.last().expect("non-empty").seq;
             if let Some(h) = &self.cfg.hooks.0 {
                 h.committed(&catch_up);
@@ -2822,20 +2825,37 @@ impl Node {
                     }
                 }
             };
-            let read = flush::read_bucket(&self.bucket.backfill, &mut cache, from + 1, to, 8 << 20).await;
+            let read = flush::read_bucket_entries(&self.bucket.backfill, &mut cache, from + 1, to, 8 << 20).await;
+            let held = matches!(&read, Ok(Some(es)) if es.first().is_some_and(|e| e.seq == from + 1));
+            // Two resets before the bucket is read (recoveries in a row) leave
+            // `to` past a second gap, with real seqs between the two: cross
+            // only the gap `from` is in, then read on.
+            let gap_end = if held || read.is_err() {
+                None
+            } else {
+                match flush::read_manifest(&self.bucket.flush).await {
+                    Ok(Some((m, _))) => Some(m.past_gaps(from)).filter(|&u| u > from && u < to),
+                    _ => None,
+                }
+            };
             let _order = self.emit_order.lock();
             let mut c = self.core.lock();
             if c.emitted != from {
                 continue;
             }
             match read {
-                Ok(Some((_, es))) if es.first().is_some_and(|e| e.seq == from + 1) => {
+                Ok(Some(es)) if held => {
                     let upto = es.last().expect("non-empty").seq;
                     if let Some(h) = &self.cfg.hooks.0 {
                         h.committed(&es);
                     }
                     self.emit.emit(from, upto, es.into_iter().map(|e| (e.seq as i64, e.data)).collect());
                     c.emitted = upto;
+                }
+                _ if gap_end.is_some() => {
+                    let u = gap_end.expect("checked");
+                    self.stats.emit_gaps.fetch_add(u - from, Ordering::Relaxed);
+                    c.emitted = u;
                 }
                 r => {
                     let to = c.jump_to.take().unwrap_or(to).max(to);
