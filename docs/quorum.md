@@ -1137,6 +1137,8 @@ The relay runs on the quorum log, and only there (`src/node/quorum.rs`; the libr
 - **Retention as a loop (slice 5).** Each leader term runs `retain::plan`, `apply` and `write` every `--qlog-retain-every-secs` (600) with `--qlog-retain-hours` (72; 0 turns it off), the same plan and re-checks as `qlog retain --apply`, billed to `qlog_retain`. `the_leader_runs_bucket_retention_on_a_loop` prunes under load and verifies what's left.
 - **The firehose starts at the first emission.** A node makes its firehose (and its backfill floor) at the first entry it emits, as Phases 1-6 did, so a node wiped past a recovery gap serves old cursors from the bucket across every gap rather than skipping the seqs between the bucket's F and its first emission.
 
+- **The PLC export and host discovery as leader jobs.** The export reader (`plc_seed`) and host discovery (`discovery`: other relays' `listHosts` and the export's PDS hosts, through this relay's own admission) run on the leader, one term at a time, with their progress in the bucket (`plc/export-checkpoint.json`, `discovery/state.json`) so a new leader resumes them. Both are caches of what the network says, not the log's state: the export's seeds live in their own SlateDB (`plc/seeds`, every member reads it), and discovery only feeds admission.
+
 Four bugs the chaos found, each now covered:
 
 - **Two sockets on one host** (a node that had just started subscribed to every host before its filter landed, and a moved host's old owner keeps reading until it polls) interleaved a DID's events at the leader: prevData mismatches, then the account desynchronized. The leader admits a host's events only from the member its host table names (`not_owner`, which the old owner's lane takes as a fenced socket), and a node reads nothing until the leader gives it hosts.
@@ -1146,7 +1148,120 @@ Four bugs the chaos found, each now covered:
 
 ### Tests, chaos and numbers (Phase 7)
 
-PHASE7_CHAOS
+`tests/qlog/relay-chaos.sh` (`just relay-chaos`) runs three `vlrelay` nodes on a local MinIO, each restarted by a supervisor, with commitlogs on tmpfs and a 1 ms emulated fsync, fed by `fakepds` (16 hosts, 200 accounts each, commits, `#identity`, `#account` and `#sync`, the fake PLC on the side), 2 s flushes. Every node's `subscribeRepos` is consumed from cursor 0 by `qlog check --relay-frames` (no seq emitted twice or out of order on any node, nothing acked lost, every node's stream the same), `qlog verify` runs every 20 s and at the end (the state at F is the segments replayed to F), and `e2e_check` compares every upstream event with what the relay emitted (each DID's commits once and in rev order, `#identity` and `#account` too). A run fails on any of them.
+
+At 3,500 events/s (10x), 90 s each, on the builds after the old mode was removed: 0 violations, 0 holes, nothing acked lost and nothing missing upstream to relay, in every scenario (about 30M events observed across the runs):
+
+| scenario | faults | emission pause or switch |
+|---|---|---|
+| kill-leader | kill -9 every 15 s | 73-75 ms median, 137 ms max (n=14) |
+| power-cut-leader | SIGUSR1 power cut | 94-95 ms median, 155 ms max |
+| pause-leader | SIGSTOP 3 s | 1.02 s median |
+| partition-leader | isolated 5 s | 1.01 s median |
+| kill-follower, down-follower | kill -9, down 6 s | 0 |
+| kill-two, power-cut-all | quorum lost, then back | 1.8 s, 2.5 s median |
+| wipe-two, wipe-all | commitlogs gone: bucket recovery | 2.4 s, 2.3 s median |
+| single-kill, single-wipe | the one-member log | 1.4 s, 1.3 s median |
+| replace-follower, replace-leader | 4 replacements each | 1.1-2.8 s command to done, longest pause 65 ms |
+| grow-shrink | 3 -> 4 -> 3 -> 4 -> 3 | 0.7-2.2 s, longest pause 77 ms |
+| flush-crash | kill -9 at random flush steps | |
+| mixed-wipe, mixed-durable, mixed-flush, baseline | a random fault every 15 s | |
+
+The first passes found one relay bug and three harness ones. `wipe-two` failed before the firehose went back to starting at the first emission (live consumers of a node wiped past a recovery gap skipped the seqs between the bucket's F and its first emission); it passes since. A mid-run `verify` that read the manifest just before a recovery's landed flagged the recovery's segments (above R, so from a later generation; `verify` now stops there). And the harness gave the proxy's routes ports that overlapped fakepds's with nine slots (so `replace-*` and `grow-shrink` never elected), and let `flush-crash` crash a node in the run's last second, leaving its hosts' tail unread when the fleet stopped (142 commits "missing"); crashes now stop with the other faults, 12 s before the end.
+
+The PLC export ran through the same scenarios (`PLC_EXPORT=1`, 150 s, kill-leader, power-cut-leader, mixed-durable) against fakepds's `/export` with 200,000 ops and a 429 on every sixth request, at 4 requests a second: in kill-leader the export changed hands eight times mid-history, each new leader resuming from the checkpoint (21,979, 42,959 ... 187,820 ops read before it), and the ninth caught up; every run ended caught up, with the relay's checks unchanged. Host discovery ran the same way (`DISCOVERY=1`, kill-leader and power-cut-all): fakepds's `listHosts` served the 16 fleet hosts and 40 that don't answer, one a page with a 429 every sixth request. The list was read to the end both times (56 seen, 16 known, 40 refused, 10-11 429s waited out), with the run taken over mid-list by a new leader 2 and 4 times, each resuming from the saved cursor. `the_leaders_job_survives_a_takeover_mid_export` does the same on a three-node log in-process (and a member's cache then fills from the seeds without a PLC lookup), and `a_new_leader_resumes_the_export_from_the_checkpoint` checks that the new writer fences the old one.
+
+**The hour run.** Phase 6's profile with the relay on top: three nodes on benchbox, commitlogs on tmpfs with a 1 ms emulated fsync (`fsync` mode, the build before durability modes), local MinIO, fakepds at 350/s over 64 hosts (commits, `#identity`, `#account`, `#sync`; ~4.9 KB frames), 30 s flushes, one hour, no faults, `STATUS_EVERY=60`. It passed:
+- 0 violations, 0 holes and 1,318,748 seqs, every one emitted on every node.
+- 146 mid-run verifies, all consistent.
+- e2e missing 0: every upstream event in the relay once, in rev order.
+- A final consumer from cursor 0 read the whole log from the bucket in 7.1 s.
+- Leader append to quorum commit: p50 1.34 ms, p99 2.61.
+- Upstream receive to emit: p50 3.6 ms, p99 6.2.
+- CPU: the leader 0.115 cores, followers 0.06.
+
+| cluster-wide, per second | Class A as counted | of it, one-key `DeleteObjects` (GC) | Class A billed | Class B | free |
+|---|---|---|---|---|---|
+| Phase 6 run 2, `qlog load`, 30 s polls | 0.478 | 0.146 | 0.332 | 1.660 | 0.146 |
+| Phase 7, the relay | 0.521 | 0.183 | 0.338 | 1.739 | 0.183 |
+
+"Billed" leaves out the GC's one-key `DeleteObjects` POSTs, which the counter files as Class A and which, per Cloudflare's own figures for the R2 hour, R2 doesn't bill as Class A. Prices are left to `scripts/cost_model.py`.
+
+| purpose / component, Phase 7 | Class A | Class B | free |
+|---|---|---|---|
+| flush / `log_segment` | 0.035 | | |
+| flush / `qlog_manifest` | 0.034 | | |
+| flush / `state_manifest`, `state_gc_boundary` | 0.067 | 0.101 | |
+| state / `state_sst` | 0.130 | 0.480 | 0.052 |
+| state / `state_manifest` | 0.143 | 0.310 | 0.081 |
+| state / `state_compactions` | 0.106 | 0.276 | 0.050 |
+| state / `state_gc_boundary` | 0.003 | 0.573 | |
+| leader, followers | 0 | 0 | |
+
+The flush's share is Phase 6's exactly (one segment and one manifest CAS a flush, the checkpoint pair). The state's is ~10% more on each class. Its SSTs now hold the relay's real records (12,864 accounts with their chains and keys, the host table, the throttle index) rather than the stand-in's one row per DID. So each flush's L0 and the compactions behind it are bigger, and GC deletes more files (0.183 a second against 0.146). Followers sent nothing in steady state, as before.
+
+
+### Durability modes (Phase 7)
+
+`--durability` says when an entry counts on a node: when a follower acks it and when the leader counts itself toward the quorum.
+
+| mode | an entry counts | a process crash | a power cut | default for |
+|---|---|---|---|---|
+| `fsync` | after its commitlog fdatasync | loses nothing | loses nothing acked | one node (the only mode it runs) |
+| `page-cache` | once written to the commitlog (the page cache); fdatasync'd in the background every `--durability-sync-ms` (100) | loses nothing: the kernel still holds the pages | can lose the last ~100 ms of acked writes on that box | three members or more |
+| `memory` | in memory, no commitlog | the node comes back empty | the same | |
+
+Promises are fdatasync'd before they're answered in every mode.
+
+**The safety argument.** Jaz's two rules stay: a seq is never reused, and nothing is emitted before a quorum holds it (in the mode's sense: a majority's disks, page caches or memory). What changes is which failures a node survives with its log whole, so the rule that decides it is this: *a node counts as intact (vouches for its log) only if its log still holds everything it ever acked*.
+
+1. **Epochs.** A promise is on disk before it's answered, in every mode, so a node never promises an older epoch after a newer one, power cut or not. A takeover still needs a quorum of promises and the `qlog/leader` CAS (Phases 1 and 5), so two leaders never hold one epoch.
+2. **Who is intact.** In `fsync` mode every acked entry was synced first, so a restarted node is intact. In `page-cache` mode a process crash leaves the page cache, and with it every write, so the node is intact too. A power cut can drop the unsynced tail, which may hold entries the node acked. The node can't tell that from the file (a short log looks like any log). So the commitlog directory records the boot id and the mode of the run that wrote it, fsynced at open. When the next open finds the previous run wrote in `page-cache` mode and the boot id has changed (or the emulated power cut's marker is there), the node keeps its log to catch up from, but starts *not intact*. A wiped disk has always started that way. It becomes intact again only once it holds the leader's commit index from when it rejoined, which by then includes every committed entry. In `memory` mode a restarted node is empty, and not intact for the same reason.
+3. **Commits and takeovers count only intact logs.** The leader counts an entry committed once a majority of intact members hold it (Phase 1's `peer_intact`). A takeover needs promises from a quorum of intact members, and adopts the longest log among them. A committed entry sits in the logs of a majority that were intact when they acked it. Any later takeover quorum of intact logs meets that majority in a node that is still intact: a node that lost power since was excluded in step 2. So the new leader holds every committed entry, and nothing emitted is reissued.
+4. **When no quorum of intact logs can exist** (power cut on a majority within the sync window in `page-cache` mode; a majority of `memory` nodes restarting), the candidate runs the bucket recovery (Phase 4), exactly as for lost disks:
+   - It starts from the state at the manifest's F, keeps any committed entries an intact survivor holds past F, and jumps to R + 1.
+   - No seq above R was ever emitted while that manifest was current, so no seq is reused.
+   - The gap up to R is recorded. Events emitted inside it are re-ingested from the recovery's cursors and reach consumers again under new seqs. Consumers already dedupe those by rev.
+5. **The mutation.** With the check in step 2 off (`--qlog-unsafe-trust-log`), nodes trust logs that lost acked entries after a power cut on all three. They elect a leader from those logs, and it hands out seqs that were already emitted with other contents. `trusting_a_short_log_after_a_power_loss_is_caught` shows the checker reports exactly that, and so does the relay chaos: `power-cut-all` with `TRUST_LOG=1` failed with 257 seqs "emitted with two contents (emitted, lost and reissued)". (`power-cut-majority` under the mutation passed: the third node's whole log usually wins the election, so it doesn't reliably expose the bug.)
+
+Residual risks:
+
+- A power cut on a majority within ~100 ms of each other in `page-cache` mode is a bucket recovery with a gap rather than a normal takeover. It never loses anything silently.
+- A disk that loses data after an fdatasync (no power-loss protection, lying firmware) breaks `fsync` mode the same way. It's the reason the cluster wants three boxes on three disks.
+- A machine that stops without rebooting, without power loss and without killing the process (a frozen VM resumed later) keeps its page cache. That's a pause, not a loss.
+
+**Chaos, by mode.** The full relay suite ran three times, once per mode (`DURABILITY=fsync|page-cache|memory`, 24 scenarios each, 3,500/s, 90 s):
+
+- **All 72 runs passed.** 0 violations, nothing acked lost, and e2e missing 0 throughout. That includes `power-cut-majority`, new here: the leader and one follower lose power at once.
+- **What differs is which faults end in a bucket recovery, as the argument says.**
+  - `kill-all` (every process killed at once) is a plain takeover in `fsync` and `page-cache` (1.9-2.3 s, the supervisor's restart plus an election) and a recovery in `memory`.
+  - `power-cut-all` and `power-cut-majority` are recoveries in `page-cache` (2.7 s and 2.1 s median) and `memory` (2.3 and 1.6 s), with their gaps recorded and every event re-ingested. In `fsync` they're takeovers.
+- **The kill -9 pause differs too, and not because of the takeover.** From the port refusing to the new leader leading takes 2-4 ms in every mode. What changes is how long the killed process takes to release its port, the follower's cue to take over: 40-56 ms in `fsync`, 72-85 in `page-cache`, 113-139 in `memory`. That grows with what the process holds in memory (a `memory` node keeps 512 MiB of log), so the pause medians are 73, ~140 and ~200 ms. A hung leader is caught by the 1 s election timeout in every mode.
+
+**Numbers, by mode.** `tests/qlog/chaos.sh baseline` on benchbox, three `qlog node`s, ~5.3 KB frames:
+
+- **Ack.** Commitlogs on tmpfs with a 2 ms emulated fsync (`FSYNC_DELAY_US=2000`), 60 s at 3,500/s and at 35,000/s. "Ack" is submit to quorum ack, client view; "consumer" is submit to the first consumer on any node. Values are p50 / p99 in ms.
+
+| mode | ack, 3,500/s | consumer, 3,500/s | ack, 35,000/s | consumer, 35,000/s |
+|---|---|---|---|---|
+| `fsync` | 2.28 / 3.06 | 3.43 / 4.82 | 2.89 / 4.47 | 4.26 / 6.15 |
+| `page-cache` | 0.24 / 0.82 | 1.41 / 2.70 | 0.80 / 1.66 | 2.13 / 3.63 |
+| `memory` | 0.20 / 0.76 | 1.45 / 2.67 | 0.61 / 36.5 | 1.98 / 40.6 |
+
+- **Ceiling.** The three commitlogs share benchbox's one consumer NVMe, with 30 s flushes to the local MinIO and 200,000/s offered until the load's backpressure held it. Committed is distinct seqs over the load's seconds; the load's own "acked" undercounts past its submit timeout.
+
+| mode | committed | notes |
+|---|---|---|
+| `fsync` | ~18,000/s (2.06M seqs in 114 s) | group fsyncs p50 23-28 ms, ~800 events each; the disk is the limit, as in Phase 2 (~25,000/s there with no flush competing for it) |
+| `page-cache` | ~35,500/s (1.71M seqs in 48 s) | background fsyncs fall to 110-350 ms p50 behind ~180 MB/s a node; the ack path never waits on them |
+| `memory` | | no number: at this offered rate the nodes' and the load's backlogs reached the run's 24 GiB memory cap, which stopped the run |
+
+What it says:
+
+- **`page-cache` takes the fsync off the ack**: ~10x faster acks at today's rate (0.24 ms against 2.3 at a 2 ms fsync) and about 2x the ceiling on one shared disk. That's within ~0.05-0.2 ms of `memory` until 35,000/s.
+- **`memory`'s p99 at 35,000/s** (36 ms) is the in-memory log's trimming and the larger heap, which `page-cache` doesn't carry (its log keeps 64 MiB in memory against 512).
+- **What `page-cache` gives up** is one case: a power cut on a majority within ~100 ms becomes a bucket recovery with a gap, rather than a takeover. On separate boxes on separate power, that's a correlated failure of a different order than a process crash, which `page-cache` survives like `fsync`. So it's the default for three or more, and `fsync` stays for one node, where the commitlog is the only copy.
+
 
 ### Real R2 hour
 
