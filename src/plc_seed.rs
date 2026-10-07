@@ -444,6 +444,11 @@ impl SeedWriter {
 /// under a read come back as a miss, and the cache fetches).
 pub struct SeedReader {
     store: Store,
+    /// Seed reads in flight at once ([`set_read_slots`]).
+    reads: tokio::sync::Semaphore,
+    /// The export's memory budget stopped its term: no seed reads (each can
+    /// load megabytes of filters and indexes) until it starts the next.
+    pub paused: std::sync::atomic::AtomicBool,
     reader: tokio::sync::RwLock<Option<Arc<slatedb::DbReader>>>,
     tried: parking_lot::Mutex<Option<Instant>>,
     /// The leader's writer, for its own fresh rows.
@@ -465,6 +470,19 @@ pub const LEARN_EVERY: Duration = Duration::from_secs(1);
 /// document is only in memory.
 const LEARN_MAX: usize = 64 * LEARN_BATCH;
 
+/// Seed reads a [`SeedReader`] runs at once; the rest wait their turn.
+/// Once the seeds' filters and indexes outgrow the metadata cache (~120 MiB
+/// of them at 58M rows against 64 MiB), a read loads megabytes of them from
+/// the bucket: on a small box the identity cache's ~128 lookups in flight
+/// pulled 40-55 MiB/s, past what the rest of the node could share.
+static READ_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(DEFAULT_READ_SLOTS);
+pub const DEFAULT_READ_SLOTS: usize = 32;
+
+/// Sets [`READ_SLOTS`] for the readers made after it.
+pub fn set_read_slots(n: usize) {
+    READ_SLOTS.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// How often a member retries opening the database before it exists, and
 /// how often an open reader looks for the writer's new manifests.
 const READER_POLL: Duration = Duration::from_secs(30);
@@ -473,6 +491,8 @@ impl SeedReader {
     pub fn new(store: Store) -> Arc<SeedReader> {
         Arc::new(SeedReader {
             store,
+            reads: tokio::sync::Semaphore::new(READ_SLOTS.load(std::sync::atomic::Ordering::Relaxed).max(1)),
+            paused: Default::default(),
             reader: Default::default(),
             tried: Default::default(),
             writer: Default::default(),
@@ -584,6 +604,10 @@ impl SeedReader {
     }
 
     pub async fn get(&self, did: &str) -> Option<Seed> {
+        if self.paused.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let _slot = self.reads.acquire().await.ok()?;
         let writer = self.writer.read().clone();
         if let Some(w) = writer {
             return w.get(did).await.ok().flatten();

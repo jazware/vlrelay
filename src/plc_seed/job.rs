@@ -57,7 +57,21 @@ pub struct PlcJob {
     stopped: std::sync::atomic::AtomicBool,
     /// Discovery's feed of the PDS hosts the documents name.
     pub feed: parking_lot::Mutex<Option<Arc<crate::discovery::Feed>>>,
+    /// Terms ended, or held back, by [`Config::mem_budget_mb`].
+    pub mem_pauses: std::sync::atomic::AtomicU64,
+    /// jemalloc's allocated bytes, MiB (a test sets its own).
+    allocated_mb: fn() -> Option<u64>,
 }
+
+/// jemalloc's allocated bytes, MiB; None when it can't be read.
+pub fn jemalloc_allocated_mb() -> Option<u64> {
+    tikv_jemalloc_ctl::epoch::advance().ok()?;
+    tikv_jemalloc_ctl::stats::allocated::read().ok().map(|b| (b >> 20) as u64)
+}
+
+/// A term resumes below this share of the budget, so a node hovering at the
+/// limit doesn't reopen the seeds every few seconds.
+const MEM_RESUME: f64 = 0.85;
 
 /// How often a member checks whether it leads.
 const WATCH: Duration = Duration::from_millis(500);
@@ -75,7 +89,28 @@ impl PlcJob {
             restarts: Default::default(),
             stopped: Default::default(),
             feed: Default::default(),
+            mem_pauses: Default::default(),
+            allocated_mb: jemalloc_allocated_mb,
         })
+    }
+
+    #[cfg(test)]
+    pub fn with_allocated(mut self: Arc<Self>, f: fn() -> Option<u64>) -> Arc<Self> {
+        Arc::get_mut(&mut self).expect("before the job is shared").allocated_mb = f;
+        self
+    }
+
+    /// Whether the process holds more than `share` of the export's memory
+    /// budget. The export is the one thing on a node that can wait: on a
+    /// small box, with the seeds past ~35M rows, it took a relay that sat
+    /// at 1.3 GB past its 2.3 GB limit within minutes.
+    pub fn over_budget(&self, share: f64) -> Option<u64> {
+        let budget = self.cfg.mem_budget_mb;
+        if budget == 0 {
+            return None;
+        }
+        let mb = (self.allocated_mb)()?;
+        (mb as f64 > budget as f64 * share).then_some(mb)
     }
 
     /// Ends the job (its term ends at its next check).
@@ -97,6 +132,7 @@ impl PlcJob {
     /// node leads.
     pub async fn run(self: Arc<Self>, qnode: std::sync::Weak<QNode>) {
         let mut tick = tokio::time::interval(WATCH);
+        let mut held = false;
         loop {
             tick.tick().await;
             if self.stopped.load(Relaxed) {
@@ -109,6 +145,21 @@ impl PlcJob {
             }
             let epoch = st.epoch;
             drop(q);
+            if let Some(mb) = self.over_budget(MEM_RESUME) {
+                self.seeds.paused.store(true, Relaxed);
+                if !held {
+                    held = true;
+                    self.mem_pauses.fetch_add(1, Relaxed);
+                    tracing::warn!(
+                        epoch,
+                        allocated_mb = mb,
+                        budget_mb = self.cfg.mem_budget_mb,
+                        "PLC export: held back, the node is over its memory budget"
+                    );
+                }
+                continue;
+            }
+            held = false;
             if let Err(e) = self.clone().term(qnode.clone(), epoch).await {
                 self.restarts.fetch_add(1, Relaxed);
                 tracing::warn!(epoch, "PLC export: the term's reader stopped: {e:#}");
@@ -120,7 +171,21 @@ impl PlcJob {
     async fn term(self: Arc<Self>, qnode: std::sync::Weak<QNode>, epoch: u64) -> anyhow::Result<()> {
         let keep: Arc<dyn Fn() -> bool + Send + Sync> = {
             let (qnode, me) = (qnode.clone(), self.clone());
-            Arc::new(move || !me.stopped.load(Relaxed) && qnode.upgrade().is_some_and(|q| PlcJob::leads(&q, epoch)))
+            Arc::new(move || {
+                if let Some(mb) = me.over_budget(1.0) {
+                    if !me.seeds.paused.swap(true, Relaxed) {
+                        me.mem_pauses.fetch_add(1, Relaxed);
+                        tracing::warn!(
+                            epoch,
+                            allocated_mb = mb,
+                            budget_mb = me.cfg.mem_budget_mb,
+                            "PLC export: pausing, the node is over its memory budget"
+                        );
+                    }
+                    return false;
+                }
+                !me.stopped.load(Relaxed) && qnode.upgrade().is_some_and(|q| PlcJob::leads(&q, epoch))
+            })
         };
         let w = loop {
             if !keep() {
@@ -135,6 +200,7 @@ impl PlcJob {
             }
         };
         tracing::info!(epoch, url = %self.cfg.url, "PLC export: this node leads; reading the export");
+        self.seeds.paused.store(false, Relaxed);
         *self.seeds.writer.write() = Some(w.clone());
         let sink = Arc::new(WriterSink { w: w.clone(), cache: self.cache.clone(), feed: self.feed.lock().clone() });
         let ing = Ingester::new(self.cfg.clone(), self.store.clone(), sink);

@@ -276,6 +276,67 @@ async fn a_new_leader_resumes_the_export_from_the_checkpoint() {
     }
 }
 
+static ALLOCATED_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Over its memory budget the leader holds the export back, or ends the
+/// term it's in (closing the seeds' writer) and stops reading seeds; under
+/// 85% of it the export resumes from its checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_export_waits_out_the_memory_budget() {
+    use crate::qlog::tests::Cluster;
+    let f = fake(4, 4_000).await;
+    let total = f.plc.op_count() as u64;
+    let c = Cluster::with_cfg(1, None, None, 64 << 20).await;
+    let store = crate::qlog::bucket::counted(&c.store, "plc");
+    let mut cfg = f.cfg(2);
+    cfg.rate = 50.0;
+    cfg.mem_budget_mb = 1_000;
+    ALLOCATED_MB.store(2_000, Relaxed);
+    let j = PlcJob::new(cfg, store.clone(), SeedReader::new(store.clone()), cache(&f.url))
+        .with_allocated(|| Some(ALLOCATED_MB.load(Relaxed)));
+    let id = c.nodes.keys().next().unwrap().clone();
+    tokio::spawn(j.clone().run(Arc::downgrade(&c.nodes[&id].node)));
+    c.wait_leader(Duration::from_secs(5)).await;
+    wait(|| j.mem_pauses.load(Relaxed) >= 1, "the held-back term").await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(j.stats().is_none(), "a term started over the budget");
+    assert!(j.seeds.paused.load(Relaxed));
+
+    // between 85% and 100% a held-back term stays held
+    ALLOCATED_MB.store(900, Relaxed);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(j.stats().is_none(), "a term started above the resume mark");
+
+    ALLOCATED_MB.store(500, Relaxed);
+    wait(|| j.stats().is_some_and(|s| s.ops.load(Relaxed) > 0), "the term under the budget").await;
+    assert!(!j.seeds.paused.load(Relaxed));
+    let did = f.plc.layout.did(0, 0);
+    wait(|| j.stats().is_some_and(|s| s.checkpoints.load(Relaxed) > 0), "a checkpoint").await;
+
+    ALLOCATED_MB.store(1_500, Relaxed);
+    wait(|| j.stats().is_none(), "the term ending over the budget").await;
+    assert!(j.seeds.paused.load(Relaxed));
+    assert!(j.seeds.get(&did).await.is_none(), "a paused node read a seed");
+    let pauses = j.mem_pauses.load(Relaxed);
+    assert!(pauses >= 2, "{pauses}");
+
+    ALLOCATED_MB.store(500, Relaxed);
+    wait(|| j.stats().is_some_and(|s| s.caught_up.load(Relaxed)), "the resumed export's catch-up").await;
+    let t0 = Instant::now();
+    loop {
+        let ops = Checkpoint::load(&store).await.unwrap().unwrap().ops();
+        if ops >= total {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(30), "checkpointed {ops} of {total}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(j.seeds.get(&did).await.is_some(), "the resumed leader's seeds");
+    j.stop();
+    wait(|| j.stats().is_none(), "the stopped term").await;
+    c.shutdown();
+}
+
 /// The job on a three-node quorum log: the leader reads the export, dies
 /// mid-export, and the new leader's job resumes it from the checkpoint; a
 /// member's identity cache then fills from the seeds without asking PLC.

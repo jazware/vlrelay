@@ -87,6 +87,8 @@ Without `--memory`, the four `--s3-*` values are required (the keys directly or 
 | `--plc-export-rate <PLC_EXPORT_RATE>` |  | `2` | /export requests per second, all streams together (a 429 waits out its Retry-After on top) |
 | `--plc-export-streams <PLC_EXPORT_STREAMS>` |  | `4` | Time windows of the export read side by side on a fresh start |
 | `--plc-seeds-slatedb <PLC_SEEDS_SLATEDB>` | `VLRELAY_PLC_SEEDS_SLATEDB` | `compactions=1,subcompactions=1,fetch-tasks=2,fetch-kb=1024,sst-mb=64,memtable-mb=128` | Memory bounds of the PLC seeds' SlateDB on the leader, as `key=value,...`: compactions at once, subcompactions each, fetch-tasks and fetch-kb of read-ahead per input SST, sst-mb per output SST, memtable-mb unflushed. Keys left out keep the defaults shown. A compaction holds about subcompactions x 8 x fetch-tasks x fetch-kb, plus its output's upload buffers |
+| `--plc-seed-reads <PLC_SEED_READS>` | `VLRELAY_PLC_SEED_READS` | `32` | PLC seed reads in flight at once (the identity cache's misses; the rest wait). Each can load megabytes of the seeds' filters and indexes from the bucket once they outgrow the metadata cache |
+| `--plc-export-mem-mb <PLC_EXPORT_MEM_MB>` | `VLRELAY_PLC_EXPORT_MEM_MB` | `0` | The leader pauses the PLC export (and its seed reads) while the process has more than this many MiB allocated, and resumes below 85% of it; 0: no limit. Size it under the container's limit with room for the kernel's socket buffers and the allocator's slack |
 | `--bootstrap-relay <BOOTSTRAP_RELAYS>` | `VLRELAY_BOOTSTRAP_RELAYS` |  | A relay whose com.atproto.sync.listHosts seeds host discovery (read only; repeatable): added to the policy's discovery.seedRelays when it has none yet. The dashboard edits the list after that |
 | `--dev-mode` |  |  | Allows plain ws://, IPs, localhost and ports for upstreams and DID documents. Implied by an http:// --host or a loopback --plc-url |
 | `--did-lookups-per-sec <DID_LOOKUPS_PER_SEC>` |  | `50` | DID document fetches per second, all DIDs together |
@@ -163,14 +165,18 @@ For the chaos harness (`tests/qlog/relay-chaos.sh`); never on a production node.
 A single node at ~3,400 hosts runs on ~1.3 GB of heap and half a core without `--plc-export`. On
 a 2 vCPU / 4 GB box:
 
-- Leave `--plc-export` off, or run it at `--plc-export-rate 1 --plc-export-streams 1` with the
-  default `--plc-seeds-slatedb`. The seeds' SlateDB then runs one compaction at a time, with no
-  subcompactions, 2 x 1 MiB of read-ahead per input and 128 MiB of memtables. On a 40M-row seeds
-  database with compactions owed, reopened and fed at the export's pace with a slow bucket, that
-  peaked at 441 MB against 882 MB with SlateDB's own defaults, and under a 700 MiB cap the
-  defaults were OOM-killed in 85 s where the bounds ran to the end (`seeds_bench`). Watch the
-  process's memory through the fill, about 28 hours at rate 1 (14 at the default 2).
+- Leave `--plc-export` off, or give it `--plc-export-mem-mb` (1700 under a 2300 MiB container
+  limit). Past ~35M rows the seeds' filters and indexes (~2 MiB per million rows, ~120 MiB at
+  58M) outgrow the 64 MiB metadata share of `--slatedb-cache-mb`, the leader's seed reads pull
+  40-55 MiB/s of them from the bucket, and with the export on a relay that held 1.3 GB went past
+  2.3 GB within minutes, at rate 1 as at rate 2. The budget pauses the export and the seed reads
+  while the process is over it and resumes below 85%. `--plc-export-rate` is requests a second
+  across every window, ~1,000 ops each.
 - `--qlog-disk-retain-mb 1024`: a single node has no followers to catch up, so the disk only
   serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of
   it, about 7 s for the default 4 GiB.
 - Keep `--slatedb-cache-mb` at 320. The state's and the seeds' databases share it.
+- To see where the heap goes, build with `--features heap-profiling` (the Dockerfile's
+  `VLRELAY_FEATURES` build argument) and start the node with
+  `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19,prof_gdump:true,prof_prefix:<dir>/heap`: jemalloc
+  writes a profile at each new peak, which `jeprof --text <binary> <file>` reads.
