@@ -8,12 +8,12 @@ import re
 import sys
 
 SECTIONS = [
-    ("Serving", "", ["listen", "trusted-proxy", "admin-token", "ui-dir"]),
+    ("Serving", "", ["listen", "trusted-proxy", "admin-token", "admin-token-file", "ui-dir"]),
     (
         "Bucket",
-        "Without `--memory`, the four `--s3-*` values are required. Every node of a cluster uses the same "
-        "bucket and `--prefix`.",
-        ["memory", "s3-endpoint", "s3-bucket", "s3-access-key", "s3-secret-key", "s3-region", "s3-unsigned-payload", "prefix"],
+        "Without `--memory`, the four `--s3-*` values are required (the keys directly or from their files). "
+        "Every node of a cluster uses the same bucket and `--prefix`.",
+        ["memory", "s3-endpoint", "s3-bucket", "s3-access-key", "s3-access-key-file", "s3-secret-key", "s3-secret-key-file", "s3-region", "s3-unsigned-payload", "prefix"],
     ),
     (
         "Upstreams and identity",
@@ -27,7 +27,7 @@ SECTIONS = [
         "Every member uses the same bucket and `--prefix`. A node with no `--qlog-peer` is a single node with "
         "its commitlog as the WAL ([Cluster](../cluster.md)).",
         ["node-id", "qlog-listen", "qlog-peer", "qlog-members", "qlog-dir", "qlog-flush-ms", "qlog-headroom",
-         "qlog-admin-token", "qlog-retain-hours", "qlog-retain-secs", "qlog-retain-every-secs",
+         "qlog-admin-token", "qlog-admin-token-file", "qlog-retain-hours", "qlog-retain-secs", "qlog-retain-every-secs",
          "qlog-host-failover-ms", "qlog-host-poll-ms", "qlog-election-ms", "qlog-heartbeat-ms",
          "qlog-state-compactor-poll-ms", "qlog-no-auto-recover", "qlog-segment-mb", "qlog-disk-retain-mb", "durability", "durability-sync-ms", "slatedb-cache-mb",
          "qlog-memory-mb"],
@@ -68,13 +68,16 @@ facts:
   - { value: "2980", label: the public port, note: "`--listen`; the image binds 0.0.0.0", tone: accent }
   - { value: "30", unit: s, label: bucket flush, note: "`--qlog-flush-ms`; the log, the records and the hosts at one seq", tone: amber }
   - { value: "72", unit: h, label: of log for cursor replay, note: "`--qlog-retain-hours`", tone: blue }
-  - { value: "flag", label: wins over its env var, note: "pass secrets as env vars; --help never prints them", tone: violet }
+  - { value: "flag", label: wins over its env var, note: "pass secrets as files; --help never prints them", tone: violet }
 ```
 
 Every flag of `vlrelay`, generated from `vlrelay --help` by `just config-doc` (`build/config_doc.py`).
-Flags with an env var can be set either way, and the flag wins. Secrets (`--s3-secret-key`,
-`--admin-token`, `--qlog-admin-token`) are best passed as env vars, and `--help` never prints their
-values.
+Flags with an env var can be set either way, and the flag wins. Each secret (`--s3-access-key`,
+`--s3-secret-key`, `--admin-token`, `--qlog-admin-token`) has a `-file` twin (`VLRELAY_ADMIN_TOKEN_FILE`
+and so on) that reads it from a file once at start, less one trailing newline. A file keeps the secret
+out of the container's env, which `docker inspect` and a rendered compose file show. Setting a secret
+and its file is an error, so is an empty file, and no error prints a secret. `--help` never prints
+their values either.
 
 The image sets `VLRELAY_LISTEN=0.0.0.0:2980` and passes `--ui-dir /usr/share/vlrelay/ui` in its
 entrypoint ([Deploy](deploy.md#the-image)).

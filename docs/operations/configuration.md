@@ -27,13 +27,16 @@ facts:
   - { value: "2980", label: the public port, note: "`--listen`; the image binds 0.0.0.0", tone: accent }
   - { value: "30", unit: s, label: bucket flush, note: "`--qlog-flush-ms`; the log, the records and the hosts at one seq", tone: amber }
   - { value: "72", unit: h, label: of log for cursor replay, note: "`--qlog-retain-hours`", tone: blue }
-  - { value: "flag", label: wins over its env var, note: "pass secrets as env vars; --help never prints them", tone: violet }
+  - { value: "flag", label: wins over its env var, note: "pass secrets as files; --help never prints them", tone: violet }
 ```
 
 Every flag of `vlrelay`, generated from `vlrelay --help` by `just config-doc` (`build/config_doc.py`).
-Flags with an env var can be set either way, and the flag wins. Secrets (`--s3-secret-key`,
-`--admin-token`, `--qlog-admin-token`) are best passed as env vars, and `--help` never prints their
-values.
+Flags with an env var can be set either way, and the flag wins. Each secret (`--s3-access-key`,
+`--s3-secret-key`, `--admin-token`, `--qlog-admin-token`) has a `-file` twin (`VLRELAY_ADMIN_TOKEN_FILE`
+and so on) that reads it from a file once at start, less one trailing newline. A file keeps the secret
+out of the container's env, which `docker inspect` and a rendered compose file show. Setting a secret
+and its file is an error, so is an empty file, and no error prints a secret. `--help` never prints
+their values either.
 
 The image sets `VLRELAY_LISTEN=0.0.0.0:2980` and passes `--ui-dir /usr/share/vlrelay/ui` in its
 entrypoint ([Deploy](deploy.md#the-image)).
@@ -45,11 +48,12 @@ entrypoint ([Deploy](deploy.md#the-image)).
 | `--listen <LISTEN>` | `VLRELAY_LISTEN` | `127.0.0.1:2980` | Serves subscribeRepos, the sync API, requestCrawl, /admin and /metrics |
 | `--trusted-proxy <TRUSTED_PROXIES>` | `VLRELAY_TRUSTED_PROXIES` |  | Proxies whose `X-Forwarded-For` names the client (CIDRs, repeatable or comma-separated): per-IP limits key on its rightmost address that isn't one of these. Other peers' headers are ignored |
 | `--admin-token <ADMIN_TOKEN>` | `VLRELAY_ADMIN_TOKEN` |  | Turns on /admin (dashboard and API) with this token |
+| `--admin-token-file <ADMIN_TOKEN_FILE>` | `VLRELAY_ADMIN_TOKEN_FILE` |  | --admin-token from a file, less one trailing newline |
 | `--ui-dir <UI_DIR>` |  |  | A built dashboard (`ui/dist`); default: this tree's, if built |
 
 ## Bucket
 
-Without `--memory`, the four `--s3-*` values are required. Every node of a cluster uses the same bucket and `--prefix`.
+Without `--memory`, the four `--s3-*` values are required (the keys directly or from their files). Every node of a cluster uses the same bucket and `--prefix`.
 
 | Flag | Env | Default | What |
 |---|---|---|---|
@@ -57,7 +61,9 @@ Without `--memory`, the four `--s3-*` values are required. Every node of a clust
 | `--s3-endpoint <S3_ENDPOINT>` | `VLRELAY_S3_ENDPOINT` |  | The S3 API endpoint, e.g. `https://s3.us-east-1.amazonaws.com` or `http://minio:9000` |
 | `--s3-bucket <S3_BUCKET>` | `VLRELAY_S3_BUCKET` |  | The bucket |
 | `--s3-access-key <S3_ACCESS_KEY>` | `VLRELAY_S3_ACCESS_KEY` |  | Access key id |
+| `--s3-access-key-file <S3_ACCESS_KEY_FILE>` | `VLRELAY_S3_ACCESS_KEY_FILE` |  | --s3-access-key from a file, less one trailing newline |
 | `--s3-secret-key <S3_SECRET_KEY>` | `VLRELAY_S3_SECRET_KEY` |  | Secret access key |
+| `--s3-secret-key-file <S3_SECRET_KEY_FILE>` | `VLRELAY_S3_SECRET_KEY_FILE` |  | --s3-secret-key from a file, less one trailing newline |
 | `--s3-region <S3_REGION>` | `VLRELAY_S3_REGION` |  | The bucket's region |
 | `--s3-unsigned-payload <S3_UNSIGNED_PAYLOAD>` | `VLRELAY_S3_UNSIGNED_PAYLOAD` |  | Send PUT bodies as SigV4 UNSIGNED-PAYLOAD instead of hashing each one (default: on for an https endpoint, where TLS covers the body) [possible values: true, false] |
 | `--prefix <PREFIX>` | `VLRELAY_PREFIX` | `vlrelay` | Key prefix in the bucket: one relay per prefix |
@@ -108,6 +114,7 @@ Every member uses the same bucket and `--prefix`. A node with no `--qlog-peer` i
 | `--qlog-flush-ms <QLOG_FLUSH_MS>` |  | `30000` | The bucket flush interval |
 | `--qlog-headroom <QLOG_HEADROOM>` |  | `8640000` | Seqs reserved past each flush (R = F + H) |
 | `--qlog-admin-token <QLOG_ADMIN_TOKEN>` | `QLOG_ADMIN_TOKEN` |  | Bearer token membership changes need (`qlog member`, the dashboard) |
+| `--qlog-admin-token-file <QLOG_ADMIN_TOKEN_FILE>` | `QLOG_ADMIN_TOKEN_FILE` |  | --qlog-admin-token from a file, less one trailing newline |
 | `--qlog-retain-hours <QLOG_RETAIN_HOURS>` |  | `72` | Bucket retention, run by the leader: segments older than this go (0: never) |
 | `--qlog-retain-secs <QLOG_RETAIN_SECS>` |  |  | Dev: retention in seconds instead |
 | `--qlog-retain-every-secs <QLOG_RETAIN_EVERY_SECS>` |  | `600` | How often the leader runs a retention pass |
