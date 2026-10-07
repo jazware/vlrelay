@@ -446,10 +446,8 @@ impl Engine {
         match kind {
             BudgetKind::PlcLookupsPerSec => self.plc.try_take(share, n, now),
             BudgetKind::NewAccountsPerMin => self.new_accounts.try_take(share / 60.0, n, now),
-            // the archive's fetch queue spends these itself
-            BudgetKind::NewHostsPerDay
-            | BudgetKind::ArchivalFetchConcurrency
-            | BudgetKind::ArchivalFetchBytesPerSec => true,
+            // a slow budget: the bucket's DailyCounter spends it
+            BudgetKind::NewHostsPerDay => true,
         }
     }
 

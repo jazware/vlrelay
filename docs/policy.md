@@ -283,9 +283,11 @@ carries the `#account`, so it commits like any event. Every node polls `policy/t
 
 ## Gaps
 
-- The consumer limits in the policy (connections per IP, consumers per node, the slow-consumer
-  cutoff, the backfill limit) aren't enforced from it yet. They come from the firehose's own
-  defaults ([Subscribe to the firehose](subscribing.md#falling-behind)).
+- The consumer limits in the policy (consumers per node, the slow-consumer cutoff, the backfill
+  limit) aren't enforced from it yet. They come from the firehose's own defaults
+  ([Subscribe to the firehose](subscribing.md#falling-behind)). Connections per IP isn't a policy
+  knob: the firehose allows 256 from one address (IPv6: one /64), enough for a relay reading
+  every `?shard=k/n` slice.
 - A relay-throttled account stays throttled until an operator lifts it, even after its host drops
   below its cap or its cap is raised.
 - Without `--plc-export`, a cold start resolves every account once at the PLC budget, about 31

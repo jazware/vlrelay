@@ -231,7 +231,7 @@ async fn audit_log_lists_every_changed_leaf() {
     let p2 = store::path(&store, &format!("{POLICY_AUDIT}/{:020}.json", 2));
     store.raw.delete(&p2).await.unwrap();
     assert_eq!(e.policy_audit(10).await.unwrap().len(), 1);
-    body.consumers.connections_per_ip = 4;
+    body.consumers.consumers_per_node = 4;
     e.save_policy(2, body, "carol", "").await.unwrap();
     let audit = e.policy_audit(10).await.unwrap();
     assert_eq!(audit.iter().map(|a| a.version).collect::<Vec<_>>(), vec![3, 2, 1]);
@@ -436,7 +436,7 @@ fn budget_shares_follow_live_nodes() {
     assert_eq!(plc(), 250.0);
     live.set(5);
     assert_eq!(plc(), 100.0);
-    // no lease seen yet: the whole budget, not nothing
+    // zero live nodes: the whole budget, not nothing
     live.set(0);
     assert_eq!(plc(), 500.0);
     assert_eq!(e.budget(BudgetKind::NewHostsPerDay), 50.0);
@@ -715,7 +715,7 @@ async fn policy_admin_maps_the_wire_types() {
 
     // a wire edit changes its fields and keeps the rest
     let mut full = p();
-    full.consumers.connections_per_ip = 3;
+    full.consumers.consumers_per_node = 3;
     e.save_policy(0, full, "t", "").await.unwrap();
     let mut doc = a.policy().await.unwrap();
     assert_eq!(doc.policy.tiers.len(), 4);
@@ -731,7 +731,7 @@ async fn policy_admin_maps_the_wire_types() {
     assert_eq!(d.version, 2);
     let full = e.policy().body;
     assert_eq!(full.tiers.default.events_per_sec, 75.0);
-    assert_eq!(full.consumers.connections_per_ip, 3);
+    assert_eq!(full.consumers.consumers_per_node, 3);
     assert_eq!(full.spam.host_new_accounts.action, SpamAction::Case);
     assert_eq!(full.spam.host_failed_validation.limit, 30.0);
     assert_eq!(to_wire(&merge_wire(&full, &doc.policy).unwrap()), doc.policy);

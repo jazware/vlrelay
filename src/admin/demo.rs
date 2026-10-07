@@ -2575,7 +2575,7 @@ mod tests {
 
         let f = d.full_policy().await.unwrap();
         let mut p = f.policy.clone();
-        p["consumers"]["connectionsPerIp"] = serde_json::json!(32);
+        p["consumers"]["consumersPerNode"] = serde_json::json!(1_200);
         let u = FullPolicyUpdate { base_version: f.version, policy: p.clone(), note: "t".into() };
         let n = d.update_full_policy(u, "admin").await.unwrap();
         assert_eq!(n.version, f.version + 1);

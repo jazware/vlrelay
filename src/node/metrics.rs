@@ -22,7 +22,7 @@ fn latency_buckets() -> Vec<f64> {
 }
 
 lazy!(EVENTS_IN: IntCounterVec = register_int_counter_vec!("vlrelay_events_in_total", "Frames read off upstream sockets, by kind", &["kind"]));
-lazy!(EVENTS_ACCEPTED: IntCounterVec = register_int_counter_vec!("vlrelay_events_accepted_total", "Events appended to the node log, by kind", &["kind"]));
+lazy!(EVENTS_ACCEPTED: IntCounterVec = register_int_counter_vec!("vlrelay_events_accepted_total", "Events appended to the log, by kind", &["kind"]));
 lazy!(EVENTS_OUT: IntCounter = register_int_counter!("vlrelay_events_out_total", "Events emitted on subscribeRepos by the merger"));
 lazy!(EVENTS_REJECTED: IntCounterVec = register_int_counter_vec!("vlrelay_events_rejected_total", "Upstream events dropped, by reason", &["reason"]));
 lazy!(EVENTS_DUPLICATE: IntCounterVec = register_int_counter_vec!("vlrelay_events_duplicate_total", "Upstream events already applied (replays after a reconnect or restart), by where they were caught", &["at"]));

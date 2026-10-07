@@ -106,7 +106,7 @@ impl Extra {
         let seq = seq as u64;
         let mut full = serde_json::to_value(crate::policy::doc::PolicyBody::default()).unwrap_or_default();
         // a couple of operator edits, so the Tuning page shows values off their defaults
-        full["consumers"]["connectionsPerIp"] = json!(24);
+        full["consumers"]["consumersPerNode"] = json!(1_500);
         full["cluster"]["newHostsPerDay"] = json!(80);
         full["discovery"]["seedRelays"] = json!([
             {"url": "https://relay1.us-east.bsky.network", "enabled": true, "refreshIntervalSecs": 21_600},

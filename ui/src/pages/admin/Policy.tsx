@@ -121,7 +121,7 @@ function validate(base: PolicyBase, b: Json): Map<string, string> {
   }
   for (const k of ['plcLookupsPerSec', 'newAccountsPerMin']) if (!(num(getIn(b, `cluster.${k}`)) > 0)) put(`cluster.${k}`, `cluster.${k} must be > 0`)
   if (!isInt(getIn(b, 'cluster.newHostsPerDay'))) put('cluster.newHostsPerDay', 'cluster.newHostsPerDay must be a whole number ≥ 0')
-  for (const k of ['connectionsPerIp', 'consumersPerNode', 'slowConsumerLagSecs', 'maxBackfillSecs']) {
+  for (const k of ['consumersPerNode', 'slowConsumerLagSecs', 'maxBackfillSecs']) {
     const v = getIn(b, `consumers.${k}`)
     if (v !== undefined && !isInt(v)) put(`consumers.${k}`, `consumers.${k} must be a whole number ≥ 0`)
   }
@@ -501,7 +501,6 @@ function ConsumerKnobs() {
   }
   const d = useDraft()
   const lim = (k: string) => num(getIn(d.body, `consumers.${k}`))
-  const perIp = max(count((c) => c.ip))
   const perNode = max(count((c) => c.node))
   const live = (cs ?? []).filter((c) => !c.backfilling)
   const slow = Math.max(0, ...live.map((c) => c.lagMs / 1000))
@@ -509,7 +508,6 @@ function ConsumerKnobs() {
   const u = (v: number, k: string, label: string) => (cs ? <Use v={v} max={lim(k)} label={label} /> : undefined)
   return (
     <>
-      <Knob path="consumers.connectionsPerIp" label="Connections per IP" why="Raise for consumers behind shared NAT." use={u(perIp, 'connectionsPerIp', `${perIp} most from one IP`)} />
       <Knob path="consumers.consumersPerNode" label="Consumers per node" why="Sockets one node serves before refusing new ones." use={u(perNode, 'consumersPerNode', `${perNode} on the busiest`)} />
       <Knob path="consumers.slowConsumerLagSecs" label="Slow consumer cutoff" why="A consumer this far behind live is disconnected and can resume." unit="s" use={u(slow, 'slowConsumerLagSecs', `${fmtNum(slow, 1)} s worst now`)} />
       <Knob path="consumers.maxBackfillSecs" label="Max backfill" why="Older cursors get OutdatedCursor. Can’t exceed what the log keeps." unit="s" use={u(back, 'maxBackfillSecs', back ? `${fmtNum(back)} s oldest replay` : 'no replays now')} />
