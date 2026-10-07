@@ -48,6 +48,8 @@ export type HostRow = {
   throttledAccounts: number
   /** How the relay found it: requestCrawl, bootstrap:<relay>, plc or cli. */
   source: string | null
+  /** The reject reason with the most of its recent rejects (last 5 min), or null. */
+  topReason: RejectReason | null
   /** Events/s, 1 s apart, oldest first: only on the overview's top hosts. */
   history?: number[]
 }

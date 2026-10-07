@@ -212,9 +212,13 @@ pub fn reject_class(reason: &str) -> RejectReason {
 const TOP_HISTORY: usize = 60;
 
 impl NodeAdmin {
-    fn row(&self, h: &HostView, series: Option<&Series>, rejects: u64) -> admin::HostRow {
+    fn row(
+        &self,
+        h: &HostView,
+        series: Option<&Series>,
+        rejects: Option<&super::metrics::HostRejects>,
+    ) -> admin::HostRow {
         let (rate, ratio) = series.map_or((0.0, 0.0), |s| (s.rate(), s.reject_ratio()));
-        let _ = rejects;
         admin::HostRow {
             host: h.record.hostname.clone(),
             tier: h.record.tier.as_str().into(),
@@ -234,6 +238,7 @@ impl NodeAdmin {
             history: Vec::new(),
             throttled_accounts: self.node.quorum.hosts.throttled(&h.record.hostname),
             source: self.node.quorum.hosts.source(&h.record.hostname),
+            top_reason: rejects.and_then(top_reason),
         }
     }
 
@@ -247,7 +252,7 @@ impl NodeAdmin {
             .iter()
             .map(|h| {
                 let k = Host(h.record.hostname.clone());
-                self.row(h, dash.hosts.get(&k), rejects.get(&k).map_or(0, |r| r.total))
+                self.row(h, dash.hosts.get(&k), rejects.get(&k))
             })
             .collect()
     }
@@ -264,7 +269,7 @@ impl NodeAdmin {
         let h = self.node.manager.host(&k).ok_or_else(|| AdminError::NotFound(format!("unknown host {host}")))?;
         let dash = self.node.dash.lock();
         let rejects = self.node.rejects.lock();
-        Ok(self.row(&h, dash.hosts.get(&k), rejects.get(&k).map_or(0, |r| r.total)))
+        Ok(self.row(&h, dash.hosts.get(&k), rejects.get(&k)))
     }
 
     async fn open_case_count(&self) -> u32 {
@@ -1400,6 +1405,20 @@ impl crate::node::quorum::LocalAsk for NodeAdmin {
     }
 }
 
+/// Rejects older than this don't count toward a host's top reason.
+const TOP_REASON_WINDOW_MS: i64 = 5 * 60_000;
+
+/// The reason with the most of a host's recent rejects (its last 50, in
+/// the last five minutes).
+fn top_reason(r: &super::metrics::HostRejects) -> Option<RejectReason> {
+    let since = now_ms() - TOP_REASON_WINDOW_MS;
+    let mut by: BTreeMap<RejectReason, usize> = BTreeMap::new();
+    for n in r.recent.iter().filter(|n| n.at_ms >= since) {
+        *by.entry(reject_class(n.reason)).or_default() += 1;
+    }
+    by.into_iter().max_by_key(|(_, n)| *n).map(|(c, _)| c)
+}
+
 /// Most rejects a second first, then most in all.
 fn rank_rejects(v: &mut Vec<admin::RejectTop>, limit: usize) {
     v.sort_by(|a, b| {
@@ -1462,6 +1481,29 @@ mod tests {
         assert_eq!(v.purposes.iter().map(|p| p.per_sec.b).sum::<f64>(), v.total.per_sec.b);
         let first = store_view("n1", &now, None, Duration::ZERO, None);
         assert_eq!(first.total.per_sec.a, 0.0, "no rate without a previous sample");
+    }
+
+    #[test]
+    fn a_hosts_top_reason_is_its_most_frequent_recent_one() {
+        use super::super::metrics::{HostRejects, RejectNote};
+        let note = |reason: &'static str, ago_ms: i64| RejectNote {
+            at_ms: now_ms() - ago_ms,
+            did: "did:plc:x".into(),
+            reason,
+            upstream_seq: 1,
+            detail: String::new(),
+        };
+        let mut r = HostRejects::default();
+        // many old ones don't count, only the last five minutes'
+        for _ in 0..10 {
+            r.recent.push_back(note("bad_signature", 10 * 60_000));
+        }
+        for _ in 0..2 {
+            r.recent.push_back(note("prev_data_mismatch", 1_000));
+        }
+        r.recent.push_back(note("bad_signature", 2_000));
+        assert_eq!(top_reason(&r), Some(RejectReason::PrevDataMismatch));
+        assert_eq!(top_reason(&HostRejects::default()), None);
     }
 
     #[test]

@@ -905,6 +905,7 @@ impl Sim {
             max_accounts: if h.tier == "trusted" { 10_000_000 } else { 100 },
             history: Vec::new(),
             throttled_accounts: if h.tier == "trusted" { 0 } else { h.accounts.saturating_sub(100).min(5_000) },
+            top_reason: h.by_reason.iter().filter(|(_, n)| **n > 0).max_by_key(|(_, n)| **n).map(|(r, _)| *r),
             source: Some(match hash(&h.name) % 5 {
                 0 => "requestCrawl".into(),
                 1 => "plc".into(),
@@ -2225,6 +2226,11 @@ mod tests {
         let dv = json(r).await;
         assert!(dv["sources"].as_array().unwrap().iter().any(|s| s["key"] == "plc" && s["inProgress"] == true));
         assert!(all.hosts.iter().all(|h| h.source.is_some()));
+        assert!(all.hosts.iter().any(|h| h.top_reason.is_some()));
+        let busy = &all.hosts.iter().find(|h| h.host == "pds-7f3a.fastvps.cloud").unwrap();
+        let det = d.host(&busy.host).await.unwrap();
+        let most = det.rejects_by_reason.iter().max_by_key(|(_, n)| **n).map(|(r, _)| *r);
+        assert_eq!(busy.top_reason, most);
         let b = json(
             call("GET", "/admin/api/hosts?source=bootstrap:&throttled=true&sort=throttled&desc=true", true)
                 .await
@@ -2249,10 +2255,14 @@ mod tests {
         let names = tiers(&pol["policy"]["tiers"]);
         assert!(all.hosts.iter().all(|h| names.contains(&h.tier)), "a host in a tier the policy doesn't have");
 
-        let top = json(call("GET", "/admin/api/ops/rejects/top?reason=bad-signature&limit=3", true).await.unwrap()).await;
+        let top =
+            json(call("GET", "/admin/api/ops/rejects/top?reason=bad-signature&limit=3", true).await.unwrap()).await;
         let top = top.as_array().unwrap();
         assert!(!top.is_empty() && top.len() <= 3);
-        assert!(top.iter().all(|t| t["host"].is_string() && t["rejectsPerSec"].is_number() && t["total"].as_u64() > Some(0)));
+        assert!(
+            top.iter()
+                .all(|t| t["host"].is_string() && t["rejectsPerSec"].is_number() && t["total"].as_u64() > Some(0))
+        );
         assert!(top.iter().all(|t| t["sample"].is_null() || t["sample"]["reason"] == "bad-signature"));
         assert!(top.windows(2).all(|w| w[0]["rejectsPerSec"].as_f64() >= w[1]["rejectsPerSec"].as_f64()));
 

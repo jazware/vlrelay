@@ -205,6 +205,10 @@ pub struct HostRow {
     /// or `cli` (None: before sources were recorded).
     #[serde(default)]
     pub source: Option<String>,
+    /// The reject reason with the most of its recent rejects (the last
+    /// five minutes), if any.
+    #[serde(default)]
+    pub top_reason: Option<RejectReason>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

@@ -321,6 +321,7 @@ mod tests {
             history: Vec::new(),
             throttled_accounts: 0,
             source: None,
+            top_reason: None,
         }
     }
 
