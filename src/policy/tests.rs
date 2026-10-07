@@ -849,7 +849,12 @@ async fn policy_admin_maps_the_wire_types() {
         .await
         .unwrap();
     assert_eq!(c.status, CaseStatus::Dismissed);
-    assert!(a.cases(crate::admin::CaseQuery { status: Some(CaseStatus::Open) }).await.unwrap().is_empty());
+    assert!(
+        a.cases(crate::admin::CaseQuery { status: Some(CaseStatus::Open), ..Default::default() })
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(a.case_detail(1).await.unwrap().evidence.len(), 1);
 }
 

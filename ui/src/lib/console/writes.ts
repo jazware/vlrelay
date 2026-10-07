@@ -53,27 +53,25 @@ export async function updateCase(id: number, u: Parameters<typeof A.updateCase>[
 }
 
 /**
- * Several cases' status at once. There's no bulk endpoint, so it's one POST per case, four at a
- * time; each answer goes into the cache as it lands and the lists refetch once at the end.
- * Resolves to the ids that failed (with why); the rest were written.
+ * Several cases' status at once, through `cases/bulk` a thousand at a time; the lists refetch
+ * once at the end. Resolves to the ids that failed (with why): a chunk the relay refused, or a
+ * case it no longer had. The rest were written.
  */
 export async function updateCases(ids: number[], u: Parameters<typeof A.updateCase>[1], onProgress?: (done: number, failed: number) => void) {
   const failed: { id: number; error: unknown }[] = []
-  let next = 0
   let done = 0
-  const worker = async () => {
-    while (next < ids.length) {
-      const id = ids[next++]
-      try {
-        writeCase(await A.updateCase(id, u))
-        done++
-      } catch (error) {
-        failed.push({ id, error })
-      }
-      onProgress?.(done, failed.length)
+  for (let i = 0; i < ids.length; i += 1000) {
+    const chunk = ids.slice(i, i + 1000)
+    try {
+      const r = await A.bulkUpdateCases({ ids: chunk, status: u.status ?? undefined, note: u.note })
+      const ok = new Set(r.ids)
+      done += r.updated
+      for (const id of chunk) if (!ok.has(id)) failed.push({ id, error: new Error(`no case ${id}`) })
+    } catch (error) {
+      for (const id of chunk) failed.push({ id, error })
     }
+    onProgress?.(done, failed.length)
   }
-  await Promise.all(Array.from({ length: Math.min(4, ids.length) }, worker))
   invalidate(keysFor('case'), true)
   return failed
 }

@@ -203,7 +203,7 @@ sure the proxy overwrites the header on every request.
 | GET | `accounts/{did}` | | `Account`: handle, host, the relay's status and the host's, takedown, rev |
 | POST | `accounts/{did}/takedown` | `{reason}` (required) | `Account` |
 | POST | `accounts/{did}/untakedown` | | `Account` |
-| GET | `cases` | `status`: open, acknowledged, resolved, dismissed | `Case[]`, worst severity first |
+| GET | `cases` | `status` (open, acknowledged, resolved, dismissed), `kind`, `host`, `limit` (default all), `offset` | `{cases, total, counts: {byStatus, byKind}}`: the page of matching cases, worst severity first, how many match, and counts for the filter tabs: `byStatus` under every filter but `status`, `byKind` under every filter but `kind` |
 | GET, POST | `cases/{id}` | POST `{status?, note}` | `Case` |
 | POST | `cases/bulk` | `{ids?: [id], filter?: {kind?, status?, host?}, status?, note}`: the cases in `ids`, or matching `filter` (both: those in `ids` that match); one of the two, and a status or a note, are required. Without a note each case gets `bulk: <status>`, so every case's notes name who changed it. At most 5,000 at once | `{updated, ids}`: the cases changed. Each is updated as `cases/{id}` would and gets a `case` change event, which coalesce to one `*` past the feed's bound |
 | GET | `cases/{id}/evidence` | | `CaseDetail`: the case, its trip count and the newest trips (what was measured, every signal's count at the time) |

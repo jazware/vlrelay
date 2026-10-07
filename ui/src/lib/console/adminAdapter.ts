@@ -10,6 +10,8 @@ import {
   type CaseBulkResult,
   type CaseBulkUpdate,
   type CaseDetail,
+  type CaseList,
+  type CaseQuery,
   type CaseStatus,
   type ClusterView,
   type Consumer,
@@ -99,7 +101,7 @@ export const consumers = () => api<Consumer[]>('consumers')
 /** Consumer ids are per node: `node` names the one serving it. Another member's is kicked there with the nodes' --qlog-admin-token. */
 export const kickConsumer = (id: number, node: string) => api(`consumers/${id}/kick`, { method: 'POST', params: { node: node || undefined } })
 export const kickCall = (id: number, node: string) => `POST /admin/api/consumers/${id}/kick${node ? `?node=${node}` : ''}`
-export const openCases = () => api<Case[]>('cases', { params: { status: 'open' } })
+export const openCases = () => api<CaseList>('cases', { params: { status: 'open' } }).then((l) => l.cases)
 export const pipeline = () => api<PipelineView>('ops/pipeline')
 export const policy = () => api<PolicyDoc>('policy')
 export const policyFull = () => api<FullPolicyDoc>('policy/full')
@@ -157,7 +159,9 @@ export const updateRule = (id: number, r: DomainRuleInput) => api<DomainRule>(`d
 export const deleteRule = (id: number) => api<void>(`domain-rules/${id}`, { method: 'DELETE' })
 
 /** Every case when `status` is left out (the filter counts need them all). */
-export const cases = (status?: CaseStatus) => api<Case[]>('cases', { params: { status } })
+export const cases = (status?: CaseStatus) => caseList({ status }).then((l) => l.cases)
+/** A page of cases with the total and the status and kind counts. */
+export const caseList = (q: CaseQuery) => api<CaseList>('cases', { params: q })
 export const caseOf = (id: number) => api<Case>(`cases/${id}`)
 export const caseEvidence = (id: number) => optional('cases/{id}/evidence', () => api<CaseDetail>(`cases/${id}/evidence`))
 export const updateCase = (id: number, u: { status?: CaseStatus | null; note: string }) => api<Case>(`cases/${id}`, { body: u })

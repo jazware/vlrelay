@@ -123,7 +123,7 @@ throttled() { [ "$(tier_of $((base + 1)) | cut -d' ' -f1)" = throttled ]; }
 case_for() {
   get cases | python3 -c "
 import json, sys
-cs = json.load(sys.stdin)
+cs = json.load(sys.stdin)['cases']
 sys.exit(0 if any(c['host'] == '127.0.0.1:$1' and c['kind'] == '$2' for c in cs) else 1)"
 }
 banned() { [ "$(tier_of $((base + 3)) | cut -d' ' -f2)" = banned ]; }
@@ -141,7 +141,7 @@ get "cases" >"$out/cases.json"
 for g in 0 4; do
   tier=$(tier_of $((base + g)))
   [ "${tier% *}" = default ] || fail "clean host $g moved to $tier"
-  if python3 -c "import json,sys; sys.exit(0 if any(c['host']=='127.0.0.1:$((base + g))' for c in json.load(open('$out/cases.json'))) else 1)"; then
+  if python3 -c "import json,sys; sys.exit(0 if any(c['host']=='127.0.0.1:$((base + g))' for c in json.load(open('$out/cases.json'))['cases']) else 1)"; then
     fail "a case opened for clean host $g"
   fi
 done

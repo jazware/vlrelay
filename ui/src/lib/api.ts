@@ -373,6 +373,9 @@ export type CaseBulkUpdate = {
   note: string
 }
 export type CaseBulkResult = { updated: number; ids: number[] }
+/** `GET cases`: a page of the matching cases, how many match, and counts by status (every filter but status) and kind (every filter but kind). */
+export type CaseList = { cases: Case[]; total: number; counts: { byStatus: Partial<Record<CaseStatus, number>>; byKind: Record<string, number> } }
+export type CaseQuery = { status?: CaseStatus; kind?: string; host?: string; limit?: number; offset?: number }
 
 // ---------------------------------------------------------------- quorum log
 

@@ -2334,7 +2334,7 @@ mod tests {
                 .unwrap();
             app.clone().oneshot(req)
         };
-        let open = d.cases(CaseQuery { status: Some(CaseStatus::Open) }).await.unwrap();
+        let open = d.cases(CaseQuery { status: Some(CaseStatus::Open), ..Default::default() }).await.unwrap();
         let kind = open[0].kind.clone();
         let want: Vec<u64> = open.iter().filter(|c| c.kind == kind).map(|c| c.id).collect();
         let r =
@@ -2360,6 +2360,33 @@ mod tests {
         assert_eq!(serde_json::from_slice::<CaseBulkResult>(&b).unwrap().updated, 0);
         assert_eq!(post(serde_json::json!({"status": "resolved"})).await.unwrap().status(), StatusCode::BAD_REQUEST);
         assert_eq!(post(serde_json::json!({"ids": [1]})).await.unwrap().status(), StatusCode::BAD_REQUEST);
+
+        // GET cases: a page, the total, and facet counts that leave out the filter they count
+        let get = |q: String| {
+            let req = Request::get(format!("/admin/api/cases?{q}"))
+                .header("authorization", "Basic YWRtaW46dA==")
+                .body(Body::empty())
+                .unwrap();
+            let app = app.clone();
+            async move {
+                let r = app.oneshot(req).await.unwrap();
+                assert_eq!(r.status(), StatusCode::OK);
+                let b = axum::body::to_bytes(r.into_body(), 1 << 24).await.unwrap();
+                serde_json::from_slice::<CaseList>(&b).unwrap()
+            }
+        };
+        let all = d.cases(CaseQuery::default()).await.unwrap();
+        let l = get(String::new()).await;
+        assert_eq!((l.total, l.cases.len()), (all.len(), all.len()));
+        assert_eq!(l.counts.by_status.values().sum::<usize>(), all.len());
+        let l = get(format!("kind={kind}&status=resolved&limit=2&offset=1")).await;
+        let resolved = all.iter().filter(|c| c.kind == kind && c.status == CaseStatus::Resolved).count();
+        assert_eq!((l.total, l.cases.len()), (resolved, resolved.saturating_sub(1).min(2)));
+        assert!(l.cases.iter().all(|c| c.kind == kind && c.status == CaseStatus::Resolved));
+        assert_eq!(l.counts.by_status["resolved"], resolved);
+        let resolved_any = all.iter().filter(|c| c.status == CaseStatus::Resolved).count();
+        assert_eq!(l.counts.by_kind.values().sum::<usize>(), resolved_any);
+    }
 
     /// A rule's `matches` and `hosts?rule=` count the hosts it decides: an exact rule takes its
     /// host from the wildcard above it, as the relay's lookup does.

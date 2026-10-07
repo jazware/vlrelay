@@ -736,6 +736,54 @@ pub struct CaseNote {
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct CaseQuery {
     pub status: Option<CaseStatus>,
+    /// `GET cases` only (an [`AdminSource`] filters by status alone).
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
+/// `GET cases`: a page of the cases matching every filter, worst severity
+/// first, how many match, and facet counts for the filter tabs.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaseList {
+    pub cases: Vec<Case>,
+    pub total: usize,
+    pub counts: CaseCounts,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaseCounts {
+    /// Every filter but `status`.
+    pub by_status: BTreeMap<String, usize>,
+    /// Every filter but `kind`.
+    pub by_kind: BTreeMap<String, usize>,
+}
+
+/// [`CaseList`] out of every case (sorted as [`AdminSource::cases`] sorts).
+pub fn case_page(all: Vec<Case>, q: &CaseQuery) -> CaseList {
+    let kind = |c: &Case| q.kind.as_ref().is_none_or(|k| *k == c.kind);
+    let status = |c: &Case| q.status.is_none_or(|s| s == c.status);
+    let host = |c: &Case| q.host.as_ref().is_none_or(|h| h.eq_ignore_ascii_case(&c.host));
+    let mut counts = CaseCounts::default();
+    for c in all.iter().filter(|c| host(c)) {
+        if kind(c) {
+            *counts.by_status.entry(c.status.as_str().to_string()).or_default() += 1;
+        }
+        if status(c) {
+            *counts.by_kind.entry(c.kind.clone()).or_default() += 1;
+        }
+    }
+    let matching: Vec<Case> = all.into_iter().filter(|c| host(c) && kind(c) && status(c)).collect();
+    let total = matching.len();
+    let cases = matching.into_iter().skip(q.offset.unwrap_or(0)).take(q.limit.unwrap_or(usize::MAX)).collect();
+    CaseList { cases, total, counts }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1763,8 +1811,9 @@ async fn untakedown<S: AdminSource>(
 ) -> AdminResult<Json<Account>> {
     Ok(Json(c.src.untakedown(&did, &a.label()).await?))
 }
-async fn cases<S: AdminSource>(State(c): Ax<S>, Query(q): Query<CaseQuery>) -> AdminResult<Json<Vec<Case>>> {
-    Ok(Json(c.src.cases(q).await?))
+async fn cases<S: AdminSource>(State(c): Ax<S>, Query(q): Query<CaseQuery>) -> AdminResult<Json<CaseList>> {
+    let all = c.src.cases(CaseQuery::default()).await?;
+    Ok(Json(case_page(all, &q)))
 }
 async fn case<S: AdminSource>(State(c): Ax<S>, Path(id): Path<u64>) -> AdminResult<Json<Case>> {
     Ok(Json(c.src.case(id).await?))
