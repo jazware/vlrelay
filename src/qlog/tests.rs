@@ -640,12 +640,15 @@ async fn durable_restarts_are_intact_at_once() {
     for _ in 0..4 {
         tokio::time::sleep(Duration::from_millis(600)).await;
         let l = c.wait_leader(Duration::from_secs(5)).await;
-        let before = c.nodes[&l].node.status().commit;
+        // not its commit index: two followers' acks commit entries its own
+        // writer may not have reached yet (a kill loses those, and the
+        // followers hold them); it emits only what its own disk holds
+        let before = c.nodes[&l].node.status().emitted;
         c.kill(&l);
         c.start(&l).await;
         let st = c.nodes[&l].node.status();
         assert!(st.intact, "{l} restarted not intact");
-        assert!(st.last >= before, "{l} came back with less than it committed: {} < {before}", st.last);
+        assert!(st.last >= before, "{l} came back with less than it emitted: {} < {before}", st.last);
     }
     let acked = load.stop().await;
     c.converge(Duration::from_secs(10)).await;
@@ -2321,6 +2324,69 @@ async fn page_cache_power_cuts_on_a_majority_recover_from_the_bucket() {
     let (_, r, m) = settle_recovered(&c, load).await;
     eprintln!("{r:?} gaps {:?}", m.gaps);
     assert_eq!(m.gaps.len(), 2, "{m:?}");
+    c.shutdown();
+}
+
+/// A follower reset past what it emitted (by a bucket recovery's leader,
+/// say, while it was still catching up) hands its consumers the skipped
+/// seqs the bucket holds before it jumps. Here the follower is cut off
+/// while the leader flushes on, then a leader the test plays resets it
+/// well past the bucket's F.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_reset_past_what_it_emitted_emits_the_bucket_first() {
+    let mut c = flushing(|_| flush_opts(), 64 << 20).await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    wait_flushed(&c, 1, Duration::from_secs(5)).await;
+    let f = c.ids.iter().find(|id| **id != l).unwrap().clone();
+    c.isolate(&f);
+    // appends already on the wire land
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let behind = c.nodes[&f].node.status().emitted;
+    assert!(behind > 0, "{f} emitted nothing before it was cut off");
+    let m = wait_flushed(&c, behind + 500, Duration::from_secs(10)).await;
+    load.stop().await;
+    let st = c.nodes[&f].node.status();
+    assert_eq!(st.emitted, behind, "{f} emitted while cut off");
+    let base = m.flushed + 1000;
+    let rpc = super::node::Rpc::new(&f, &c.addrs[&f], Arc::new(Faults::default()));
+    let reset = wire::Append {
+        epoch: st.promised,
+        leader: "test".into(),
+        prev_epoch: st.promised,
+        prev_seq: base,
+        commit: base,
+        leader_last: base,
+        reset: true,
+        flushed: m.flushed,
+        reserve: m.reserve,
+        generation: st.generation,
+        entries: Vec::new(),
+    };
+    match rpc.call(&wire::Msg::Append(reset), Duration::from_secs(2)).await {
+        Ok(wire::Msg::AppendResp(r)) => assert!(r.ok, "{r:?}"),
+        r => panic!("{r:?}"),
+    }
+    let stream = format!("{f}#{}", c.incarnations[&f]);
+    let t = Instant::now();
+    loop {
+        let st = c.nodes[&f].node.status();
+        let last = c.checker.lock().last(&stream).unwrap_or(0);
+        if st.emitted == base && last >= m.flushed {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "{f} emitted through {} and its stream reached {last}: want {base}, after every seq through F {}",
+            st.emitted,
+            m.flushed
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let after: Vec<u64> =
+        c.emitted.lock().iter().filter(|(s, q, _)| *s == stream && *q > behind).map(|e| e.1).collect();
+    assert_eq!(after, (behind + 1..=m.flushed).collect::<Vec<_>>());
+    assert_eq!(c.nodes[&f].node.status().emit_gaps, base - m.flushed);
     c.shutdown();
 }
 

@@ -432,6 +432,10 @@ struct Core {
     intact: bool,
     need_upto: Option<u64>,
     emitted: u64,
+    /// The log was reset past `emitted` while this stream had consumers:
+    /// the emitter hands them what the bucket holds of the skipped seqs
+    /// before it jumps here.
+    jump_to: Option<u64>,
     /// This node's log is on its own disk up to here: it emits no further,
     /// so a power cut never leaves it behind what its consumers saw.
     durable: u64,
@@ -726,6 +730,7 @@ impl Node {
                 intact: genesis || whole,
                 need_upto: None,
                 emitted,
+                jump_to: None,
                 durable: if durability.journaling() { log_last } else { u64::MAX },
                 cut: 0,
                 matched: HashMap::new(),
@@ -1695,14 +1700,7 @@ impl Node {
             }
             if a.reset && a.prev_seq > c.log.commit() && c.log.epoch_at(a.prev_seq) != Some(a.prev_epoch) {
                 self.stats.resets.fetch_add(1, Ordering::Relaxed);
-                if a.prev_seq > c.emitted {
-                    // a node that hasn't emitted yet just starts its stream at the base
-                    if c.emitted > 0 {
-                        self.stats.emit_gaps.fetch_add(a.prev_seq - c.emitted, Ordering::Relaxed);
-                        tracing::warn!(id = %self.cfg.id, from = c.emitted, to = a.prev_seq, "qlog: reset past what was emitted: a gap in this node's stream");
-                    }
-                    c.emitted = a.prev_seq;
-                }
+                self.emit_past(&mut c, a.prev_seq);
                 c.log.reset(a.prev_epoch, a.prev_seq);
             }
             let commit_before = c.log.commit();
@@ -2403,13 +2401,7 @@ impl Node {
         let prev = match reset_to {
             Some((e, s)) => {
                 self.stats.resets.fetch_add(1, Ordering::Relaxed);
-                if s > c.emitted {
-                    if c.emitted > 0 {
-                        self.stats.emit_gaps.fetch_add(s - c.emitted, Ordering::Relaxed);
-                        tracing::warn!(id = %self.cfg.id, from = c.emitted, to = s, "qlog: adopting a tail past what was emitted: a gap in this node's stream");
-                    }
-                    c.emitted = s;
-                }
+                self.emit_past(&mut c, s);
                 c.log.reset(e, s);
                 (e, s)
             }
@@ -2793,6 +2785,74 @@ impl Node {
 
     // ---- emission
 
+    /// The log is about to be reset to `to`. A node that hasn't emitted
+    /// just starts its stream there. One with consumers would skip
+    /// committed seqs it never handed them (it was behind when the reset
+    /// came, e.g. a follower mid-catch-up when a bucket recovery's leader
+    /// resets it to R + 1): those are in the bucket up to the recovery's S
+    /// or the leader's flush, so the emitter hands them over first.
+    fn emit_past(&self, c: &mut Core, to: u64) {
+        if to <= c.emitted {
+            return;
+        }
+        if self.emit.firehose().is_none() {
+            c.emitted = to;
+        } else if self.cfg.flush.is_some() {
+            c.jump_to = Some(c.jump_to.map_or(to, |j| j.max(to)));
+            self.commit.send_modify(|_| {});
+        } else {
+            self.stats.emit_gaps.fetch_add(to - c.emitted, Ordering::Relaxed);
+            tracing::warn!(id = %self.cfg.id, from = c.emitted, to, "qlog: reset past what was emitted: a gap in this node's stream");
+            c.emitted = to;
+        }
+    }
+
+    /// Emits what the bucket holds past `emitted` toward `jump_to`, then
+    /// jumps there (past a recovery's gap, which no segment holds).
+    async fn emit_jump(&self) {
+        let mut cache: flush::SegCache = None;
+        loop {
+            let (from, to) = {
+                let mut c = self.core.lock();
+                match c.jump_to {
+                    Some(to) if to > c.emitted => (c.emitted, to),
+                    _ => {
+                        c.jump_to = None;
+                        return;
+                    }
+                }
+            };
+            let read = flush::read_bucket(&self.bucket.backfill, &mut cache, from + 1, to, 8 << 20).await;
+            let _order = self.emit_order.lock();
+            let mut c = self.core.lock();
+            if c.emitted != from {
+                continue;
+            }
+            match read {
+                Ok(Some((_, es))) if es.first().is_some_and(|e| e.seq == from + 1) => {
+                    let upto = es.last().expect("non-empty").seq;
+                    if let Some(h) = &self.cfg.hooks.0 {
+                        h.committed(&es);
+                    }
+                    self.emit.emit(from, upto, es.into_iter().map(|e| (e.seq as i64, e.data)).collect());
+                    c.emitted = upto;
+                }
+                r => {
+                    let to = c.jump_to.take().unwrap_or(to).max(to);
+                    if let Err(e) = &r {
+                        tracing::warn!(id = %self.cfg.id, from, "qlog: reading the skipped seqs from the bucket failed: {e:#}");
+                    }
+                    // past the bucket's last seq this is a recovery's gap (seqs that
+                    // never existed); after a failed read, real seqs are skipped
+                    self.stats.emit_gaps.fetch_add(to - from, Ordering::Relaxed);
+                    tracing::warn!(id = %self.cfg.id, from, to, "qlog: reset past what was emitted: a gap in this node's stream");
+                    c.emitted = to;
+                    return;
+                }
+            }
+        }
+    }
+
     /// Hands committed entries to the firehose, in order, as the commit
     /// index moves. Nothing above the commit index is ever handed over.
     async fn emitter(self: Arc<Self>) {
@@ -2804,9 +2864,15 @@ impl Node {
                 return;
             }
             loop {
+                if self.core.lock().jump_to.is_some() {
+                    self.emit_jump().await;
+                }
                 let _order = self.emit_order.lock();
                 let (from, upto, events) = {
                     let mut c = self.core.lock();
+                    if c.jump_to.is_some() {
+                        continue;
+                    }
                     let upto = c.log.commit().min(c.durable);
                     if upto <= c.emitted {
                         break;
