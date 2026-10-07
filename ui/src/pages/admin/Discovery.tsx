@@ -14,6 +14,7 @@ import { discoveryPoll } from '../../lib/console/polls'
 import { useRelay } from '../../lib/console/relay'
 import { Link, navigate } from '../../lib/router'
 import '../../console-rules.css'
+import { Admissions } from './Admissions'
 import { addSeedRelay, DiscoveryPolicy, DraftBar, normSeedUrl, policySourcePoll, seedUrlError } from './Policy'
 import { NodeTag } from './relayUi'
 
@@ -228,6 +229,7 @@ export function Discovery() {
             )}
           </Loaded>
         </Panel>
+        <Admissions />
         <Panel title="Seed relays and budgets" to="/admin/policy" src={<Src>policy/full · discovery</Src>} right={<span className="muted sm">edits stay a draft until you save</span>} foot={<span>Saved as a new policy version; every node reloads it within 10 s and the leader picks up new sources on its next pass.</span>}>
           <DiscoveryPolicy />
         </Panel>

@@ -4,7 +4,7 @@ import { Chip, Spinner, type ChipKind } from '../../components/console/kit'
 import { toast } from '../../components/console/toast'
 import { errText, type QDurability, type QRecovery, type QStatus, type QSwitch, type QuorumEvent, type QuorumView, type SettingsView } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
-import { fmtBytes, fmtMs, fmtNum, seqS } from '../../lib/console/fmt'
+import { ago, fmtBytes, fmtMs, fmtNum, seqS } from '../../lib/console/fmt'
 import { quorumPoll, type SeenEpoch } from '../../lib/console/polls'
 import type { RelayView } from '../../lib/console/relay'
 
@@ -224,6 +224,46 @@ export function epochDetail(e: EpochEvent): string {
     default:
       return "seen by this console: no member's history lists it"
   }
+}
+
+/** How long a leader change stays news: the Overview banner and ⌘K's "Needs attention". */
+export const LEADER_NEWS_MS = 30 * 60_000
+
+/** The epoch the current leader took over in (the newest change that isn't a lone step-down), when it's dated. */
+export function currentLead(events: EpochEvent[]): EpochEvent | undefined {
+  const e = events.find((x) => x.kind !== 'stepdown')
+  return e?.atMs !== undefined ? e : undefined
+}
+
+/** The newest leader change, when it happened within LEADER_NEWS_MS. */
+export function recentLeaderChange(events: EpochEvent[], now = Date.now()): EpochEvent | undefined {
+  const e = currentLead(events)
+  return e && now - e.atMs! < LEADER_NEWS_MS ? e : undefined
+}
+
+/** A leader change in one line and its detail: "relay-a took over from relay-b 4m ago". */
+export function leaderChangeText(e: EpochEvent): { title: string; desc: string } {
+  const from = e.lead?.from ?? e.down?.node
+  const when = e.atMs ? ago(e.atMs) : ''
+  const who = e.leader ?? 'no member'
+  const title =
+    e.kind === 'takeover'
+      ? from && from !== e.leader
+        ? `Leader changed ${when}: ${who} took over from ${from}`
+        : `${who} took the lead ${when}`
+      : e.kind === 'handoff'
+        ? `Leader changed ${when}: ${from ?? 'the leader'} handed off to ${who}`
+        : e.kind === 'switch'
+          ? `Members changed ${when}: ${who} leads the new set`
+          : e.kind === 'recovery'
+            ? `${who} recovered the log from the bucket ${when}`
+            : `Epoch changed ${when}: ${who} leads`
+  const parts = [
+    e.kind === 'switch' || e.kind === 'recovery' ? epochDetail(e) : e.down ? `${e.down.node} stepped down (${e.down.why})` : '',
+    e.pausedMs !== undefined ? `${e.kind === 'recovery' ? 'took' : 'appends paused'} ${fmtMs(e.pausedMs)}` : '',
+    e.fromEpoch !== undefined ? `epoch ${e.fromEpoch} → ${e.epoch}` : `epoch ${e.epoch}`,
+  ]
+  return { title, desc: parts.filter(Boolean).join(' · ') }
 }
 
 /** Members before and after: kept plain, added dashed green, removed struck red. */

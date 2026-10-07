@@ -4,7 +4,7 @@ import { registerDetail } from '../../components/console/Drawer'
 import { hostActionDialog, useHostsVersion, type HostVerb } from '../../components/console/hostActions'
 import { closePanel, openPanel } from '../../components/console/nav'
 import { toast } from '../../components/console/toast'
-import { Chip, Copy, Empty, HostStatusChip, KV, Sec, Strip, TierTag, type ChipKind } from '../../components/console/kit'
+import { Chip, Copy, Empty, HostStatusChip, KV, Over, Sec, Strip, TierTag, type ChipKind } from '../../components/console/kit'
 import { errText, type Account, type Case, type CaseStatus, type DomainRule, type DomainRuleInput, type RuleEffect, type Severity, type SignalKey } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { ago, dt, fmtNum, plural, shortDid } from '../../lib/console/fmt'
@@ -412,7 +412,9 @@ function CaseBody({ c, page }: { c: Case; page: boolean }) {
                     <td className="sm muted" title={dt(t.atMs)}>
                       {ago(t.atMs)}
                     </td>
-                    <td className="r mono sm">{caseObs({ kind: c.kind, observed: t.observed, threshold: t.threshold })}</td>
+                    <td className="r">
+                      <Over r={t.threshold > 0 ? t.observed / t.threshold : NaN} detail={caseObs({ kind: c.kind, observed: t.observed, threshold: t.threshold })} />
+                    </td>
                     <td className="r mono sm">{t.windowSecs} s</td>
                     <td className="mono sm">{t.node}</td>
                     <td style={{ whiteSpace: 'normal', minWidth: 200 }}>

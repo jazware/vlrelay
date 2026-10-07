@@ -1,15 +1,18 @@
 import { useEffect, useRef, type ReactNode } from 'react'
 import { setAdminToken } from '../../lib/api'
 import { releaseHeld } from '../../lib/console/firehose'
-import { clock, dur, fmtSi } from '../../lib/console/fmt'
+import { ago, clock, dur, fmtSi } from '../../lib/console/fmt'
 import { getLive, togglePaused, toggleSources, useLiveState } from '../../lib/console/live'
-import { consumersPoll, isSlow, openCasesPoll, overviewPoll, policyFullPoll, slowLagMs, throttledPoll } from '../../lib/console/polls'
-import { useRelay } from '../../lib/console/relay'
+import { capPoll, consumersPoll, historyPoll, isSlow, openCasesPoll, overviewPoll, policyFullPoll, quorumPoll, seenEpochs, slowLagMs, throttledPoll } from '../../lib/console/polls'
+import { useRelay, type RelayView } from '../../lib/console/relay'
 import { setTheme, useResolvedTheme } from '../../lib/hooks'
 import { Link, navigate, usePath } from '../../lib/router'
 import { closeDialog, DialogHost, isDialogOpen, openDialog } from './dialogs'
 import { detailPath, Drawer } from './Drawer'
-import { Jack, Kbd, Swatch } from './kit'
+import { attention } from '../../pages/admin/relayUi'
+import { epochEvents } from '../../pages/admin/quorumUi'
+import { GLYPH, Jack, Kbd, Swatch } from './kit'
+import { recentList } from './recent'
 import { closePanel, openPanel, panelOf } from './nav'
 import { isPaletteOpen, lookupProvider, Palette, registerPalette, setPaletteOpen, type PalItem } from './Palette'
 import { SECTION, SECTIONS, TABBAR, type Section, type SectionId } from './sections'
@@ -190,7 +193,50 @@ function StreamChip({ held }: { held: boolean }) {
   )
 }
 
-/** The shell's own palette entries: sections, console actions, nodes. */
+const RECENT_GLYPH: Record<string, string> = { host: '⇄', node: '◆', epoch: '◇', consumer: '◆', case: '▤', acct: '@', rule: '§', flag: '⚑', dsource: '◇', ver: '▤' }
+
+/** Keeps a shared poll running without re-rendering whatever mounts it. */
+function Keep({ use }: { use: () => unknown }) {
+  use()
+  return null
+}
+
+/** ⌘K's inbox for an empty query: the banners' notices (each opening its row), then the details opened in this tab. */
+function inboxItems(view: RelayView | undefined): PalItem[] {
+  const qd = quorumPoll.get().data
+  const events = view?.quorum ? epochEvents(qd?.supported ? qd.data : undefined, historyPoll.get().data?.events ?? [], seenEpochs()) : []
+  const att = attention({
+    view,
+    events,
+    throttled: throttledPoll.get().data?.hosts,
+    capped: capPoll.get().data?.hosts,
+    consumers: consumersPoll.get().data,
+    slowCutMs: slowLagMs(policyFullPoll.get().data),
+    cases: openCasesPoll.get().data,
+  }).map(
+    (a): PalItem => ({
+      group: 'Needs attention',
+      inbox: true,
+      glyph: <span className={`cx-g s-${a.tone}`}>{GLYPH[a.tone]}</span>,
+      title: a.title,
+      desc: a.desc,
+      run: a.run,
+    }),
+  )
+  const recent = recentList().map(
+    (r): PalItem => ({
+      group: 'Recent',
+      inbox: true,
+      glyph: RECENT_GLYPH[r.type] ?? '›',
+      title: r.title,
+      desc: `${/^[A-Z][a-z]/.test(r.kind) ? r.kind[0].toLowerCase() + r.kind.slice(1) : r.kind} · ${ago(r.at)}`,
+      run: () => openPanel(r.type, r.id),
+    }),
+  )
+  return [...att, ...recent]
+}
+
+/** The shell's own palette entries: sections, console actions, nodes, and the empty query's inbox. */
 function useCorePalette() {
   const { view } = useRelay()
   const viewRef = useRef(view)
@@ -224,7 +270,7 @@ function useCorePalette() {
             openPanel('node', n.id)
           },
         }))
-        return [...goto, ...acts, ...nodes]
+        return [...inboxItems(viewRef.current), ...goto, ...acts, ...nodes]
       },
     })
     return () => {
@@ -413,6 +459,9 @@ export function Shell({ section, crumbs, children }: { section: Section; crumbs?
       </nav>
       <Drawer />
       <Palette />
+      {/* the palette's inbox reads these when it opens */}
+      <Keep use={capPoll.use} />
+      {view?.quorum && <Keep use={historyPoll.use} />}
       <DialogHost />
       <Toasts />
     </div>

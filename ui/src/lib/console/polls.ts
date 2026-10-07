@@ -23,9 +23,16 @@ function push(key: string, v: number | undefined | null) {
 export const seriesOf = (key: string): number[] => series.get(key) ?? []
 export const seriesTick = () => seriesVersion
 
+let lastSeq: number | undefined
+let seqMovedAt: number | undefined
+/** When the console last saw the newest seq move (to within a poll), or undefined before it has. */
+export const seqSeenAt = () => seqMovedAt
+
 export const overviewPoll = createPoller<Overview>(A.overview, 2000, {
   heartbeat: true,
   onData: (o) => {
+    if (lastSeq !== undefined && o.lastSeq !== lastSeq) seqMovedAt = Date.now()
+    lastSeq = o.lastSeq
     push('stream', o.streamEventsPerSec ?? o.eventsOutPerSec)
     for (const n of o.byNode ?? []) if (!n.stale) push(`node-in:${n.node}`, n.eventsInPerSec)
     seriesVersion++

@@ -265,6 +265,21 @@ export const settingsOf = (node: string) => api<SettingsView>('settings', { para
 
 // ---------------------------------------------------------------- what the console wants next
 
+/** One host in a reason's top list: its rejects a second now, the total counted and when the last was. */
+export type RejectTopHost = { host: string; rejectsPerSec: number; total: number; lastAtMs: number; sample?: unknown }
+
+let hasRejectsTop: boolean | undefined
+/**
+ * The hosts sending the most rejects for one reason, cluster-wide. A relay that doesn't serve it
+ * answers 404 once; after that the console stops asking until the page reloads.
+ */
+export async function rejectsTop(reason: string, limit = 10): Promise<Optional<RejectTopHost[]>> {
+  if (hasRejectsTop === false) return { supported: false, endpoint: 'GET ops/rejects/top', why: '' }
+  const r = await optional('GET ops/rejects/top', () => api<RejectTopHost[]>('ops/rejects/top', { params: { reason, limit } }))
+  hasRejectsTop = r.supported
+  return r
+}
+
 /** Endpoints the design assumes but the relay doesn't serve: answer with `missing(endpoint, why)` and list them here (CONSOLE.md has the table). */
-export const MISSING: readonly (readonly [endpoint: string, feeds: string])[] = []
+export const MISSING: readonly (readonly [endpoint: string, feeds: string])[] = [['GET ops/rejects/top?reason&limit', 'top hosts per reject reason (Hosts with ?reason=)']]
 export { missing }

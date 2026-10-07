@@ -159,3 +159,42 @@
     margin: 6px 10px 4px;
   }
 }
+
+/* ---------------------------------------------------------------- host owners: one stacked bar, a lookup */
+.cx-ownbar {
+  display: flex;
+  height: 14px;
+  border-radius: 4px;
+  overflow: hidden;
+  gap: 2px;
+  background: var(--sunk);
+}
+.cx-ownbar > i {
+  display: block;
+  min-width: 2px;
+  transition: opacity 0.12s;
+}
+.cx-ownbar > i.unowned {
+  background: repeating-linear-gradient(135deg, var(--err) 0 3px, transparent 3px 6px);
+}
+.cx-ownbar.focus > i:not(.hl) {
+  opacity: 0.3;
+}
+.cx-ownlegend {
+  margin-top: 8px;
+}
+.cx-ownlegend b {
+  color: var(--ink);
+  font-weight: 600;
+}
+.cx-ownfind {
+  margin-top: 12px;
+}
+.cx-ownfind .cx-inp {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+}
+.cx-ownhits {
+  margin-top: 6px;
+}

@@ -5,14 +5,14 @@ import { registerDetail } from '../../components/console/Drawer'
 import { Banners, Bars, Chip, Copy, Empty, Glyph, KV, LiveVal, Loaded, Meter, Mini, PageHead, Panel, SearchInput, Sec, Seg, Spark, Src, Strip, Tiles, type BannerSpec, type TileSpec } from '../../components/console/kit'
 import { openPanel } from '../../components/console/nav'
 import { registerPalette } from '../../components/console/Palette'
-import type { Consumer } from '../../lib/api'
+import type { Consumer, Overview } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
 import { dt, dur, fmtBytes, fmtMs, fmtNum, fmtSi, plural, seqS } from '../../lib/console/fmt'
-import { consumersPoll, isSlow, overviewPoll, policyFullPoll, quorumPoll, seriesOf, settingsPoll, slowLagMs } from '../../lib/console/polls'
+import { consumersPoll, isSlow, overviewPoll, policyFullPoll, quorumPoll, seqSeenAt, seriesOf, settingsPoll, slowLagMs } from '../../lib/console/polls'
 import { useRelay } from '../../lib/console/relay'
 import { Link, navigate, useSearch } from '../../lib/router'
 import './logPages.css'
-import { RoleChip, memberRows, membershipOn } from './quorumUi'
+import { RoleChip, memberRows, membershipOn, type MemberRow } from './quorumUi'
 import { NodeTag } from './relayUi'
 
 // Every subscribeRepos socket on every member (the answering node asks the others over the peer
@@ -61,6 +61,57 @@ export function kickDialog(c: Consumer) {
     if (ok) consumersPoll.refresh()
     return ok
   })
+}
+
+/** Entries the leader has committed that a member hasn't emitted yet. */
+const behindOf = (rows: MemberRow[], id: string) => {
+  const commit = rows.find((r) => r.kind === 'leader')?.s?.commit
+  const m = rows.find((r) => r.id === id)
+  return commit !== undefined && m?.s ? Math.max(0, commit - m.s.emitted) : undefined
+}
+const BEHIND_WARN = 1000
+
+/**
+ * Is the stream itself fresh: how long since the newest seq moved (to within a poll), the time
+ * to firehose, and the serving node furthest behind the commit. The tile that says whether
+ * "we're behind" is the relay or the consumer.
+ */
+function freshnessTile(o: Overview | undefined, rows: MemberRow[], held: boolean): TileSpec {
+  const seen = seqSeenAt()
+  const age = seen !== undefined ? Date.now() - seen : undefined
+  const worst = rows
+    .filter((r) => r.s && !r.stale && r.kind !== 'retired')
+    .map((r) => ({ id: r.id, n: behindOf(rows, r.id) ?? 0 }))
+    .sort((a, b) => b.n - a.n)[0]
+  const moving = age !== undefined && age < 5000
+  const tone = held || (age !== undefined && age > 30_000) ? 'err' : !moving && age !== undefined ? 'warn' : (o && o.timeToFirehoseP99Ms > 250) || (worst && worst.n > BEHIND_WARN) ? 'warn' : 'ok'
+  return {
+    label: (
+      <span className="t2">
+        <Glyph k={tone} /> Stream freshness
+      </span>
+    ),
+    right: 'newest seq age',
+    value: held ? 'held' : age === undefined ? '—' : moving ? '< 2 s' : dur(age),
+    spark: (
+      <div className="cx-tsub">
+        TTF p99 {o ? fmtMs(o.timeToFirehoseP99Ms) : '—'}
+        {worst ? (worst.n > 0 ? ` · ${worst.id} ${fmtNum(worst.n)} behind` : ' · every node at the commit') : ''}
+      </div>
+    ),
+    title: 'How long since the console saw the newest seq move (it polls every 2 s), the time from a PDS frame to the firehose, and the serving node furthest behind the commit',
+    to: '/admin/quorum',
+  }
+}
+
+/** One line on how this consumer is doing, to paste back to whoever asked. */
+function verdict(c: Consumer, cut: number, behind: number | undefined): string {
+  const lag = fmtMs(c.lagMs)
+  if (c.readTier === 'disk' || c.readTier === 'bucket') return `Replaying from ${c.readTier === 'disk' ? `${c.node}'s local disk` : "the bucket's segments"}, ${lag} behind live${c.cursor > 0 ? ` (cursor ${seqS(c.cursor)})` : ''}.`
+  if (c.backfilling) return `Replaying from the firehose's memory, ${lag} behind live.`
+  if (behind !== undefined && behind > BEHIND_WARN) return `Its node ${c.node} is ${fmtNum(behind)} entries behind the commit: the lag is the relay's, not the consumer's.`
+  if (isSlow(c, cut)) return `Falling behind: ${lag} behind live, cut off at ${fmtMs(cut)}. It reads slower than the stream.`
+  return `Live, ${lag} behind, under the ${fmtMs(cut)} cutoff.`
 }
 
 /** Where its next events come from: the firehose's memory, the node's own log, or the bucket's segments. */
@@ -150,10 +201,16 @@ export function Consumers() {
     })
 
   const tiles: TileSpec[] = [
+    freshnessTile(o, mrows, view?.quorum?.health === 'down'),
     { label: 'Consumers', right: 'every node', value: all ? fmtNum(all.length) : '—', sec: `${fmtNum(backfill)} replaying` },
     { label: 'Events sent', right: 'every node', value: o ? fmtSi(o.eventsOutPerSec) : '—', unit: '/s', spark: <Spark data={o?.history.eventsOut ?? []} color="c5" /> },
-    { label: 'Egress', right: 'every node', value: o ? `${fmtBytes(o.bytesOutPerSec)}/s` : '—', spark: <Spark data={o?.history.bytesOut ?? []} color="c5" /> },
-    { label: 'Per full-stream consumer', value: frameBytes ? `${fmtBytes(stream * frameBytes)}/s` : '—', sec: 'at the stream’s rate now', title: 'The merged stream’s rate times the mean frame size sent' },
+    {
+      label: 'Egress',
+      right: frameBytes ? `≈ ${fmtBytes(stream * frameBytes)}/s per consumer` : 'every node',
+      value: o ? `${fmtBytes(o.bytesOutPerSec)}/s` : '—',
+      spark: <Spark data={o?.history.bytesOut ?? []} color="c5" />,
+      title: 'Per full-stream consumer: the merged stream’s rate times the mean frame size sent',
+    },
     { label: 'Slowest live', value: slowest ? fmtMs(slowest.lagMs) : '—', sec: `cut off at ${fmtMs(cut)}`, title: 'The live consumer furthest behind the newest seq' },
   ]
 
@@ -341,6 +398,7 @@ registerDetail('consumer', {
     const subs = consumersPoll.use()
     const ov = overviewPoll.use()
     const pol = policyFullPoll.use()
+    const qp = quorumPoll.use()
     const { view } = useRelay()
     const c = subs.data?.find((x) => keyOf(x) === id)
     if (!c) return { title: `#${id.split('/').pop()}`, body: null, loading: subs.loading, missing: subs.loading ? undefined : 'It disconnected: consumer ids are per connection.' }
@@ -349,8 +407,13 @@ registerDetail('consumer', {
     const stream = o ? (o.streamEventsPerSec ?? o.eventsOutPerSec) : 0
     const share = stream > 0 ? c.eventsPerSec / stream : 0
     const mine = seriesOf(`cons:${id}`)
+    const behind = qp.data?.supported ? behindOf(memberRows(qp.data.data, view), c.node) : undefined
+    const line = verdict(c, cut, behind)
     const main = (
       <>
+        <div className={`cx-verdict ${isSlow(c, cut) || (behind ?? 0) > BEHIND_WARN ? 'warn' : c.backfilling ? 'info' : 'ok'}`}>
+          <Copy text={line} mono={false} />
+        </div>
         <Strip
           items={[
             ['events/s', fmtSi(c.eventsPerSec)],

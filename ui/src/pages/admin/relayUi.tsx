@@ -1,13 +1,14 @@
 import type { ReactNode } from 'react'
-import { Chip, Swatch, type BannerSpec } from '../../components/console/kit'
+import { Chip, Swatch, type BannerSpec, type Tone } from '../../components/console/kit'
 import { openPanel } from '../../components/console/nav'
 import { hostActionDialog } from '../../components/console/hostActions'
 import { REASON_LABEL } from '../../components/relay'
-import type { Consumer, HostRow, RejectReason } from '../../lib/api'
-import { fmtMs, fmtNum, plural } from '../../lib/console/fmt'
+import type { Case, Consumer, HostRow, RejectReason } from '../../lib/api'
+import { ago, fmtMs, fmtNum, plural } from '../../lib/console/fmt'
 import { isSlow } from '../../lib/console/polls'
 import type { RelayView } from '../../lib/console/relay'
-import { Link } from '../../lib/router'
+import { Link, navigate } from '../../lib/router'
+import { leaderChangeText, recentLeaderChange, type EpochEvent } from './quorumUi'
 
 // What the Overview and Hosts pages share: the banners, reject wording, a node tag.
 
@@ -182,3 +183,65 @@ export const Lg = ({ color, dashed, children }: { color: string; dashed?: boolea
     {children}
   </span>
 )
+
+/** One thing needing attention, as ⌘K lists it: the same notices as the banners, each opening its row. */
+export type Attention = { id: string; tone: Tone; title: string; desc?: string; run: () => void }
+
+/** What the banners say across the console (the quorum, nodes, a leader change, hosts, consumers, cases), as palette items. */
+export function attention(o: {
+  view?: RelayView
+  events: EpochEvent[]
+  throttled?: HostRow[]
+  capped?: HostRow[]
+  consumers?: Consumer[]
+  slowCutMs: number
+  cases?: Case[]
+}): Attention[] {
+  const out: Attention[] = []
+  const q = o.view?.quorum
+  if (q?.health === 'down')
+    out.push({ id: 'held', tone: 'err', title: `The firehose is held: ${q.answering.length} of ${q.members.length} members answering`, desc: q.leader ? 'the leader has no majority' : 'no leader', run: () => navigate('/admin/quorum') })
+  else if (q?.health === 'degraded') {
+    const missing = q.members.filter((m) => !q.answering.includes(m))
+    out.push({ id: 'degraded', tone: 'warn', title: `${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} not answering`, desc: `${q.answering.length} of ${q.members.length} members`, run: () => openPanel('node', missing[0]) })
+  }
+  for (const n of o.view?.nodes ?? []) if (n.stale && !q?.members.includes(n.id)) out.push({ id: `stale-${n.id}`, tone: 'warn', title: `${n.id} didn't answer`, desc: n.error ?? 'node', run: () => openPanel('node', n.id) })
+  const lead = q && q.health !== 'down' ? recentLeaderChange(o.events) : undefined
+  if (lead) {
+    const t = leaderChangeText(lead)
+    out.push({ id: 'leader', tone: 'info', title: t.title, desc: `epoch ${lead.epoch}`, run: () => openPanel('epoch', lead.id) })
+  }
+  const behind = (o.throttled ?? []).filter((h) => h.lagMs > 60_000)
+  if (behind.length)
+    out.push({
+      id: 'behind',
+      tone: 'warn',
+      title: behind.length === 1 ? `${behind[0].host} is ${fmtMs(behind[0].lagMs)} behind its own stream` : `${plural(behind.length, 'throttled host')} more than a minute behind`,
+      desc: behind.length === 1 ? 'throttled' : `worst ${behind[0].host}, ${fmtMs(behind[0].lagMs)}`,
+      run: () => openPanel('host', behind[0].host),
+    })
+  const atCap = (o.capped ?? []).filter((h) => h.maxAccounts > 0 && h.accounts >= h.maxAccounts && h.status !== 'banned' && h.status !== 'suspended')
+  if (atCap.length) out.push({ id: 'cap', tone: 'warn', title: `${plural(atCap.length, 'host')} at the account cap`, desc: 'Hosts · at cap', run: () => navigate('/admin/hosts?flag=cap') })
+  const slow = (o.consumers ?? []).filter((c) => isSlow(c, o.slowCutMs)).sort((a, b) => b.lagMs - a.lagMs)
+  if (slow.length)
+    out.push({
+      id: 'slow',
+      tone: 'warn',
+      title: slow.length === 1 ? `Consumer #${slow[0].id} is falling behind` : `${slow.length} consumers are falling behind`,
+      desc: `#${slow[0].id} on ${slow[0].node} · ${fmtMs(slow[0].lagMs)} behind`,
+      run: () => openPanel('consumer', `${slow[0].node}/${slow[0].id}`),
+    })
+  const cases = o.cases ?? []
+  if (cases.length) {
+    const crit = cases.filter((c) => c.severity === 'critical').length
+    const oldest = Math.min(...cases.map((c) => c.openedAtMs))
+    out.push({
+      id: 'cases',
+      tone: crit ? 'err' : 'warn',
+      title: cases.length === 1 ? `Case ${cases[0].id}: ${cases[0].kind.replace(/-/g, ' ')} on ${cases[0].host}` : `${plural(cases.length, 'open case')}${crit ? `, ${crit} critical` : ''}`,
+      desc: `oldest ${ago(oldest)} · Moderation`,
+      run: () => (cases.length === 1 ? openPanel('case', String(cases[0].id)) : navigate('/admin/moderation')),
+    })
+  }
+  return out
+}

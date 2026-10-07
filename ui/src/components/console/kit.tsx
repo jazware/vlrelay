@@ -129,6 +129,28 @@ export function Meter({ v, max, k, wide, title }: { v: number; max: number; k?: 
   )
 }
 
+/** A ratio to a limit as "6.7×". */
+export const fmtX = (r: number) => (!isFinite(r) ? '—' : r >= 9.95 ? `${Math.round(r)}×` : r >= 0.095 ? `${r.toFixed(1)}×` : `${r.toFixed(2)}×`)
+
+/**
+ * How far past its limit a value is: the ratio as the headline, the value and limit muted
+ * beside it, and a bar on one log scale (0.1× to 10×) with a tick at the limit, so a bigger
+ * overage always draws longer and anything past 10× pins.
+ */
+export function Over({ r, detail, title }: { r: number; detail?: ReactNode; title?: string }) {
+  const pos = isFinite(r) && r > 0 ? Math.min(1, Math.max(0, (Math.log10(r) + 1) / 2)) : 0
+  const k = !isFinite(r) ? 'idle' : r >= 1 ? 'err' : r >= 0.7 ? 'warn' : 'ok'
+  return (
+    <span className={`cx-over ${k}${detail === undefined ? ' bare' : ''}`} title={title}>
+      <span className="ob" aria-hidden="true">
+        <i style={{ width: `${(pos * 100).toFixed(1)}%` }} />
+      </span>
+      <b>{fmtX(r)}</b>
+      {detail !== undefined && <span className="od">{detail}</span>}
+    </span>
+  )
+}
+
 export function MiniBar({ parts, width = 56 }: { parts: { v: number; color: string; title?: string }[]; width?: number }) {
   const total = parts.reduce((a, p) => a + p.v, 0) || 1
   return (

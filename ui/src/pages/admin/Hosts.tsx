@@ -1,29 +1,34 @@
 import { useEffect, useMemo } from 'react'
 import { DataTable, type Col } from '../../components/console/DataTable'
 import { useHostsVersion } from '../../components/console/hostActions'
-import { Banners, Chip, Empty, Glyph, HostName, Kbd, Loaded, LiveVal, Meter, PageHead, Panel, SearchInput, Seg, Src, Tiles, TierTag, hostTone, type TileSpec } from '../../components/console/kit'
+import { Banners, Chip, Empty, Glyph, HostName, Kbd, Loaded, LiveVal, Meter, NeedsVersion, PageHead, Panel, SearchInput, Seg, Src, Tiles, TierTag, hostTone, type TileSpec } from '../../components/console/kit'
+import { openPanel } from '../../components/console/nav'
 import { HOST_STATUSES } from '../../components/relay'
-import type { HostRow, HostStatus } from '../../lib/api'
+import type { HostRow, HostStatus, RejectReason } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
-import { fmtMs, fmtNum, fmtRatio, fmtSi } from '../../lib/console/fmt'
+import { ago, dt, fmtMs, fmtNum, fmtRatio, fmtSi } from '../../lib/console/fmt'
 import { useLivePoll } from '../../lib/console/live'
 import { capPoll, discoveryPoll, overviewPoll, policyFullPoll, policyPoll, slowLagMs, throttledPoll } from '../../lib/console/polls'
 import { useRelay } from '../../lib/console/relay'
 import { Link, useSearch } from '../../lib/router'
-import { Admissions } from './Admissions'
+import { AdmissionTable } from './Admissions'
 import { SourceSelect, SourceTag, sourceOk } from './hostSource'
 import { crawlDialog } from './Overview'
-import { NodeTag, relayBanners } from './relayUi'
+import { NodeTag, REASON_WHAT, reasonLabel, relayBanners } from './relayUi'
 
 // Every PDS the relay knows, thousands of them: the server filters, sorts and pages
-// (GET hosts?q&tier&status&sort&desc&limit&offset). The flags (at cap, lagging, erroring) and the
-// source have no server filter, so with one on the page asks for every match and filters here.
+// (GET hosts?q&tier&status&sort&desc&limit&offset). The flags (at cap, lagging, erroring, accounts
+// created throttled) and the source have no server filter, so with one on the page asks for every
+// match and filters here. `?reason=` (from the Overview's reject bars) adds the hosts sending
+// that reject, and a search that finds nothing shows the name's admissions.
 
 const PAGE = 100
-type Flag = '' | 'cap' | 'lag' | 'err'
+type Flag = '' | 'cap' | 'lag' | 'err' | 'thr'
 const SORTABLE: A.HostSort[] = ['host', 'status', 'events', 'errors', 'accounts', 'lag', 'seq']
 const live = (h: HostRow) => h.status === 'connected' || h.status === 'throttled'
-const flagOk = (f: Flag, h: HostRow) => (f === 'cap' ? h.maxAccounts > 0 && h.accounts >= h.maxAccounts : f === 'lag' ? live(h) && h.lagMs > 60_000 : f === 'err' ? h.errorRate > 0.1 : true)
+const atCap = (h: HostRow) => h.maxAccounts > 0 && h.accounts >= h.maxAccounts
+const flagOk = (f: Flag, h: HostRow) =>
+  f === 'cap' ? atCap(h) : f === 'lag' ? live(h) && h.lagMs > 60_000 : f === 'err' ? h.errorRate > 0.1 : f === 'thr' ? h.throttledAccounts > 0 || atCap(h) : true
 
 function useUrlState() {
   const s = useSearch()
@@ -33,6 +38,7 @@ function useUrlState() {
     status: (s.get('status') ?? '') as HostStatus | '',
     flag: (s.get('flag') ?? '') as Flag,
     source: s.get('source') ?? '',
+    reason: (s.get('reason') ?? '') as RejectReason | '',
     sort: (s.get('sort') as A.HostSort) || 'events',
     asc: s.get('asc') === '1',
     page: Math.max(0, Number(s.get('page') ?? 0) || 0),
@@ -51,6 +57,7 @@ function setUrl(p: Partial<UrlState>, cur: UrlState) {
   put('status', n.status)
   put('flag', n.flag)
   put('source', n.source)
+  put('reason', n.reason)
   put('sort', n.sort)
   put('asc', n.asc)
   put('page', n.page)
@@ -191,7 +198,7 @@ export function Hosts() {
         }
         actions={
           <>
-            <button type="button" className="cx-btn" onClick={crawlDialog}>
+            <button type="button" className="cx-btn" onClick={() => crawlDialog()}>
               Request crawl…
             </button>
             <Link className="cx-btn" to="/admin/moderation#rules">
@@ -204,8 +211,10 @@ export function Hosts() {
       <div className="cx-tilesbox">
         <Tiles tiles={statusTiles} />
       </div>
+      {u.reason && <ReasonTop reason={u.reason} clear={() => setUrl({ reason: '' }, u)} />}
       <Panel
-        title="Every host"
+        title={u.reason ? <>Every host by its share of rejects</> : 'Every host'}
+        className={u.reason ? 'cx-mt' : undefined}
         src={<Src>hosts?q&amp;tier&amp;status&amp;sort&amp;limit&amp;offset</Src>}
         right={
           <span className="muted sm">
@@ -231,6 +240,7 @@ export function Hosts() {
               { v: 'cap', label: 'at cap' },
               { v: 'lag', label: 'lagging' },
               { v: 'err', label: 'erroring' },
+              { v: 'thr', label: 'throttled accts' },
             ]}
             onChange={(flag) => setUrl({ flag }, u)}
           />
@@ -239,17 +249,22 @@ export function Hosts() {
         <Loaded load={list}>
           {() => (
             <>
-              <DataTable
-                rows={rows}
-                cols={cols}
-                rowKey={(h) => h.host}
-                open={(h) => ({ type: 'host', id: h.host })}
-                dim={(h) => h.status === 'banned' || h.status === 'suspended'}
-                compact
-                label="Hosts"
-                serverSort={{ id: u.sort, asc: u.asc, sortable: SORTABLE, onSort: (s) => setUrl({ sort: s.id as A.HostSort, asc: s.asc }, u) }}
-                empty={<Empty title="No host matches">Try a shorter name or clear the filters.</Empty>}
-              />
+              {/* outside the table, so a phone doesn't scroll it sideways */}
+              {!rows.length && u.q.trim() && !u.tier && !u.status && !u.flag && !u.source ? (
+                <NoMatch q={u.q} />
+              ) : (
+                <DataTable
+                  rows={rows}
+                  cols={cols}
+                  rowKey={(h) => h.host}
+                  open={(h) => ({ type: 'host', id: h.host })}
+                  dim={(h) => h.status === 'banned' || h.status === 'suspended'}
+                  compact
+                  label="Hosts"
+                  serverSort={{ id: u.sort, asc: u.asc, sortable: SORTABLE, onSort: (s) => setUrl({ sort: s.id as A.HostSort, asc: s.asc }, u) }}
+                  empty={<Empty title="No host matches">Try a shorter name or clear the filters.</Empty>}
+                />
+              )}
               <div className="cx-pager">
                 <span className="l">
                   {fmtNum(matched)}
@@ -270,41 +285,108 @@ export function Hosts() {
           )}
         </Loaded>
       </Panel>
-      <div className="cx-grid2 cx-mt">
-        <Admissions />
-        <Panel title="Tiers" to="/admin/policy" src={<Src>policy · hosts?tier</Src>}>
-          {pol.data ? (
-            <div className="cx-tw">
-              <table className="cx-t compact">
-                <thead>
-                  <tr>
-                    <th>Tier</th>
-                    <th className="r">Hosts</th>
-                    <th className="r">Events/s</th>
-                    <th className="r">Account cap</th>
-                    <th className="r">New accounts/h</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {Object.entries(pol.data.policy.tiers).map(([t, l]) => (
-                    <tr key={t} data-open={`row:${t}`} onClick={() => setUrl({ tier: u.tier === t ? '' : t }, u)} className={u.tier === t ? 'sel' : undefined}>
-                      <td>
-                        <TierTag t={t} /> {t === pol.data!.policy.defaultTier && <span className="muted sm">default</span>}
-                      </td>
-                      <td className="r mono">{counts.has(t) ? fmtNum(counts.get(t)!) : '—'}</td>
-                      <td className="r mono">{fmtNum(l.eventsPerSec)}</td>
-                      <td className="r mono">{fmtSi(l.maxAccounts)}</td>
-                      <td className="r mono">{fmtNum(l.newAccountsPerHour)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <Loaded load={pol}>{() => null}</Loaded>
-          )}
-        </Panel>
-      </div>
     </>
+  )
+}
+
+/** A sample reject as the server gives it: a string, or a frame with its detail and DID. */
+function sampleText(s: unknown): string | undefined {
+  if (typeof s === 'string') return s
+  if (s && typeof s === 'object') {
+    const o = s as { detail?: string; did?: string }
+    return o.detail || o.did
+  }
+  return undefined
+}
+
+/** The hosts sending the most of one reject reason, cluster-wide (GET ops/rejects/top). */
+function ReasonTop({ reason, clear }: { reason: RejectReason; clear: () => void }) {
+  const top = useLivePoll(() => A.rejectsTop(reason, 10), `top:${reason}`, 5000)
+  const d = top.data
+  const label = reasonLabel(reason)
+  return (
+    <Panel
+      title={<>Hosts sending “{label}”</>}
+      src={<Src>ops/rejects/top?reason&amp;limit</Src>}
+      right={
+        <button type="button" className="cx-btn sm quiet" onClick={clear}>
+          ✕ any reason
+        </button>
+      }
+      foot={<span>{REASON_WHAT[reason] ? `${REASON_WHAT[reason][0].toUpperCase()}${REASON_WHAT[reason].slice(1)}.` : null} Every member's count, heaviest first.</span>}
+    >
+      {!d ? (
+        <Loaded load={top}>{() => null}</Loaded>
+      ) : !d.supported ? (
+        <NeedsVersion what={`The hosts sending “${label}”`} endpoint="GET ops/rejects/top">
+          Below, every host by its share of rejects for any reason; a host's own page splits them by reason.
+        </NeedsVersion>
+      ) : !d.data.length ? (
+        <Empty>No host has sent “{label}” lately.</Empty>
+      ) : (
+        <div className="cx-tw">
+          <table className="cx-t compact">
+            <thead>
+              <tr>
+                <th>Host</th>
+                <th className="r">Rejects/s</th>
+                <th className="r">Total</th>
+                <th className="r">Last</th>
+                <th>Sample</th>
+              </tr>
+            </thead>
+            <tbody>
+              {d.data.map((h, i) => (
+                <tr key={`${h.host}#${i}`} data-open={`host:${h.host}`} onClick={() => openPanel('host', h.host)}>
+                  <td>
+                    <HostName host={h.host} />
+                  </td>
+                  <td className="r mono sm">
+                    <LiveVal>{fmtSi(h.rejectsPerSec)}</LiveVal>
+                  </td>
+                  <td className="r mono sm t2">{fmtNum(h.total)}</td>
+                  <td className="r sm muted nowrap" title={h.lastAtMs ? dt(h.lastAtMs) : undefined}>
+                    {ago(h.lastAtMs)}
+                  </td>
+                  <td className="sm t2 trunc" style={{ maxWidth: 320 }} title={sampleText(h.sample)}>
+                    {sampleText(h.sample) ?? <span className="muted">—</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Panel>
+  )
+}
+
+const HOSTNAME = /^[a-z0-9-]+(\.[a-z0-9-]+)+(:\d+)?$/
+
+/** No known host matches the search: what this node's admissions say about the name, and a crawl request. */
+function NoMatch({ q }: { q: string }) {
+  const l = useLivePoll(A.admissions, 'admissions', 10_000)
+  const name = q.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '')
+  const hits = (l.data?.entries ?? []).filter((a) => a.host.toLowerCase().includes(name)).slice(0, 12)
+  return (
+    <div className="cx-nomatch">
+      <Empty title={<>No known host matches “{name}”</>}>
+        {!l.data
+          ? l.error
+            ? "This node's admissions didn't load."
+            : 'Looking through its admissions…'
+          : hits.length
+            ? `What this node did with it lately, newest first:`
+            : "Nothing in this node's last 500 admissions either: the relay hasn't heard of it."}
+      </Empty>
+      {hits.length > 0 && <AdmissionTable entries={hits} />}
+      {HOSTNAME.test(name) && (
+        <div className="cx-pn-b" style={{ textAlign: 'center' }}>
+          <button type="button" className="cx-btn sm primary" onClick={() => crawlDialog(name)}>
+            Request crawl for {name}…
+          </button>
+        </div>
+      )}
+    </div>
   )
 }
