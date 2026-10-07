@@ -2676,14 +2676,19 @@ a.cx-rrow:hover {
   gap: 28px;
   align-items: start;
 }
+.cx-hero > div {
+  container-type: inline-size;
+}
+/* Sized so the whole hostname (--n characters) fits the column on one line;
+   at the floor size a long one wraps at its first dot, never mid-word. */
 .cx-hero h1 {
   margin: 0;
-  font-size: clamp(34px, 6vw, 64px);
+  font-size: clamp(28px, calc(100cqi / (var(--n, 16) * 0.7)), 64px);
   line-height: 1;
   font-weight: 800;
   font-stretch: 125%;
   letter-spacing: -0.03em;
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
 }
 .cx-hero h1 .d {
   color: var(--ink3);

@@ -107,6 +107,21 @@ const Fig = ({ v, unit, label, em }: { v: ReactNode; unit?: string; label: strin
   </div>
 )
 
+/** Whether /admin answers from here: a proxy in front of a public relay usually hides it. */
+function useConsoleReachable() {
+  const [ok, setOk] = useState(false)
+  useEffect(() => {
+    let live = true
+    fetch('/admin', { method: 'HEAD' })
+      .then((r) => live && setOk(r.ok))
+      .catch(() => {})
+    return () => {
+      live = false
+    }
+  }, [])
+  return ok
+}
+
 export function Public() {
   const l = publicPoll.use()
   const s = l.data
@@ -114,6 +129,7 @@ export function Public() {
   const host = location.host
   const dot = /^\d+(\.\d+){3}(:\d+)?$/.test(host) ? -1 : host.indexOf('.')
   const ws = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${host}/xrpc/com.atproto.sync.subscribeRepos`
+  const consoleHere = useConsoleReachable()
   useEffect(() => {
     document.title = `${location.hostname} · vlRelay`
   }, [])
@@ -129,9 +145,11 @@ export function Public() {
         <Link to="/docs" className="l hide-sm">
           Docs
         </Link>
-        <Link to="/admin" className="l">
-          Console
-        </Link>
+        {consoleHere && (
+          <Link to="/admin" className="l">
+            Console
+          </Link>
+        )}
         <span className="cx-spacer" />
         <button type="button" className="cx-iconbtn" onClick={toggle} title="Toggle theme" aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>
           <ThemeIcon />
@@ -140,10 +158,11 @@ export function Public() {
       <main className="cx-pub-in">
         <section className="cx-hero">
           <div>
-            <h1>
+            <h1 style={{ '--n': host.length } as React.CSSProperties}>
               {dot > 0 ? (
                 <>
                   {host.slice(0, dot)}
+                  <wbr />
                   <span className="d">{host.slice(dot)}</span>
                 </>
               ) : (
@@ -161,9 +180,11 @@ export function Public() {
               <Link to="/docs/subscribing" className="cx-btn">
                 How to subscribe
               </Link>
-              <Link to="/admin" className="cx-btn quiet">
-                Operator console
-              </Link>
+              {consoleHere && (
+                <Link to="/admin" className="cx-btn quiet">
+                  Operator console
+                </Link>
+              )}
             </div>
             <div className="cx-pubstat" aria-live="polite">
               {l.error && !s ? (
@@ -286,7 +307,7 @@ export function Public() {
           <Link to="/docs">Docs</Link>
           <a href="/api/public/stats">Stats JSON</a>
           <a href="/xrpc/_health">Health</a>
-          <Link to="/admin">Operator console</Link>
+          {consoleHere && <Link to="/admin">Operator console</Link>}
         </footer>
       </main>
       <Toasts />
