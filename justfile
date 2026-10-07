@@ -115,9 +115,19 @@ docker-build tag="vlrelay:local" tools="":
 docker-build-benchbox tag="":
     build/benchbox-image.sh {{tag}}
 
-# Build the production amd64 image on this Mac from the committed tree and push it
-# (build/mac-image.sh, build/Dockerfile.cross; PUSH=0 to only load it)
-docker-push tag=`git rev-parse --short=12 HEAD`:
+# Build the production amd64 image from the committed tree and push it, without Docker:
+# zigbuild + crane onto the pinned base (build/oci-image.sh, scripts/oci/README.md). Prints the ref.
+image-push tag=`git rev-parse --short=12 HEAD`:
+    build/oci-image.sh {{tag}}
+
+alias docker-push := image-push
+
+# Rebuild the runtime base (Dockerfile's runtime-base stage) and pin its digest in build/oci-base
+image-base:
+    build/oci-image.sh base
+
+# The same image the old way: docker buildx with build/Dockerfile.cross (build/mac-image.sh; PUSH=0 to only load it)
+docker-push-buildx tag=`git rev-parse --short=12 HEAD`:
     build/mac-image.sh {{tag}}
 
 # Regenerate docs/operations/configuration.md from `vlrelay --help` (run after changing a flag)
