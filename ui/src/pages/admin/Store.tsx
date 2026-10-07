@@ -48,6 +48,7 @@ function memberTotals(q: QuorumView) {
 
 const setting = (s: SettingsView | undefined, flag: string) => s?.entries.find((e) => e.flag === flag)
 
+const MONTH_SECS = 30 * 86_400
 const cnt = (n: number) => (n < 10_000 ? fmtNum(n) : fmtSi(n))
 const rate = (v: number | undefined) => (v === undefined ? '—' : v === 0 ? '0' : v < 0.01 ? '<0.01' : v < 10 ? v.toFixed(2) : fmtSi(v))
 
@@ -90,9 +91,22 @@ export function Store() {
   const win = v.windowSecs > 0 ? `last ${dur(v.windowSecs * 1000)}` : 'filling in'
   const tot = v.total
 
+  // what the current rate comes to over a month: a count, not a price
+  const month = (perSec: number) => <div className="cx-tsub">{v.windowSecs > 0 ? `≈ ${fmtSi(perSec * MONTH_SECS)} per 30 days at this rate` : win}</div>
+  const monthTitle = `${v.node}'s rate over the ${win}, kept up for 30 days`
   const tiles: TileSpec[] = [
-    { label: 'Class A', right: 'writes, lists', value: v.windowSecs > 0 ? rate(tot.perSec.a) : '—', unit: '/s', sec: win, spark: <Spark data={seriesOf('store-a')} color="c3" /> },
-    { label: 'Class B', right: 'reads', value: v.windowSecs > 0 ? rate(tot.perSec.b) : '—', unit: '/s', sec: win, spark: <Spark data={seriesOf('store-b')} color="c5" /> },
+    { label: 'Class A', right: 'writes, lists', value: v.windowSecs > 0 ? rate(tot.perSec.a) : '—', unit: '/s', sec: win, title: monthTitle, spark: (
+        <>
+          <Spark data={seriesOf('store-a')} color="c3" />
+          {month(tot.perSec.a)}
+        </>
+      ) },
+    { label: 'Class B', right: 'reads', value: v.windowSecs > 0 ? rate(tot.perSec.b) : '—', unit: '/s', sec: win, title: monthTitle, spark: (
+        <>
+          <Spark data={seriesOf('store-b')} color="c5" />
+          {month(tot.perSec.b)}
+        </>
+      ) },
     { label: 'Since start', right: v.node, value: cnt(tot.requests.a), unit: 'A', sec: `${cnt(tot.requests.b)} B · ${cnt(tot.requests.free)} free` },
     { label: 'Payload', right: v.node, value: fmtBytes(tot.bytesUp), unit: 'up', sec: `${fmtBytes(tot.bytesDown)} down` },
     { label: 'Log segments', right: ret ? `as of ${ago(ret.plan.at_ms)}` : undefined, value: ret ? fmtBytes(ret.plan.segment_bytes) : '—', sec: ret ? `${fmtNum(ret.plan.segments)} segments` : 'no retention pass yet' },
@@ -132,6 +146,9 @@ export function Store() {
                 <th>Purpose</th>
                 <th className="r">A/s</th>
                 <th className="r">B/s</th>
+                <th className="r" title="A and B requests in 30 days at this rate: a count, not a price">
+                  30 d at this rate
+                </th>
                 <th className="r">A total</th>
                 <th className="r">B total</th>
                 <th className="r">Up</th>
@@ -145,6 +162,7 @@ export function Store() {
                   <td className="mono">{p.purpose}</td>
                   <td className="r mono sm">{rate(p.perSec.a)}</td>
                   <td className="r mono sm">{rate(p.perSec.b)}</td>
+                  <td className="r mono sm t2">{v.windowSecs > 0 ? fmtSi((p.perSec.a + p.perSec.b) * MONTH_SECS) : '—'}</td>
                   <td className="r mono sm">{fmtNum(p.requests.a)}</td>
                   <td className="r mono sm">{fmtNum(p.requests.b)}</td>
                   <td className="r mono sm">{fmtBytes(p.bytesUp)}</td>
@@ -156,7 +174,7 @@ export function Store() {
               ))}
               {!purposes.length && (
                 <tr>
-                  <td colSpan={8}>
+                  <td colSpan={9}>
                     <Empty>{v.node} hasn't sent a bucket request since it started.</Empty>
                   </td>
                 </tr>

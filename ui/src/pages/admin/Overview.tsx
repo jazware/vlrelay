@@ -1,16 +1,18 @@
 import { useEffect, useState } from 'react'
 import { openDialog, FormDialog } from '../../components/console/dialogs'
 import { Exchange } from '../../components/console/Exchange'
-import { Banners, Bars, Empty, Glyph, HealthLine, HostName, Kbd, Loaded, LiveVal, PageHead, Panel, RRow, Spark, Src, Swatch, Tiles, type HealthCell, type TileSpec, type Tone } from '../../components/console/kit'
+import { Banners, Bars, Empty, Glyph, HealthLine, HostName, Kbd, Loaded, LiveVal, PageHead, Panel, RRow, Seg, Spark, Src, Swatch, Tiles, type BannerSpec, type HealthCell, type TileSpec, type Tone } from '../../components/console/kit'
 import { LiveTail } from '../../components/console/LiveTail'
 import { openPanel } from '../../components/console/nav'
 import { toast } from '../../components/console/toast'
-import type { Overview as O, RejectReason } from '../../lib/api'
+import type { HostRow, Overview as O, RejectReason } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
-import { ago, dur, fmtBytes, fmtMs, fmtNum, fmtSi, plural, seqS } from '../../lib/console/fmt'
-import { togglePaused, useLiveState } from '../../lib/console/live'
-import { capPoll, consumersPoll, isSlow, openCasesPoll, overviewPoll, policyFullPoll, publicPoll, seriesOf, slowLagMs, throttledPoll } from '../../lib/console/polls'
+import { ago, dur, fmtBytes, fmtMs, fmtNum, fmtRatio, fmtSi, plural, seqS, since } from '../../lib/console/fmt'
+import { togglePaused, useLiveState, useLivePoll } from '../../lib/console/live'
+import { capPoll, consumersPoll, historyPoll, isSlow, openCasesPoll, overviewPoll, policyFullPoll, publicPoll, quorumPoll, seenEpochs, seriesOf, slowLagMs, throttledPoll } from '../../lib/console/polls'
 import { useRelay, type RelayView } from '../../lib/console/relay'
+import { navigate } from '../../lib/router'
+import { currentLead, epochEvents, leaderChangeText, recentLeaderChange, type EpochEvent } from './quorumUi'
 import { Lg, NodeTag, REASON_WHAT, reasonLabel, relayBanners } from './relayUi'
 
 // The relay at a glance: what needs attention, one line of health, the figures, the exchange
@@ -19,12 +21,12 @@ import { Lg, NodeTag, REASON_WHAT, reasonLabel, relayBanners } from './relayUi'
 
 const sumAt = (h: O['history']) => h.t.map((_, i) => Object.values(h.rejects).reduce((a, s) => a + (s?.[i] ?? 0), 0))
 
-export function crawlDialog() {
-  openDialog((close) => <CrawlForm close={close} />)
+export function crawlDialog(initial = '') {
+  openDialog((close) => <CrawlForm close={close} initial={initial} />)
 }
 
-function CrawlForm({ close }: { close: () => void }) {
-  const [host, setHost] = useState('')
+function CrawlForm({ close, initial }: { close: () => void; initial: string }) {
+  const [host, setHost] = useState(initial)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>()
   const v = host.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '')
@@ -79,18 +81,46 @@ function useSeqNow(seq: number | undefined, rate: number, at: number | undefined
   return seq + Math.min(2.5, (Date.now() - at) / 1000) * rate
 }
 
-function healthCells(o: O, view: RelayView | undefined, cases: number, crit: number, throttled: number, consumers: { n: number; slow: number; backfill: number } | undefined): HealthCell[] {
+/** The banner for a leader change in the last 30 minutes, with a way into its epoch. */
+export function leaderBanner(e: EpochEvent): BannerSpec {
+  const t = leaderChangeText(e)
+  return {
+    id: 'leader',
+    tone: 'info',
+    title: t.title,
+    desc: t.desc,
+    right: (
+      <button type="button" className="cx-btn sm" onClick={() => openPanel('epoch', e.id)}>
+        Open epoch ›
+      </button>
+    ),
+  }
+}
+
+const REJECTS_TO = '/admin/hosts?sort=errors'
+type Busy = 'events' | 'rejects'
+const topReason = (r: Partial<Record<RejectReason, number>>) => (Object.entries(r) as [RejectReason, number][]).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1])[0]?.[0]
+
+function healthCells(o: O, view: RelayView | undefined, cases: number, crit: number, throttled: number, consumers: { n: number; slow: number; backfill: number } | undefined, leadSince?: number): HealthCell[] {
   const q = view?.quorum
   const stream = o.streamEventsPerSec ?? o.eventsOutPerSec
   const rejPct = (o.rejectsPerSec / Math.max(1, o.eventsInPerSec)) * 100
   const held = q?.health === 'down'
   const cells: HealthCell[] = [
-    { label: 'Firehose', tone: held ? 'err' : 'ok', value: held ? 'held' : fmtSi(stream), unit: held ? undefined : 'ev/s', sub: held ? `nothing past ${seqS(q?.commit)}` : `seq ${seqS(o.lastSeq)}`, to: '/admin' },
-    { label: 'Time to firehose', tone: o.timeToFirehoseP99Ms > 250 ? 'warn' : 'ok', value: fmtMs(o.timeToFirehoseP99Ms), unit: 'p99', sub: `p50 ${fmtMs(o.timeToFirehoseP50Ms)}`, to: '/admin' },
+    { label: 'Firehose', tone: held ? 'err' : 'ok', value: held ? 'held' : fmtSi(stream), unit: held ? undefined : 'ev/s', sub: held ? `nothing past ${seqS(q?.commit)}` : `seq ${seqS(o.lastSeq)}`, to: '/admin/consumers', title: 'Who reads the stream, and how far behind' },
+    {
+      label: 'Time to firehose',
+      tone: o.timeToFirehoseP99Ms > 250 ? 'warn' : 'ok',
+      value: fmtMs(o.timeToFirehoseP99Ms),
+      unit: 'p99',
+      sub: `p50 ${fmtMs(o.timeToFirehoseP50Ms)}`,
+      to: q ? '/admin/quorum' : '/admin/consumers',
+      title: q ? 'Most of it is the commit: the quorum page has its latency' : undefined,
+    },
   ]
   if (q) {
     const tone: Tone = q.health === 'down' ? 'err' : q.health === 'degraded' ? 'warn' : 'ok'
-    cells.push({ label: 'Quorum', tone, value: `${q.answering.length}`, unit: `of ${q.members.length}`, sub: held ? 'no leader with a majority' : `epoch ${q.epoch} · ${q.leader ?? '—'} leads`, to: '/admin/quorum' })
+    cells.push({ label: 'Quorum', tone, value: `${q.answering.length}`, unit: `of ${q.members.length}`, sub: held ? 'no leader with a majority' : leadSince ? `${q.leader ?? '—'} leads · since ${since(leadSince)}` : `epoch ${q.epoch} · ${q.leader ?? '—'} leads`, to: '/admin/quorum', title: `epoch ${q.epoch}` })
     cells.push({
       label: 'Flush to bucket',
       tone: held ? 'err' : 'ok',
@@ -106,7 +136,7 @@ function healthCells(o: O, view: RelayView | undefined, cases: number, crit: num
   }
   cells.push(
     { label: 'PDS hosts', tone: throttled > 3 ? 'warn' : 'ok', value: fmtNum(o.hostsConnected), sub: `connected of ${fmtNum(o.hostsTotal)}${throttled ? ` · ${throttled} thr` : ''}`, to: '/admin/hosts' },
-    { label: 'Rejects', tone: rejPct > 2 ? 'warn' : 'ok', value: fmtSi(o.rejectsPerSec), unit: '/s', sub: `${rejPct.toFixed(2)}% of frames`, to: '/admin' },
+    { label: 'Rejects', tone: rejPct > 2 ? 'warn' : 'ok', value: fmtSi(o.rejectsPerSec), unit: '/s', sub: 'hosts by rejects ›', to: REJECTS_TO, title: `${rejPct.toFixed(2)}% of frames` },
     { label: 'Consumers', tone: consumers?.slow ? 'warn' : 'ok', value: fmtNum(o.consumers), sub: consumers ? `${consumers.slow} slow · ${consumers.backfill} backfilling` : 'subscribeRepos', to: '/admin/consumers' },
     { label: 'Cases', tone: crit ? 'err' : cases ? 'warn' : 'ok', value: fmtNum(cases), unit: 'open', sub: crit ? `${crit} critical` : 'none critical', to: '/admin/moderation' },
   )
@@ -129,6 +159,22 @@ export function Overview() {
   const cut = slowLagMs(pol.data)
   const q = view?.quorum
   const cores = view?.nodes.filter((n) => n.core) ?? []
+  const qp = quorumPoll.use()
+  // the shell keeps the history poll running on a quorum relay
+  const hist = historyPoll.get()
+  const events = q ? epochEvents(qp.data?.supported ? qp.data.data : undefined, hist.data?.events ?? [], seenEpochs()) : []
+  const lead = currentLead(events)
+  const [busy, setBusy] = useState<Busy>('events')
+  const rej = useLivePoll(() => (busy === 'rejects' ? A.hosts({ sort: 'errors', desc: true, limit: 8 }).then((r) => r.hosts) : Promise.resolve([] as HostRow[])), `busy:${busy}`, 5000)
+  const rejNames = (rej.data ?? []).filter((h) => h.errorRate > 0).map((h) => h.host)
+  // the top reason is in each host's detail: asked only while the rejects view is on
+  const reasonsOf = useLivePoll(
+    () => Promise.all(rejNames.map((h) => A.host(h).then((d) => [h, topReason(d.rejectsByReason)] as const, () => [h, undefined] as const))),
+    `busy-reasons:${rejNames.join(',')}`,
+    10_000,
+    { keep: true },
+  )
+  const reasonOf = new Map(reasonsOf.data ?? [])
 
   const sub = (
     <>
@@ -142,7 +188,7 @@ export function Overview() {
       <button type="button" className="cx-btn" onClick={togglePaused}>
         {live.paused ? '▶ Resume' : '❚❚ Pause'} <Kbd k="space" />
       </button>
-      <button type="button" className="cx-btn" onClick={crawlDialog}>
+      <button type="button" className="cx-btn" onClick={() => crawlDialog()}>
         Request crawl…
       </button>
     </>
@@ -161,6 +207,9 @@ export function Overview() {
   const slow = subs.data?.filter((c) => isSlow(c, cut)).length ?? 0
   const consumers = subs.data ? { n: subs.data.length, slow, backfill: subs.data.filter((c) => c.backfilling).length } : undefined
   const banners = relayBanners({ view, throttled: thr.data?.hosts, capped: cap.data?.hosts, consumers: subs.data, slowCutMs: cut, scope: 'overview' })
+  const changed = q && q.health !== 'down' ? recentLeaderChange(events) : undefined
+  // after the quorum's own banner (held or degraded), before the rest
+  if (changed) banners.splice(banners[0]?.id === 'degraded' ? 1 : 0, 0, leaderBanner(changed))
   const commitP99 = seriesOf('commit-p99')
   const tiles: TileSpec[] = [
     { label: 'Frames in', right: 'from PDSes', value: fmtSi(o.eventsInPerSec), unit: '/s', spark: <Spark data={h.eventsIn} color="accent" />, to: '/admin/hosts' },
@@ -180,7 +229,7 @@ export function Overview() {
     <>
       <PageHead title="Overview" sub={sub} actions={actions} />
       <Banners items={banners} />
-      <HealthLine cells={healthCells(o, view, cases.data?.length ?? o.openCases, crit, thr.data?.total ?? 0, consumers)} />
+      <HealthLine cells={healthCells(o, view, cases.data?.length ?? o.openCases, crit, thr.data?.total ?? 0, consumers, lead && lead.leader === q?.leader ? lead.atMs : undefined)} />
       <div className="cx-ov">
         <div className="cx-stack">
           <div className="cx-tilesbox t4" style={{ margin: 0 }}>
@@ -216,12 +265,72 @@ export function Overview() {
           <div className="cx-grid2 ov2">
             <Panel title="Rejects by reason" src={<Src>overview.rejectsByReason</Src>} right={<span className="muted sm">per second</span>}>
               {reasons.length ? (
-                <Bars color="err" rows={reasons.map(([k, v]) => ({ key: k, label: reasonLabel(k), v, fmt: `${fmtSi(v)}/s`, title: REASON_WHAT[k] }))} />
+                <Bars
+                  color="err"
+                  rows={reasons.map(([k, v]) => ({
+                    key: k,
+                    label: reasonLabel(k),
+                    v,
+                    fmt: (
+                      <>
+                        {fmtSi(v)}/s <span className="muted">›</span>
+                      </>
+                    ),
+                    title: `${REASON_WHAT[k]}. Opens the hosts sending it.`,
+                    onClick: () => navigate(`${REJECTS_TO}&reason=${k}`),
+                  }))}
+                />
               ) : (
                 <Empty>No rejects right now.</Empty>
               )}
             </Panel>
-            <Panel title="Busiest hosts" to="/admin/hosts" src={<Src>overview.topHosts</Src>}>
+            <Panel
+              title="Busiest hosts"
+              to={busy === 'rejects' ? REJECTS_TO : '/admin/hosts'}
+              src={<Src>{busy === 'rejects' ? 'hosts?sort=errors&limit=8 · hosts/{host}' : 'overview.topHosts'}</Src>}
+              right={<Seg<Busy> label="Busiest by" value={busy} options={[{ v: 'events', label: 'events' }, { v: 'rejects', label: 'rejects' }]} onChange={setBusy} />}
+            >
+              {busy === 'rejects' ? (
+                !rej.data ? (
+                  <Loaded load={rej}>{() => null}</Loaded>
+                ) : rejNames.length ? (
+                  <div className="cx-tw">
+                    <table className="cx-t compact">
+                      <thead>
+                        <tr>
+                          <th>Host</th>
+                          <th className="r" title="Rejected frames over all frames, last minute">
+                            Rejected
+                          </th>
+                          <th>Top reason</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {rej.data
+                          .filter((h) => h.errorRate > 0)
+                          .map((r, i) => {
+                            const why = reasonOf.get(r.host)
+                            return (
+                              <tr key={`${r.host}#${i}`} data-open={`host:${r.host}`} onClick={() => openPanel('host', r.host)}>
+                                <td className="trunc" style={{ maxWidth: 190 }}>
+                                  <HostName host={r.host} short />
+                                </td>
+                                <td className={`r mono sm${r.errorRate > 0.25 ? ' s-err' : r.errorRate > 0.05 ? ' s-warn' : ''}`}>
+                                  <LiveVal>{fmtRatio(r.errorRate)}</LiveVal>
+                                </td>
+                                <td className="sm t2" title={why ? REASON_WHAT[why] : undefined}>
+                                  {why ? reasonLabel(why) : <span className="muted">—</span>}
+                                </td>
+                              </tr>
+                            )
+                          })}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <Empty>No host is sending rejects right now.</Empty>
+                )
+              ) : (
               <div className="cx-tw">
                 <table className="cx-t compact">
                   <thead>
@@ -248,9 +357,10 @@ export function Overview() {
                   </tbody>
                 </table>
               </div>
+              )}
             </Panel>
           </div>
-          <Panel title="Firehose" right={<span className="muted sm">every node sends the same seqs</span>}>
+          <Panel title="Firehose"right={<span className="muted sm">every node sends the same seqs</span>}>
             <LiveTail height={300} />
           </Panel>
         </div>

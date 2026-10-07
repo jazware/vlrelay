@@ -19,8 +19,10 @@ export type PalItem = {
   keys?: string[]
   /** Extra text to match on (DIDs, emails) besides the title and description. */
   hay?: string
-  /** Shown for an empty query too (sections, a few actions). */
+  /** Shown for an empty query when nothing needs attention and nothing was opened yet (sections, a few actions). */
   always?: boolean
+  /** The empty query's inbox: what needs attention and what was opened recently. */
+  inbox?: boolean
   run: () => void
 }
 export type PalProvider = {
@@ -44,7 +46,7 @@ export function setPaletteOpen(v: boolean) {
   subs.forEach((l) => l())
 }
 
-const ORDER = ['Look up', 'Actions', 'Go to', 'Hosts', 'Nodes', 'Consumers', 'Cases', 'Recent']
+const ORDER = ['Needs attention', 'Recent', 'Look up', 'Actions', 'Go to', 'Hosts', 'Nodes', 'Consumers', 'Cases']
 const rank = (g: string) => {
   const i = ORDER.indexOf(g)
   return i < 0 ? ORDER.length : i
@@ -158,8 +160,10 @@ function PaletteInner() {
   const items = useMemo(() => {
     const all = [...providers].flatMap((p) => p.items(q.trim()))
     let shown: PalItem[]
-    if (!ql) shown = all.filter((x) => x.always)
-    else {
+    if (!ql) {
+      const inbox = all.filter((x) => x.inbox)
+      shown = inbox.length ? inbox : all.filter((x) => x.always)
+    } else {
       const direct = all.filter((x) => x.group === 'Look up')
       const scored = all
         .filter((x) => x.group !== 'Look up')
@@ -254,6 +258,14 @@ function PaletteInner() {
               </div>
             )
           })}
+          {!ql && items.some((x) => x.inbox) && (
+            <div className="cx-pal-more">
+              <span className="cx-gh">Go to · Actions</span>
+              <span className="muted">
+                Type to search sections, hosts and actions, or <Kbd k="g" /> then a letter
+              </span>
+            </div>
+          )}
           {!items.length && <div className="cx-empty">{ql ? `Nothing matches “${q.trim()}”. Try a hostname, a DID, a node, or “ban …”.` : 'Type to search.'}</div>}
         </div>
         <div className="pfoot">

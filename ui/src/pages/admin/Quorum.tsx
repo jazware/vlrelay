@@ -1,18 +1,18 @@
 import { useState, type ReactNode } from 'react'
 import { DataTable, type Col } from '../../components/console/DataTable'
-import { Banners, Chip, Empty, HostName, KV, LiveVal, Loaded, NeedsVersion, PageHead, Panel, Spark, Src, Swatch, Tiles, type BannerSpec, type TileSpec } from '../../components/console/kit'
+import { Banners, Chip, Empty, HostName, KV, LiveVal, Loaded, NeedsVersion, PageHead, Panel, RRow, Spark, Src, Swatch, Tiles, type BannerSpec, type TileSpec } from '../../components/console/kit'
 import { LogRail, type RailData } from '../../components/console/LogRail'
 import { openPanel } from '../../components/console/nav'
 import { confirmAction } from '../../components/console/dialogs'
 import { errText, type ClusterView, type HostRow, type QStatus, type QuorumView } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
-import { ago, clock, dt, dur, fmtBytes, fmtMs, fmtNum, fmtSi, fmtUs, plural, seqS } from '../../lib/console/fmt'
+import { ago, clock, dt, dur, fmtBytes, fmtMs, fmtNum, fmtSi, fmtUs, seqS, since } from '../../lib/console/fmt'
 import { useLivePoll } from '../../lib/console/live'
 import { clusterPoll, flushSeenAt, historyPoll, overviewPoll, quorumPoll, seenEpochs, seriesOf, settingsPoll } from '../../lib/console/polls'
 import { useRelay, type RelayView } from '../../lib/console/relay'
 import './logPages.css'
 import './quorumDetail'
-import { Durability, EPOCH_GLYPH, EpochChip, epochDetail, epochEvents, memberRows, membersDialog, membershipOn, refStatus, RoleChip, type EpochEvent, type MemberRow } from './quorumUi'
+import { currentLead, Durability, EPOCH_GLYPH, EpochChip, epochDetail, epochEvents, memberRows, membersDialog, membershipOn, refStatus, RoleChip, type EpochEvent, type MemberRow } from './quorumUi'
 import { Lg, NodeTag, relayBanners } from './relayUi'
 
 // The quorum log and the cluster around it: the log rail (each member's track around F and the
@@ -66,7 +66,7 @@ function QuorumLog({ qv, at, c, view }: { qv: QuorumView; at?: number; c?: Clust
   const fSeen = A.flushedAt(lead, flushSeenAt())
   const tiles: TileSpec[] = [
     { label: 'Epoch', value: ref ? String(ref.epoch) : '—', sec: ref ? `promised ${ref.promised}` : undefined },
-    { label: 'Leader', value: lead ? lead.id : '—', sec: lead ? plural(lead.takeovers, 'takeover') + ' here' : 'none: nothing commits' },
+    leaderTile(lead, currentLead(events)),
     { label: 'Members answering', value: `${answering}`, unit: `of ${members.length}`, sec: `majority is ${majority}` },
     { label: 'Commit index', value: seqS(lead?.commit ?? ref?.commit), spark: <Spark data={seriesOf('stream')} color="signal" /> },
     {
@@ -158,15 +158,45 @@ function QuorumLog({ qv, at, c, view }: { qv: QuorumView; at?: number; c?: Clust
         <Members rows={rows} lead={lead} />
       </Panel>
       <div className="cx-grid2 cx-mt">
-        <FlushPanel lead={lead} flushMs={flushMs} on={on} />
-        <ShardPanel c={c} view={view} />
-      </div>
-      <div className="cx-grid2 cx-mt">
-        <Counters rows={rows} />
-        <Pipeline view={view} />
+        <div className="cx-stack">
+          <FlushPanel lead={lead} flushMs={flushMs} on={on} />
+          <ShardPanel c={c} view={view} />
+        </div>
+        <div className="cx-stack">
+          <Counters rows={rows} />
+          <Pipeline view={view} />
+        </div>
       </div>
     </>
   )
+}
+
+/** Who leads, since when, and the change that put it there (its epoch's drawer). */
+function leaderTile(lead: QStatus | undefined, cur: EpochEvent | undefined): TileSpec {
+  if (!lead) return { label: 'Leader', value: '—', sec: 'none: nothing commits' }
+  const mine = cur && cur.leader === lead.id ? cur : undefined
+  if (!mine) return { label: 'Leader', value: lead.id, sec: `epoch ${lead.epoch}`, title: "No member's history dates this leader's term" }
+  const from = mine.lead?.from ?? mine.down?.node
+  const how =
+    mine.kind === 'takeover' || mine.kind === 'handoff'
+      ? `${mine.kind}${from && from !== lead.id ? ` from ${from}` : ''}`
+      : mine.kind === 'switch'
+        ? 'membership change'
+        : mine.kind === 'recovery'
+          ? 'bucket recovery'
+          : 'new epoch'
+  return {
+    label: 'Leader',
+    value: lead.id,
+    unit: `since ${since(mine.atMs!)}`,
+    spark: (
+      <div className="cx-tsub">
+        <button type="button" className="cx-linklike" onClick={() => openPanel('epoch', mine.id)} title={`epoch ${mine.epoch}, ${dt(mine.atMs!)}`}>
+          {how} ›
+        </button>
+      </div>
+    ),
+  }
 }
 
 // ---------------------------------------------------------------- members
@@ -438,63 +468,105 @@ function FlushPanel({ lead, flushMs, on }: { lead?: QStatus; flushMs?: number; o
 
 function ShardPanel({ c, view }: { c?: ClusterView; view?: RelayView }) {
   const [focus, setFocus] = useState<string | null>(null)
+  const [map, setMap] = useState(false)
+  const [q, setQ] = useState('')
+  const needle = q.trim().toLowerCase()
+  const found = useLivePoll(() => (needle.length >= 2 ? A.hosts({ q: needle, sort: 'host', desc: false, limit: 6 }) : Promise.resolve(undefined)), `owner:${needle}`, 10_000, { keep: true })
+  const owners = (c?.nodes ?? []).filter((n) => n.ownedHosts > 0 || !n.stale).sort((a, b) => a.id.localeCompare(b.id))
+  const total = owners.reduce((a, n) => a + n.ownedHosts, 0) + (c?.unownedHosts ?? 0)
+  const pct = (n: number) => (total ? (n / total) * 100 : 0)
+  const parts = [...owners.map((n) => ({ id: n.id, n: n.ownedHosts, color: view?.byId.get(n.id)?.color })), ...(c?.unownedHosts ? [{ id: '', n: c.unownedHosts, color: undefined }] : [])]
+  return (
+    <Panel title="Host owners" src={<Src>cluster · hosts?q</Src>} right={<span className="muted sm">{c ? `${fmtNum(c.hosts)} hosts in the leader's table` : null}</span>}>
+      <div className="cx-pn-b">
+        {!c ? (
+          <Empty>Loading…</Empty>
+        ) : !total ? (
+          <Empty>No hosts yet: the leader gives each host it learns of to a member as a log entry.</Empty>
+        ) : (
+          <>
+            <div className={`cx-ownbar${focus ? ' focus' : ''}`} role="img" aria-label={parts.map((p) => `${p.id || 'unowned'} ${fmtNum(p.n)}`).join(', ')}>
+              {parts.map((p) => (
+                <i key={p.id || 'unowned'} className={`${p.id ? '' : 'unowned'}${focus === p.id ? ' hl' : ''}`} style={{ width: `${pct(p.n)}%`, background: p.color }} title={`${p.id || 'unowned'}: ${fmtNum(p.n)} hosts`} />
+              ))}
+            </div>
+            <div className="cx-shardlegend cx-ownlegend">
+              {owners.map((n) => (
+                <button key={n.id} type="button" onMouseEnter={() => setFocus(n.id)} onMouseLeave={() => setFocus(null)} onFocus={() => setFocus(n.id)} onBlur={() => setFocus(null)} onClick={() => openPanel('node', n.id)}>
+                  <Swatch color={view?.byId.get(n.id)?.color} />
+                  <b className="mono">{Math.round(pct(n.ownedHosts))}%</b> {n.id} <span className="mono muted">{fmtNum(n.ownedHosts)}</span>
+                </button>
+              ))}
+              {!!c.unownedHosts && (
+                <span className="s-err">
+                  <Swatch /> <b className="mono">{Math.round(pct(c.unownedHosts))}%</b> unowned <span className="mono">{fmtNum(c.unownedHosts)}</span>
+                </span>
+              )}
+            </div>
+          </>
+        )}
+        <div className="cx-form-row cx-ownfind">
+          <input className="cx-inp mono" placeholder="find a host's owner" aria-label="Find a host's owner" value={q} onChange={(e) => setQ(e.target.value)} spellCheck={false} autoComplete="off" />
+          <button type="button" className="cx-btn sm quiet" aria-expanded={map} onClick={() => setMap(!map)}>
+            {map ? 'Hide the map' : 'Show the map'}
+          </button>
+        </div>
+        {needle.length >= 2 &&
+          (found.data?.hosts.length ? (
+            <div className="cx-ownhits">
+              {found.data.hosts.map((h, i) => (
+                <RRow key={`${h.host}#${i}`} onClick={() => openPanel('host', h.host)} x={h.status}>
+                  <Swatch color={h.node ? view?.byId.get(h.node)?.color : undefined} />
+                  <span className="nm">
+                    <HostName host={h.host} />
+                  </span>
+                  <span className="mono sm t2">{h.node || 'unowned'}</span>
+                </RRow>
+              ))}
+              {found.data.total > found.data.hosts.length && <div className="muted sm">and {fmtNum(found.data.total - found.data.hosts.length)} more; type more of the name</div>}
+            </div>
+          ) : found.data ? (
+            <div className="muted sm">No host matches “{needle}”.</div>
+          ) : null)}
+      </div>
+      {map && <OwnerMap view={view} focus={focus} />}
+    </Panel>
+  )
+}
+
+/** One cell per host in the leader's table, coloured by its owner: behind "Show the map", since it asks for thousands of rows. */
+function OwnerMap({ view, focus }: { view?: RelayView; focus: string | null }) {
   const [hover, setHover] = useState<HostRow | null>(null)
   const list = useLivePoll(() => A.hosts({ sort: 'host', desc: false, limit: OWNER_CAP }), 'owners', 10_000, { keep: true })
   const hosts = list.data?.hosts ?? []
-  const owners = (c?.nodes ?? []).filter((n) => n.ownedHosts > 0 || !n.stale).sort((a, b) => a.id.localeCompare(b.id))
   const dead = (h: HostRow) => !h.node || !!view?.byId.get(h.node)?.stale
+  if (!list.data) return <Loaded load={list}>{() => null}</Loaded>
   return (
-    <Panel
-      title="Host owners"
-      src={<Src>cluster · hosts?sort=host</Src>}
-      right={
-        <span className="cx-shardlegend">
-          {owners.map((n) => (
-            <button key={n.id} type="button" onMouseEnter={() => setFocus(n.id)} onMouseLeave={() => setFocus(null)} onFocus={() => setFocus(n.id)} onBlur={() => setFocus(null)} onClick={() => openPanel('node', n.id)}>
-              <Swatch color={view?.byId.get(n.id)?.color} />
-              {n.id} <span className="mono">{fmtNum(n.ownedHosts)}</span>
-            </button>
-          ))}
-          {!!c?.unownedHosts && (
-            <span className="s-err">
-              <Swatch /> unowned <span className="mono">{fmtNum(c.unownedHosts)}</span>
-            </span>
-          )}
-        </span>
-      }
-    >
-      {!list.data ? (
-        <Loaded load={list}>{() => null}</Loaded>
-      ) : !hosts.length ? (
-        <Empty>No hosts yet: the leader gives each host it learns of to a member as a log entry.</Empty>
-      ) : (
-        <div className="cx-pn-b">
-          <div className={`cx-shardmap${hosts.length > 64 ? ' dense' : ''}${focus ? ' focus' : ''}`} onMouseLeave={() => setHover(null)}>
-            {hosts.map((h, i) => (
-              <button
-                key={`${h.host}#${i}`}
-                type="button"
-                className={`cx-shard${dead(h) ? ' unowned' : ''}${focus && h.node === focus ? ' hl' : ''}`}
-                style={dead(h) ? undefined : { background: view?.byId.get(h.node)?.color ?? 'var(--idle)' }}
-                onMouseEnter={() => setHover(h)}
-                onFocus={() => setHover(h)}
-                onClick={() => openPanel('host', h.host)}
-                aria-label={`${h.host}: ${h.node || 'unowned'}`}
-              />
-            ))}
-          </div>
-          <div className="cx-shardinfo">
-            {hover ? (
-              <>
-                <span className="mono">{hover.host}</span> · {hover.node ? `read by ${hover.node}` : 'nobody reads it'} · {hover.status}
-              </>
-            ) : (
-              `One cell per host in the leader's table${list.data.total > hosts.length ? ` (the first ${fmtNum(hosts.length)} of ${fmtNum(list.data.total)})` : ''}. The leader gives each to a member as a log entry and moves a dead member's hosts after the failover timeout.`
-            )}
-          </div>
-        </div>
-      )}
-    </Panel>
+    <div className="cx-pn-b">
+      <div className={`cx-shardmap${hosts.length > 64 ? ' dense' : ''}${focus ? ' focus' : ''}`} onMouseLeave={() => setHover(null)}>
+        {hosts.map((h, i) => (
+          <button
+            key={`${h.host}#${i}`}
+            type="button"
+            className={`cx-shard${dead(h) ? ' unowned' : ''}${focus && h.node === focus ? ' hl' : ''}`}
+            style={dead(h) ? undefined : { background: view?.byId.get(h.node)?.color ?? 'var(--idle)' }}
+            onMouseEnter={() => setHover(h)}
+            onFocus={() => setHover(h)}
+            onClick={() => openPanel('host', h.host)}
+            aria-label={`${h.host}: ${h.node || 'unowned'}`}
+          />
+        ))}
+      </div>
+      <div className="cx-shardinfo">
+        {hover ? (
+          <>
+            <span className="mono">{hover.host}</span> · {hover.node ? `read by ${hover.node}` : 'nobody reads it'} · {hover.status}
+          </>
+        ) : (
+          `One cell per host in the leader's table${list.data.total > hosts.length ? ` (the first ${fmtNum(hosts.length)} of ${fmtNum(list.data.total)})` : ''}. The leader gives each to a member as a log entry and moves a dead member's hosts after the failover timeout.`
+        )}
+      </div>
+    </div>
   )
 }
 

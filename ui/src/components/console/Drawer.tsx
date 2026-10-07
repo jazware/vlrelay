@@ -2,6 +2,7 @@ import { useEffect, useRef, type ReactNode } from 'react'
 import { Link, navigate } from '../../lib/router'
 import { Empty, Kbd, Loading, PageHead } from './kit'
 import { closePanel, fullPath, openPanel, usePanel } from './nav'
+import { noteRecent } from './recent'
 import { SECTION, type SectionId } from './sections'
 
 // One renderer per kind of row (node, shard, event, account…), shown either in the slide-over
@@ -36,8 +37,18 @@ export const detailPath = (type: string, id: string) => {
   return k ? fullPath(SECTION[k.section].path, type, id) : undefined
 }
 
+/** Remembers a detail once it has loaded, for ⌘K's "Recent". */
+function useNoteRecent(type: string, id: string, k: DetailKind, v: DetailView) {
+  const ready = !v.loading && !v.missing
+  const title = typeof v.title === 'string' ? v.title : id
+  useEffect(() => {
+    if (ready) noteRecent({ type, id, title, kind: k.kind })
+  }, [type, id, ready, title, k.kind])
+}
+
 function Inner({ type, id, k }: { type: string; id: string; k: DetailKind }) {
   const v = k.use(id, 'drawer')
+  useNoteRecent(type, id, k, v)
   const body = useRef<HTMLDivElement>(null)
   useEffect(() => {
     body.current?.scrollTo(0, 0)
@@ -86,6 +97,7 @@ export function Drawer() {
 export function DetailPage({ type, id }: { type: string; id: string }) {
   const k = registry.get(type)!
   const v = k.use(id, 'page')
+  useNoteRecent(type, id, k, v)
   const sec = SECTION[k.section]
   return (
     <div className="cx-fullpage">

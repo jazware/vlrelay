@@ -2962,3 +2962,120 @@ a.cx-rrow:hover {
     overflow-wrap: anywhere;
   }
 }
+
+/* ---------------------------------------------------------------- why a host is held (host drawer) */
+.cx-why {
+  margin: 10px 0;
+}
+.cx-why .bb > div + div {
+  margin-top: 3px;
+}
+.cx-why .bb .cx-form-row {
+  margin-top: 9px;
+}
+
+/* ---------------------------------------------------------------- over a limit: ratio, value / limit, log bar */
+.cx-over {
+  display: inline-grid;
+  grid-template-columns: 52px 4.6ch 13ch;
+  align-items: center;
+  justify-content: end;
+  column-gap: 8px;
+  vertical-align: middle;
+  font-variant-numeric: tabular-nums;
+}
+.cx-over.bare {
+  grid-template-columns: 52px 4.6ch;
+}
+.cx-over .ob {
+  position: relative;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--sunk);
+}
+.cx-over .ob > i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--ok);
+}
+/* the limit, at 1× on the 0.1×–10× scale */
+.cx-over .ob::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: -3px;
+  bottom: -3px;
+  width: 1.5px;
+  margin-left: -0.75px;
+  background: var(--ink2);
+  border-radius: 1px;
+}
+.cx-over.warn .ob > i {
+  background: var(--warn);
+}
+.cx-over.err .ob > i {
+  background: var(--err);
+}
+.cx-over b {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: right;
+}
+.cx-over.err b {
+  color: var(--err);
+}
+.cx-over .od {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink3);
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- a consumer's one-line verdict */
+.cx-verdict {
+  margin: 10px 0;
+  padding: 7px 10px;
+  border-left: 3px solid var(--ok);
+  border-radius: 0 6px 6px 0;
+  background: var(--sunk);
+  font-size: 13px;
+  color: var(--ink);
+}
+.cx-verdict.warn {
+  border-left-color: var(--warn);
+}
+.cx-verdict.info {
+  border-left-color: var(--info);
+}
+.cx-verdict .cx-copy {
+  text-align: left;
+  white-space: normal;
+}
+
+/* ---------------------------------------------------------------- a search with no host: the name's admissions */
+.cx-nomatch .cx-tw {
+  border-top: 1px solid var(--rule);
+}
+
+/* ---------------------------------------------------------------- ⌘K: the empty query's pointer to the rest */
+.cx-pal-more {
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 6px;
+}
+.cx-pal-more > .muted {
+  padding: 3px 10px;
+  font-size: 12.5px;
+}
+
+/* a tile's second line, where a sparkline would go */
+.cx-tile .cx-tsub {
+  font-size: 11.5px;
+  color: var(--ink2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

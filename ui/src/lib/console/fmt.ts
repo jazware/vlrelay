@@ -1,6 +1,11 @@
 // Console formatting on top of lib/format.ts. Everything returns "—" for unknown values.
 
+import { relTime } from '../format'
+
 export { fmtBytes, fmtNum, fmtSi, relTime as ago, short } from '../format'
+
+/** How long since: "4m", "1h" (relTime without its "ago"). */
+export const since = (ms: number) => relTime(ms).replace(/ ago$/, '')
 
 /** A duration: "42s", "3m 10s", "2h 5m", "4d 1h". */
 export function dur(ms: number | undefined | null): string {
