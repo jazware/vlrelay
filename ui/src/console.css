@@ -1225,6 +1225,8 @@ a.cx-tile:hover {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* the value, its unit and a second figure; the second figure wraps under a narrow tile's value
+   rather than being cut off */
 .cx-tile .tv {
   font-family: var(--mono);
   font-size: 20px;
@@ -1234,20 +1236,24 @@ a.cx-tile:hover {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 6px;
 }
 .cx-tile .tv small {
   font-size: 11.5px;
   font-weight: 400;
   color: var(--ink3);
   letter-spacing: 0;
-  margin-left: 3px;
+  margin-left: -3px;
 }
 .cx-tile .tv .sec {
   font-size: 12px;
   color: var(--ink2);
   font-weight: 500;
-  margin-left: 6px;
   letter-spacing: 0;
+  line-height: 1.5;
 }
 .cx-pn > .cx-tiles {
   border-radius: 0 0 8px 8px;
@@ -1437,6 +1443,23 @@ table.cx-t td.wrap {
 table.cx-t.compact td {
   height: 28px;
   padding: 3px 10px;
+}
+/* the column that takes a wide table's spare width, so the others sit at their content's width
+   instead of spreading apart (a name or description, or an empty one at the end) */
+table.cx-t th.fill,
+table.cx-t td.fill {
+  width: 100%;
+}
+table.cx-t td.fill.wrap {
+  min-width: 200px;
+}
+/* a group's header row in a table split into tbody groups */
+table.cx-t tr.grp td {
+  font-weight: 600;
+  background: color-mix(in oklab, var(--sunk) 55%, transparent);
+}
+table.cx-t tr.grp td.wrap {
+  font-weight: 400;
 }
 .cx-cellid {
   display: flex;
@@ -3060,7 +3083,7 @@ a.cx-rrow:hover {
 /* ---------------------------------------------------------------- over a limit: ratio, value / limit, log bar */
 .cx-over {
   display: inline-grid;
-  grid-template-columns: 52px 4.6ch 13ch;
+  grid-template-columns: 52px 5.6ch minmax(13ch, auto);
   align-items: center;
   justify-content: end;
   column-gap: 8px;
@@ -3068,7 +3091,7 @@ a.cx-rrow:hover {
   font-variant-numeric: tabular-nums;
 }
 .cx-over.bare {
-  grid-template-columns: 52px 4.6ch;
+  grid-template-columns: 52px 5.6ch;
 }
 .cx-over .ob {
   position: relative;

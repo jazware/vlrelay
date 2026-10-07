@@ -198,3 +198,62 @@
 .cx-ownhits {
   margin-top: 6px;
 }
+
+/* the object store: a readable name over its raw key, purpose groups, a share split by class */
+.cx-named {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  white-space: nowrap;
+}
+.cx-named .raw {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink3);
+}
+.cx-named.in {
+  padding-left: 14px;
+  color: var(--ink2);
+}
+.cx-share {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.cx-share .bar {
+  display: flex;
+  width: 96px;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--sunk);
+  flex: none;
+}
+.cx-share .bar.none {
+  background: transparent;
+}
+.cx-share .bar i {
+  display: block;
+  height: 100%;
+}
+.cx-share .a,
+.cx-sw.a {
+  background: var(--c3);
+}
+.cx-share .b,
+.cx-sw.b {
+  background: var(--c5);
+}
+.cx-sw {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  vertical-align: 0;
+}
+.cx-sep {
+  border-top: 1px solid var(--rule2);
+}

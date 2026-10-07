@@ -7,6 +7,7 @@ import type { BackpressureReason, Case, DomainRule, HostAction, HostDetail, Poli
 import { ago, dt, fmtMs, fmtNum, fmtRatio, fmtSi, plural, shortDid } from '../../lib/console/fmt'
 import { useCases, useHostDetail, useHostRow, usePolicy, useRules } from '../../lib/console/queries'
 import { useRelay } from '../../lib/console/relay'
+import { overriddenOn } from '../../lib/console/ruleScope'
 import { Link } from '../../lib/router'
 import { SourceTag } from './hostSource'
 import { deleteRuleDialog, releaseDialog } from './moderationDetail'
@@ -90,8 +91,21 @@ const ruleButtons = (r: DomainRule) => [
 ]
 const ruleSets = (r: DomainRule) => (r.effect.kind === 'ban' ? 'banned' : r.effect.kind === 'tier' ? r.effect.tier : r.effect.kind === 'throttle' ? `${fmtNum(r.effect.eventsPerSec)} events/s` : 'allowed')
 
+/** After the rule that won for a host, the broader rule it took the host from. */
+const Overrides = ({ over }: { over?: DomainRule }) =>
+  over ? (
+    <span className="muted">
+      {' '}
+      (overrides{' '}
+      <button type="button" className="cx-linklike" onClick={() => openPanel('rule', String(over.id))}>
+        rule {over.id}
+      </button>
+      )
+    </span>
+  ) : null
+
 /** A host setting a domain rule decides: the rule wins, so the row says which rule and what it sets. */
-function ByRule({ rule, children }: { rule: DomainRule; children?: ReactNode }) {
+function ByRule({ rule, over, children }: { rule: DomainRule; over?: DomainRule; children?: ReactNode }) {
   return (
     <span className="cx-byrule">
       <span>
@@ -99,6 +113,7 @@ function ByRule({ rule, children }: { rule: DomainRule; children?: ReactNode }) 
         <span className="nowrap">
           → <span className="to">{ruleSets(rule)}</span>
         </span>
+        <Overrides over={over} />
       </span>
       {children}
     </span>
@@ -128,6 +143,7 @@ function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; 
   const acts = [...d.actions].sort((a, b) => b.atMs - a.atMs)
   const last = (k: HostAction['action']) => acts.find((a) => a.action.action === k)
   const rule = r.rule != null ? rules?.find((x) => x.id === r.rule) : undefined
+  const over = rule && rules ? overriddenOn(r.host, rule.id, rules) : undefined
   const { thrSet, ruleThr, opThr } = throttleOf(d, rule)
   const ruleTier = rule?.effect.kind === 'tier' ? rule.effect.tier : undefined
   const hourUse = d.series.events.length ? (d.series.events.reduce((a, b) => a + b, 0) / d.series.events.length) * 3600 : r.eventsPerSec * 3600
@@ -150,6 +166,7 @@ function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; 
   const ruleLine = (r: DomainRule, lead = 'Set') => (
     <>
       {lead} by {ruleName(r)} → {ruleSets(r)}
+      <Overrides over={over} />
       {r.note ? <> “{r.note}”</> : null} · {r.createdBy}, {ago(r.createdAtMs)}
     </>
   )
@@ -299,6 +316,7 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
   const blocked = r.status === 'banned' || r.status === 'suspended'
   const tiers = Object.keys(pol.data?.policy.tiers ?? { [r.tier]: null })
   const rule = r.rule != null ? rules.data?.find((x) => x.id === r.rule) : undefined
+  const over = rule && rules.data ? overriddenOn(r.host, rule.id, rules.data) : undefined
   const tierRule = tierRuleOf(rule)
   const banRule = rule?.effect.kind === 'ban' ? rule : undefined
   const thr = throttleOf(d, rule)
@@ -436,9 +454,12 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
             [
               'Domain rule',
               r.rule != null ? (
-                <button key="r" type="button" className="cx-linklike" onClick={() => openPanel('rule', String(r.rule))}>
-                  rule {r.rule}
-                </button>
+                <span key="r">
+                  <button type="button" className="cx-linklike" onClick={() => openPanel('rule', String(r.rule))}>
+                    rule {r.rule}
+                  </button>
+                  <Overrides over={over} />
+                </span>
               ) : (
                 <span key="r" className="muted">none</span>
               ),
@@ -455,7 +476,7 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
             wide={!!tierRule}
             desc={
               tierRule ? (
-                <ByRule rule={tierRule}>
+                <ByRule rule={tierRule} over={over}>
                   {tierRule.effect.kind === 'tier' && r.tier !== tierRule.effect.tier && <span>It's {r.tier} now; the rule's tier applies when that's lifted.</span>}
                 </ByRule>
               ) : (
@@ -481,7 +502,7 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
             wide={thr.ruleThr !== undefined}
             desc={
               thr.ruleThr !== undefined ? (
-                <ByRule rule={rule!}>
+                <ByRule rule={rule!} over={over}>
                   <span>{thr.opThr ? `An operator throttle at ${fmtNum(r.throttle!)}/s holds too; the lower one wins.` : 'An operator throttle only holds below it.'}</span>
                 </ByRule>
               ) : thr.opThr ? (
@@ -527,7 +548,7 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
       <Sec title="Suspend or ban" danger open={page || blocked} flush>
         <div className="cx-acts">
           {banRule && r.status !== 'suspended' ? (
-            <Act title="Ban" wide desc={<ByRule rule={banRule} />}>
+            <Act title="Ban" wide desc={<ByRule rule={banRule} over={over} />}>
               <span className="cx-form-row">{ruleButtons(banRule)}</span>
             </Act>
           ) : blocked ? (

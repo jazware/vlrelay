@@ -76,6 +76,8 @@ export type HostQuery = {
   /** only hosts with (true) or without (false) throttled accounts */
   throttled?: boolean
   flag?: HostFlag
+  /** only the hosts this domain rule decides; an older relay ignores it, so check each row's `rule` */
+  rule?: number
   sort: HostSort
   desc: boolean
   limit?: number
@@ -85,7 +87,7 @@ export type HostQuery = {
 export type HostFlag = 'atCap' | 'lagging' | 'erroring' | 'throttledOrAtCap'
 /** Server-side filter, sort and page (`limit` default 10,000 on the server). */
 export const hosts = (q: HostQuery) =>
-  api<HostList>('hosts', { params: { q: q.q || undefined, tier: q.tier || undefined, status: q.status || undefined, source: q.source || undefined, throttled: q.throttled, flag: q.flag, sort: q.sort, desc: q.desc, limit: q.limit, offset: q.offset } })
+  api<HostList>('hosts', { params: { q: q.q || undefined, tier: q.tier || undefined, status: q.status || undefined, source: q.source || undefined, throttled: q.throttled, flag: q.flag, rule: q.rule, sort: q.sort, desc: q.desc, limit: q.limit, offset: q.offset } })
 export const host = (h: string) => api<HostDetail>(`hosts/${enc(h)}`)
 export const hostAction = (h: string, a: HostAction) => api<HostRow>(`hosts/${enc(h)}/action`, { body: a })
 /** What hostAction sends, for the confirm dialog's footer. */

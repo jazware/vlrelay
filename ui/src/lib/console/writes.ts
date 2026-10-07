@@ -52,6 +52,32 @@ export async function updateCase(id: number, u: Parameters<typeof A.updateCase>[
   return c
 }
 
+/**
+ * Several cases' status at once. There's no bulk endpoint, so it's one POST per case, four at a
+ * time; each answer goes into the cache as it lands and the lists refetch once at the end.
+ * Resolves to the ids that failed (with why); the rest were written.
+ */
+export async function updateCases(ids: number[], u: Parameters<typeof A.updateCase>[1], onProgress?: (done: number, failed: number) => void) {
+  const failed: { id: number; error: unknown }[] = []
+  let next = 0
+  let done = 0
+  const worker = async () => {
+    while (next < ids.length) {
+      const id = ids[next++]
+      try {
+        writeCase(await A.updateCase(id, u))
+        done++
+      } catch (error) {
+        failed.push({ id, error })
+      }
+      onProgress?.(done, failed.length)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(4, ids.length) }, worker))
+  invalidate(keysFor('case'), true)
+  return failed
+}
+
 function wroteAccount(a: Account) {
   qc.setQueryData(keys.account(a.did), a)
   invalidate(keysFor('takedown', a.did), true)

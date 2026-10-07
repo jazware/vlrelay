@@ -1,22 +1,20 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { DataTable, type Col } from '../../components/console/DataTable'
 import { hostActionDialog, BIG_HOST_CAP } from '../../components/console/hostActions'
 import { openPanel } from '../../components/console/nav'
 import { registerPalette, type PalItem } from '../../components/console/Palette'
-import { Chip, Empty, Glyph, HostName, Kbd, Loaded, Meter, Over, PageHead, Panel, Sec, Seg, Src, TierTag, Updated } from '../../components/console/kit'
-import type { Account, Case, CaseStatus, DomainRule, HostRow, PolicyAudit, SignalKey, SignalTop, TakedownEntry } from '../../lib/api'
+import { Chip, Empty, HostName, Kbd, Loaded, Meter, Over, PageHead, Panel, Sec, Src, TierTag, Updated } from '../../components/console/kit'
+import type { Account, Case, DomainRule, HostRow, PolicyAudit, SignalKey, SignalTop, TakedownEntry } from '../../lib/api'
 import { cached, keys } from '../../lib/console/cache'
 import { ago, dt, fmtNum, fmtSi, plural, shortDid } from '../../lib/console/fmt'
 import { useAccountSearch, useCases, useHostList, useOverview, useRules, useRulesAudit, useSignals, useTakedowns } from '../../lib/console/queries'
-import { sevTone } from '../../lib/console/tone'
+import { overriddenBy, overriddenRules } from '../../lib/console/ruleScope'
 import { Link, useSearch } from '../../lib/router'
+import { Cases } from './casesPanel'
 import { signalOfKind } from './Policy'
 import {
   AccountChip,
-  CaseStatusChip,
   EffectChip,
-  SEV_RANK,
-  caseObs,
   signalKeyRef,
   releaseDialog,
   ruleDialog,
@@ -27,8 +25,6 @@ import {
 // accounts hosts created throttled. Every row opens in the slide-over (case, acct, rule, host);
 // every write is a confirm with its call.
 
-type Filter = CaseStatus | 'all'
-const FILTERS: Filter[] = ['open', 'acknowledged', 'resolved', 'dismissed', 'all']
 const isDid = (s: string) => /^did:(plc|web):\S+$/.test(s.trim())
 
 function setParam(k: string, v: string) {
@@ -38,81 +34,6 @@ function setParam(k: string, v: string) {
   const q = s.toString()
   history.replaceState(null, '', `${location.pathname}${q ? `?${q}` : ''}${location.hash}`)
   dispatchEvent(new PopStateEvent('popstate'))
-}
-
-function Cases() {
-  const all = useCases()
-  const search = useSearch()
-  const f = (search.get('cases') as Filter | null) ?? 'open'
-  const counts = useMemo(() => {
-    const m: Record<string, number> = { all: 0 }
-    for (const c of all.data ?? []) {
-      m[c.status] = (m[c.status] ?? 0) + 1
-      m.all++
-    }
-    return m
-  }, [all.data])
-  const rows = useMemo(
-    () => (all.data ?? []).filter((c) => f === 'all' || c.status === f).sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity] || b.openedAtMs - a.openedAtMs),
-    [all.data, f],
-  )
-  const cols: Col<Case>[] = [
-    {
-      id: 'id',
-      label: 'Case',
-      sort: (a, b) => a.id - b.id,
-      render: (c) => (
-        <span className="mono">
-          <Glyph k={sevTone(c.severity)} title={c.severity} /> {c.id}
-        </span>
-      ),
-    },
-    { id: 'kind', label: 'Kind', render: (c) => c.kind.replace(/-/g, ' ') },
-    {
-      id: 'subject',
-      label: 'Subject',
-      render: (c) => (
-        <span className="cx-cellid">
-          <HostName host={c.host} />
-          {c.did && <span className="cx-did">{shortDid(c.did)}</span>}
-        </span>
-      ),
-    },
-    {
-      id: 'obs',
-      label: 'Over threshold',
-      r: true,
-      title: 'How far past its threshold it was when it tripped: observed / threshold. The bar is logarithmic, 0.1× to 10×, with a tick at the threshold',
-      sort: (a, b) => a.observed / (a.threshold || 1) - b.observed / (b.threshold || 1),
-      render: (c) => <Over r={c.threshold > 0 ? c.observed / c.threshold : NaN} detail={caseObs(c)} />,
-    },
-    { id: 'auto', label: 'Auto action', render: (c) => (c.autoAction ? <span className="mono sm">{c.autoAction}</span> : <span className="muted sm">none</span>) },
-    { id: 'status', label: 'Status', render: (c) => <CaseStatusChip c={c} /> },
-    { id: 'opened', label: 'Opened', r: true, sort: (a, b) => a.openedAtMs - b.openedAtMs, render: (c) => <span className="sm muted" title={dt(c.openedAtMs)}>{ago(c.openedAtMs)}</span> },
-  ]
-  return (
-    <Panel
-      title="Cases"
-      src={<><Src>cases</Src> <Src>cases/{'{id}'}/evidence</Src></>}
-      right={<Seg<Filter> label="Case status" value={f} options={FILTERS.map((s) => ({ v: s, label: s === 'acknowledged' ? 'ack' : s, n: counts[s] ?? 0 }))} onChange={(v) => setParam('cases', v === 'open' ? '' : v)} />}
-      foot={<span>Opened when a host or account crosses a spam threshold in the policy. A host gets at most one open case per kind.</span>}
-    >
-      <Loaded load={all}>
-        {() => (
-          <DataTable
-            rows={rows}
-            cols={cols}
-            rowKey={(c) => String(c.id)}
-            open={(c) => ({ type: 'case', id: String(c.id) })}
-            dim={(c) => c.status === 'resolved' || c.status === 'dismissed'}
-            compact
-            label="Cases"
-            empty={<Empty title={f === 'open' ? 'No open cases' : `No ${f === 'all' ? '' : `${f} `}cases`}>Nothing has crossed a threshold.</Empty>}
-          />
-        )}
-      </Loaded>
-    </Panel>
-  )
 }
 
 type SignalRow = { s: SignalTop; k?: SignalKey; r: number }
@@ -184,7 +105,7 @@ function Takedowns() {
   const l = useTakedowns()
   const cols: Col<TakedownEntry>[] = [
     { id: 'did', label: 'Account', render: (t) => <span className="cx-did" title={t.did}>{shortDid(t.did)}</span> },
-    { id: 'reason', label: 'Reason', className: 'wrap sm t2', render: (t) => t.reason || <span className="muted">—</span> },
+    { id: 'reason', label: 'Reason', fill: true, className: 'wrap sm t2', render: (t) => t.reason || <span className="muted">—</span> },
     { id: 'by', label: 'By', render: (t) => <span className="sm">{t.by}</span> },
     { id: 'at', label: 'When', r: true, sort: (a, b) => a.atMs - b.atMs, render: (t) => <span className="sm muted" title={dt(t.atMs)}>{ago(t.atMs)}</span> },
   ]
@@ -264,6 +185,20 @@ function Lookup() {
   )
 }
 
+/** A rule's place among the others: the hosts more specific rules take from it, and the broader rule it wins over. */
+function Precedence({ r, rules }: { r: DomainRule; rules: DomainRule[] }) {
+  const by = overriddenBy(r, rules)
+  const lost = by.reduce((n, s) => n + s.matches, 0)
+  const over = overriddenRules(r, rules)[0]
+  const parts = [
+    ...(by.length ? [`${plural(lost, 'host')} to ${by.length === 1 ? `rule ${by[0].id}` : plural(by.length, 'rule')}`] : []),
+    ...(over ? [`overrides rule ${over.id}`] : []),
+  ]
+  if (!parts.length) return <span className="muted">—</span>
+  const title = [...by.map((s) => `rule ${s.id} (${s.pattern}) takes ${plural(s.matches, 'host')}`), ...(over ? [`wins over rule ${over.id} (${over.pattern}) on its hosts`] : [])].join('\n')
+  return <span title={title}>{parts.join(' · ')}</span>
+}
+
 function Rules() {
   const l = useRules()
   const audit = useRulesAudit()
@@ -274,8 +209,9 @@ function Rules() {
     { id: 'id', label: '#', sort: (a, b) => a.id - b.id, render: (r) => <span className="mono muted">{r.id}</span> },
     { id: 'pattern', label: 'Pattern', sort: (a, b) => a.pattern.localeCompare(b.pattern), render: (r) => <span className="mono">{r.pattern}</span> },
     { id: 'effect', label: 'Effect', render: (r) => <EffectChip e={r.effect} /> },
-    { id: 'note', label: 'Note', className: 'wrap sm t2', render: (r) => r.note || <span className="muted">—</span> },
-    { id: 'matches', label: 'Matches', r: true, sort: (a, b) => a.matches - b.matches, render: (r) => <span className="mono">{fmtNum(r.matches)}</span> },
+    { id: 'note', label: 'Note', fill: true, className: 'wrap sm t2', render: (r) => r.note || <span className="muted">—</span> },
+    { id: 'matches', label: 'Covers', r: true, sort: (a, b) => a.matches - b.matches, render: (r) => <span className="mono">{fmtNum(r.matches)}</span> },
+    { id: 'prec', label: 'Precedence', className: 'sm t2', render: (r) => <Precedence r={r} rules={l.data ?? []} /> },
     { id: 'by', label: 'By', render: (r) => <span className="sm">{r.createdBy}</span> },
     { id: 'at', label: 'Added', r: true, sort: (a, b) => a.createdAtMs - b.createdAtMs, render: (r) => <span className="sm muted" title={dt(r.createdAtMs)}>{ago(r.createdAtMs)}</span> },
   ]
@@ -350,6 +286,7 @@ function Throttled() {
     {
       id: 'host',
       label: 'Host',
+      fill: true,
       render: (h) => (
         <span className="cx-cellid">
           <HostName host={h.host} />
