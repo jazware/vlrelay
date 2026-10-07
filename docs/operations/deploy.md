@@ -129,6 +129,10 @@ UPSTREAM=morel.us-east.host.bsky.network VLRELAY_ADMIN_TOKEN=$(openssl rand -hex
 For a real deployment, swap MinIO for your bucket (`VLRELAY_S3_*`), drop the `minio` services,
 and mount a local disk for `--qlog-dir` (`VLRELAY_QLOG_DIR`), writable by uid 10001.
 
+A 2 vCPU / 4 GB box carries a single node at a few thousand hosts, but not the PLC export's
+first fill at its default rate on top. [Configuration](configuration.md#a-small-box) has the
+settings for one.
+
 ## A cluster
 
 Three nodes on separate machines, each with a local NVMe disk, the same bucket and the same

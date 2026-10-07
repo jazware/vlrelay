@@ -366,6 +366,18 @@ pub struct HostTable {
     /// count, sent with the table).
     #[serde(default)]
     pub throttled: BTreeMap<String, u64>,
+    /// `rows` left out: the reader said it holds this epoch and version
+    /// ([`HostsAsk`]). At thousands of hosts with their policy fields the
+    /// rows are megabytes, and only the cursors move between versions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub same_rows: bool,
+}
+
+/// A member's `leader:hosts` ask: the (epoch, version) of the table it
+/// holds. An empty ask (an older member) gets the whole table.
+#[derive(Serialize, Deserialize)]
+struct HostsAsk {
+    have: (u64, u64),
 }
 
 /// A host's owner among `live`: the highest hash of (member, host), so a
@@ -526,6 +538,27 @@ impl RelayHooks {
 
     fn qnode(&self) -> Option<Arc<crate::qlog::node::Node>> {
         self.node.get().and_then(|w| w.upgrade())
+    }
+
+    /// The term's host table, without its rows for a reader that holds
+    /// `have`. None when this node isn't leading.
+    fn host_table(&self, have: Option<(u64, u64)>) -> Option<HostTable> {
+        let t = self.term.read().clone()?;
+        let i = t.inner.lock();
+        let same_rows = have == Some((i.hosts.epoch, i.hosts.version));
+        Some(HostTable {
+            epoch: i.hosts.epoch,
+            version: i.hosts.version,
+            rows: if same_rows { BTreeMap::new() } else { i.hosts.rows.clone() },
+            cursors: i.hosts.cursors.clone(),
+            throttled: i
+                .throttled
+                .iter()
+                .filter(|(_, d)| !d.is_empty())
+                .map(|(h, d)| (h.clone(), d.len() as u64))
+                .collect(),
+            same_rows,
+        })
     }
 
     fn committed_dup(&self, host: &str, useq: i64, did: &str) -> bool {
@@ -1043,7 +1076,7 @@ impl Hooks for RelayHooks {
                     }
                 }
                 let mut i = term.inner.lock();
-                i.hosts = HostTable { epoch, version: 1, rows, cursors, throttled: BTreeMap::new() };
+                i.hosts = HostTable { epoch, version: 1, rows, cursors, throttled: BTreeMap::new(), same_rows: false };
                 i.throttled = throttled;
             }
             let emitted = node.emitted();
@@ -1193,19 +1226,8 @@ impl Hooks for RelayHooks {
         Box::pin(async move {
             match topic {
                 "leader:hosts" => {
-                    let t = self.term.read().clone()?;
-                    let table = {
-                        let i = t.inner.lock();
-                        let mut table = i.hosts.clone();
-                        table.throttled = i
-                            .throttled
-                            .iter()
-                            .filter(|(_, d)| !d.is_empty())
-                            .map(|(h, d)| (h.clone(), d.len() as u64))
-                            .collect();
-                        table
-                    };
-                    serde_json::to_vec(&table).ok().map(Bytes::from)
+                    let have = serde_json::from_slice::<HostsAsk>(&body).ok().map(|a| a.have);
+                    serde_json::to_vec(&self.host_table(have)?).ok().map(Bytes::from)
                 }
                 "leader:flush" => {
                     let want = self.cfg.admin_token.as_deref().filter(|t| !t.is_empty())?;
@@ -1820,8 +1842,27 @@ impl Glue {
     }
 
     async fn read_table(&self, patience: Duration) -> Option<HostTable> {
-        let b = self.client.ask_leader("leader:hosts", Bytes::new(), patience).await.ok()?;
+        let have = {
+            let c = self.hosts.table.read();
+            (c.epoch > 0).then_some((c.epoch, c.version))
+        };
+        // the leader's own member has the table in memory: asking through
+        // the log's client would be JSON both ways every poll
+        if let Some(t) = self.local_table(have) {
+            return Some(t);
+        }
+        let ask = have.map(|have| Bytes::from(serde_json::to_vec(&HostsAsk { have }).expect("serializable")));
+        let b = self.client.ask_leader("leader:hosts", ask.unwrap_or_default(), patience).await.ok()?;
         serde_json::from_slice::<HostTable>(&b).map_err(|e| tracing::warn!("quorum: a bad host table: {e}")).ok()
+    }
+
+    /// This node's own term's table, while the log has it leading that
+    /// term (a term the node lost waits for `term_ended`; the log knows
+    /// first).
+    fn local_table(&self, have: Option<(u64, u64)>) -> Option<HostTable> {
+        let epoch = self.hooks.term.read().as_ref()?.epoch;
+        self.qnode.leading(epoch)?;
+        self.hooks.host_table(have)
     }
 
     /// Follows a table read from the leader: the hosts it gives this node
@@ -1829,20 +1870,32 @@ impl Glue {
     /// re-applied to its socket and limits now. An older table than the
     /// one held (a settle and the poll read concurrently) is dropped.
     fn install_table(&self, t: HostTable) {
+        let same_rows = t.same_rows;
         let moved: Vec<String> = {
             let mut cur = self.hosts.table.write();
             let (new, old) = ((t.epoch, t.version), (cur.epoch, cur.version));
             if new < old || (new == old && cur.cursors == t.cursors && cur.throttled == t.throttled) {
                 return;
             }
-            let moved = t
-                .rows
-                .values()
-                .filter(|r| cur.rows.get(&r.hostname).is_none_or(|c| c.tier != r.tier || c.extra != r.extra))
-                .map(|r| r.hostname.clone())
-                .collect();
-            *cur = t;
-            moved
+            if same_rows {
+                // the rows left out aren't the ones this node holds: the
+                // next read sends them
+                if new != old {
+                    return;
+                }
+                cur.cursors = t.cursors;
+                cur.throttled = t.throttled;
+                Vec::new()
+            } else {
+                let moved = t
+                    .rows
+                    .values()
+                    .filter(|r| cur.rows.get(&r.hostname).is_none_or(|c| c.tier != r.tier || c.extra != r.extra))
+                    .map(|r| r.hostname.clone())
+                    .collect();
+                *cur = t;
+                moved
+            }
         };
         // what the leader doesn't have yet goes again
         let local: Vec<state::HostRecord> = self.hosts.local.read().values().cloned().collect();
@@ -1872,6 +1925,9 @@ impl Glue {
                 });
             }
             _ => notify(moved),
+        }
+        if same_rows {
+            return;
         }
         let owned = self.hosts.owned(&self.id);
         let mut cur = self.owned.lock();
@@ -2781,6 +2837,110 @@ mod tests {
         }
         c.shutdown();
     }
+    /// A member that holds the leader's (epoch, version) reads the cursors
+    /// alone; one behind, or an ask without a version, gets the rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_host_table_leaves_out_rows_a_member_holds() {
+        let c = Cluster::with_cfg(3, None, Some(cluster_cfg(MapIdentity::new(), 0)), 64 << 20).await;
+        c.wait_leader(Duration::from_secs(5)).await;
+        let client = c.client();
+        owner(&client).await;
+        let ask = |have: Option<(u64, u64)>| {
+            let client = client.clone();
+            async move {
+                let body = have.map(|have| Bytes::from(serde_json::to_vec(&HostsAsk { have }).unwrap()));
+                let b = client.ask_leader("leader:hosts", body.unwrap_or_default(), Duration::from_secs(5)).await;
+                serde_json::from_slice::<HostTable>(&b.unwrap()).unwrap()
+            }
+        };
+        let full = ask(None).await;
+        assert!(!full.same_rows && full.rows.contains_key(HOST));
+        let same = ask(Some((full.epoch, full.version))).await;
+        assert!(same.same_rows && same.rows.is_empty(), "{same:?}");
+        assert_eq!((same.epoch, same.version), (full.epoch, full.version));
+        let behind = ask(Some((full.epoch, full.version - 1))).await;
+        assert!(!behind.same_rows && behind.rows.contains_key(HOST));
+        c.shutdown();
+    }
+
+    /// What a member's poll of a 3,400-host table costs, rows carrying
+    /// policy fields: the whole table through JSON (as every poll was) and
+    /// the cursors alone (an unchanged version over the wire, or the
+    /// leader's own member). `cargo test --profile dev-release
+    /// host_table_poll_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn host_table_poll_cost() {
+        let hosts = 3_400;
+        let mut t = HostTable { epoch: 7, version: 1234, ..Default::default() };
+        for n in 0..hosts {
+            let h = format!("pds-{n}.host.example.com");
+            let trail: Vec<serde_json::Value> = (0..8)
+                .map(|k| {
+                    serde_json::json!({"at": 1_759_000_000_000u64 + k, "by": "operator@example.com",
+                        "action": "set-tier", "tier": "throttled", "note": "spam wave from fresh accounts, see case 1234"})
+                })
+                .collect();
+            let mut extra = serde_json::Map::new();
+            extra.insert("operator_throttle".into(), serde_json::json!({"events_per_sec": 5.0, "until": 0}));
+            extra.insert("account_cap".into(), serde_json::json!(10_000));
+            extra.insert("restore_tier".into(), serde_json::json!("default"));
+            extra.insert("actions".into(), serde_json::Value::Array(trail));
+            t.rows.insert(
+                h.clone(),
+                HostRow {
+                    hostname: h.clone(),
+                    tier: state::Tier::Default,
+                    first_seen: 1_700_000_000,
+                    owner: Some("relay-1".into()),
+                    source: Some("listHosts".into()),
+                    extra,
+                },
+            );
+            t.cursors.insert(h, 123_456_789);
+        }
+        let n = 50;
+        let time = |f: &dyn Fn() -> usize| {
+            let t0 = Instant::now();
+            let mut bytes = 0;
+            for _ in 0..n {
+                bytes = std::hint::black_box(f());
+            }
+            (t0.elapsed() / n, bytes)
+        };
+        let (whole, whole_b) = time(&|| {
+            // the leader cloned its table under the term's lock first
+            let b = serde_json::to_vec(&t.clone()).unwrap();
+            let back: HostTable = serde_json::from_slice(&b).unwrap();
+            assert_eq!(back.rows.len(), hosts);
+            b.len()
+        });
+        let (wire, wire_b) = time(&|| {
+            let p = HostTable {
+                epoch: t.epoch,
+                version: t.version,
+                rows: BTreeMap::new(),
+                cursors: t.cursors.clone(),
+                throttled: t.throttled.clone(),
+                same_rows: true,
+            };
+            let b = serde_json::to_vec(&p).unwrap();
+            let back: HostTable = serde_json::from_slice(&b).unwrap();
+            assert!(back.same_rows);
+            b.len()
+        });
+        let (local, _) = time(&|| t.cursors.clone().len());
+        eprintln!(
+            "POLL hosts={hosts} whole_json={whole:?} ({} KiB) cursors_json={wire:?} ({} KiB) local={local:?}; \
+             at 2 polls/s: {:.1}% / {:.2}% / {:.3}% of a core",
+            whole_b >> 10,
+            wire_b >> 10,
+            whole.as_secs_f64() * 200.0,
+            wire.as_secs_f64() * 200.0,
+            local.as_secs_f64() * 200.0,
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn release_throttled_lifts_a_hosts_throttled_accounts_through_the_log() {
         let ident = MapIdentity::new();

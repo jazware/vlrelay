@@ -387,7 +387,7 @@ impl SeedWriter {
         let path = db_path(store);
         let (cache, id) = crate::qlog::cache::for_db(path.as_ref());
         let db = slatedb::Db::builder(path, store.raw.clone())
-            .with_settings(crate::qlog::state::settings(64 << 20))
+            .with_settings(crate::qlog::state::settings(64 << 20, crate::qlog::state::seed_bounds()))
             .with_db_cache(cache, id)
             .with_merge_operator(merge_operator())
             .build()

@@ -20,9 +20,11 @@ SECTIONS = [
         "Upstreams and identity",
         "`--host` and `--crawl` work on any member: a host admitted anywhere goes into the leader's host table, "
         "and the leader gives it to a member.",
-        ["host", "crawl", "host-tier", "plc-url", "plc-export", "plc-export-url", "plc-export-rate", "plc-export-streams", "bootstrap-relay", "dev-mode", "did-lookups-per-sec", "did-lookup-prefetch", "did-web-seed-ttl-secs"],
+        ["host", "crawl", "host-tier", "plc-url", "plc-export", "plc-export-url", "plc-export-rate", "plc-export-streams", "plc-seeds-slatedb", "bootstrap-relay", "dev-mode", "did-lookups-per-sec", "did-lookup-prefetch", "did-web-seed-ttl-secs"],
     ),
-    ("Pipeline and serving", "", ["lanes", "ingest-threads", "host-inflight-events", "host-inflight-mb", "inflight-events", "inflight-mb", "ring-mb", "max-lag-mb", "log-compression"]),
+    ("Pipeline and serving", "", ["lanes", "ingest-threads", "host-inflight-events", "host-inflight-mb", "inflight-events", "inflight-mb", "ring-mb", "max-lag-mb", "log-compression",
+                              "event-horizon-secs", "lag-case-minutes", "lag-case-sustain-secs", "lag-case-grace-secs",
+                              "lag-case-pressure-pct", "lag-case-resolve-secs"]),
     (
         "Quorum log",
         "Every member uses the same bucket and `--prefix`. A node with no `--qlog-peer` is a single node with "
@@ -30,7 +32,7 @@ SECTIONS = [
         ["node-id", "qlog-listen", "qlog-peer", "qlog-members", "qlog-dir", "qlog-flush-ms", "qlog-headroom",
          "qlog-admin-token", "qlog-admin-token-file", "qlog-retain-hours", "qlog-retain-secs", "qlog-retain-every-secs",
          "qlog-host-failover-ms", "qlog-host-poll-ms", "qlog-election-ms", "qlog-heartbeat-ms",
-         "qlog-state-compactor-poll-ms", "qlog-no-auto-recover", "qlog-segment-mb", "qlog-disk-retain-mb", "durability", "durability-sync-ms", "slatedb-cache-mb",
+         "qlog-state-compactor-poll-ms", "qlog-state-slatedb", "qlog-no-auto-recover", "qlog-segment-mb", "qlog-disk-retain-mb", "durability", "durability-sync-ms", "slatedb-cache-mb",
          "qlog-memory-mb"],
     ),
     (
@@ -82,6 +84,25 @@ their values either.
 
 The image sets `VLRELAY_LISTEN=0.0.0.0:2980` and passes `--ui-dir /usr/share/vlrelay/ui` in its
 entrypoint ([Deploy](deploy.md#the-image)).
+"""
+
+
+FOOTER = """## A small box
+
+A single node at ~3,400 hosts runs on ~1.3 GB of heap and half a core without `--plc-export`. On
+a 2 vCPU / 4 GB box:
+
+- Leave `--plc-export` off, or run it at `--plc-export-rate 1 --plc-export-streams 1` with the
+  default `--plc-seeds-slatedb`. The seeds' SlateDB then runs one compaction at a time, with no
+  subcompactions, 2 x 1 MiB of read-ahead per input and 128 MiB of memtables. On a 40M-row seeds
+  database with compactions owed, reopened and fed at the export's pace with a slow bucket, that
+  peaked at 441 MB against 882 MB with SlateDB's own defaults, and under a 700 MiB cap the
+  defaults were OOM-killed in 85 s where the bounds ran to the end (`seeds_bench`). Watch the
+  process's memory through the fill, about 28 hours at rate 1 (14 at the default 2).
+- `--qlog-disk-retain-mb 1024`: a single node has no followers to catch up, so the disk only
+  serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of
+  it, about 7 s for the default 4 GiB.
+- Keep `--slatedb-cache-mb` at 320. The state's and the seeds' databases share it.
 """
 
 
@@ -164,6 +185,7 @@ def main():
         out.append("| Flag | Env | Default | What |\n|---|---|---|---|")
         out.extend(row(flags[n]) for n in names)
         out.append("")
+    out.append(FOOTER)
     sys.stdout.write("\n".join(out))
 
 

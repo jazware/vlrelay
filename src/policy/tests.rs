@@ -799,6 +799,91 @@ async fn an_auto_throttle_after_an_operators_set_tier_is_on_the_trail() {
     assert_eq!(PolicyAdmin::host_actions(&hosts.get_host("pds.example.com").await.unwrap().unwrap()).len(), 2);
 }
 
+/// A bucket whose writes fail on the way (a reset connection, a timeout).
+#[derive(Debug)]
+struct WritesFail(Arc<dyn object_store::ObjectStore>);
+
+impl std::fmt::Display for WritesFail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WritesFail")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for WritesFail {
+    async fn put_opts(
+        &self,
+        _: &object_store::path::Path,
+        _: PutPayload,
+        _: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        Err(object_store::Error::Generic { store: "S3", source: "error sending request: connection reset".into() })
+    }
+    async fn put_multipart_opts(
+        &self,
+        l: &object_store::path::Path,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.0.put_multipart_opts(l, o).await
+    }
+    async fn get_opts(
+        &self,
+        l: &object_store::path::Path,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.0.get_opts(l, o).await
+    }
+    fn delete_stream(
+        &self,
+        l: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.0.delete_stream(l)
+    }
+    fn list(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.0.list(p)
+    }
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.0.list_with_delimiter(p).await
+    }
+    async fn copy_opts(
+        &self,
+        f: &object_store::path::Path,
+        t: &object_store::path::Path,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.0.copy_opts(f, t, o).await
+    }
+}
+
+/// A save the bucket failed is a 503 with a Retry-After, which says the
+/// same save may work again, not a 500; a bucket that refuses the keys
+/// stays a 500.
+#[tokio::test]
+async fn a_policy_save_the_bucket_failed_is_unavailable() {
+    use axum::response::IntoResponse;
+    let raw: Arc<dyn object_store::ObjectStore> = Arc::new(WritesFail(Arc::new(object_store::memory::InMemory::new())));
+    let store = Store { raw, prefix: "vlrelay".into(), latency: None };
+    let a = PolicyAdmin::new(engine(&store, "a"), Arc::new(MemHosts::default()));
+    let mut body = p();
+    body.cluster.new_hosts_per_day = 10;
+    let err = a.update_full_policy(0, body, "op", "").await.unwrap_err();
+    assert!(matches!(err, crate::admin::AdminError::Unavailable(_)), "{err:?}");
+    let r = err.into_response();
+    assert_eq!(r.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.headers()[axum::http::header::RETRY_AFTER], "5");
+
+    let denied = object_store::Error::PermissionDenied { path: "p".into(), source: "403".into() };
+    assert!(matches!(store::SaveError::from_store(denied), store::SaveError::Store(_)));
+    let timed_out = object_store::Error::Generic { store: "policy", source: "object store call timed out".into() };
+    assert!(matches!(store::SaveError::from_store(timed_out), store::SaveError::Unavailable(_)));
+}
+
 #[tokio::test]
 async fn policy_admin_maps_the_wire_types() {
     let store = Store::memory(None);
