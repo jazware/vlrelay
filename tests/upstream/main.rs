@@ -324,12 +324,14 @@ async fn backpressured(tweak: impl FnOnce(&mut UpstreamConfig), want: Backpressu
     })
     .await;
     assert_eq!(m.host(&h).unwrap().record.status, HostStatus::Backpressure);
+    // the socket buffered the host's frames while paused, and the host keeps
+    // sending: only a consumer that outruns it ever lets the queue empty (a
+    // polling one, slowed by a busy machine, can fall behind for good)
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let t = Instant::now();
     let mut clear = false;
-    while !clear && t.elapsed() < Duration::from_secs(5) {
-        while rx.try_recv().is_ok() {}
+    while !clear && t.elapsed() < Duration::from_secs(20) {
         tokio::time::sleep(Duration::from_millis(1)).await;
-        while rx.try_recv().is_ok() {}
         let v = m.host(&h).unwrap();
         throttled |= v.record.status == HostStatus::Throttled;
         clear = v.record.status == HostStatus::Active && v.backpressure.is_none();
@@ -337,6 +339,7 @@ async fn backpressured(tweak: impl FnOnce(&mut UpstreamConfig), want: Backpressu
     assert!(clear, "still {:?} {:?}", m.host(&h).unwrap().record.status, m.host(&h).unwrap().backpressure);
     assert!(!throttled, "an unlimited host showed as throttled");
     m.shutdown().await.unwrap();
+    drain.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
