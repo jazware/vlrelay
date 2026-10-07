@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && node scripts/check-hooks.mjs && vite build",
     "typecheck": "tsc --noEmit",
+    "check-hooks": "node scripts/check-hooks.mjs",
     "preview": "vite preview",
     "check-docs": "node docs-build/check.mjs && node scripts/check-docs-private.mjs"
   },
