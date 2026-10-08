@@ -62,11 +62,11 @@ fn our_verdict(frame: &Bytes, did_key: &str) -> Result<(), String> {
 }
 
 fn reencode(c: &ParsedCommit) -> Bytes {
-    use vlsync_atproto::events::{CommitFrame, RepoOp, commit_frame};
+    use vlatproto::events::{CommitFrame, RepoOp, commit_frame};
     let mut car = Vec::new();
-    vlsync_atproto::car::write_header(&mut car, &c.car_roots[0]);
+    vlatproto::car::write_header(&mut car, &c.car_roots[0]);
     for (cid, b) in &c.blocks {
-        vlsync_atproto::car::write_block(&mut car, cid, b);
+        vlatproto::car::write_block(&mut car, cid, b);
     }
     let ops: Vec<RepoOp> = c
         .ops

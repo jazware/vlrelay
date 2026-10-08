@@ -271,7 +271,7 @@ pub enum LineError {
 pub fn parse_line(line: &[u8]) -> Result<ExportOp, LineError> {
     let v: J = serde_json::from_slice(line).map_err(|_| LineError::Json)?;
     let did = v.get("did").and_then(J::as_str).ok_or(LineError::Did)?;
-    if !vlsync_atproto::plc::valid_plc_did(did) {
+    if !vlatproto::plc::valid_plc_did(did) {
         return Err(LineError::Did);
     }
     let created_at = v.get("createdAt").and_then(J::as_str).ok_or(LineError::CreatedAt)?;
@@ -280,13 +280,13 @@ pub fn parse_line(line: &[u8]) -> Result<ExportOp, LineError> {
         return Err(LineError::Nullified);
     }
     let op = v.get("operation").ok_or(LineError::Op)?;
-    let ty = vlsync_atproto::plc::op_type(op, true).ok_or(LineError::Op)?;
+    let ty = vlatproto::plc::op_type(op, true).ok_or(LineError::Op)?;
     let seed = match ty {
-        vlsync_atproto::plc::OpType::Tombstone => {
+        vlatproto::plc::OpType::Tombstone => {
             Seed { created_ms, tombstone: true, key: None, pds: None, pds_http: false, lookup: false }
         }
-        vlsync_atproto::plc::OpType::Operation | vlsync_atproto::plc::OpType::LegacyCreate => {
-            let (key, pds) = if ty == vlsync_atproto::plc::OpType::LegacyCreate {
+        vlatproto::plc::OpType::Operation | vlatproto::plc::OpType::LegacyCreate => {
+            let (key, pds) = if ty == vlatproto::plc::OpType::LegacyCreate {
                 (op.get("signingKey"), op.get("service"))
             } else {
                 (

@@ -15,8 +15,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use vlatproto::cbor::Value;
 use vlrelay::upstream::frame::{encode_error, encode_message};
-use vlsync_atproto::cbor::Value;
 
 #[derive(Clone, Copy, Debug)]
 pub struct HostSpec {
@@ -165,9 +165,9 @@ pub fn frame_at(name: &str, seq: i64, size: usize, time: &str) -> Vec<u8> {
 
 /// `sentNs` of a fan frame.
 pub fn sent_ns(f: &[u8]) -> i64 {
-    let (_, n) = vlsync_atproto::cbor::ValueRef::decode_prefix(f).unwrap();
-    match vlsync_atproto::cbor::ValueRef::decode(&f[n..]).unwrap().get("sentNs") {
-        Some(vlsync_atproto::cbor::ValueRef::Int(t)) => *t,
+    let (_, n) = vlatproto::cbor::ValueRef::decode_prefix(f).unwrap();
+    match vlatproto::cbor::ValueRef::decode(&f[n..]).unwrap().get("sentNs") {
+        Some(vlatproto::cbor::ValueRef::Int(t)) => *t,
         _ => panic!("no sentNs"),
     }
 }

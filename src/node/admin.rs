@@ -1542,7 +1542,7 @@ fn kick_body(token: &str, id: u64, by: &str) -> serde_json::Value {
 fn kick_request(body: &[u8], token: Option<&str>) -> Result<(u64, String), &'static str> {
     let req: serde_json::Value = serde_json::from_slice(body).map_err(|_| "bad request")?;
     let given = req["token"].as_str().unwrap_or("");
-    if !token.is_some_and(|t| vlsync_atproto::xrpc::token_eq(t, given)) {
+    if !token.is_some_and(|t| vlatproto::xrpc::token_eq(t, given)) {
         return Err("unauthorized");
     }
     let id = req["id"].as_u64().ok_or("bad request")?;

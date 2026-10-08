@@ -21,9 +21,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
-use vlsync_atproto::cbor::{write_int, write_map_head, write_text};
-use vlsync_atproto::cid::Cid;
-use vlsync_atproto::tid::Tid;
+use vlatproto::cid::Cid;
+use vlatproto::frame::info_frame;
+use vlatproto::tid::Tid;
 
 pub type Batch = Arc<Vec<(i64, Bytes)>>;
 
@@ -214,7 +214,7 @@ pub fn run_emitter(
             }
         }
         let burst = if burst_until.is_some() { shape.burst_x } else { 1.0 };
-        let now = vlsync_atproto::events::now_rfc3339();
+        let now = vlatproto::events::now_rfc3339();
         for e in es.iter_mut() {
             let f = &e.host.faults;
             if let (Some((secs, every)), Some(t)) = (f.stall, e.next_stall)
@@ -378,21 +378,6 @@ async fn get_repo(State(h): State<Arc<HostState>>, Query(q): Query<HashMap<Strin
     }
 }
 
-fn info_frame(name: &str, message: &str) -> Bytes {
-    let mut out = Vec::new();
-    write_map_head(&mut out, 2);
-    write_text(&mut out, "t");
-    write_text(&mut out, "#info");
-    write_text(&mut out, "op");
-    write_int(&mut out, 1);
-    write_map_head(&mut out, 2);
-    write_text(&mut out, "name");
-    write_text(&mut out, name);
-    write_text(&mut out, "message");
-    write_text(&mut out, message);
-    Bytes::from(out)
-}
-
 async fn subscribe(
     State(h): State<Arc<HostState>>,
     Query(q): Query<HashMap<String, String>>,
@@ -422,15 +407,19 @@ async fn stream(h: Arc<HostState>, mut sock: WebSocket, cursor: Option<i64>) {
             Some(c) if c > ring.seq => None,
             Some(c) => {
                 let oldest = ring.items.front().map_or(ring.seq + 1, |x| x.0);
-                let info = (c + 1 < oldest)
-                    .then(|| info_frame("OutdatedCursor", "Requested cursor exceeded limit. Possibly missing events"));
+                let info = (c + 1 < oldest).then(|| {
+                    Bytes::from(info_frame(
+                        "OutdatedCursor",
+                        "Requested cursor exceeded limit. Possibly missing events",
+                    ))
+                });
                 let start = ring.items.partition_point(|x| x.0 <= c);
                 Some((rx, ring.items.iter().skip(start).map(|x| x.1.clone()).collect::<Vec<_>>(), info))
             }
         }
     };
     let Some((mut rx, backlog, info)) = snap else {
-        let f = vlsync_atproto::events::error_frame("FutureCursor", "Cursor in the future.");
+        let f = vlatproto::events::error_frame("FutureCursor", "Cursor in the future.");
         let _ = sock.send(Message::Binary(Bytes::from(f))).await;
         let _ = sock.send(Message::Close(None)).await;
         return;
@@ -471,7 +460,7 @@ async fn stream(h: Arc<HostState>, mut sock: WebSocket, cursor: Option<i64>) {
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let f = vlsync_atproto::events::error_frame("ConsumerTooSlow", "Stream consumer too slow");
+                    let f = vlatproto::events::error_frame("ConsumerTooSlow", "Stream consumer too slow");
                     let _ = sock.send(Message::Binary(Bytes::from(f))).await;
                     let _ = sock.send(Message::Close(None)).await;
                     return;

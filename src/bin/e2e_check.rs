@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use vlsync_atproto::cbor::ValueRef;
+use vlatproto::cbor::ValueRef;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -193,7 +193,7 @@ fn classify(frame: &[u8]) -> Result<Option<Classified>, String> {
         "#sync" => {
             let rev = s("rev").unwrap_or_default();
             let root = match body.get("blocks") {
-                Some(ValueRef::Bytes(b)) => vlsync_atproto::car::read_car(b)
+                Some(ValueRef::Bytes(b)) => vlatproto::car::read_car(b)
                     .ok()
                     .and_then(|(roots, _)| roots.first().map(|c| c.to_string()))
                     .unwrap_or_else(|| "-".into()),

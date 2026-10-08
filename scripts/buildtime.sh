@@ -7,14 +7,15 @@
 # MODULE (a new pub fn with a fresh constant, so codegen and the link really
 # happen). Prints the median seconds. The module is restored afterwards.
 #
-# Env: MODULE (src/seq.rs), REPS (3), STEPS ("check build test-build link-big"),
+# Env: MODULE (src/seq.rs), REPS (3), STEPS ("check build test-build", plus link-big
+# in the monorepo: vlpds through interop/),
 # BUILD_ARGS (extra cargo build flags, e.g. --config ...), and anything cargo reads (RUSTFLAGS, CARGO_TARGET_DIR, CARGO_PROFILE_*).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 label=${1:-default}
 module=${MODULE:-src/seq.rs}
 reps=${REPS:-3}
-steps=${STEPS:-check build test-build link-big}
+steps=${STEPS:-check build test-build$([ -d interop ] && echo " link-big")}
 backup=$(mktemp)
 cp "$module" "$backup"
 trap 'cp "$backup" "$module"; rm -f "$backup"' EXIT

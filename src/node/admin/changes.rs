@@ -680,8 +680,8 @@ mod tests {
                             let f = crate::upstream::frame::encode_message(
                                 "#commit",
                                 &[
-                                    ("seq", vlsync_atproto::cbor::Value::Int(seq)),
-                                    ("time", vlsync_atproto::cbor::Value::Text(time)),
+                                    ("seq", vlatproto::cbor::Value::Int(seq)),
+                                    ("time", vlatproto::cbor::Value::Text(time)),
                                 ],
                             );
                             if sock.send(Message::Binary(f.into())).await.is_err() {

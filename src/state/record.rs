@@ -12,8 +12,8 @@
 
 use bytes::{BufMut, Bytes};
 use sha2::{Digest, Sha256};
-use vlsync_atproto::cid::{CODEC_DAG_CBOR, Cid};
-use vlsync_atproto::tid::Tid;
+use vlatproto::cid::{CODEC_DAG_CBOR, Cid};
+use vlatproto::tid::Tid;
 use vlsync_store::keys::{SLOT_PREFIX_LEN, slot_prefix};
 
 pub const DID_FAMILY: u8 = b'd';

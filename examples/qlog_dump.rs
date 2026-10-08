@@ -3,7 +3,7 @@
 //!
 //!   cargo run --example qlog_dump -- http://127.0.0.1:3590 PREFIX [DID]
 
-use vlsync_atproto::cbor::ValueRef;
+use vlatproto::cbor::ValueRef;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

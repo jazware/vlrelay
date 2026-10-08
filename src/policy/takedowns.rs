@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use vlsync_firehose::firehose::{FrameFilter, FrameKind, FrameMeta};
+use vlatproto::frame::{FrameKind, FrameMeta};
+use vlsync_firehose::firehose::FrameFilter;
 use vlsync_store::store::Store;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

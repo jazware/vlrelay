@@ -44,8 +44,8 @@ pub enum StoreError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoRow {
     pub did: String,
-    pub head: vlsync_atproto::cid::Cid,
-    pub rev: vlsync_atproto::tid::Tid,
+    pub head: vlatproto::cid::Cid,
+    pub rev: vlatproto::tid::Tid,
     pub status: AccountStatus,
 }
 

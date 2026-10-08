@@ -1268,7 +1268,7 @@ impl Node {
                     .cfg
                     .admin_token
                     .as_deref()
-                    .is_some_and(|t| !t.is_empty() && vlsync_atproto::xrpc::token_eq(t, &r.token));
+                    .is_some_and(|t| !t.is_empty() && vlatproto::xrpc::token_eq(t, &r.token));
                 if !allowed {
                     return Msg::Failed { reason: "unauthorized: the qlog admin token is required".into() };
                 }

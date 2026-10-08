@@ -22,10 +22,6 @@ build:
 test *args:
     if command -v cargo-nextest >/dev/null; then cargo nextest run {{args}}; else cargo test {{args}}; fi
 
-# Upstream tests against a real in-process vlpds (interop/: its own package, so `test` doesn't build the PDS)
-test-interop *args:
-    cd interop && cargo test {{args}}
-
 # Re-check on every save (bacon when installed, else cargo-watch, else a polling loop)
 watch job="check":
     scripts/watch.sh {{job}}
@@ -99,7 +95,7 @@ relay-chaos scenario *args:
 
 # ---- images ----------------------------------------------------------------
 
-# Production image for this machine's platform (tools=1 adds fakepds and e2e_check; the context is .. while vlsync is a path dependency)
+# Production image for this machine's platform (tools=1 adds fakepds and e2e_check; the context is .. while vlsync and vlatproto are path dependencies)
 docker-build tag="vlrelay:local" tools="":
     ctx=.; if grep -q '^vlsync-store = { path' Cargo.toml; then ctx=..; fi; \
     docker buildx build -f Dockerfile --build-arg VLRELAY_TOOLS={{tools}} -t {{tag}} --load $ctx

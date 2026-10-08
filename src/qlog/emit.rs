@@ -206,7 +206,7 @@ impl Admin {
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "))
-                .is_some_and(|got| vlsync_atproto::xrpc::token_eq(t, got)),
+                .is_some_and(|got| vlatproto::xrpc::token_eq(t, got)),
         }
     }
 }

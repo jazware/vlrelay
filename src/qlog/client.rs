@@ -321,7 +321,7 @@ pub async fn ask(addr: &str, topic: &str, body: Bytes, timeout: Duration) -> any
 /// `pad` bytes to set its size and `sent` (unix µs) for end-to-end latency.
 /// Returns (prefix, suffix) around the `seq` the leader splices in.
 pub fn test_frame(did: &str, pad: usize, sent_us: i64) -> (Bytes, Bytes) {
-    use vlsync_atproto::cbor::*;
+    use vlatproto::cbor::*;
     let mut p = Vec::with_capacity(pad + did.len() + 48);
     write_map_head(&mut p, 2);
     write_text(&mut p, "t");
@@ -341,7 +341,7 @@ pub fn test_frame(did: &str, pad: usize, sent_us: i64) -> (Bytes, Bytes) {
 
 /// (seq, did, sent µs) of a [`test_frame`] as emitted; None for anything else.
 pub fn parse_test_frame(frame: &[u8]) -> Option<(u64, String, i64)> {
-    use vlsync_atproto::cbor::ValueRef;
+    use vlatproto::cbor::ValueRef;
     let (hdr, n) = ValueRef::decode_prefix(frame).ok()?;
     if !matches!(hdr.get("t"), Some(ValueRef::Text(t)) if *t == "#identity") {
         return None;
@@ -364,7 +364,7 @@ pub fn parse_test_frame(frame: &[u8]) -> Option<(u64, String, i64)> {
 
 /// The `#info` name of an info frame (`OutdatedCursor`), if it is one.
 pub fn info_name(frame: &[u8]) -> Option<String> {
-    use vlsync_atproto::cbor::ValueRef;
+    use vlatproto::cbor::ValueRef;
     let (hdr, n) = ValueRef::decode_prefix(frame).ok()?;
     if !matches!(hdr.get("t"), Some(ValueRef::Text(t)) if *t == "#info") {
         return None;

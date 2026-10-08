@@ -1558,7 +1558,7 @@ fn authenticate(token: &str, req: &Request) -> Result<Actor, (StatusCode, &'stat
             .to_str()
             .ok()
             .and_then(|h| h.strip_prefix("Basic "))
-            .is_some_and(|b| vlsync_atproto::xrpc::basic_admin_ok(b, token));
+            .is_some_and(|b| vlatproto::xrpc::basic_admin_ok(b, token));
         return if ok { Ok(Actor::Token) } else { Err(unauthorized()) };
     }
     match req.extensions().get::<proxy::ProxyIdentity>() {

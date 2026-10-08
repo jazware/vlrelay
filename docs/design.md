@@ -54,8 +54,8 @@ write path isn't the problem this time. These are:
 
 ## What it takes from vlpds
 
-The pieces it takes are shared crates now, vlsync (in jazware/vlpds's `vlsync/`), which both
-build on: vlRelay doesn't depend on the PDS.
+The pieces it takes are shared crates now, vlsync and vlatproto (jazware/vlsync and
+jazware/vlatproto), which both build on: vlRelay doesn't depend on the PDS.
 
 | | Piece | How the relay uses it |
 |---|---|---|

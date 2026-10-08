@@ -878,7 +878,7 @@ fn parse_frame(b: &[u8], relay: bool) -> Option<(u64, String, i64)> {
     if !relay {
         return parse_test_frame(b);
     }
-    use vlsync_atproto::cbor::ValueRef;
+    use vlatproto::cbor::ValueRef;
     let (hdr, n) = ValueRef::decode_prefix(b).ok()?;
     if !matches!(hdr.get("op"), Some(ValueRef::Int(1))) {
         return None;

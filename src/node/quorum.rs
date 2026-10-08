@@ -2120,11 +2120,11 @@ impl Glue {
     /// An operator's takedown, made by the leader as an `#account` on the
     /// log.
     pub async fn takedown(&self, did: &str, takedown: bool) -> anyhow::Result<FwdOutcome> {
-        let frame = vlsync_atproto::events::account_frame(
+        let frame = vlatproto::events::account_frame(
             did,
             !takedown,
             takedown.then_some("takendown"),
-            &vlsync_atproto::events::now_rfc3339(),
+            &vlatproto::events::now_rfc3339(),
         );
         let item = Item {
             prefix: frame.prefix.into(),
@@ -2153,12 +2153,12 @@ pub async fn release_throttled(client: &Client, from: &str, host: &str) -> anyho
     }
     let list: Vec<Throttled> = serde_json::from_value(v["accounts"].clone())?;
     let mut released = 0u64;
-    let time = vlsync_atproto::events::now_rfc3339();
+    let time = vlatproto::events::now_rfc3339();
     for chunk in list.chunks(256) {
         let items = chunk
             .iter()
             .map(|t| {
-                let frame = vlsync_atproto::events::account_frame(&t.did, t.active, t.status.as_deref(), &time);
+                let frame = vlatproto::events::account_frame(&t.did, t.active, t.status.as_deref(), &time);
                 let mut op = vec![0xff, OP_RELEASE, t.active as u8];
                 put_str16(&mut op, t.status.as_deref().unwrap_or(""));
                 Item {
@@ -2542,8 +2542,8 @@ mod tests {
     use crate::qlog::tests::{Cluster, ConfigFn, config};
     use crate::state::tests::MapIdentity;
     use crate::verify::{Verified, VerifiedKind};
-    use vlsync_atproto::cid::Cid;
-    use vlsync_atproto::tid::Tid;
+    use vlatproto::cid::Cid;
+    use vlatproto::tid::Tid;
 
     const HOST: &str = "h0";
 
@@ -2793,11 +2793,11 @@ mod tests {
         let from = owner(&client).await;
         assert!(matches!(submit_one(&client, identity(&did, &from)).await, Outcome::Appended(_)));
         let operator = |takedown: bool| {
-            let frame = vlsync_atproto::events::account_frame(
+            let frame = vlatproto::events::account_frame(
                 &did,
                 !takedown,
                 takedown.then_some("takendown"),
-                &vlsync_atproto::events::now_rfc3339(),
+                &vlatproto::events::now_rfc3339(),
             );
             Item {
                 prefix: frame.prefix.into(),

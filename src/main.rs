@@ -409,7 +409,7 @@ fn read_secret_files(a: &mut Args) -> anyhow::Result<()> {
 }
 
 fn main() {
-    vlsync_atproto::http::set_user_agent(concat!("vlrelay/", env!("CARGO_PKG_VERSION")));
+    vlatproto::http::set_user_agent(concat!("vlrelay/", env!("CARGO_PKG_VERSION")));
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,slatedb=warn".into()),

@@ -10,8 +10,8 @@ use super::shard::{ShardState, Ticket};
 use super::{StateStore, StoreError};
 use crate::types::Host;
 use std::sync::Arc;
-use vlsync_atproto::cid::{CODEC_DAG_CBOR, Cid};
-use vlsync_atproto::tid::Tid;
+use vlatproto::cid::{CODEC_DAG_CBOR, Cid};
+use vlatproto::tid::Tid;
 
 /// The verify workstream's chain check, behind a trait until
 /// `verify::check_chain(prev, &Verified) -> Result<ChainState, ChainError>`

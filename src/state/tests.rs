@@ -2,8 +2,8 @@ use super::*;
 use crate::types::Host;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-use vlsync_atproto::cid::Cid;
-use vlsync_atproto::tid::Tid;
+use vlatproto::cid::Cid;
+use vlatproto::tid::Tid;
 use vlsync_store::store::Store;
 
 pub(crate) struct MapIdentity {

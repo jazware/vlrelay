@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use vlsync_atproto::crypto::Keypair;
+use vlatproto::crypto::Keypair;
 
 #[derive(Clone, Copy, Debug)]
 struct Op {

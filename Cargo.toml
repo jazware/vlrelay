@@ -7,15 +7,15 @@ license = "MIT"
 publish = false
 
 [dependencies]
-# What vlRelay shares with vlpds (vlsync): the store, segments and
-# slots; CBOR, CIDs, the MST, CARs, crypto and DID resolution; the log
-# layout, the firehose merger and backfill.
-vlsync-store = { git = "https://github.com/jazware/vlsync", rev = "0fc77d93a5e1099628729eb3cd3ee894006685bb", features = ["jemalloc"] }
-vlsync-atproto = { git = "https://github.com/jazware/vlsync", rev = "0fc77d93a5e1099628729eb3cd3ee894006685bb" }
-vlsync-firehose = { git = "https://github.com/jazware/vlsync", rev = "0fc77d93a5e1099628729eb3cd3ee894006685bb" }
+# What vlRelay shares with vlpds: the store, segments and slots, the log
+# layout, the firehose merger and backfill (vlsync); CBOR, CIDs,
+# the MST, CARs, crypto and DID resolution (vlatproto).
+vlsync-store = { git = "https://github.com/jazware/vlsync", rev = "a11a68921fdc41c5609469ee1b995c1b1786daac", features = ["jemalloc"] }
+vlatproto = { git = "https://github.com/jazware/vlatproto", rev = "186c75bfd8b10e800f08586cbb69804e709d6ce1" }
+vlsync-firehose = { git = "https://github.com/jazware/vlsync", rev = "a11a68921fdc41c5609469ee1b995c1b1786daac" }
 # SlateDB metrics with a `db` label per database, and each one's shape for
 # GET /admin/api/store
-slate-metrics = { git = "https://github.com/jazware/vlsync", rev = "0fc77d93a5e1099628729eb3cd3ee894006685bb" }
+slate-metrics = { git = "https://github.com/jazware/vlsync", rev = "a11a68921fdc41c5609469ee1b995c1b1786daac" }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws", "macros", "http2"] }
@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 # the SlateDB fork every vlsync user builds against (its Cargo.toml lists the patches)
-slatedb = { package = "vlsync-slatedb", git = "https://github.com/jazware/vlsync", rev = "0fc77d93a5e1099628729eb3cd3ee894006685bb" }
+slatedb = { package = "vlsync-slatedb", git = "https://github.com/jazware/vlsync", rev = "a11a68921fdc41c5609469ee1b995c1b1786daac" }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -54,7 +54,7 @@ webpki-roots = "1"
 object_store = { version = "0.14", features = ["aws"] }
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
-# signature verification (src/verify.rs): secp256k1 as vlsync-atproto builds it, and P-256
+# signature verification (src/verify.rs): secp256k1 as vlatproto builds it, and P-256
 secp256k1 = { version = "0.33", features = ["global-context"] }
 p256 = { version = "0.14", features = ["ecdsa", "getrandom"] }
 ring = "0.17"

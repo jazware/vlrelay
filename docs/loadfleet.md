@@ -226,7 +226,7 @@ commit is signed by the account's key, the tree rebuilt from the records alone h
 `data` as its root, and the commit and rev match getLatestCommit. Another host's DID gets
 `RepoNotFound`. `cargo test --bin fakepds` runs a smaller version.
 
-The checker (`src/fakepds/check.rs`) is built from vlsync-atproto's `cbor`, `car`, `mst` and
+The checker (`src/fakepds/check.rs`) is built from vlatproto's `cbor`, `car`, `mst` and
 `crypto` modules, the ones vlpds uses. It verifies the CAR root and every block hash, the commit's DID, rev, version and
 signature, the rev order, `since`/`prevData` against the last commit it saw for the account, and
 the inversion of every op on the CAR's partial tree back to `prevData`. Every clean event passes

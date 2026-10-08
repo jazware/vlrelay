@@ -257,7 +257,7 @@ fn proof_mutations_reject() {
     assert_eq!(verify_commit(&m, &key), Err(Reject::CommitRevMismatch));
 
     let mut m = c.clone();
-    m.rev = Tid::from_parts(vlsync_atproto::tid::now_micros() + 3_600_000_000, 0);
+    m.rev = Tid::from_parts(vlatproto::tid::now_micros() + 3_600_000_000, 0);
     assert_eq!(verify_commit(&m, &key), Err(Reject::FutureRev));
 
     let mut m = c.clone();
@@ -382,7 +382,7 @@ fn fixture_frames() -> Vec<(String, Bytes)> {
 }
 
 pub(crate) fn frame_from_json(t: &str, body: &serde_json::Value) -> Bytes {
-    use vlsync_atproto::cbor::Value;
+    use vlatproto::cbor::Value;
     let header = Value::Map(vec![("t".into(), Value::Text(t.into())), ("op".into(), Value::Int(1))]);
     // Value::from_json sorts keys canonically; null blobs are an older PDS's
     let mut body = body.clone();

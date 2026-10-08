@@ -1,6 +1,6 @@
 use super::*;
 use crate::verify::synth::{Curve, Repo, Signer};
-use vlsync_atproto::events;
+use vlatproto::events;
 
 fn finish(f: events::Frame, seq: i64) -> Bytes {
     let mut out = Vec::new();
@@ -41,7 +41,7 @@ fn route_agrees_with_parse() {
 /// another's event.
 #[test]
 fn route_reads_the_kinds_did_key() {
-    use vlsync_atproto::cbor::{write_map_head, write_text, write_uint};
+    use vlatproto::cbor::{write_map_head, write_text, write_uint};
     let mut f = Vec::new();
     write_map_head(&mut f, 2);
     write_text(&mut f, "t");
@@ -81,9 +81,9 @@ fn seq_splice_round_trips() {
             let (_, sp1) = e.frame_and_seq().unwrap();
             assert_eq!(out[sp.end as usize..], f[sp1.end as usize..]);
             // same bytes as encoding the frame with that seq from scratch
-            let v = vlsync_atproto::cbor::Value::decode_prefix(&out).unwrap();
-            let body = vlsync_atproto::cbor::Value::decode(&out[v.1..]).unwrap();
-            assert_eq!(body.get("seq"), Some(&vlsync_atproto::cbor::Value::Int(seq)));
+            let v = vlatproto::cbor::Value::decode_prefix(&out).unwrap();
+            let body = vlatproto::cbor::Value::decode(&out[v.1..]).unwrap();
+            assert_eq!(body.get("seq"), Some(&vlatproto::cbor::Value::Int(seq)));
             v.0.encode(&mut Vec::new());
         }
     }
@@ -91,7 +91,7 @@ fn seq_splice_round_trips() {
 
 #[test]
 fn info_and_error_frames() {
-    use vlsync_atproto::cbor::*;
+    use vlatproto::cbor::*;
     let mut f = Vec::new();
     write_map_head(&mut f, 2);
     write_text(&mut f, "t");
@@ -114,7 +114,7 @@ fn info_and_error_frames() {
 
 #[test]
 fn unknown_types_pass_as_unknown() {
-    use vlsync_atproto::cbor::*;
+    use vlatproto::cbor::*;
     let mut f = Vec::new();
     write_map_head(&mut f, 2);
     write_text(&mut f, "t");
@@ -170,8 +170,8 @@ fn limits_and_syntax() {
 fn unsigned_commit_split() {
     let did = "did:plc:splitsplitsplit";
     let data = Cid::dag_cbor(b"x");
-    let unsigned = vlsync_atproto::events::encode_commit(did, "3jzfcijpj2z2a", &data, None);
-    let signed = vlsync_atproto::events::encode_commit(did, "3jzfcijpj2z2a", &data, Some(&[7u8; 64]));
+    let unsigned = vlatproto::events::encode_commit(did, "3jzfcijpj2z2a", &data, None);
+    let signed = vlatproto::events::encode_commit(did, "3jzfcijpj2z2a", &data, Some(&[7u8; 64]));
     let (u, sig) = split_signed_commit(&signed).unwrap();
     assert_eq!(sig, &[7u8; 64]);
     let mut out = Vec::new();

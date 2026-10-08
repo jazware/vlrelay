@@ -42,8 +42,8 @@ ENV CARGO_PROFILE_RELEASE_DEBUG=0
 # firehose consumer, docs/loadfleet.md) and e2e_check (docs/devloop.md). One
 # cargo invocation, so they reuse the compiled lib.
 ARG VLRELAY_TOOLS=""
-# The vlsync crates are git dependencies on jazware/vlpds (Cargo.toml),
-# fetched here.
+# vlsync and vlatproto are git dependencies on jazware/vlsync and
+# jazware/vlatproto (Cargo.toml), fetched here.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \

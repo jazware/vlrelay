@@ -373,7 +373,7 @@ pub(crate) async fn connect(cfg: &UpstreamConfig, host: &Host, cursor: Option<i6
     let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
     let mut addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((bare, port)).await?.collect();
     if !cfg.dev_mode {
-        addrs.retain(|a| vlsync_atproto::did_resolver::is_public_ip(a.ip()));
+        addrs.retain(|a| vlatproto::did_resolver::is_public_ip(a.ip()));
     }
     anyhow::ensure!(!addrs.is_empty(), "{bare} has no usable address");
     let mut last_err = None;
@@ -416,7 +416,7 @@ fn relay_server(h: &tokio_tungstenite::tungstenite::http::HeaderMap) -> Option<&
 fn tls_config() -> Arc<rustls::ClientConfig> {
     static C: std::sync::LazyLock<Arc<rustls::ClientConfig>> = std::sync::LazyLock::new(|| {
         let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        let c = rustls::ClientConfig::builder_with_provider(vlsync_atproto::http::tls_provider())
+        let c = rustls::ClientConfig::builder_with_provider(vlatproto::http::tls_provider())
             .with_safe_default_protocol_versions()
             .expect("rustls protocol versions")
             .with_root_certificates(roots)
@@ -533,7 +533,7 @@ pub(crate) mod tests {
                     let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(s, cb).await else { return };
                     let _ = seen_tx.send(query.clone());
                     if query.contains("cursor=500") {
-                        let f = vlsync_atproto::events::error_frame("FutureCursor", "cursor in the future");
+                        let f = vlatproto::events::error_frame("FutureCursor", "cursor in the future");
                         let _ = ws.send(Message::Binary(f.into())).await;
                         let _ = ws.close(None).await;
                     } else {

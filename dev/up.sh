@@ -11,7 +11,6 @@
 # accounts then need a PLC elsewhere, so mostly for debugging).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-crate="$(cd "$here/.." && pwd)"
 . "$here/ports.sh"
 state="${DEV_STATE:-$here/state}"
 mkdir -p "$state"
@@ -33,12 +32,7 @@ echo "dev-up: docker services up in $(($(date +%s) - t0))s"
 
 bin=${VLPDS_BIN:-}
 if [ -z "$bin" ]; then
-  # vlpds's binary, through interop/ (the package that depends on it), in
-  # this crate's target dir: it shares the dependency builds with vlrelay
-  # instead of a second full build
-  target="${CARGO_TARGET_DIR:-$crate/target}"
-  (cd "$crate/interop" && CARGO_TARGET_DIR="$target" cargo build --quiet -p vlpds --bin vlpds)
-  bin="$target/debug/vlpds"
+  bin=$("$here/vlpds-bin.sh")
 fi
 
 # fixed dev PLC rotation keys, one per upstream (local PLC only)
