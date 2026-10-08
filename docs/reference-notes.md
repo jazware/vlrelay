@@ -350,7 +350,7 @@ cd tools/refdiff && cargo build --release
   --secs 780 --out run.json
 ```
 
-We ran it twice from a bench box in the US on 2026-10-04, 09:10 and 09:28 UTC (a Sunday, ~2 am Pacific, so near the daily low), for 16 and 13 minutes. amanita is a Bluesky mushroom with ~213k accounts. eurosky.social (~35k accounts, in Europe) and blacksky.app (~42k accounts, its own PDS implementation) are the biggest independent hosts by account count in `listHosts`. Raw output is in `tools/refdiff/results/`.
+We ran it twice from a bench box in the US on 2026-10-04, 09:10 and 09:28 UTC (a Sunday, ~2 am Pacific, so near the daily low), for 16 and 13 minutes. amanita is a Bluesky mushroom with ~213k accounts. eurosky.social (~35k accounts, in Europe) and blacksky.app (~42k accounts, its own PDS implementation) are the biggest independent hosts by account count in `listHosts`. The raw output names the accounts behind each missing event, so it isn't published.
 
 ### Frame sizes and rates
 
