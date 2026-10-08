@@ -90,8 +90,13 @@ pub struct Identity {
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("identity lookup failed: {0}")]
-pub struct IdentityError(pub String);
+#[error("identity lookup failed: {msg}")]
+pub struct IdentityError {
+    pub msg: String,
+    /// The DID's lookups have failed for long enough: the event is
+    /// rejected rather than tried again (node/patience.rs).
+    pub gave_up: bool,
+}
 
 /// The identity cache (verify workstream's `identity.rs`), behind a trait
 /// until it lands. `fresh` bypasses the cache.
@@ -223,7 +228,9 @@ pub enum Reject {
     #[error("shard {0} is not owned here")]
     NotOwner(vlsync_store::slots::ShardId),
     #[error(transparent)]
-    Identity(#[from] IdentityError),
+    Identity(IdentityError),
+    #[error(transparent)]
+    IdentityGaveUp(IdentityError),
     #[error("state store: {0}")]
     Store(String),
 }
@@ -232,6 +239,12 @@ impl Reject {
     /// Retrying later may succeed: don't count the upstream event as done.
     pub fn retryable(&self) -> bool {
         matches!(self, Reject::Identity(_) | Reject::Store(_) | Reject::NotOwner(_))
+    }
+}
+
+impl From<IdentityError> for Reject {
+    fn from(e: IdentityError) -> Reject {
+        if e.gave_up { Reject::IdentityGaveUp(e) } else { Reject::Identity(e) }
     }
 }
 

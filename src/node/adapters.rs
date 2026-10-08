@@ -41,18 +41,24 @@ impl Chain for VerifyChain {
 }
 
 /// The DID document cache as the state store's [`IdentitySource`].
-pub struct CacheIdentity<F: Fetch = HttpFetch>(pub Arc<IdentityCache<F>>);
+pub struct CacheIdentity<F: Fetch = HttpFetch>(pub Arc<IdentityCache<F>>, pub Arc<super::patience::Patience>);
 
 #[async_trait::async_trait]
 impl<F: Fetch> IdentitySource for CacheIdentity<F> {
     async fn resolve(&self, did: &str, fresh: bool) -> Result<Option<state::Identity>, IdentityError> {
         match self.0.lookup_paced(did, fresh).await {
-            Ok(id) => Ok(Some(state::Identity {
-                pds: id.pds_host.clone(),
-                signing_key: id.signing_key_multibase.as_deref().and_then(multikey_bytes).map(state::SigningKey),
-            })),
+            Ok(id) => {
+                self.1.succeeded(did);
+                Ok(Some(state::Identity {
+                    pds: id.pds_host.clone(),
+                    signing_key: id.signing_key_multibase.as_deref().and_then(multikey_bytes).map(state::SigningKey),
+                }))
+            }
             Err(LookupError::NotFound | LookupError::BadDid) => Ok(None),
-            Err(e) => Err(IdentityError(e.to_string())),
+            Err(e @ LookupError::Failed(_)) => {
+                Err(IdentityError { gave_up: self.1.leader_failed(did), msg: e.to_string() })
+            }
+            Err(e) => Err(IdentityError { msg: e.to_string(), gave_up: false }),
         }
     }
 }

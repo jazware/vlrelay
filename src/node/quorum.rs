@@ -1336,7 +1336,7 @@ impl RelayHooks {
 
 /// How long an event the leader keeps answering "try again" (its state not
 /// ready, PLC trouble) is retried before the host is asked to send it again.
-const GIVE_UP: Duration = Duration::from_secs(20);
+pub(super) const GIVE_UP: Duration = Duration::from_secs(20);
 const SLOTS: usize = 16;
 const MAX_BATCH: usize = 512;
 const MAX_BATCH_BYTES: usize = 4 << 20;
@@ -1780,6 +1780,9 @@ pub struct Glue {
     pub shared: Arc<Shared>,
     pub setup: QuorumSetup,
     pub plc: Option<Arc<crate::plc_seed::job::PlcJob>>,
+    /// Which DIDs' lookups have failed long enough to be final, for the
+    /// host stage and the leader alike.
+    pub patience: Arc<super::patience::Patience>,
     manager: std::sync::OnceLock<Arc<Manager>>,
     filter: watch::Sender<HostFilter>,
     owned: Mutex<HashSet<Host>>,
@@ -2327,9 +2330,10 @@ impl Node {
             crate::identity::HttpFetch::new(&cfg.plc_url, cfg.dev_mode),
             cfg.identity.clone(),
         ));
+        let patience = Arc::new(super::patience::Patience::default());
         let state = Arc::new(state::StateStore::new(
             super::adapters::VerifyChain,
-            Arc::new(super::adapters::CacheIdentity(identity.clone())),
+            Arc::new(super::adapters::CacheIdentity(identity.clone(), patience.clone())),
             state::ApplyConfig::default(),
         ));
         let plc = q.plc_export.clone().map(|c| {
@@ -2495,6 +2499,7 @@ impl Node {
                 shared: shared.clone(),
                 setup: q.clone(),
                 plc: plc.clone(),
+                patience: patience.clone(),
                 manager: std::sync::OnceLock::new(),
                 filter: filter_tx,
                 owned: Mutex::new(HashSet::new()),

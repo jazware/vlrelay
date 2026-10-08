@@ -842,7 +842,7 @@ mod tests {
         let store = Store::memory(None);
         let state = Arc::new(StateStore::new(
             VerifyChain,
-            Arc::new(crate::node::adapters::CacheIdentity(identity.clone())),
+            Arc::new(crate::node::adapters::CacheIdentity(identity.clone(), Default::default())),
             ApplyConfig::default(),
         ));
         crate::state::tests::attach_memory_shard(&state).await;
