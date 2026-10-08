@@ -5,7 +5,7 @@ import { openPanel } from '../../components/console/nav'
 import { HOST_STATUSES } from '../../components/relay'
 import type { HostRow, HostStatus, RejectReason } from '../../lib/api'
 import * as A from '../../lib/console/adminAdapter'
-import { ago, dt, fmtMs, fmtNum, fmtRatio, fmtSi } from '../../lib/console/fmt'
+import { ago, dt, fmtCount, fmtMs, fmtNum, fmtRatio, fmtSi } from '../../lib/console/fmt'
 import { slowLagMs, useAdmissions, useCapHosts, useDiscovery, useHostList, useOverview, usePolicy, usePolicyFull, useRejectsTop, useThrottledHosts, useTierCounts } from '../../lib/console/queries'
 import { useRelay } from '../../lib/console/relay'
 import { Link, useSearch } from '../../lib/router'
@@ -154,8 +154,8 @@ export function Hosts() {
       r: true,
       render: (h) => (
         <>
-          <span className="mono sm">{fmtSi(h.accounts)}</span> {h.maxAccounts > 0 && <Meter v={h.accounts} max={h.maxAccounts} k={h.accounts >= h.maxAccounts ? 'err' : h.accounts > h.maxAccounts * 0.8 ? 'warn' : undefined} />}{' '}
-          <span className="muted sm mono">{h.maxAccounts > 0 ? fmtSi(h.maxAccounts) : '—'}</span>
+          <span className="mono sm">{fmtCount(h.accounts)}</span> {h.maxAccounts > 0 && <Meter v={h.accounts} max={h.maxAccounts} k={h.accounts >= h.maxAccounts ? 'err' : h.accounts > h.maxAccounts * 0.8 ? 'warn' : undefined} />}{' '}
+          <span className="muted sm mono">{h.maxAccounts > 0 ? fmtCount(h.maxAccounts) : '—'}</span>
         </>
       ),
     },

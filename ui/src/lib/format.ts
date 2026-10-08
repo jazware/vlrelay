@@ -30,6 +30,12 @@ export function fmtNum(n: number | undefined | null, digits = 0): string {
   return n.toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: 0 })
 }
 
+/** A count (accounts, hosts): fmtSi without decimals below 1k, so 3 isn't "3.00". */
+export function fmtCount(n: number): string {
+  if (!isFinite(n)) return '—'
+  return Math.abs(n) < 1e3 ? Math.round(n).toString() : fmtSi(n)
+}
+
 /** Compact rate/latency formatting for chart axes and tiles. */
 export function fmtSi(n: number): string {
   if (!isFinite(n)) return '—'

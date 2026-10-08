@@ -2,7 +2,7 @@
 
 import { relTime } from '../format'
 
-export { fmtBytes, fmtNum, fmtSi, relTime as ago, short } from '../format'
+export { fmtBytes, fmtCount, fmtNum, fmtSi, relTime as ago, short } from '../format'
 
 /** How long since: "4m", "1h" (relTime without its "ago"). */
 export const since = (ms: number) => relTime(ms).replace(/ ago$/, '')

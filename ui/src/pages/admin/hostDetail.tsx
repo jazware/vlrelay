@@ -4,7 +4,7 @@ import { openPanel } from '../../components/console/nav'
 import { BIG_HOST_CAP, hostActionDialog } from '../../components/console/hostActions'
 import { Bars, Copy, Empty, Glyph, HostStatusChip, KV, Meter, Mini, Minis, Sec, Seg, Spark, Strip, TierTag } from '../../components/console/kit'
 import type { BackpressureReason, Case, DomainRule, HostAction, HostDetail, Policy, RejectReason } from '../../lib/api'
-import { ago, dt, fmtMs, fmtNum, fmtRatio, fmtSi, plural, shortDid } from '../../lib/console/fmt'
+import { ago, dt, fmtCount, fmtMs, fmtNum, fmtRatio, fmtSi, plural, shortDid } from '../../lib/console/fmt'
 import { useCases, useHostDetail, useHostRow, usePolicy, useRules } from '../../lib/console/queries'
 import { useRelay } from '../../lib/console/relay'
 import { overriddenOn } from '../../lib/console/ruleScope'
@@ -348,7 +348,7 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
         items={[
           ['events/s', live ? fmtSi(r.eventsPerSec) : '—'],
           ['rejected', fmtRatio(r.errorRate)],
-          ['accounts / cap', `${fmtSi(r.accounts)} / ${cap ? fmtSi(cap) : '—'}`],
+          ['accounts / cap', `${fmtCount(r.accounts)} / ${cap ? fmtCount(cap) : '—'}`],
           ['read lag', live && r.lagMs ? `${fmtMs(r.lagMs)}${r.catchUpPace ? ` · catching up ×${fmtNum(r.catchUpPace)}` : ''}` : '—'],
           ['upstream seq', fmtNum(r.lastUpstreamSeq)],
         ]}
@@ -406,7 +406,7 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
                   <td>{l}</td>
                   <td className="r mono sm">{v > 0 ? fmtNum(v) : 'unlimited'}</td>
                   <td>
-                    {v > 0 && <Meter v={u} max={v} k={u >= v ? 'err' : u > v * 0.8 ? 'warn' : 'ok'} />} <span className="mono sm">{fmtSi(u)}</span>
+                    {v > 0 && <Meter v={u} max={v} k={u >= v ? 'err' : u > v * 0.8 ? 'warn' : 'ok'} />} <span className="mono sm">{l === 'Accounts' ? fmtCount(u) : fmtSi(u)}</span>
                   </td>
                 </tr>
               ))}

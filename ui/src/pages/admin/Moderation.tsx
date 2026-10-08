@@ -6,7 +6,7 @@ import { registerPalette, type PalItem } from '../../components/console/Palette'
 import { Chip, Empty, HostName, Kbd, Loaded, Meter, Over, PageHead, Panel, Sec, Src, TierTag, Updated } from '../../components/console/kit'
 import type { Account, Case, DomainRule, HostRow, PolicyAudit, SignalKey, SignalTop, TakedownEntry } from '../../lib/api'
 import { cached, keys } from '../../lib/console/cache'
-import { ago, dt, fmtNum, fmtSi, plural, shortDid } from '../../lib/console/fmt'
+import { ago, dt, fmtCount, fmtNum, plural, shortDid } from '../../lib/console/fmt'
 import { useAccountSearch, useCases, useHostList, useOverview, useRules, useRulesAudit, useSignals, useTakedowns } from '../../lib/console/queries'
 import { overriddenBy, overriddenRules } from '../../lib/console/ruleScope'
 import { Link, useSearch } from '../../lib/router'
@@ -301,7 +301,7 @@ function Throttled() {
       r: true,
       render: (h) => (
         <span className="mono sm">
-          {fmtSi(h.accounts)} <Meter v={h.accounts} max={h.maxAccounts} k="err" /> {fmtSi(h.maxAccounts)}
+          {fmtCount(h.accounts)} <Meter v={h.accounts} max={h.maxAccounts} k="err" /> {fmtCount(h.maxAccounts)}
         </span>
       ),
     },
