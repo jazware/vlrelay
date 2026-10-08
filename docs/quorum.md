@@ -329,7 +329,7 @@ nothing in steady state.
 - title: Promise round
   body: The new leader asks every member to promise e + 1. Each one that does stops accepting epoch e and answers with the last `(epoch, seq)` it holds.
 - title: Adopt the longest tail
-  body: With promises from a quorum of intact members (itself included), it adopts the tail with the highest last epoch, then the highest seq, and fetches what it lacks from that member (4 MiB a request). Every committed entry is on a quorum, and any two quorums share a member, so the adopted tail holds every committed entry.
+  body: With promises from a quorum of intact members (itself included), it adopts the tail with the highest last epoch, then the highest seq, and fetches what it lacks from that member (4 MiB a request), from its memory or its commitlog. If that member's commitlog no longer reaches back to the candidate's commit index, it sends from its oldest entry, which is at or below F, and the candidate resets there, since the bucket holds the seqs below it. Every committed entry is on a quorum, and any two quorums share a member, so the adopted tail holds every committed entry.
 - title: Re-tag and lead
   body: It re-tags every entry above its commit index with its own epoch, replicates the tail (followers truncate anything that differs), opens the state, replays, and starts admitting.
 ```

@@ -1790,9 +1790,16 @@ impl Node {
             let c = self.core.lock();
             (epoch == c.promised && from_seq <= c.log.base().1).then(|| c.log.base().1)
         };
-        // older than memory holds: committed, so straight from the commitlog
+        // older than memory holds: committed, so straight from the commitlog,
+        // from its oldest entry if it no longer reaches back to `from_seq`.
+        // A reset there stays at or below F; memory is trimmed past F, so a
+        // reset to its base would skip seqs the bucket doesn't hold yet.
+        let from = match (below, self.durability.first_readable()) {
+            (Some(base), Some(f)) if f >= from_seq && f < base => f + 1,
+            _ => from_seq,
+        };
         if let Some(base) = below
-            && let Some((prev_epoch, entries)) = self.durability.read(from_seq, base, max_bytes).await
+            && let Some((prev_epoch, entries)) = self.durability.read(from, base, max_bytes).await
             && !entries.is_empty()
         {
             let c = self.core.lock();
@@ -1801,7 +1808,7 @@ impl Node {
                 return Msg::FetchResp {
                     ok: true,
                     base_epoch: prev_epoch,
-                    base_seq: from_seq - 1,
+                    base_seq: from - 1,
                     last_seq: c.log.last_seq(),
                     entries,
                 };

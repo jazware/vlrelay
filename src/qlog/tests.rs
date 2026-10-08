@@ -1277,6 +1277,65 @@ async fn a_leader_whose_state_writer_is_fenced_still_flushes() {
     c.shutdown();
 }
 
+/// A candidate behind a member's disk adopts that member's tail with a
+/// reset, at the oldest entry its disk holds: never past F, so the
+/// candidate's stream (from the bucket up to there) and its state (applied
+/// from F) both carry on. Its memory, trimmed past F while flushes stopped,
+/// is no place to reset to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_behind_the_disk_resets_to_its_oldest_entry_not_past_f() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let s = stop.clone();
+    let c = flushing(
+        move |_| {
+            let s = s.clone();
+            flush::Options { crash: Some(Arc::new(move |_| s.load(Ordering::Acquire))), ..flush_opts() }
+        },
+        64 << 20,
+    )
+    .await;
+    let l = c.wait_leader(Duration::from_secs(5)).await;
+    let f = c.ids.iter().find(|id| **id != l).unwrap().clone();
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(1));
+    let node = c.nodes[&f].node.clone();
+    let t = Instant::now();
+    while node.readable_floor() <= 1 {
+        assert!(t.elapsed() < Duration::from_secs(30), "{f}'s disk still reaches seq 1: {}", status_line(&c));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop.store(true, Ordering::Release);
+    // the flush in flight, if any, commits or crashes
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let m = flush::read_manifest(&c.store).await.unwrap().unwrap().0;
+    let t = Instant::now();
+    while node.status().base <= m.flushed + 1000 {
+        assert!(
+            t.elapsed() < Duration::from_secs(30),
+            "{f}'s memory still reaches F {}: {}",
+            m.flushed,
+            status_line(&c)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    load.stop().await;
+    assert_eq!(
+        flush::read_manifest(&c.store).await.unwrap().unwrap().0.flushed,
+        m.flushed,
+        "a flush ran after the stop"
+    );
+    let rpc = super::node::Rpc::new(&f, &c.addrs[&f], Arc::new(Faults::default()));
+    let fetch =
+        wire::Msg::Fetch { epoch: node.status().promised, from: "test".into(), from_seq: 1, max_bytes: 64 << 10 };
+    match rpc.call(&fetch, Duration::from_secs(2)).await {
+        Ok(wire::Msg::FetchResp { ok: true, base_seq, entries, .. }) => {
+            assert!(base_seq <= m.flushed, "a reset to {base_seq}, past F {}: {}", m.flushed, status_line(&c));
+            assert_eq!(entries.first().map(|e| e.seq), Some(base_seq + 1));
+        }
+        r => panic!("{r:?}"),
+    }
+    c.shutdown();
+}
+
 /// A follower down long enough that the leader's disk no longer reaches
 /// back to it catches up from the bucket segments, not by a reset (which
 /// would be a gap in its stream).
