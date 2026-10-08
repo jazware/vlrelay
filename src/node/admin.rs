@@ -7,8 +7,9 @@
 //!
 //! The overview, pipeline view and public page add up every member's own
 //! report (`node:report`, asked at most once a second; a member that
-//! doesn't answer in time is stale for the round). Host details and
-//! reconnects are the reading node's, on its own dashboard. Accounts are the leader's records, so an account
+//! doesn't answer in time is stale for the round). The hosts list shows
+//! each host as the member that reads it reports it (`node:hosts`); host
+//! details and reconnects are the reading node's, on its own dashboard. Accounts are the leader's records, so an account
 //! lookup or a takedown answers on any node only through the leader's log
 //! (takedowns) or on the leader itself (lookups).
 
@@ -907,13 +908,15 @@ impl AdminSource for NodeAdmin {
 
     async fn hosts(&self, q: admin::HostQuery) -> AdminResult<admin::HostList> {
         let mut rows = self.rows();
-        // a host another member reads: named, without this node's numbers
         let owners = self.node.quorum.hosts.owners();
-        for r in &mut rows {
-            if let Some(o) = owners.get(&r.host) {
-                r.node = o.clone();
-            }
-        }
+        let me = self.id().to_string();
+        let others = owners.values().any(|o| *o != me);
+        let theirs = if others {
+            self.node.quorum.ask_peers("node:hosts", Bytes::new(), MEMBER_REPORT_TIMEOUT).await
+        } else {
+            Vec::new()
+        };
+        merge_owner_rows(&mut rows, &owners, theirs);
         Ok(Self::sort_page(rows, &q))
     }
 
@@ -1562,6 +1565,7 @@ impl crate::node::quorum::LocalAsk for NodeAdmin {
             let v = match topic {
                 "node:consumers" => serde_json::to_value(self.local_consumers()).ok()?,
                 "node:report" => serde_json::to_value(self.local_report().await).ok()?,
+                "node:hosts" => serde_json::to_value(self.owned_rows()).ok()?,
                 "node:changes" => self.answer_pull(&body)?,
                 "node:settings" => serde_json::to_value(self.settings.as_ref()?).ok()?,
                 "node:usage" => serde_json::to_value(self.local_usage().await.ok()?).ok()?,
@@ -1580,6 +1584,41 @@ impl crate::node::quorum::LocalAsk for NodeAdmin {
             };
             serde_json::to_vec(&v).ok().map(Bytes::from)
         })
+    }
+}
+
+/// Each host's row as its owner reads it (`node:hosts`): this node only
+/// has its registry's idle copy of a host another member reads. A member
+/// that didn't answer leaves its hosts as this node has them, named. The
+/// account count is the larger of the two, since only the leader counts
+/// new accounts.
+fn merge_owner_rows(
+    rows: &mut [admin::HostRow],
+    owners: &HashMap<String, String>,
+    theirs: Vec<(String, Result<Bytes, String>)>,
+) {
+    let mut by_host: HashMap<String, admin::HostRow> = HashMap::new();
+    for (id, r) in theirs {
+        let Ok(list) = r.and_then(|b| serde_json::from_slice::<Vec<admin::HostRow>>(&b).map_err(|e| e.to_string()))
+        else {
+            continue;
+        };
+        for row in list {
+            if owners.get(&row.host) == Some(&id) {
+                by_host.insert(row.host.clone(), row);
+            }
+        }
+    }
+    for r in rows.iter_mut() {
+        let Some(o) = owners.get(&r.host) else { continue };
+        r.node = o.clone();
+        if let Some(mut theirs) = by_host.remove(&r.host) {
+            theirs.accounts = theirs.accounts.max(r.accounts);
+            theirs.version = r.version.take().or(theirs.version);
+            theirs.updated_at_ms = r.updated_at_ms.or(theirs.updated_at_ms);
+            theirs.owner_version = r.owner_version.take().or(theirs.owner_version);
+            *r = theirs;
+        }
     }
 }
 
@@ -1687,6 +1726,46 @@ mod tests {
         let p = crate::admin::public::project(&o, None);
         assert_eq!((p.nodes, p.nodes_healthy, p.hosts_connected), (3, 2, 26));
         assert_eq!(p.health, crate::admin::public::Health::Degraded);
+    }
+
+    /// The leader listed other members' hosts from its own registry: idle,
+    /// upstream seq 0, none of the owner's numbers.
+    #[test]
+    fn hosts_another_member_reads_show_that_members_row() {
+        let idle =
+            |h: &str| admin::HostRow { last_upstream_seq: 0, accounts: 2, ..row(h, admin::HostStatus::Idle, None) };
+        let mut rows = vec![
+            row("mine.example", admin::HostStatus::Connected, None),
+            idle("theirs.example"),
+            idle("silent.example"),
+        ];
+        let owners: HashMap<String, String> =
+            [("mine.example", "n1"), ("theirs.example", "n2"), ("silent.example", "n3")]
+                .into_iter()
+                .map(|(h, o)| (h.to_string(), o.to_string()))
+                .collect();
+        let live = admin::HostRow {
+            last_upstream_seq: 500,
+            accounts: 0,
+            node: "n2".into(),
+            ..row("theirs.example", admin::HostStatus::Connected, None)
+        };
+        // a row a member sends for a host it no longer reads is left out
+        let stray = admin::HostRow { node: "n2".into(), ..row("mine.example", admin::HostStatus::Connected, None) };
+        let theirs = vec![
+            ("n2".to_string(), Ok(Bytes::from(serde_json::to_vec(&vec![live, stray]).unwrap()))),
+            ("n3".to_string(), Err("no answer from n3".to_string())),
+        ];
+        merge_owner_rows(&mut rows, &owners, theirs);
+        let by: HashMap<&str, &admin::HostRow> = rows.iter().map(|r| (r.host.as_str(), r)).collect();
+        assert_eq!((by["mine.example"].node.as_str(), by["mine.example"].status), ("n1", admin::HostStatus::Connected));
+        let t = by["theirs.example"];
+        assert_eq!(
+            (t.node.as_str(), t.status, t.last_upstream_seq, t.accounts),
+            ("n2", admin::HostStatus::Connected, 500, 2)
+        );
+        let s = by["silent.example"];
+        assert_eq!((s.node.as_str(), s.status), ("n3", admin::HostStatus::Idle));
     }
 
     #[test]
