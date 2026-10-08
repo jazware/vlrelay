@@ -76,6 +76,10 @@ pub struct Client {
     /// node id -> address
     nodes: Vec<(String, String)>,
     cur: tokio::sync::Mutex<Option<Arc<Conn>>>,
+    /// A connection per node, kept when it answers NotLeader: while nobody
+    /// leads, a reconnect per try was ~100 sockets a second per client,
+    /// each left in TIME_WAIT.
+    open: Mutex<HashMap<String, Arc<Conn>>>,
     next: AtomicUsize,
     hint: Mutex<Option<String>>,
     /// The address that last timed out, and until when it's skipped: a hung
@@ -102,6 +106,7 @@ impl Client {
         Arc::new(Client {
             nodes,
             cur: tokio::sync::Mutex::new(None),
+            open: Mutex::new(HashMap::new()),
             next: AtomicUsize::new(0),
             hint: Mutex::new(None),
             avoid: Mutex::new(None),
@@ -134,7 +139,15 @@ impl Client {
                 a
             }
         };
-        let c = Conn::open(&addr).await.ok()?;
+        let live = self.open.lock().get(&addr).filter(|c| !c.dead.load(Ordering::Acquire)).cloned();
+        let c = match live {
+            Some(c) => c,
+            None => {
+                let c = Conn::open(&addr).await.ok()?;
+                self.open.lock().insert(addr, c.clone());
+                c
+            }
+        };
         *g = Some(c.clone());
         Some(c)
     }
