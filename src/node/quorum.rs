@@ -99,6 +99,9 @@ pub struct QuorumSetup {
     /// The leader reads the PLC directory's export into the seed database
     /// (`plc_seed`), and every member seeds its DID documents from it.
     pub plc_export: Option<crate::plc_seed::ingest::Config>,
+    /// With `plc_export`: this member's copy of the seeds on local disk
+    /// (`plc_seed::local`).
+    pub plc_seeds_dir: Option<std::path::PathBuf>,
 }
 
 impl QuorumSetup {
@@ -129,6 +132,7 @@ impl QuorumSetup {
             durability: crate::qlog::commitlog::DurabilityMode::Sync(crate::qlog::commitlog::SyncMode::Fsync),
             trust_after_power_loss: false,
             plc_export: None,
+            plc_seeds_dir: None,
         }
     }
 }
@@ -2339,6 +2343,14 @@ impl Node {
         let plc = q.plc_export.clone().map(|c| {
             let st = crate::qlog::bucket::counted(&store, "plc");
             let seeds = crate::plc_seed::SeedReader::new(st.clone());
+            if let Some(dir) = q.plc_seeds_dir.clone() {
+                let local = crate::plc_seed::local::Local::new(dir, seeds.source());
+                let _ = seeds.local.set(local.clone());
+                let cache = identity.clone();
+                let on_row: crate::plc_seed::local::OnRow =
+                    Arc::new(move |did, seed| crate::plc_seed::invalidate_if_stale(&cache, did, seed));
+                tokio::spawn(local.run(seeds.clone(), Some(on_row)));
+            }
             identity.set_seeder(Arc::new(crate::plc_seed::Seeder {
                 seeds: seeds.clone(),
                 state: state.clone(),

@@ -234,6 +234,49 @@ after a DID's cached document was fetched and the two differ, the leader drops i
 pace, fetch, parse, handoff, apply, checkpoint). Requests are counted as `qlog_plc`
 (`GET /admin/api/store`).
 
+### Local seed tables
+
+An LSM is the wrong shape for the read side. Every seed row is a merge operand, so a get probes
+every sorted run's filter, and the filters and indexes (~2 B a row, ~190 MiB at 99M ops) have to
+sit in memory or each lookup fetches them. At 99M ops and 14 sorted runs a relay with a 64 MiB
+metadata cache did ~35 lookups/s at 32 at once, p50 0.9 s, ~5 bucket GETs each
+(`seeds_bench`, R2's latency injected). That holds at 5x only with ~1 GB of filters in memory.
+
+With `--plc-seeds-dir`, each member keeps its own copy as a table on local disk
+(`plc_seed::table`): a fixed 49-byte record per DID in 4 KiB pages of an on-disk hash, 1,024
+shard files. A did:plc id is 120 bits of a sha256, so the id is the hash. Its first 10 bits pick
+the shard, the next 56 are the record's tag, and the tag's top 32 bits pick the page, so
+placement follows the database's key order. A lookup is one 8 KiB `pread` (the home page and the
+one it spills into), with nothing per DID in memory: a page cache helps and nothing needs it. A
+record keeps the op's `createdAt` (ms), the flags (tombstone, http, fetched rather than
+exported), the key's curve and parity and its 32 bytes, and a 3-byte number for the PDS host
+(~21k hosts in all of PLC's history). A key that isn't a compressed k256 or P-256 multikey is
+left out, and its DID resolves from PLC as it would anyway. did:web rows (lookups only) are
+placed by a sha256 of the DID.
+
+Two DIDs that share 66 bits share a record, and the second's lookup finds the first's key, fails
+the signature and refreshes from PLC, the path a stale seed takes. At 457M DIDs a collision
+anywhere is about a 1% event. A page that fills spills into the next, at most 8 pages on, and a
+row with no slot there is dropped (`dropped`): DIDs ground to one page (a few million sha256s
+each, and PLC rate-limits creates) cost only the pages they land on. A shard grows by 1.15x when
+it's 95% full and rewrites only itself, so a table's extra disk is 1/1,024 of it at a time. A
+page carries a CRC, and one that fails reads as empty.
+
+The bucket's database stays the shared, durable copy. Each row the leader writes is also kept for
+3 days under `c` + the time it was written. A member builds its table from one scan of the
+database (its own reader, read-ahead 2 MiB x 2 per sorted run), then reads the changelog every
+10 s from 10 minutes before its cursor, which covers the leader's flush and the readers' manifest
+poll (rows read twice are harmless), and syncs the table before it moves the cursor
+(`meta.json`). A member whose cursor is older than the changelog, or whose table came from
+another database, rebuilds. The leader also writes what it applies straight into its own table.
+Until a member's table is built, its lookups read the database as before. The rows a member
+reads off the changelog also drop its identity cache's stale documents, which only the leader's
+did before.
+
+At 99M rows a build took 229 s on 2 cores against R2's latency (3,365 GETs, peak RSS 187 MB) and
+wrote 5.5 GB (58 B a DID). Lookups through the seeder then ran at ~174k/s, p50 175 µs and p99
+0.55 ms, with no bucket requests.
+
 ### Fetched documents
 
 The seeds also keep what the cache fetches, so they hold the export plus every document the relay

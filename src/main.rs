@@ -93,6 +93,13 @@ struct Args {
     /// from the bucket once they outgrow the metadata cache.
     #[arg(long, env = "VLRELAY_PLC_SEED_READS", default_value_t = vlrelay::plc_seed::DEFAULT_READ_SLOTS)]
     plc_seed_reads: usize,
+    /// With --plc-export: keeps this member's copy of the PLC seeds in a
+    /// table on this local disk (~58 B a DID), built from the bucket's seed
+    /// database and kept current from its changelog. A seed lookup is then
+    /// one local read with nothing per DID in memory. Unset: lookups read
+    /// the seed database.
+    #[arg(long, env = "VLRELAY_PLC_SEEDS_DIR")]
+    plc_seeds_dir: Option<PathBuf>,
     /// A relay whose com.atproto.sync.listHosts seeds host discovery (read
     /// only; repeatable): added to the policy's discovery.seedRelays when
     /// it has none yet. The dashboard edits the list after that.
@@ -346,7 +353,7 @@ struct QuorumArgs {
     #[arg(long, env = "VLRELAY_SLATEDB_DISK_CACHE_DIR")]
     slatedb_disk_cache_dir: Option<PathBuf>,
     /// The disk cache's size in MiB, both databases together (an eighth,
-    /// at least 64 MiB, for the state).
+    /// at least 64 MiB, for the state; all of it with --plc-seeds-dir).
     #[arg(long, env = "VLRELAY_SLATEDB_DISK_CACHE_MB", default_value_t = 16384)]
     slatedb_disk_cache_mb: u64,
 }
@@ -524,6 +531,8 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
         pc.streams = a.plc_export_streams.max(1);
         pc.mem_budget_mb = a.plc_export_mem_mb;
         q.plc_export = Some(pc);
+        q.plc_seeds_dir = a.plc_seeds_dir.clone();
+        vlrelay::qlog::cache::set_seeds_local(a.plc_seeds_dir.is_some());
     }
     let node = Node::start(store, cfg, q).await?;
 

@@ -89,6 +89,20 @@ struct Cli {
     /// Looks up through a member's reader instead of the leader's writer.
     #[arg(long)]
     reader: bool,
+    /// Before the lookups, builds a local seed table here from the database
+    /// (`--plc-seeds-dir`; emptied first unless --table-keep), and looks up
+    /// through it.
+    #[arg(long)]
+    table_dir: Option<PathBuf>,
+    #[arg(long)]
+    table_keep: bool,
+    /// After the table: the leader writes `--tail-rate` rows a second
+    /// (flushed every 10 s) this long while a member's reader follows the
+    /// changelog into the table every 10 s; reports the member's GETs.
+    #[arg(long, default_value_t = 0)]
+    tail_test_secs: u64,
+    #[arg(long, default_value_t = 5)]
+    tail_rate: u64,
 }
 
 fn rss_kb(field: &str) -> u64 {
@@ -152,13 +166,17 @@ fn seed(i: u64, created_ms: u64) -> Seed {
 }
 
 fn get_count() -> u64 {
+    gets_of("qlog_plc")
+}
+
+fn gets_of(client: &str) -> u64 {
     prometheus::gather()
         .iter()
         .filter(|f| f.name() == "vlpds_object_store_requests_total")
         .flat_map(|f| f.get_metric().iter())
         .filter(|m| {
             m.get_label().iter().any(|l| l.name() == "op" && l.value().starts_with("get"))
-                && m.get_label().iter().any(|l| l.name() == "client" && l.value() == "qlog_plc")
+                && m.get_label().iter().any(|l| l.name() == "client" && l.value() == client)
         })
         .map(|m| m.get_counter().get_value() as u64)
         .sum()
@@ -184,6 +202,8 @@ async fn main() -> anyhow::Result<()> {
     let fs = object_store::local::LocalFileSystem::new_with_prefix(&a.dir)?;
     let base = vlsync_store::store::Store { raw: Arc::new(fs), prefix: "vlrelay".into(), latency: None };
     let store = vlrelay::qlog::bucket::counted(&base, "plc");
+    // a member's reader, counted apart from the leader's writer
+    let follower = vlrelay::qlog::bucket::counted(&base, "tool");
 
     let peak = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
@@ -237,7 +257,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(a.tail_secs)).await;
     let lookups = if a.lookups > 0 {
         let known = a.known.unwrap_or(written).max(1);
-        Some(lookups(&a, &store, Arc::new(w), known).await?)
+        Some(lookups(&a, &store, &follower, Arc::new(w), known).await?)
     } else {
         w.close().await;
         None
@@ -262,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
 async fn lookups(
     a: &Cli,
     store: &vlsync_store::store::Store,
+    follower: &vlsync_store::store::Store,
     w: Arc<SeedWriter>,
     known: u64,
 ) -> anyhow::Result<String> {
@@ -272,6 +293,30 @@ async fn lookups(
         w.close().await;
     } else {
         r.set_writer(w.clone()).await;
+    }
+    let mut built = String::new();
+    if let Some(dir) = &a.table_dir {
+        let local = vlrelay::plc_seed::local::Local::new(dir.clone(), r.source());
+        if a.table_keep {
+            local.open_existing().await?;
+        } else {
+            let (g0, t0) = (get_count(), Instant::now());
+            local.build(&r).await?;
+            let t = local.table().expect("built");
+            built = format!(
+                "TABLE build_s={:.1} rows={} disk_mb={} bytes_per_did={:.1} gets={} rss_mb={}\n",
+                t0.elapsed().as_secs_f64(),
+                t.len(),
+                t.disk_bytes() >> 20,
+                t.disk_bytes() as f64 / t.len().max(1) as f64,
+                get_count() - g0,
+                rss_kb("VmRSS:") >> 10,
+            );
+        }
+        if a.tail_test_secs > 0 && !a.reader {
+            built.push_str(&tail_test(a, follower, &w, dir).await?);
+        }
+        let _ = r.local.set(local);
     }
     let hist = Arc::new(parking_lot::Mutex::new(hdrhistogram::Histogram::<u64>::new(3)?));
     let (found, next) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
@@ -304,8 +349,14 @@ async fn lookups(
     let gets = get_count() - gets0;
     let h = hist.lock().clone();
     let out = format!(
-        "LOOKUPS via={} n={} conc={} found={} per_s={:.0} p50_us={} p90_us={} p99_us={} max_us={} gets_per_lookup={:.2} rss_mb={}",
-        if a.reader { "reader" } else { "writer" },
+        "{built}LOOKUPS via={} n={} conc={} found={} per_s={:.0} p50_us={} p90_us={} p99_us={} max_us={} gets_per_lookup={:.2} rss_mb={}",
+        if a.table_dir.is_some() {
+            "table"
+        } else if a.reader {
+            "reader"
+        } else {
+            "writer"
+        },
         a.lookups,
         a.lookup_concurrency,
         found.load(Relaxed),
@@ -321,4 +372,58 @@ async fn lookups(
         w.close().await;
     }
     Ok(out)
+}
+
+async fn tail_test(
+    a: &Cli,
+    follower: &vlsync_store::store::Store,
+    w: &Arc<SeedWriter>,
+    dir: &std::path::Path,
+) -> anyhow::Result<String> {
+    use vlrelay::plc_seed::{SeedReader, local::Local};
+    let m = SeedReader::new(follower.clone());
+    let fl = Local::new(dir.to_path_buf(), m.source());
+    // the member's table is the one just built: same rows, same cursor
+    fl.clone().step(&m, None).await?;
+    let t0 = Instant::now();
+    let g0 = gets_of("qlog_tool");
+    let writer = {
+        let (w, rate, secs) = (w.clone(), a.tail_rate.max(1), a.tail_test_secs);
+        tokio::spawn(async move {
+            let mut i = 0u64;
+            let mut last_flush = Instant::now();
+            while t0.elapsed().as_secs() < secs {
+                let n = 1_000_000_000 + i;
+                let _ = w.apply(vec![(did(n), seed(n, 1_800_000_000_000 + i))]).await;
+                i += 1;
+                if last_flush.elapsed().as_secs() >= 10 {
+                    let _ = w.flush().await;
+                    last_flush = Instant::now();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1000 / rate)).await;
+            }
+            let _ = w.flush().await;
+            i
+        })
+    };
+    let mut rounds = 0u64;
+    while t0.elapsed().as_secs() < a.tail_test_secs {
+        tokio::time::sleep(vlrelay::plc_seed::local::TAIL_EVERY).await;
+        fl.clone().step(&m, None).await?;
+        rounds += 1;
+    }
+    let written = writer.await?;
+    // past the reader's manifest poll, so the last rows are visible
+    tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+    fl.clone().step(&m, None).await?;
+    let gets = gets_of("qlog_tool") - g0;
+    let t = fl.table().expect("table");
+    let seen = (0..written).filter(|i| t.get(&did(1_000_000_000 + i)).ok().flatten().is_some()).count();
+    Ok(format!(
+        "TAIL secs={} rounds={} written={written} in_table={seen} member_gets={gets} gets_per_s={:.2} tailed={}\n",
+        a.tail_test_secs,
+        rounds + 1,
+        gets as f64 / t0.elapsed().as_secs_f64(),
+        fl.stats.tailed.load(Relaxed),
+    ))
 }

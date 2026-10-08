@@ -82,10 +82,34 @@ impl DiskDb {
     }
 
     fn share(self, total: u64) -> u64 {
+        if SEEDS_LOCAL.load(std::sync::atomic::Ordering::Relaxed) {
+            return match self {
+                DiskDb::State => total,
+                DiskDb::Seeds => 0,
+            };
+        }
         let state = (total / 8).max(64 << 20);
         match self {
             DiskDb::State => state,
             DiskDb::Seeds => total.saturating_sub(state).max(64 << 20),
+        }
+    }
+}
+
+/// The seeds are read from a local table (`plc_seed::local`): their
+/// database is only scanned and compacted, so the disk is the state's.
+static SEEDS_LOCAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// After [`configure_disk`]. Turning it on drops the seeds' old disk cache
+/// folder, which nothing would read or evict any more.
+pub fn set_seeds_local(on: bool) {
+    SEEDS_LOCAL.store(on, std::sync::atomic::Ordering::Relaxed);
+    if on && let Some(Some(d)) = DISK.get() {
+        let old = d.dir.join(DiskDb::Seeds.folder());
+        if old.exists()
+            && let Err(e) = std::fs::remove_dir_all(&old)
+        {
+            tracing::warn!(dir = %old.display(), "removing the PLC seeds' old disk cache: {e}");
         }
     }
 }
@@ -102,7 +126,9 @@ pub fn configure_disk(dir: Option<std::path::PathBuf>, total_mb: u64) {
 /// [`configure_disk`].
 pub fn disk_options(db: DiskDb) -> slatedb::config::ObjectStoreCacheOptions {
     let mut o = slatedb::config::ObjectStoreCacheOptions::default();
-    if let Some(Some(d)) = DISK.get() {
+    if let Some(Some(d)) = DISK.get()
+        && db.share(d.total_bytes) > 0
+    {
         o.root_folder = Some(d.dir.join(db.folder()));
         o.max_cache_size_bytes = Some(db.share(d.total_bytes) as usize);
         // what a node writes it reads next; caching it skips the GET

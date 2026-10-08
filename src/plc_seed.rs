@@ -25,7 +25,10 @@
 //! it was fetched, so a restart doesn't resolve those accounts again and an
 //! export op created after the fetch still wins.
 //!
-//! Every member reads the database ([`SeedReader`]). On a DID document cache
+//! Every member reads the database ([`SeedReader`]), or with
+//! `--plc-seeds-dir` its own copy of it on local disk ([`local`], a
+//! [`table`] built from the database and kept current from its changelog,
+//! [`CHANGELOG_TTL`]), so a lookup is one local read. On a DID document cache
 //! miss the seed fills the cache without spending the PLC lookup budget;
 //! the leader also weighs it against the account's record ([`choose`]). A
 //! forced refresh (an `#identity`, a signature that fails against the
@@ -38,6 +41,8 @@
 
 pub mod ingest;
 pub mod job;
+pub mod local;
+pub mod table;
 
 use crate::identity::{self, Identity};
 use crate::state::record::{HostKey, Record};
@@ -370,6 +375,45 @@ pub fn choose(rec: Option<&Record>, seed: Option<&Seed>, now_s: u32, ttl_s: u32)
     Pick::Seed
 }
 
+/// Every row the leader writes is also kept this long under `c` + the
+/// time it was written, so a member's local table ([`table`]) can follow
+/// the database without scanning it. A member further behind rebuilds.
+pub const CHANGELOG_TTL: Duration = Duration::from_secs(3 * 24 * 3600);
+
+pub fn changelog_key(written_ms: u64, key: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(9 + key.len());
+    k.push(b'c');
+    k.extend_from_slice(&written_ms.to_be_bytes());
+    k.extend_from_slice(key);
+    k
+}
+
+/// A changelog key's (written ms, seed key).
+pub fn split_changelog_key(k: &[u8]) -> Option<(u64, &[u8])> {
+    let (&b'c', rest) = k.split_first()? else { return None };
+    let (ms, key) = rest.split_at_checked(8)?;
+    Some((u64::from_be_bytes(ms.try_into().ok()?), key))
+}
+
+pub(crate) fn scan_options() -> slatedb::config::ScanOptions {
+    // a full build reads the whole database once, its blocks kept out of
+    // the cache the lookups use. Read-ahead is per sorted run: at 99M rows
+    // 8 MiB x 4 peaked at 944 MB and built in 160 s, 2 MiB x 2 at 187 MB in
+    // 229 s (2 cores, R2's latency), and a small box has the memory to spare
+    // less than the minutes
+    slatedb::config::ScanOptions::default()
+        .with_read_ahead_bytes(2 << 20)
+        .with_cache_blocks(false)
+        .with_max_fetch_tasks(2)
+}
+
+/// A changelog read: the changelog sorts first in every sorted run, and a
+/// few minutes of it is a block or two each. Blocks are fetched one at a
+/// time and kept, so the next read, 10 s later, finds most of them cached.
+fn tail_scan_options() -> slatedb::config::ScanOptions {
+    slatedb::config::ScanOptions::default().with_cache_blocks(true)
+}
+
 fn db_path(store: &Store) -> object_store::path::Path {
     object_store::path::Path::from(format!("{}/{SEEDS_PATH}", store.prefix))
 }
@@ -419,11 +463,22 @@ impl SeedWriter {
             return Ok(0);
         }
         let mut wb = slatedb::WriteBatch::new();
+        let now = crate::policy::store::now_ms() as u64;
+        let ttl = slatedb::config::PutOptions {
+            ttl: slatedb::config::Ttl::ExpireAfterMillis(CHANGELOG_TTL.as_millis() as u64),
+        };
         for (did, seed) in &rows {
-            wb.merge(seed_key(did), seed.encode());
+            let (k, v) = (seed_key(did), seed.encode());
+            wb.put_with_options(changelog_key(now, &k), v.clone(), &ttl);
+            wb.merge(k, v);
         }
         self.db.write(wb).await?;
         Ok(rows.len())
+    }
+
+    /// The database's rows in `range`, a few blocks' worth: a stretch of the changelog.
+    pub async fn scan(&self, range: std::ops::Range<Vec<u8>>) -> anyhow::Result<slatedb::DbIterator> {
+        Ok(self.db.scan_with_options(range, &tail_scan_options()).await?)
     }
 
     /// Makes every applied entry durable (the database runs without a WAL).
@@ -462,6 +517,9 @@ pub struct SeedReader {
     pub learned_written: std::sync::atomic::AtomicU64,
     pub learned_batches: std::sync::atomic::AtomicU64,
     pub learned_dropped: std::sync::atomic::AtomicU64,
+    /// This member's copy on local disk, when it has one
+    /// (`--plc-seeds-dir`).
+    pub local: std::sync::OnceLock<Arc<local::Local>>,
 }
 
 /// Fetched documents buffered before a write batch is due anyway.
@@ -503,6 +561,7 @@ impl SeedReader {
             learned_written: Default::default(),
             learned_batches: Default::default(),
             learned_dropped: Default::default(),
+            local: Default::default(),
         })
     }
 
@@ -619,7 +678,57 @@ impl SeedReader {
         }
     }
 
+    /// The bucket path of the seed database, which a local table names as
+    /// its source.
+    pub fn source(&self) -> String {
+        db_path(&self.store).to_string()
+    }
+
+    /// Rows of the database in `range` (a stretch of the changelog), from
+    /// the leader's writer or this member's reader. None: neither is open
+    /// yet.
+    pub async fn scan(&self, range: std::ops::Range<Vec<u8>>) -> anyhow::Result<Option<slatedb::DbIterator>> {
+        let writer = self.writer.read().clone();
+        if let Some(w) = writer {
+            return Ok(Some(w.scan(range).await?));
+        }
+        match self.reader().await {
+            Some(r) => Ok(Some(r.scan_with_options(range, &tail_scan_options()).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// A reader of its own for one full scan (a local table's build), so
+    /// the leader's writer opening or closing under it can't end the scan.
+    /// It keeps nothing on disk: the scan reads each block once.
+    pub async fn scan_reader(&self) -> anyhow::Result<slatedb::DbReader> {
+        let opts = slatedb::config::DbReaderOptions {
+            manifest_poll_interval: READER_POLL,
+            skip_wal_replay: true,
+            ..Default::default()
+        };
+        let path = db_path(&self.store);
+        let (cache, id) = crate::qlog::cache::for_db(path.as_ref());
+        Ok(slatedb::DbReader::builder(path, self.store.raw.clone())
+            .with_db_cache(cache, id)
+            .with_merge_operator(merge_operator())
+            .with_options(opts)
+            .build()
+            .await?)
+    }
+
     pub async fn get(&self, did: &str) -> Option<Seed> {
+        if let Some(t) = self.local.get().and_then(|l| l.table()) {
+            let did = did.to_string();
+            return match tokio::task::spawn_blocking(move || t.get(&did)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    tracing::debug!("reading the PLC seed table: {e}");
+                    None
+                }
+                Err(_) => None,
+            };
+        }
         if self.paused.load(std::sync::atomic::Ordering::Relaxed) {
             return None;
         }

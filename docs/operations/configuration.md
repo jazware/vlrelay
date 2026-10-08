@@ -87,6 +87,7 @@ Without `--memory`, the four `--s3-*` values are required (the keys directly or 
 | `--plc-export-rate <PLC_EXPORT_RATE>` |  | `2` | /export requests per second, all streams together (a 429 waits out its Retry-After on top) |
 | `--plc-export-streams <PLC_EXPORT_STREAMS>` |  | `4` | Time windows of the export read side by side on a fresh start |
 | `--plc-seeds-slatedb <PLC_SEEDS_SLATEDB>` | `VLRELAY_PLC_SEEDS_SLATEDB` | `compactions=1,subcompactions=1,fetch-tasks=2,fetch-kb=1024,sst-mb=64,memtable-mb=128,codec=zstd` | Memory bounds of the PLC seeds' SlateDB on the leader, as `key=value,...`: compactions at once, subcompactions each, fetch-tasks and fetch-kb of read-ahead per input SST, sst-mb per output SST, memtable-mb unflushed, and codec (zstd, lz4 or none) for new SSTs (each SST records its own, so changing it needs no wipe). Keys left out keep the defaults shown. A compaction holds about subcompactions x 8 x fetch-tasks x fetch-kb, plus its output's upload buffers |
+| `--plc-seeds-dir <PLC_SEEDS_DIR>` | `VLRELAY_PLC_SEEDS_DIR` |  | With --plc-export: keeps this member's copy of the PLC seeds in a table on this local disk (~58 B a DID), built from the bucket's seed database and kept current from its changelog. A seed lookup is then one local read with nothing per DID in memory. Unset: lookups read the seed database |
 | `--plc-seed-reads <PLC_SEED_READS>` | `VLRELAY_PLC_SEED_READS` | `32` | PLC seed reads in flight at once (the identity cache's misses; the rest wait). Each can load megabytes of the seeds' filters and indexes from the bucket once they outgrow the metadata cache |
 | `--plc-export-mem-mb <PLC_EXPORT_MEM_MB>` | `VLRELAY_PLC_EXPORT_MEM_MB` | `0` | The leader pauses the PLC export (and its seed reads) while the process has more than this many MiB allocated, and resumes below 85% of it; 0: no limit. Size it under the container's limit with room for the kernel's socket buffers and the allocator's slack |
 | `--bootstrap-relay <BOOTSTRAP_RELAYS>` | `VLRELAY_BOOTSTRAP_RELAYS` |  | A relay whose com.atproto.sync.listHosts seeds host discovery (read only; repeatable): added to the policy's discovery.seedRelays when it has none yet. The dashboard edits the list after that |
@@ -147,7 +148,7 @@ Every member uses the same bucket and `--prefix`. A node with no `--qlog-peer` i
 | `--slatedb-cache-mb <SLATEDB_CACHE_MB>` | `VLRELAY_SLATEDB_CACHE_MB` | `320` | SlateDB's block and metadata cache, shared by every database this node opens (the quorum log's state, the PLC seeds): the total in MiB, four parts blocks to one of indexes and filters |
 | `--slatedb-meta-mb <SLATEDB_META_MB>` | `VLRELAY_SLATEDB_META_MB` |  | Of --slatedb-cache-mb, MiB for indexes and filters (default: a fifth). With --slatedb-disk-cache-dir the blocks are a local read anyway, and a filter or index that misses is megabytes |
 | `--slatedb-disk-cache-dir <SLATEDB_DISK_CACHE_DIR>` | `VLRELAY_SLATEDB_DISK_CACHE_DIR` |  | Keeps the state's and the PLC seeds' SSTs on this local disk (SlateDB's object-store cache), so reads past the memory cache don't go to the bucket. Unset: no disk cache |
-| `--slatedb-disk-cache-mb <SLATEDB_DISK_CACHE_MB>` | `VLRELAY_SLATEDB_DISK_CACHE_MB` | `16384` | The disk cache's size in MiB, both databases together (an eighth, at least 64 MiB, for the state) |
+| `--slatedb-disk-cache-mb <SLATEDB_DISK_CACHE_MB>` | `VLRELAY_SLATEDB_DISK_CACHE_MB` | `16384` | The disk cache's size in MiB, both databases together (an eighth, at least 64 MiB, for the state; all of it with --plc-seeds-dir) |
 | `--qlog-memory-mb <QLOG_MEMORY_MB>` |  |  | Committed log kept in memory (default 64 with --qlog-dir, else 512) |
 
 ## Chaos
@@ -168,19 +169,25 @@ For the chaos harness (`tests/qlog/relay-chaos.sh`); never on a production node.
 A single node at ~3,400 hosts runs on ~1.3 GB of heap and half a core without `--plc-export`. On
 a 2 vCPU / 4 GB box:
 
-- With `--plc-export`, give the node `--slatedb-disk-cache-dir` on local disk and
-  `--plc-export-mem-mb` (1800 under a 2300 MiB container limit). Every PLC op is a seed row (~85 B
-  in SlateDB, ~2 B of filters and indexes per row), and every row is a merge, so a lookup probes
-  each sorted run's filter. Without the disk cache, once those filters and indexes outgrow the
-  metadata share (past ~35M rows) a seed lookup is ~4 bucket GETs in a row: at 99M ops and 14
-  sorted runs a relay did ~12 lookups/s at ~2.7 s each, 50 GETs/s, and its lanes backed up. With
-  it, the SSTs (8.3 GB at 99M ops) sit on local disk, and a read the memory cache misses is a
-  local one.
-- `--slatedb-meta-mb 224` of the 320: the seeds' filters and indexes (~190 MiB at 99M ops) and
-  the state's then stay in memory, and the blocks they point to are a local read anyway. Past
-  ~110M rows they don't fit any more.
-- The budget pauses the export and the seed reads while the process is over it and resumes
-  below 85%. `--plc-export-rate` is requests a second across every window, ~1,000 ops each.
+- With `--plc-export`, give the node `--plc-seeds-dir` on local disk. Every member then keeps
+  the seeds as a table there, ~58 B a DID with nothing per DID in memory: 5.0 GB at 91M DIDs,
+  15 GB at 274M, 25 GB at 457M. A lookup is one 8 KiB read, p50 ~0.1-0.2 ms and p99 0.5-6 ms
+  cold on NVMe under a 512 MiB cgroup, at any of those sizes. A member builds it from one scan of
+  the bucket's seed database (229 s at 99M rows on 2 cores against R2's latency, 3,365 GETs,
+  peak 187 MB), then follows its changelog every 10 s (~0.2 GETs/s). The table survives
+  restarts, and a member whose cursor is older than the 3-day changelog rebuilds.
+- Without it, a seed lookup reads the seed database. Every row is a merge, so a lookup probes
+  each sorted run's filter, and the filters and indexes are ~2 B a row (~190 MiB at 99M ops). At
+  99M ops and 14 sorted runs, with the default 64 MiB metadata share, lookups ran ~35/s at 32 at
+  once, p50 0.9 s, ~5 bucket GETs each. `--slatedb-disk-cache-dir` with
+  `--slatedb-meta-mb 224` gets that to ~4,900/s, p50 5.7 ms and no GETs once the SSTs (8-15 GB)
+  are on local disk, but the metadata stops fitting past ~110M rows.
+- `--slatedb-disk-cache-dir` keeps the state's SSTs on local disk too (all of
+  `--slatedb-disk-cache-mb` with `--plc-seeds-dir`). The seeder reads the account's record
+  beside the seed, so both should be local.
+- Give it `--plc-export-mem-mb` (1800 under a 2300 MiB container limit). The budget pauses the
+  export and the seed reads while the process is over it and resumes below 85%.
+  `--plc-export-rate` is requests a second across every window, ~1,000 ops each.
 - `--qlog-disk-retain-mb 1024`: a single node has no followers to catch up, so the disk only
   serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of
   it, about 7 s for the default 4 GiB.

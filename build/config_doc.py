@@ -21,7 +21,7 @@ SECTIONS = [
         "Upstreams and identity",
         "`--host` and `--crawl` work on any member: a host admitted anywhere goes into the leader's host table, "
         "and the leader gives it to a member.",
-        ["host", "crawl", "host-tier", "plc-url", "plc-export", "plc-export-url", "plc-export-rate", "plc-export-streams", "plc-seeds-slatedb", "plc-seed-reads", "plc-export-mem-mb", "bootstrap-relay", "dev-mode", "did-lookups-per-sec", "did-lookup-prefetch", "did-web-seed-ttl-secs"],
+        ["host", "crawl", "host-tier", "plc-url", "plc-export", "plc-export-url", "plc-export-rate", "plc-export-streams", "plc-seeds-slatedb", "plc-seeds-dir", "plc-seed-reads", "plc-export-mem-mb", "bootstrap-relay", "dev-mode", "did-lookups-per-sec", "did-lookup-prefetch", "did-web-seed-ttl-secs"],
     ),
     ("Pipeline and serving", "", ["lanes", "ingest-threads", "host-inflight-events", "host-inflight-mb", "inflight-events", "inflight-mb", "ring-mb", "max-lag-mb", "log-compression",
                               "event-horizon-secs", "lag-case-minutes", "lag-case-sustain-secs", "lag-case-grace-secs",
@@ -94,19 +94,25 @@ FOOTER = """## A small box
 A single node at ~3,400 hosts runs on ~1.3 GB of heap and half a core without `--plc-export`. On
 a 2 vCPU / 4 GB box:
 
-- With `--plc-export`, give the node `--slatedb-disk-cache-dir` on local disk and
-  `--plc-export-mem-mb` (1800 under a 2300 MiB container limit). Every PLC op is a seed row (~85 B
-  in SlateDB, ~2 B of filters and indexes per row), and every row is a merge, so a lookup probes
-  each sorted run's filter. Without the disk cache, once those filters and indexes outgrow the
-  metadata share (past ~35M rows) a seed lookup is ~4 bucket GETs in a row: at 99M ops and 14
-  sorted runs a relay did ~12 lookups/s at ~2.7 s each, 50 GETs/s, and its lanes backed up. With
-  it, the SSTs (8.3 GB at 99M ops) sit on local disk, and a read the memory cache misses is a
-  local one.
-- `--slatedb-meta-mb 224` of the 320: the seeds' filters and indexes (~190 MiB at 99M ops) and
-  the state's then stay in memory, and the blocks they point to are a local read anyway. Past
-  ~110M rows they don't fit any more.
-- The budget pauses the export and the seed reads while the process is over it and resumes
-  below 85%. `--plc-export-rate` is requests a second across every window, ~1,000 ops each.
+- With `--plc-export`, give the node `--plc-seeds-dir` on local disk. Every member then keeps
+  the seeds as a table there, ~58 B a DID with nothing per DID in memory: 5.0 GB at 91M DIDs,
+  15 GB at 274M, 25 GB at 457M. A lookup is one 8 KiB read, p50 ~0.1-0.2 ms and p99 0.5-6 ms
+  cold on NVMe under a 512 MiB cgroup, at any of those sizes. A member builds it from one scan of
+  the bucket's seed database (229 s at 99M rows on 2 cores against R2's latency, 3,365 GETs,
+  peak 187 MB), then follows its changelog every 10 s (~0.2 GETs/s). The table survives
+  restarts, and a member whose cursor is older than the 3-day changelog rebuilds.
+- Without it, a seed lookup reads the seed database. Every row is a merge, so a lookup probes
+  each sorted run's filter, and the filters and indexes are ~2 B a row (~190 MiB at 99M ops). At
+  99M ops and 14 sorted runs, with the default 64 MiB metadata share, lookups ran ~35/s at 32 at
+  once, p50 0.9 s, ~5 bucket GETs each. `--slatedb-disk-cache-dir` with
+  `--slatedb-meta-mb 224` gets that to ~4,900/s, p50 5.7 ms and no GETs once the SSTs (8-15 GB)
+  are on local disk, but the metadata stops fitting past ~110M rows.
+- `--slatedb-disk-cache-dir` keeps the state's SSTs on local disk too (all of
+  `--slatedb-disk-cache-mb` with `--plc-seeds-dir`). The seeder reads the account's record
+  beside the seed, so both should be local.
+- Give it `--plc-export-mem-mb` (1800 under a 2300 MiB container limit). The budget pauses the
+  export and the seed reads while the process is over it and resumes below 85%.
+  `--plc-export-rate` is requests a second across every window, ~1,000 ops each.
 - `--qlog-disk-retain-mb 1024`: a single node has no followers to catch up, so the disk only
   serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of
   it, about 7 s for the default 4 GiB.

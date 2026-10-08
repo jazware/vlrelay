@@ -18,6 +18,7 @@ use vlsync_store::store::Store;
 /// with the cache's TTL, and an `#identity` refreshes them sooner).
 struct WriterSink {
     w: Arc<SeedWriter>,
+    local: Option<Arc<super::local::Local>>,
     cache: Arc<IdentityCache<HttpFetch>>,
     feed: Option<Arc<crate::discovery::Feed>>,
 }
@@ -34,6 +35,9 @@ impl Sink for WriterSink {
         }
         for (did, seed) in &ops {
             super::invalidate_if_stale(&self.cache, did, seed);
+        }
+        if let Some(l) = &self.local {
+            l.apply(ops.clone()).await;
         }
         self.w.apply(ops).await
     }
@@ -204,6 +208,7 @@ impl PlcJob {
         self.seeds.set_writer(w.clone()).await;
         let sink = Arc::new(WriterSink {
             w: w.clone(),
+            local: self.seeds.local.get().cloned(),
             cache: self.cache.clone(),
             feed: self.feed.lock().clone(),
         });
