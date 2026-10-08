@@ -39,7 +39,7 @@ tikv-jemallocator = "0.7"
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # dev tools (src/bin/e2e_check.rs, src/bin/devnet.rs). Features match
-# vlpds's exactly: a different feature set would rebuild these and vlpds.
+# vlsync's exactly: a different feature set would rebuild these and vlsync.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures = "0.3"
 # getrusage, for the dashboard's CPU per node
@@ -54,7 +54,7 @@ webpki-roots = "1"
 object_store = { version = "0.14", features = ["aws"] }
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
-# signature verification (src/verify.rs): crates and features vlpds already builds
+# signature verification (src/verify.rs): secp256k1 as vlsync-atproto builds it, and P-256
 secp256k1 = { version = "0.33", features = ["global-context"] }
 p256 = { version = "0.14", features = ["ecdsa", "getrandom"] }
 ring = "0.17"

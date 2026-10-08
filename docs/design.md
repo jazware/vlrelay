@@ -54,6 +54,9 @@ write path isn't the problem this time. These are:
 
 ## What it takes from vlpds
 
+The pieces it takes are shared crates now, vlsync (in jazware/vlpds's `vlsync/`), which both
+build on: vlRelay doesn't depend on the PDS.
+
 | | Piece | How the relay uses it |
 |---|---|---|
 | take | Log segments | The flush uploads the log as vlpds segments (64 MiB, zstd), which old cursors read back. |

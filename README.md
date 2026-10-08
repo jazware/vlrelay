@@ -6,8 +6,8 @@ MinIO bucket as its long-term copy.
 
 ![The vlRelay dashboard's overview on real traffic: one node of a three-node cluster reading ten Bluesky and independent PDSes, with events in and out, time to firehose, rejects, hosts and consumers](docs/assets/dashboard-real-overview.jpg)
 
-It's built from the parts of [vlpds](https://github.com/jazware/vlpds) that worked: its log
-segments, firehose serving and SlateDB state. Consumers see a normal relay. indigo's Go consumers,
+It's built from the parts of [vlpds](https://github.com/jazware/vlpds) that worked, now the vlsync
+crates both build on: its log segments, firehose serving and SlateDB state. Consumers see a normal relay. indigo's Go consumers,
 `goat` and Jetstream read it unchanged.
 
 ## Highlights
@@ -87,7 +87,7 @@ docker build -t vlrelay:local .              # the same image, built locally
 or without Docker:
 
 ```sh
-cargo build --release                        # target/release/vlrelay (pulls vlpds from git)
+cargo build --release                        # target/release/vlrelay (pulls the vlsync crates from git)
 cd ui && npm ci && npm run build && cd ..    # the dashboard and docs, served from ui/dist
 target/release/vlrelay --memory --host morel.us-east.host.bsky.network --admin-token dev
 ```

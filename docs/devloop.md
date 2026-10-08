@@ -42,9 +42,10 @@ Bluesky's reference PDS and two [vlpds](https://github.com/jazware/vlpds) server
 - `just`, `curl`, `lsof` and `python3` (the chaos harnesses' fault proxy and reports).
 - Go and Node, only for `just compat`.
 
-vlpds comes in as a Cargo dependency, so you don't need a checkout of it. `dev-up` builds vlpds's
-own binary from this crate's lockfile and target dir (`cargo build -p vlpds --bin vlpds`), which
-costs ~80 s once and shares every dependency with the relay build. The first `dev-up` also builds
+vlpds comes in as a Cargo dependency of `interop/` (the tests against an in-process vlpds), so you
+don't need a checkout of it. `dev-up` builds vlpds's own binary through it, in this crate's target
+dir (`cd interop && cargo build -p vlpds --bin vlpds`), which costs ~80 s once and shares most
+dependencies with the relay build. The first `dev-up` also builds
 two images: MinIO from source (`vlpds-minio:local`, since MinIO no longer publishes container
 images) and the PLC directory from did-method-plc's repo at a pinned commit. The reference PDS is
 pulled from `ghcr.io/bluesky-social/pds`.

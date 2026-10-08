@@ -1,6 +1,6 @@
-//! A sync 1.1 checker built only from vlpds's CBOR, CAR, MST and crypto
-//! code, so fakepds's frames are checked by an implementation it didn't
-//! write itself. Used by `selftest` and `consume --verify`.
+//! A sync 1.1 checker built only from vlsync-atproto's CBOR, CAR, MST and
+//! crypto code (vlpds's), so fakepds's frames are checked by an
+//! implementation it didn't write itself. Used by `selftest` and `consume --verify`.
 
 use super::fleet::Layout;
 use std::collections::HashMap;
