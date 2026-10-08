@@ -119,7 +119,11 @@ fn did(i: u64) -> String {
     let s: String = (0..24)
         .map(|n| {
             let c = if n < 12 { a & 31 } else { b & 31 };
-            if n < 12 { a >>= 5 } else { b >>= 5 }
+            if n < 12 {
+                a >>= 5
+            } else {
+                b >>= 5
+            }
             B32[c as usize] as char
         })
         .collect();
@@ -255,7 +259,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn lookups(a: &Cli, store: &vlsync_store::store::Store, w: Arc<SeedWriter>, known: u64) -> anyhow::Result<String> {
+async fn lookups(
+    a: &Cli,
+    store: &vlsync_store::store::Store,
+    w: Arc<SeedWriter>,
+    known: u64,
+) -> anyhow::Result<String> {
     use vlrelay::plc_seed::SeedReader;
     vlrelay::plc_seed::set_read_slots(a.lookup_concurrency);
     let r = SeedReader::new(store.clone());
