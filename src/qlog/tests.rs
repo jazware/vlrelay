@@ -49,18 +49,29 @@ pub(crate) struct Cluster {
     ring_bytes: usize,
 }
 
-/// Each port handed out once per process, below the ephemeral range: an
-/// OS-picked port can come back to a cluster running alongside, whose
-/// nodes would then append to this one's.
+/// Each port handed out once, below the ephemeral range: an OS-picked port
+/// can come back to a cluster running alongside, whose nodes would then
+/// append to this one's. Within a process a counter keeps ports apart;
+/// across processes (nextest runs each test in its own) a lock file per
+/// port does, held until the process exits. A bind check alone isn't
+/// enough: a killed node's port is free until it restarts.
 pub(crate) fn free_port() -> u16 {
+    const LO: u64 = 15_000;
+    const SPAN: u64 = 10_000;
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let base = 15_000 + (std::process::id() as u64 % 20) * 500;
-    loop {
-        let p = (base + NEXT.fetch_add(1, Ordering::Relaxed) % 500) as u16;
-        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+    static HELD: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
+    let dir = std::env::temp_dir().join("vlrelay-test-ports");
+    let _ = std::fs::create_dir_all(&dir);
+    let start = (std::process::id() as u64 * 97) % SPAN;
+    for _ in 0..SPAN {
+        let p = (LO + (start + NEXT.fetch_add(1, Ordering::Relaxed)) % SPAN) as u16;
+        let Ok(f) = std::fs::File::create(dir.join(format!("{p}.lock"))) else { continue };
+        if f.try_lock().is_ok() && std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+            HELD.lock().push(f);
             return p;
         }
     }
+    panic!("no free test port in {LO}..{}", LO + SPAN);
 }
 
 pub(crate) fn config(id: &str, addrs: &HashMap<String, String>) -> Config {
