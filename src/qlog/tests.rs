@@ -1167,14 +1167,19 @@ async fn flushing_random_chaos_keeps_every_manifest_consistent() {
     let seed: u64 = std::env::var("QLOG_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let armed = Arc::new(AtomicBool::new(true));
+    // a crash and its report happen under the lock, so once disarmed every
+    // crashed flush loop is in `rx`
+    let armed = Arc::new(Mutex::new(Some(tx)));
     let a = armed.clone();
     let mut c = flushing(
         move |id| {
-            let (t, id, a) = (tx.clone(), id.to_string(), a.clone());
+            let (id, a) = (id.to_string(), a.clone());
             flush::Options {
                 crash: Some(Arc::new(move |_| {
-                    if a.load(Ordering::Acquire) && rand::thread_rng().gen_bool(0.04) {
+                    let a = a.lock();
+                    if let Some(t) = a.as_ref()
+                        && rand::thread_rng().gen_bool(0.04)
+                    {
                         let _ = t.send(id.clone());
                         return true;
                     }
@@ -1229,8 +1234,7 @@ async fn flushing_random_chaos_keeps_every_manifest_consistent() {
         }
     }
     c.heal();
-    armed.store(false, Ordering::Release);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    armed.lock().take();
     while let Ok(id) = rx.try_recv() {
         c.kill(&id);
     }
