@@ -153,6 +153,14 @@ Every member uses the same bucket and `--prefix`. A node with no `--qlog-peer` i
 | `--slatedb-disk-cache-mb <SLATEDB_DISK_CACHE_MB>` | `VLRELAY_SLATEDB_DISK_CACHE_MB` | `16384` | The disk cache's size in MiB, both databases together (an eighth, at least 64 MiB, for the state; all of it with --plc-seeds-dir) |
 | `--qlog-memory-mb <QLOG_MEMORY_MB>` |  |  | Committed log kept in memory (default 64 with --qlog-dir, else 512) |
 
+## Logs
+
+Logs go to stderr. `json` is one object per line, the event's fields at the top level next to `timestamp`, `level`, `target` and `message`, for a log shipper. Production runs `json`. Local dev and the test scripts keep `text`.
+
+| Flag | Env | Default | What |
+|---|---|---|---|
+| `--log-format <LOG_FORMAT>` | `VLRELAY_LOG_FORMAT` | `text` | Log line format on stderr: text (ANSI colour only on a terminal, never with NO_COLOR) or json (one object per line; production). Level filter: RUST_LOG (default info,slatedb=warn) `text`: Human-readable lines; ANSI colour only when stderr is a terminal and NO_COLOR is unset · `json`: One JSON object per line (log shippers) |
+
 ## Chaos
 
 For the chaos harness (`tests/qlog/relay-chaos.sh`). Never set them on a production node.

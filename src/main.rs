@@ -241,8 +241,35 @@ struct Args {
     /// The member's name in the quorum log.
     #[arg(long, default_value = "relay", env = "VLRELAY_NODE_ID")]
     node_id: String,
+    /// Log line format on stderr: text (ANSI colour only on a terminal,
+    /// never with NO_COLOR) or json (one object per line; production). Level
+    /// filter: RUST_LOG (default info,slatedb=warn).
+    #[arg(long, env = "VLRELAY_LOG_FORMAT", value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
     #[command(flatten)]
     quorum: QuorumArgs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum LogFormat {
+    /// Human-readable lines; ANSI colour only when stderr is a terminal and
+    /// NO_COLOR is unset.
+    Text,
+    /// One JSON object per line (log shippers).
+    Json,
+}
+
+fn init_logging(format: LogFormat) {
+    use std::io::IsTerminal;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,slatedb=warn".into());
+    let b = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr);
+    match format {
+        LogFormat::Json => b.json().flatten_event(true).with_current_span(false).init(),
+        LogFormat::Text => {
+            let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+            b.with_ansi(!no_color && std::io::stderr().is_terminal()).init()
+        }
+    }
 }
 
 /// The quorum log (docs/quorum.md): one node of a cluster of any size (one
@@ -447,17 +474,13 @@ fn read_secret_files(a: &mut Args) -> anyhow::Result<()> {
 
 fn main() {
     vlatproto::http::set_user_agent(concat!("vlrelay/", env!("CARGO_PKG_VERSION")));
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,slatedb=warn".into()),
-        )
-        .init();
-    // reqwest, tungstenite and object_store each pull rustls; with more than
-    // one provider compiled in, nothing picks one unless we do
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let cmd = Args::command();
     let matches = cmd.clone().get_matches();
     let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    init_logging(args.log_format);
+    // reqwest, tungstenite and object_store each pull rustls; with more than
+    // one provider compiled in, nothing picks one unless we do
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let settings = vlrelay::admin::settings::from_clap(&cmd, &matches);
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("main").build().expect("runtime");
     let code = match rt.block_on(run(args, settings)) {

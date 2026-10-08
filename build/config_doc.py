@@ -38,6 +38,13 @@ SECTIONS = [
          "qlog-memory-mb"],
     ),
     (
+        "Logs",
+        "Logs go to stderr. `json` is one object per line, the event's fields at the top level next to "
+        "`timestamp`, `level`, `target` and `message`, for a log shipper. Production runs `json`. Local dev and "
+        "the test scripts keep `text`.",
+        ["log-format"],
+    ),
+    (
         "Chaos",
         "For the chaos harness (`tests/qlog/relay-chaos.sh`). Never set them on a production node.",
         ["qlog-crash-at", "qlog-crash-prob", "qlog-crash-stop-file", "qlog-power-cut-on-usr1", "qlog-fsync-delay-us", "qlog-unsafe-trust-log"],
