@@ -39,7 +39,7 @@ tools)
   (cd "$scratch/jetstream-legacy" && go build -o "$gobin/jetstream-legacy" ./cmd/jetstream)
   (cd "$compat/ts" && npm install --silent)
   cargo build --quiet --bin vlrelay --bin e2e_check --bin devnet
-  cargo build --quiet -p vlpds --bin vlpds
+  (cd interop && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/../target}" cargo build --quiet -p vlpds --bin vlpds)
   ;;
 up)
   dev/up.sh

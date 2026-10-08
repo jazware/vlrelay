@@ -25,9 +25,9 @@ run_step() {
     check) cargo check --quiet --bin vlrelay ;;
     build) cargo build --quiet ${BUILD_ARGS:-} --bin vlrelay ;;
     test-build) cargo test --quiet --no-run --lib 2>/dev/null ;;
-    # a full-size binary: vlpds's main.rs recompiled and everything linked,
-    # which is what an edit costs once the relay links all of vlpds
-    link-big) touch ../vlpds/src/main.rs && cargo build --quiet ${BUILD_ARGS:-} -p vlpds --bin vlpds ;;
+    # a full-size binary: vlpds's main.rs recompiled and everything linked
+    # (through interop/, which depends on vlpds), to compare with the relay's
+    link-big) touch ../vlpds/src/main.rs && (cd interop && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/../target}" cargo build --quiet ${BUILD_ARGS:-} -p vlpds --bin vlpds) ;;
   esac
 }
 median() { sort -n | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}'; }
