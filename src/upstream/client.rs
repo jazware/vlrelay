@@ -379,7 +379,12 @@ pub(crate) async fn connect(cfg: &UpstreamConfig, host: &Host, cursor: Option<i6
     let mut last_err = None;
     let mut stream = None;
     for a in addrs {
-        match TcpStream::connect(a).await {
+        let sock = if a.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+        // before connect, so the window scale it advertises fits
+        if cfg.recv_buffer_bytes > 0 {
+            sock.set_recv_buffer_size(cfg.recv_buffer_bytes.min(u32::MAX as usize) as u32)?;
+        }
+        match sock.connect(a).await {
             Ok(s) => {
                 stream = Some(s);
                 break;

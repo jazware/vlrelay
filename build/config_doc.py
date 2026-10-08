@@ -23,7 +23,7 @@ SECTIONS = [
         "and the leader gives it to a member.",
         ["host", "crawl", "host-tier", "plc-url", "plc-export", "plc-export-url", "plc-export-rate", "plc-export-streams", "plc-seeds-slatedb", "plc-seeds-dir", "plc-seed-reads", "plc-export-mem-mb", "bootstrap-relay", "dev-mode", "did-lookups-per-sec", "did-lookup-prefetch", "did-web-seed-ttl-secs"],
     ),
-    ("Pipeline and serving", "", ["lanes", "ingest-threads", "host-inflight-events", "host-inflight-mb", "inflight-events", "inflight-mb", "ring-mb", "max-lag-mb", "log-compression",
+    ("Pipeline and serving", "", ["lanes", "ingest-threads", "host-inflight-events", "host-inflight-mb", "inflight-events", "inflight-mb", "ingest-mem-mb", "upstream-rcvbuf-kb", "ring-mb", "max-lag-mb", "log-compression",
                               "event-horizon-secs", "lag-case-minutes", "lag-case-sustain-secs", "lag-case-grace-secs",
                               "lag-case-pressure-pct", "lag-case-resolve-secs"]),
     (
@@ -110,9 +110,19 @@ a 2 vCPU / 4 GB box:
 - `--slatedb-disk-cache-dir` keeps the state's SSTs on local disk too (all of
   `--slatedb-disk-cache-mb` with `--plc-seeds-dir`). The seeder reads the account's record
   beside the seed, so both should be local.
-- Give it `--plc-export-mem-mb` (1800 under a 2300 MiB container limit). The budget pauses the
-  export and the seed reads while the process is over it, and resumes them below 85%.
-  `--plc-export-rate` counts requests a second across every window, at ~1,000 ops each.
+- Give it `--ingest-mem-mb` (1500 under a 2300 MiB container limit). No host is read while the
+  process's anonymous memory is over it, until it's back under 90%. The in-flight caps count
+  frames, not what the heap holds around them (the ring, the log's memory, a flush, the state's
+  memtables, the PLC export), so on their own they don't bound the heap. What's already in flight
+  still lands after a pause, so leave ~300 MB above the budget for it.
+- Keep `--upstream-rcvbuf-kb` at its default of 256. A paused host's backlog waits in its socket's
+  receive buffer, outside the in-flight caps and the ingest budget, and the kernel's autotuning
+  grows each one to 6 MiB: 200 busy hosts held ~500 MB of socket memory that way. At 256 KiB a
+  host holds at most ~512 KiB in the kernel and still reads ~3.5 MB/s at a 70 ms round trip.
+- Give it `--plc-export-mem-mb` under `--ingest-mem-mb` (1200 with the numbers above), so the
+  export yields before the hosts do. The budget pauses the export and the seed reads while the
+  process is over it, and resumes them below 85%. `--plc-export-rate` counts requests a second
+  across every window, at ~1,000 ops each.
 - Set `--qlog-disk-retain-mb 1024`. A single node has no followers to catch up, so its disk only
   serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of it,
   about 7 s for the default 4 GiB.
@@ -120,7 +130,9 @@ a 2 vCPU / 4 GB box:
 - To see where the heap goes, build with `--features heap-profiling` (the Dockerfile's
   `VLRELAY_FEATURES` build argument) and start the node with
   `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19,prof_gdump:true,prof_prefix:<dir>/heap`. jemalloc
-  then writes a profile at each new peak, which `jeprof --text <binary> <file>` reads.
+  then writes a profile at each new peak, which `jeprof --text <binary> <file>` reads. Under a
+  growing load that's thousands of files a minute: `lg_prof_interval:33` instead of
+  `prof_gdump:true` writes one every 8 GiB allocated.
 """
 
 

@@ -2472,6 +2472,7 @@ impl Node {
         ucfg.endpoint = super::endpoint_fn(cfg.dev_mode, explicit);
         ucfg.limits = cfg.upstream_limits.clone();
         ucfg.inflight = cfg.inflight;
+        ucfg.recv_buffer_bytes = cfg.upstream_rcvbuf_bytes;
         ucfg.event_horizon = cfg.event_horizon;
         let (manager, rx) = Manager::new(ucfg, hosts.clone(), Some(cursors.clone() as Arc<dyn upstream::CursorSource>));
         let _ = cursors.registry.set(manager.registry().clone());

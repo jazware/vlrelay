@@ -36,6 +36,17 @@ static PAUSES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!("vlrelay_upstream_pauses_total", "Socket reads paused at an in-flight cap", &["cap"])
         .unwrap()
 });
+static MEMORY: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "vlrelay_process_memory_bytes",
+        "The process's anonymous memory (its cgroup's anon, or jemalloc's resident bytes), as --ingest-mem-mb counts it"
+    )
+    .unwrap()
+});
+static MEMORY_PAUSED: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!("vlrelay_upstream_memory_paused", "1 while upstream reads are paused at --ingest-mem-mb")
+        .unwrap()
+});
 pub static HOST_INFLIGHT_MAX: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!("vlrelay_upstream_host_inflight_events_max", "The most frames any one host has in flight")
         .unwrap()
@@ -54,11 +65,14 @@ pub struct FlowLimits {
     pub host_bytes: usize,
     pub events: usize,
     pub bytes: usize,
+    /// The process's anonymous memory ([`process_memory`]) past which no
+    /// host is read; 0: none.
+    pub memory: u64,
 }
 
 impl Default for FlowLimits {
     fn default() -> Self {
-        FlowLimits { host_events: 8192, host_bytes: 64 << 20, events: 32768, bytes: 384 << 20 }
+        FlowLimits { host_events: 8192, host_bytes: 64 << 20, events: 32768, bytes: 384 << 20, memory: 0 }
     }
 }
 
@@ -97,6 +111,8 @@ pub struct Flow {
     counts: Counts,
     notify: Notify,
     waiters: AtomicUsize,
+    /// Over `FlowLimits::memory` ([`Flow::watch_memory`]).
+    mem_over: AtomicBool,
 }
 
 impl Flow {
@@ -106,7 +122,42 @@ impl Flow {
             counts: Counts::default(),
             notify: Notify::new(),
             waiters: AtomicUsize::new(0),
+            mem_over: AtomicBool::new(false),
         })
+    }
+
+    /// Samples the process's memory against `FlowLimits::memory`, if set.
+    /// The in-flight caps count frames, not what each one costs on its way
+    /// (decoded, copied into the log and the ring) or what else the heap
+    /// holds meanwhile (a flush, the state's memtables, the PLC export), so
+    /// a catch-up burst could pass a small box's limit with every cap
+    /// respected.
+    pub fn watch_memory(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        let budget = self.limits().memory;
+        if budget == 0 {
+            return None;
+        }
+        let me = Arc::downgrade(self);
+        Some(tokio::spawn(async move {
+            let mut t = tokio::time::interval(Duration::from_millis(200));
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                t.tick().await;
+                let Some(f) = me.upgrade() else { return };
+                let Some(m) = process_memory() else { continue };
+                MEMORY.set(m as i64);
+                let was = f.mem_over.load(Ordering::Acquire);
+                let over = if was { m as f64 >= budget as f64 * RESUME } else { m > budget };
+                if over != was {
+                    f.mem_over.store(over, Ordering::Release);
+                    MEMORY_PAUSED.set(over as i64);
+                    tracing::info!(memory_mb = m >> 20, budget_mb = budget >> 20, over, "upstream: memory budget");
+                    if !over {
+                        f.notify.notify_waiters();
+                    }
+                }
+            }
+        }))
     }
 
     pub fn limits(&self) -> FlowLimits {
@@ -134,6 +185,8 @@ impl Flow {
             || self.counts.bytes.load(Ordering::Relaxed) >= l.bytes.max(1)
         {
             Some("global")
+        } else if self.mem_over.load(Ordering::Acquire) {
+            Some("memory")
         } else {
             None
         }
@@ -155,6 +208,7 @@ impl Flow {
         under(h.events(), l.host_events, RESUME)
             && under(h.bytes(), l.host_bytes, RESUME)
             && self.node_under(&l, RESUME)
+            && !self.mem_over.load(Ordering::Acquire)
     }
 
     /// The cap `h` is at, as the host's status reports it.
@@ -254,13 +308,34 @@ fn under(n: usize, cap: usize, share: f64) -> bool {
     (n as f64) < cap.max(1) as f64 * share
 }
 
+/// The process's anonymous memory: its cgroup v2's `anon`, which counts
+/// what jemalloc holds and hasn't returned, or outside one jemalloc's
+/// resident bytes. Not the sockets' buffers: reading is what drains them,
+/// so pausing for them would never end (`--upstream-rcvbuf-kb` bounds
+/// them instead).
+pub fn process_memory() -> Option<u64> {
+    static STAT: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
+        let c = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let rel = c.lines().find_map(|l| l.strip_prefix("0::"))?;
+        let p = std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')).join("memory.stat");
+        p.exists().then_some(p)
+    });
+    if let Some(p) = STAT.as_ref()
+        && let Ok(s) = std::fs::read_to_string(p)
+    {
+        return s.lines().find_map(|l| l.strip_prefix("anon ")).and_then(|v| v.trim().parse().ok());
+    }
+    tikv_jemalloc_ctl::epoch::advance().ok()?;
+    tikv_jemalloc_ctl::stats::resident::read().ok().map(|b| b as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
     async fn a_host_at_its_cap_waits_for_permits() {
-        let f = Flow::new(FlowLimits { host_events: 2, host_bytes: 1 << 20, events: 3, bytes: 1 << 20 });
+        let f = Flow::new(FlowLimits { host_events: 2, host_bytes: 1 << 20, events: 3, bytes: 1 << 20, memory: 0 });
         let a = Arc::new(HostFlow::default());
         let b = Arc::new(HostFlow::default());
         let p1 = f.acquire(&a, 10);
@@ -285,7 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn paused_hosts_wait_for_the_resume_mark_and_leave_one_at_a_time() {
-        let f = Flow::new(FlowLimits { host_events: 100, host_bytes: 1 << 20, events: 10, bytes: 1 << 20 });
+        let f = Flow::new(FlowLimits { host_events: 100, host_bytes: 1 << 20, events: 10, bytes: 1 << 20, memory: 0 });
         let busy = Arc::new(HostFlow::default());
         let mut held: Vec<_> = (0..10).map(|_| f.acquire(&busy, 10)).collect();
         let hosts: Vec<_> = (0..3).map(|_| Arc::new(HostFlow::default())).collect();
@@ -315,5 +390,21 @@ mod tests {
         for w in waiters {
             tokio::time::timeout(Duration::from_millis(100), w).await.expect("woken").unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn over_the_memory_budget_no_host_is_read() {
+        let f = Flow::new(FlowLimits { memory: 1, ..FlowLimits::default() });
+        let h = Arc::new(HostFlow::default());
+        assert!(f.has_room(&h));
+        f.mem_over.store(true, Ordering::Release);
+        assert_eq!(f.backpressure(&h), Some(super::super::Backpressure::NodeInflightFull));
+        let (f2, h2) = (f.clone(), h.clone());
+        let w = tokio::spawn(async move { f2.wait_room(&h2).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!w.is_finished() && h.paused());
+        f.mem_over.store(false, Ordering::Release);
+        f.notify.notify_waiters();
+        tokio::time::timeout(Duration::from_millis(100), w).await.expect("woken").unwrap();
     }
 }

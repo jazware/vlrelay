@@ -70,6 +70,9 @@ pub struct UpstreamConfig {
     /// tungstenite's per-socket read buffer; its 128 KiB default dominates
     /// an idle connection's memory.
     pub read_buffer_bytes: usize,
+    /// SO_RCVBUF of each socket; 0: the kernel's autotuning. A paused
+    /// host's backlog waits in it, outside the in-flight caps.
+    pub recv_buffer_bytes: usize,
     /// Frames read and not yet done, per host and in all; a host at a cap
     /// isn't read.
     pub inflight: flow::FlowLimits,
@@ -100,6 +103,7 @@ impl UpstreamConfig {
             // the reference relay's limit on a single event
             max_frame_bytes: 5 << 20,
             read_buffer_bytes: 16 * 1024,
+            recv_buffer_bytes: 0,
             inflight: flow::FlowLimits::default(),
             event_horizon: EVENT_HORIZON,
         }
@@ -263,6 +267,9 @@ impl Manager {
         self.registry.load().await?;
         let mut bg = self.background.lock();
         bg.push(tokio::spawn(self.fair.clone().run(out)));
+        if let Some(h) = self.flow.watch_memory() {
+            bg.push(h);
+        }
         let me = Arc::downgrade(self);
         let every = self.cfg.flush_interval;
         bg.push(tokio::spawn(async move {

@@ -187,6 +187,19 @@ struct Args {
     /// The same cap over every host, in bytes.
     #[arg(long, default_value_t = 384)]
     inflight_mb: usize,
+    /// No host is read while the process holds more than this many MiB of
+    /// anonymous memory (its cgroup's anon; jemalloc's resident bytes
+    /// outside a cgroup), until it's back under 90%. 0: no limit. Size it
+    /// under the container's limit with room for the hosts' socket buffers
+    /// (--upstream-rcvbuf-kb) and the page cache the log reads.
+    #[arg(long, env = "VLRELAY_INGEST_MEM_MB", default_value_t = 0)]
+    ingest_mem_mb: u64,
+    /// Each upstream socket's receive buffer, KiB (SO_RCVBUF, which the
+    /// kernel doubles for its overhead). A paused host's backlog waits in
+    /// it, so it's what every connected host can hold in kernel memory.
+    /// 0: the kernel's autotuning (up to tcp_rmem's max, 6 MiB by default).
+    #[arg(long, env = "VLRELAY_UPSTREAM_RCVBUF_KB", default_value_t = 256)]
+    upstream_rcvbuf_kb: usize,
     /// Per-host limits and spam signals count a host's events by the time
     /// it stamped on them, so a replayed backlog costs what the traffic
     /// did; a time older than this counts at this horizon.
@@ -494,7 +507,9 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
         host_bytes: a.host_inflight_mb.max(1) << 20,
         events: a.inflight_events.max(1),
         bytes: a.inflight_mb.max(1) << 20,
+        memory: a.ingest_mem_mb << 20,
     };
+    cfg.upstream_rcvbuf_bytes = a.upstream_rcvbuf_kb << 10;
     cfg.event_horizon = Duration::from_secs(a.event_horizon_secs);
     cfg.lag_cases = vlrelay::node::lag::LagCaseConfig {
         threshold: Duration::from_secs(a.lag_case_minutes.max(1) * 60),

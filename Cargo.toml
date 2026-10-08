@@ -37,6 +37,8 @@ prometheus = { version = "0.14", default-features = false }
 tikv-jemallocator = "0.7"
 # the PLC export's memory budget reads jemalloc's allocated bytes
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
+# the flush hands its freed segment buffers back (arena.<all>.purge)
+tikv-jemalloc-sys = { version = "0.7", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # dev tools (src/bin/e2e_check.rs, src/bin/devnet.rs). Features match
 # vlsync's exactly: a different feature set would rebuild these and vlsync.

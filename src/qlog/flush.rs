@@ -1020,9 +1020,29 @@ async fn seal(b: SegmentBuilder, ord: u64, prefix_end: u64) -> anyhow::Result<by
         let mut obj = segment::compress(&obj, segment::compression_level())?.unwrap_or(obj);
         // compress leaves a buffer as big as its worst case
         obj.shrink_to_fit();
+        release_freed();
         Ok(obj.into())
     })
     .await?
+}
+
+/// Hands the pages of freed buffers back to the OS now. The node keeps
+/// freed large pages for reuse until they decay (main.rs's malloc conf),
+/// so a backlog flush's 64 MiB buffers, a few freed a second, held ~600 MB
+/// of RSS past what was allocated for ~10 s.
+fn release_freed() {
+    // MALLCTL_ARENAS_ALL
+    let name = b"arena.4096.purge\0";
+    // SAFETY: a NUL-terminated name, and purge reads and writes nothing
+    unsafe {
+        tikv_jemalloc_sys::mallctl(
+            name.as_ptr().cast(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        );
+    }
 }
 
 /// Creates segment `ord`.

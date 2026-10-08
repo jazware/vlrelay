@@ -90,7 +90,7 @@ pub enum Backpressure {
     /// durable (`--host-inflight-events`, `--host-inflight-mb`).
     InflightFull,
     /// The node's in-flight cap over every host (`--inflight-events`,
-    /// `--inflight-mb`).
+    /// `--inflight-mb`), or its memory budget (`--ingest-mem-mb`).
     NodeInflightFull,
     /// Its fair-queue slot is full: the lanes aren't taking frames, usually
     /// while they wait on identity lookups.

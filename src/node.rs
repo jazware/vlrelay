@@ -97,6 +97,8 @@ pub struct NodeConfig {
     pub upstream_limits: upstream::Limits,
     /// In-flight caps on what's read from upstreams (`upstream::flow`).
     pub inflight: upstream::flow::FlowLimits,
+    /// SO_RCVBUF of each upstream socket; 0: the kernel's autotuning.
+    pub upstream_rcvbuf_bytes: usize,
     /// Enforced when set (`node::policy`); without it hosts run at their
     /// tier's default limits and nothing is counted.
     pub policy: Option<policy::PolicyEngine>,
@@ -126,6 +128,7 @@ impl NodeConfig {
             identity: crate::identity::Options::default(),
             upstream_limits: upstream::Limits::default(),
             inflight: upstream::flow::FlowLimits::default(),
+            upstream_rcvbuf_bytes: 0,
             policy: None,
             cli_host_tier: Tier::Trusted,
             lag_cases: lag::LagCaseConfig::default(),
