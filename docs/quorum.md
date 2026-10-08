@@ -767,7 +767,11 @@ Every node keeps its upstream sockets, verify and lanes.
   the consistency check and bucket recovery all carry over, and salvage replays into the state too.
 - Host shards are log entries. The leader keeps the host table: every host, its tier and the member
   that owns it. A host's owner is the live member (heard from within `--qlog-host-failover-ms`, 2 s)
-  with the highest rendezvous hash, and only a dead owner's hosts move. A changed row rides the next
+  with the highest rendezvous hash, and a dead owner's hosts move at once. Every 5 s the leader also
+  moves up to 4 hosts (or 1/64 of the table, if more) from the member with the most to the one with
+  the fewest, among members live for 15 s, until no two differ by more than one. Of the busiest
+  member's hosts it moves the one the receiver's hash ranks highest, so a member that rejoins mostly
+  gets back the hosts it had, and an even spread never moves. A changed row rides the next
   appended entry as a state write (`h/{host}`), so a new leader starts from the old table with no
   reshuffle. Members read the table from the leader every `--qlog-host-poll-ms` (500 ms), with each
   host's newest committed cursor, so a node that gains a host resumes it from there. A member names

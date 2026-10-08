@@ -93,7 +93,9 @@ after a reconnect) is answered without an entry. Details: [Cluster](cluster.md#t
 
 The leader keeps the host table: every PDS, its tier and the member that reads it. A host's reader
 is the live member with the highest rendezvous hash for it. So when a node goes quiet for 2 s
-(`--qlog-host-failover-ms`), only its own hosts move, and they resume from their cursors. `--host`
+(`--qlog-host-failover-ms`), only its own hosts move, and they resume from their cursors. When it
+comes back and has stayed up for 15 s, the leader moves hosts back to it a few at a time (4 every 5 s,
+or 1/64 of the table on a big one) until no node reads more than one host more than another. `--host`
 and `requestCrawl` work on any node, since a host admitted anywhere goes into the leader's table.
 The leader can also find hosts on its own, from other relays' `listHosts` (`--bootstrap-relay`) and,
 with `--plc-export`, the PDSes the PLC export names. It only reads those lists and never asks another relay to crawl

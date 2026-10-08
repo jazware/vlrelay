@@ -23,8 +23,10 @@
 //! - Hosts: the leader keeps the host table (every host, its tier and the
 //!   member that owns it), changes ride the next entry's meta into the
 //!   state, and members read it from the leader every `host_poll`. Owners
-//!   are the live members by rendezvous hash: a dead member's hosts move,
-//!   nothing else does.
+//!   are the live members by rendezvous hash: a dead member's hosts move
+//!   at once, and a few hosts a round move from the busiest member to the
+//!   idlest until the spread is even (`rebalance_moves`), so a member that
+//!   rejoins gets its share back.
 //! - Cursors: each node sends its owned hosts' acked cursors every second;
 //!   they ride the log as in Phases 3-4, and a bucket recovery rewinds the
 //!   hosts to the recovery's cursors before a node's cursors count again.
@@ -387,16 +389,60 @@ struct HostsAsk {
 /// A host's owner among `live`: the highest hash of (member, host), so a
 /// member's departure moves only its own hosts.
 fn rendezvous<'a>(host: &str, live: &'a [String]) -> Option<&'a String> {
-    live.iter().max_by_key(|m| {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for b in m.bytes().chain([0xff]).chain(host.bytes()) {
-            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    live.iter().max_by_key(|m| affinity(m, host))
+}
+
+fn affinity(member: &str, host: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in member.bytes().chain([0xff]).chain(host.bytes()) {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    // a final mix: FNV's low bits barely move for a one-byte change
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^ (h >> 33)
+}
+
+/// A member must have been live this long before hosts move to it, so a
+/// flapping member isn't handed hosts it drops again, and a new term
+/// doesn't shuffle hosts before every member has acked it.
+const REBALANCE_SETTLE: Duration = Duration::from_secs(15);
+/// How often the leader moves a round of hosts toward an even spread.
+const REBALANCE_EVERY: Duration = Duration::from_secs(5);
+
+/// Hosts moved per round: every move reconnects a socket and replays it
+/// from its cursor, so a round is a few hosts, or ~1.5% of a big table.
+fn rebalance_budget(hosts: usize) -> usize {
+    (hosts / 64).max(4)
+}
+
+/// Up to `max` (host, new owner) moves that even out the hosts among
+/// `members`, each from the member with the most to the one with the
+/// fewest, until no two differ by more than one. Hosts whose owner isn't
+/// in `members` are `assign`'s. Of the busiest member's hosts, the one the
+/// receiver's hash ranks highest moves, so after a rejoin the hosts that
+/// go back are mostly the ones rendezvous gave the member before.
+fn rebalance_moves(rows: &BTreeMap<String, HostRow>, members: &[String], max: usize) -> Vec<(String, String)> {
+    let mut by: BTreeMap<&str, Vec<&str>> = members.iter().map(|m| (m.as_str(), Vec::new())).collect();
+    for (h, r) in rows {
+        if let Some(v) = r.owner.as_deref().and_then(|o| by.get_mut(o)) {
+            v.push(h.as_str());
         }
-        // a final mix: FNV's low bits barely move for a one-byte change
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51afd7ed558ccd);
-        h ^ (h >> 33)
-    })
+    }
+    let mut moves = Vec::new();
+    while moves.len() < max {
+        let Some((&hi, _)) = by.iter().max_by_key(|(_, v)| v.len()) else { break };
+        let Some((&lo, _)) = by.iter().min_by_key(|(_, v)| v.len()) else { break };
+        if by[hi].len() <= by[lo].len() + 1 {
+            break;
+        }
+        let from = by.get_mut(hi).expect("a member");
+        let i = (0..from.len()).max_by_key(|&i| affinity(lo, from[i])).expect("not empty");
+        let h = from.swap_remove(i);
+        by.get_mut(lo).expect("a member").push(h);
+        moves.push((h.to_string(), lo.to_string()));
+    }
+    moves
 }
 
 // ---------------------------------------------------------------- the leader's term
@@ -840,8 +886,30 @@ impl RelayHooks {
         i.hosts.version += 1;
     }
 
-    /// The term's assignment loop: while it leads, every `host_poll`.
+    /// One round of [`rebalance_moves`] among the members live for at
+    /// least [`REBALANCE_SETTLE`]; the moves ride the next entry.
+    fn rebalance(&self, term: &Term, settled: &[String]) {
+        let mut i = term.inner.lock();
+        let moves = rebalance_moves(&i.hosts.rows, settled, rebalance_budget(i.hosts.rows.len()));
+        if moves.is_empty() {
+            return;
+        }
+        self.stats.host_moves.fetch_add(moves.len() as u64, Ordering::Relaxed);
+        for (h, o) in moves {
+            let Some(row) = i.hosts.rows.get_mut(&h) else { continue };
+            tracing::info!(host = %h, from = ?row.owner, to = %o, epoch = term.epoch, "quorum: host rebalanced");
+            row.owner = Some(o);
+            let row = row.clone();
+            i.pending_rows.insert(h, row);
+        }
+        i.hosts.version += 1;
+    }
+
+    /// The term's assignment loop: while it leads, every `host_poll`, and
+    /// a rebalancing round every [`REBALANCE_EVERY`].
     async fn assign_loop(self: Arc<Self>, term: Arc<Term>) {
+        let mut since: HashMap<String, Instant> = HashMap::new();
+        let mut rebalanced = Instant::now();
         loop {
             let Some(n) = self.qnode() else { return };
             let Some(live) = n.live_members(term.epoch, self.cfg.host_failover) else { return };
@@ -849,6 +917,17 @@ impl RelayHooks {
                 return;
             }
             self.assign(&term, &live);
+            let now = Instant::now();
+            since.retain(|m, _| live.contains(m));
+            for m in &live {
+                since.entry(m.clone()).or_insert(now);
+            }
+            if now.duration_since(rebalanced) >= REBALANCE_EVERY {
+                rebalanced = now;
+                let settled: Vec<String> =
+                    live.iter().filter(|m| now.duration_since(since[*m]) >= REBALANCE_SETTLE).cloned().collect();
+                self.rebalance(&term, &settled);
+            }
             tokio::time::sleep(self.cfg.host_poll.min(Duration::from_millis(500))).await;
         }
     }
@@ -2899,6 +2978,93 @@ mod tests {
         let behind = ask(Some((full.epoch, full.version - 1))).await;
         assert!(!behind.same_rows && behind.rows.contains_key(HOST));
         c.shutdown();
+    }
+
+    fn spread(rows: &BTreeMap<String, HostRow>, members: &[String]) -> Vec<usize> {
+        members.iter().map(|m| rows.values().filter(|r| r.owner.as_ref() == Some(m)).count()).collect()
+    }
+
+    #[test]
+    fn a_rejoined_member_gets_its_share_back_a_few_hosts_a_round() {
+        let ids: Vec<String> = ["relay-1", "relay-2", "relay-3"].map(String::from).to_vec();
+        let mut rows: BTreeMap<String, HostRow> = (0..40)
+            .map(|n| {
+                let h = format!("pds-{n}.example.com");
+                let row = HostRow {
+                    hostname: h.clone(),
+                    tier: state::Tier::default(),
+                    first_seen: 0,
+                    owner: rendezvous(&h, &ids).cloned(),
+                    source: None,
+                    extra: Default::default(),
+                };
+                (h, row)
+            })
+            .collect();
+        let home: HashMap<String, String> =
+            rows.values().map(|r| (r.hostname.clone(), r.owner.clone().unwrap())).collect();
+        // relay-1 dies: its hosts go to the other two by rendezvous
+        let rest = &ids[1..];
+        for r in rows.values_mut() {
+            if r.owner.as_deref() == Some("relay-1") {
+                r.owner = rendezvous(&r.hostname, rest).cloned();
+            }
+        }
+        assert_eq!(spread(&rows, &ids)[0], 0);
+        // it rejoins: rounds of at most the budget until even
+        let budget = rebalance_budget(rows.len());
+        let (mut rounds, mut moved) = (0, 0);
+        loop {
+            let moves = rebalance_moves(&rows, &ids, budget);
+            if moves.is_empty() {
+                break;
+            }
+            assert!(moves.len() <= budget);
+            for (h, o) in moves {
+                rows.get_mut(&h).unwrap().owner = Some(o);
+                moved += 1;
+            }
+            rounds += 1;
+            assert!(rounds < 10, "never converged: {:?}", spread(&rows, &ids));
+        }
+        let s = spread(&rows, &ids);
+        assert!(s.iter().max().unwrap() - s.iter().min().unwrap() <= 1, "{s:?}");
+        assert!((13..=14).contains(&s[0]), "{s:?}");
+        // only about relay-1's share moved, and most of it went back home
+        assert!(moved <= 16, "{moved} moves for {s:?}");
+        let home_again =
+            rows.values().filter(|r| r.owner.as_deref() == Some("relay-1") && home[&r.hostname] == "relay-1").count();
+        assert!(home_again * 2 >= s[0], "{home_again} of {} back home", s[0]);
+        // even is stable
+        assert!(rebalance_moves(&rows, &ids, budget).is_empty());
+    }
+
+    #[test]
+    fn rebalancing_leaves_unsettled_members_and_their_hosts_alone() {
+        let ids: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+        let row = |n: usize, owner: &str| {
+            let h = format!("h{n}");
+            (
+                h.clone(),
+                HostRow {
+                    hostname: h,
+                    tier: state::Tier::default(),
+                    first_seen: 0,
+                    owner: Some(owner.into()),
+                    source: None,
+                    extra: Default::default(),
+                },
+            )
+        };
+        // c owns 10 but hasn't settled; a and b are within one of each other
+        let rows: BTreeMap<String, HostRow> = (0..5)
+            .map(|n| row(n, "a"))
+            .chain((5..9).map(|n| row(n, "b")))
+            .chain((9..19).map(|n| row(n, "c")))
+            .collect();
+        assert!(rebalance_moves(&rows, &ids[..2], 4).is_empty());
+        assert!(rebalance_moves(&rows, &ids[..1], 4).is_empty());
+        assert!(rebalance_moves(&rows, &[], 4).is_empty());
     }
 
     /// What a member's poll of a 3,400-host table costs, rows carrying
