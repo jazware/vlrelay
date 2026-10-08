@@ -60,7 +60,7 @@ use metrics::{Dash, HostRejects, RejectNote, Ttf};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use vlsync_store::store::Store;
@@ -229,6 +229,18 @@ fn state_rejection(e: &state::Reject) -> Rejection {
     Rejection { reason, detail: e.to_string() }
 }
 
+/// A lane's queue: unbounded, since every frame holds its upstream
+/// in-flight permit until it's done and the caps bound them. A bounded lane
+/// that filled behind one slow event blocked the one dispatcher, and every
+/// other lane with it.
+struct Lane {
+    tx: mpsc::UnboundedSender<Job>,
+    queued: AtomicUsize,
+}
+
+/// The depth a lane counts as full at, for the lag cases' pressure.
+const LANE_FULL: usize = 256;
+
 struct Job {
     frame: UpstreamFrame,
     received: Instant,
@@ -254,7 +266,7 @@ pub struct Node {
     pub policy: Option<Arc<policy::PolicyHooks>>,
     /// Per host: sockets below this epoch are fenced (`forward::Fence`).
     fences: Mutex<crate::types::FastMap<Host, Arc<AtomicU64>>>,
-    lanes: Vec<mpsc::Sender<Job>>,
+    lanes: Vec<Lane>,
     prefetch: Arc<tokio::sync::Semaphore>,
     pub ingest: tokio::runtime::Handle,
     pub started_ms: i64,
@@ -325,8 +337,8 @@ impl Node {
         let mut lane_tx = Vec::new();
         let mut lane_rx = Vec::new();
         for _ in 0..cfg.lanes.max(1) {
-            let (tx, rx) = mpsc::channel(256);
-            lane_tx.push(tx);
+            let (tx, rx) = mpsc::unbounded_channel();
+            lane_tx.push(Lane { tx, queued: AtomicUsize::new(0) });
             lane_rx.push(rx);
         }
         let node = Arc::new(Node {
@@ -358,8 +370,8 @@ impl Node {
                 n.acks.connected(host, epoch, cursor, restarted);
             }
         }));
-        for rx in lane_rx {
-            ingest_handle.spawn(node.clone().lane(rx));
+        for (i, rx) in lane_rx.into_iter().enumerate() {
+            ingest_handle.spawn(node.clone().lane(i, rx));
         }
         ingest_handle.spawn(node.clone().dispatch(rx));
         tokio::spawn(node.clone().tap());
@@ -399,7 +411,8 @@ impl Node {
             let lane = &self.lanes[lane_of(did, self.lanes.len())];
             let fence = self.fence(&f.host, f.epoch);
             metrics::LANE_QUEUED.inc();
-            if lane.send(Job { frame: f, received, first, fence }).await.is_err() {
+            lane.queued.fetch_add(1, Ordering::Relaxed);
+            if lane.tx.send(Job { frame: f, received, first, fence }).is_err() {
                 return;
             }
         }
@@ -424,7 +437,7 @@ impl Node {
         }
     }
 
-    async fn lane(self: Arc<Self>, mut rx: mpsc::Receiver<Job>) {
+    async fn lane(self: Arc<Self>, i: usize, mut rx: mpsc::UnboundedReceiver<Job>) {
         use futures::StreamExt;
         use futures::stream::FuturesUnordered;
         // the leader's answers to this lane's events, polled between jobs
@@ -440,6 +453,7 @@ impl Node {
                 },
             };
             metrics::LANE_QUEUED.dec();
+            self.lanes[i].queued.fetch_sub(1, Ordering::Relaxed);
             // held until the event is done, which bounds what's in flight
             let permit = job.frame.permit.take();
             let host = job.frame.host.clone();
@@ -627,8 +641,8 @@ impl Node {
 
     /// How full this node's in-flight caps and busiest lane are.
     fn pressure(&self) -> lag::Pressure {
-        let lanes =
-            self.lanes.iter().map(|l| 1.0 - l.capacity() as f64 / l.max_capacity().max(1) as f64).fold(0.0, f64::max);
+        let deepest = self.lanes.iter().map(|l| l.queued.load(Ordering::Relaxed)).max().unwrap_or(0);
+        let lanes = (deepest as f64 / LANE_FULL as f64).min(1.0);
         lag::Pressure { inflight: self.manager.inflight_fill(), lanes }
     }
 
