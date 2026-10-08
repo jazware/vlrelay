@@ -2980,6 +2980,49 @@ mod tests {
         c.shutdown();
     }
 
+    /// A host's next owner resumes from the newest cursor committed for it,
+    /// not the last flush's (up to 30 s older, which a PDS with a short
+    /// replay window answers with `OutdatedCursor` and a gap), on the same
+    /// leader and on the next one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_moved_host_resumes_from_its_newest_committed_cursor_not_the_flushed_one() {
+        let ident = MapIdentity::new();
+        let did = crate::state::tests::plc(1);
+        ident.set(&did, HOST, 1);
+        let base = cluster_cfg(ident, 0);
+        let cfg: ConfigFn = Arc::new(move |id: &str, addrs: &HashMap<String, String>| {
+            let mut c = base(id, addrs);
+            c.flush.as_mut().expect("a flush").interval = Duration::from_secs(3600);
+            c
+        });
+        let mut c = Cluster::with_cfg(3, None, Some(cfg), 64 << 20).await;
+        c.wait_leader(Duration::from_secs(5)).await;
+        let client = c.client();
+        let from = owner(&client).await;
+        let cursors = encode_cursors(&BTreeMap::from([(HOST.to_string(), 4242)]));
+        let d = client.submit_events(vec![commit(&did, 0, &from)], cursors, Bytes::new(), 0).await;
+        assert!(matches!(d.outcomes[..], [Outcome::Appended(_)]), "{:?}", d.outcomes);
+        let table_cursor = |client: Arc<Client>| async move {
+            let t = Instant::now();
+            loop {
+                if let Ok(b) = client.ask_leader("leader:hosts", Bytes::new(), Duration::from_secs(1)).await
+                    && let Ok(t) = serde_json::from_slice::<HostTable>(&b)
+                    && t.cursors.get(HOST) == Some(&4242)
+                {
+                    return;
+                }
+                assert!(t.elapsed() < Duration::from_secs(10), "the table never had the committed cursor");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        table_cursor(client.clone()).await;
+        let l = c.wait_leader(Duration::from_secs(5)).await;
+        assert_eq!(c.nodes[&l].node.status().flushed, 0, "nothing flushed: the cursor is the log's");
+        c.kill(&l);
+        table_cursor(client.clone()).await;
+        c.shutdown();
+    }
+
     fn spread(rows: &BTreeMap<String, HostRow>, members: &[String]) -> Vec<usize> {
         members.iter().map(|m| rows.values().filter(|r| r.owner.as_ref() == Some(m)).count()).collect()
     }

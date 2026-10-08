@@ -222,7 +222,8 @@ and its chaos harness are deleted. Its runs found a few things that still shape 
   later soaks came from hosts whose window ran out while the relay couldn't keep up. With
   fakepds's 64 MB window that's about a minute of trouble at that rate, where a production PDS
   keeps days. The relay counts and logs an upstream `OutdatedCursor` and takes what comes, so the
-  accounts with gaps desynchronize on their next commit and wait for a `#sync`.
+  accounts with gaps desynchronize on their next commit, and the node reading the host resyncs
+  each from its PDS ([The quorum log](quorum.md#the-relay-on-the-log)).
 - A host whose sequence restarted needs a replay from 0 ([below](#futurecursor-replay-from-0)).
 
 And a few lessons about the harness itself:
@@ -256,8 +257,8 @@ sequence from its first event (`src/upstream/client.rs`):
 - The cost is one full replay of the host's window, which the in-flight caps bound in memory.
 
 The alternative, marking the affected accounts for resync, needs to know which accounts the gap
-touched, which we can't know without the missing events. The relay would then wait for each
-account's next `#sync`, which may never come. Replaying from 0 loses nothing the host still has.
-When the reconnect comes long after the restart, the host's window may no longer reach back to it
-and answers `OutdatedCursor` at cursor 0, and those accounts desynchronize. A `FutureCursor` in
+touched, which we can't know without the missing events. Replaying from 0 loses nothing the host
+still has. When the reconnect comes long after the restart, the host's window may no longer reach
+back to it and answers `OutdatedCursor` at cursor 0. Those accounts desynchronize on their next
+commit and are resynced from the PDS then. A `FutureCursor` in
 answer to cursor 0 is a broken host, and the relay backs off.

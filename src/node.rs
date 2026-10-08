@@ -45,6 +45,7 @@ pub mod metrics;
 pub mod patience;
 pub mod policy;
 pub mod quorum;
+pub mod resync;
 
 use crate::event::{self, Kind, SeqSpan};
 use crate::identity::{HttpFetch, Identity, IdentityCache};
@@ -277,6 +278,7 @@ pub struct Node {
     /// leader's hooks and the host table.
     pub quorum: Arc<quorum::Glue>,
     lag: Mutex<lag::LagWatch>,
+    pub resync: resync::Resync,
 }
 
 /// Scheme for each `--host` given as a URL, so a dev upstream on
@@ -366,6 +368,7 @@ impl Node {
             started_ms: upstream::host::now_ms() as i64,
             quorum,
             lag: Mutex::new(lag::LagWatch::new(cfg.lag_cases)),
+            resync: resync::Resync::default(),
         });
         let weak = Arc::downgrade(&node);
         manager.on_connect(Arc::new(move |host: &Host, epoch, cursor, restarted| {

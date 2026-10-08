@@ -84,6 +84,7 @@ relay sees every one as a distinct host, `127.0.0.1:30007` say. A host serves:
 | `com.atproto.server.describeServer` | `did:web:h<g>.fakepds.test` and the host's handle domain |
 | `com.atproto.sync.listRepos` | every account that has a commit, with its head and rev |
 | `com.atproto.sync.getRepoStatus`, `getLatestCommit` | the account's head (always `active`) |
+| `com.atproto.sync.getBlocks` | the current commit's block only (what a relay resyncing an account asks for). Any other CID is `BlockNotFound`. |
 | `com.atproto.sync.getRepo` | the whole repo as a CAR (`application/vnd.ipld.car`): the commit as the root, then every MST node and record in vlpds's streamable order. `since` is ignored, so it's always the full repo. |
 | `/xrpc/_health` | 200 |
 

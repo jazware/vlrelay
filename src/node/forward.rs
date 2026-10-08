@@ -108,6 +108,9 @@ impl Node {
             Ok(Ok(Outcome::Rejected(m))) => {
                 let (reason, detail) = m.split_once(": ").unwrap_or((m.as_str(), ""));
                 let r = Rejection { reason: static_reason(reason), detail: detail.to_string() };
+                if kind == "commit" && super::resync::RESYNC_REASONS.contains(&r.reason) {
+                    self.want_resync(&host, &did);
+                }
                 self.reject(&host, &did, useq, r);
                 self.finish(&host, useq, epoch, None);
             }

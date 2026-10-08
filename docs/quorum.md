@@ -785,6 +785,22 @@ Every node keeps its upstream sockets, verify and lanes.
 - The leader admits a host's events only from the member its table names. Without that, a moved
   host's old owner (reading until its next poll) and the new one interleaved a DID's events at the
   leader in testing.
+- A moved host resumes from the newest cursor committed for it. That trails the old owner's acked
+  cursor by about a second, since cursors ride the log once a second, and a new leader has every
+  cursor it emitted as a follower, not just the last flush's. A move can't make up the old
+  owner's own lag, though. A host moved while its owner is 10 s behind (cold DID caches at startup,
+  say) is read again from 10 s back, and a PDS that keeps less history than that answers
+  `OutdatedCursor` and skips ahead. The node logs what was skipped ("upstream skipped past our
+  cursor").
+- A desynchronized account is resynced from its PDS. An event the relay never got (a skipped
+  window, a long outage) leaves the account's next commit building on a head the relay doesn't
+  hold, and every later commit with it. So the host owner that gets a `prev_data_mismatch` or
+  `desynchronized` rejection asks the PDS for the account's head (`getLatestCommit`, then that
+  block from `getBlocks`), checks its signature as for any `#sync`, and sends it to the leader as
+  one. The leader resets the chain to it and emits the `#sync`, so consumers resync too. Each host
+  gets one request at a time and at most 5 accounts a second, 8 hosts are fetched from at once,
+  and an account is asked for at most once a minute (`src/node/resync.rs`,
+  `vlrelay_resyncs_total`).
 - Retention is a loop. Each leader term runs a retention pass every `--qlog-retain-every-secs` (600)
   with `--qlog-retain-hours` (72, 0 turns it off). It deletes segments past the horizon oldest first,
   after publishing the new floor (`pruned_seq` in `retain/qlog`), and old state paths that nothing

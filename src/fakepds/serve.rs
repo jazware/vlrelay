@@ -288,6 +288,7 @@ pub fn router(h: Arc<HostState>) -> Router {
         .route("/xrpc/com.atproto.sync.getRepoStatus", get(repo_status))
         .route("/xrpc/com.atproto.sync.getLatestCommit", get(latest_commit))
         .route("/xrpc/com.atproto.sync.getRepo", get(get_repo))
+        .route("/xrpc/com.atproto.sync.getBlocks", get(get_blocks))
         .route("/xrpc/_health", get(|| async { Json(json!({"version": "fakepds"})) }))
         .fallback(|| async {
             xrpc_err(StatusCode::NOT_IMPLEMENTED, "MethodNotImplemented", "fakepds doesn't serve this")
@@ -376,6 +377,26 @@ async fn get_repo(State(h): State<Arc<HostState>>, Query(q): Query<HashMap<Strin
         Ok(car) => ([(axum::http::header::CONTENT_TYPE, "application/vnd.ipld.car")], car).into_response(),
         Err(e) => xrpc_err(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", &e.to_string()),
     }
+}
+
+/// The current commit's block, the one block a relay resyncing an account
+/// asks for. Any other CID (an older commit, a tree node) is answered as
+/// missing.
+async fn get_blocks(State(h): State<Arc<HostState>>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let (_, i) = match own_did(&h, &q) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let Some(s) = h.repos.get(i) else {
+        return xrpc_err(StatusCode::BAD_REQUEST, "RepoNotFound", "no commit yet");
+    };
+    if q.get("cids").and_then(|c| Cid::parse(c).ok()) != Some(s.commit) {
+        return xrpc_err(StatusCode::BAD_REQUEST, "BlockNotFound", "only the current commit's block is kept");
+    }
+    let mut car = Vec::with_capacity(s.signed.len() + 96);
+    vlatproto::car::write_header(&mut car, &s.commit);
+    vlatproto::car::write_block(&mut car, &s.commit, &s.signed);
+    ([(axum::http::header::CONTENT_TYPE, "application/vnd.ipld.car")], car).into_response()
 }
 
 async fn subscribe(

@@ -156,6 +156,7 @@ impl HostTask {
         let mut last_rx = Instant::now();
         let mut ping = tokio::time::interval_at(Instant::now() + cfg.ping_interval, cfg.ping_interval);
         let mut got_frames = false;
+        let mut outdated = false;
         let mut last_seq = self.entry.received_seq();
         let horizon_ms = cfg.event_horizon.as_millis() as i64;
         // the limiter's buckets run on the host's clock (`super::clock`),
@@ -220,6 +221,7 @@ impl HostTask {
                 Ok(Peek::Info { name, message }) => {
                     if name == "OutdatedCursor" {
                         self.entry.count_error(|c| c.outdated_cursor += 1);
+                        outdated = true;
                     }
                     tracing::info!(host = %self.entry.host.0, name, message, "upstream info");
                     continue;
@@ -266,6 +268,12 @@ impl HostTask {
             };
             let upstream_seq = match seq {
                 Some(s) => {
+                    if std::mem::take(&mut outdated) {
+                        // what the host no longer had: its accounts' next commits won't chain
+                        // until they're resynced
+                        let skipped = cursor.map(|c| s - c - 1);
+                        tracing::warn!(host = %self.entry.host.0, ?cursor, first = s, ?skipped, "upstream skipped past our cursor");
+                    }
                     if last_seq.is_some_and(|l| s <= l) {
                         self.entry.count_error(|c| c.seq_regressions += 1);
                         continue;
