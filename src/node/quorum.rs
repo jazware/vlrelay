@@ -2085,6 +2085,26 @@ impl Glue {
         futures::future::join_all(asks).await
     }
 
+    /// `topic` asked of every other member and learner at once, each
+    /// bounded by `timeout`.
+    pub async fn ask_peers(&self, topic: &str, body: Bytes, timeout: Duration) -> Vec<(String, Result<Bytes, String>)> {
+        let st = self.qnode.status();
+        let mut ids: Vec<String> = st.members.iter().chain(&st.learners).filter(|m| **m != self.id).cloned().collect();
+        ids.sort();
+        ids.dedup();
+        let asks = ids.into_iter().map(|id| {
+            let body = body.clone();
+            async move {
+                let r = match self.qnode.addr_of(&id) {
+                    None => Err(format!("no address for {id}")),
+                    Some(a) => crate::qlog::client::ask(&a, topic, body, timeout).await.map_err(|e| format!("{e:#}")),
+                };
+                (id, r)
+            }
+        });
+        futures::future::join_all(asks).await
+    }
+
     /// The qlog admin token, for asks that change something.
     pub fn admin_token(&self) -> Option<&str> {
         self.setup.admin_token.as_deref().filter(|t| !t.is_empty())

@@ -5,10 +5,10 @@
 //! the leader's host table to hold it (`Glue::settle_host`). The cluster and Quorum views are
 //! the quorum log's members (`node::quorum::Glue`).
 //!
-//! Numbers are this node's own: the hosts it reads, its consumers, its
-//! rates. Other members' rates and hosts show in the cluster view (from
-//! their statuses); their consumers, host details and reconnects are on
-//! their own dashboards. Accounts are the leader's records, so an account
+//! The overview, pipeline view and public page add up every member's own
+//! report (`node:report`, asked at most once a second; a member that
+//! doesn't answer in time is stale for the round). Host details and
+//! reconnects are the reading node's, on its own dashboard. Accounts are the leader's records, so an account
 //! lookup or a takedown answers on any node only through the leader's log
 //! (takedowns) or on the leader itself (lookups).
 
@@ -52,6 +52,39 @@ pub struct NodeAdmin {
     /// How long a host action waits to see its write in the cluster's host
     /// table before answering `pending`.
     settle: Duration,
+    /// Every member's report, asked at most every [`MEMBERS_TTL`]: the
+    /// overview and the public page poll every second or so.
+    members: Mutex<Option<(Instant, Arc<Vec<Member>>)>>,
+    members_refresh: tokio::sync::Mutex<()>,
+    /// When each member last answered (unix ms), for a stale member's row.
+    last_ok: Mutex<HashMap<String, i64>>,
+}
+
+const MEMBERS_TTL: Duration = Duration::from_secs(1);
+/// A member slower than this to report is shown stale for the round.
+const MEMBER_REPORT_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// This node's report and its peers' answers to `node:report` as the
+/// dashboard's members: a peer that didn't answer, or answered nonsense, is
+/// stale (zeros, left out of every sum) and the rest still add up.
+fn gather_members(
+    local: NodeReport,
+    peers: Vec<(String, Result<Bytes, String>)>,
+    last_ok: &mut HashMap<String, i64>,
+) -> Vec<Member> {
+    let mut out = vec![Member::ok(local)];
+    for (id, r) in peers {
+        let r = r.and_then(|b| serde_json::from_slice::<NodeReport>(&b).map_err(|e| format!("a bad report: {e}")));
+        out.push(match r {
+            Ok(rep) => {
+                last_ok.insert(id, rep.time_ms);
+                Member::ok(rep)
+            }
+            Err(e) => Member::stale(&id, "unreachable", e, last_ok.get(&id).copied().unwrap_or(0)),
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
 }
 
 /// [`NodeAdmin::settle`]'s default: the leader's table is a round trip
@@ -139,6 +172,9 @@ impl NodeAdmin {
             feed: crate::admin::changes::ChangeFeed::new(&node.cfg.node_id),
             watch: Mutex::new(changes::Watch::default()),
             settle: HOST_ACTION_SETTLE,
+            members: Mutex::new(None),
+            members_refresh: tokio::sync::Mutex::new(()),
+            last_ok: Mutex::new(HashMap::new()),
             node,
         }
     }
@@ -158,8 +194,24 @@ impl NodeAdmin {
         &self.node.cfg.node_id
     }
 
+    /// Every member of the quorum log with its own report (`node:report`).
     async fn members(&self) -> Arc<Vec<Member>> {
-        Arc::new(vec![Member::ok(self.local_report().await)])
+        let fresh =
+            || self.members.lock().as_ref().filter(|(at, _)| at.elapsed() < MEMBERS_TTL).map(|(_, m)| m.clone());
+        if let Some(m) = fresh() {
+            return m;
+        }
+        let _g = self.members_refresh.lock().await;
+        if let Some(m) = fresh() {
+            return m;
+        }
+        let (local, peers) = tokio::join!(
+            self.local_report(),
+            self.node.quorum.ask_peers("node:report", Bytes::new(), MEMBER_REPORT_TIMEOUT)
+        );
+        let m = Arc::new(gather_members(local, peers, &mut self.last_ok.lock()));
+        *self.members.lock() = Some((Instant::now(), m.clone()));
+        m
     }
 
     /// (cores busy since the last read at least a second ago, resident bytes).
@@ -1509,6 +1561,7 @@ impl crate::node::quorum::LocalAsk for NodeAdmin {
         Box::pin(async move {
             let v = match topic {
                 "node:consumers" => serde_json::to_value(self.local_consumers()).ok()?,
+                "node:report" => serde_json::to_value(self.local_report().await).ok()?,
                 "node:changes" => self.answer_pull(&body)?,
                 "node:settings" => serde_json::to_value(self.settings.as_ref()?).ok()?,
                 "node:usage" => serde_json::to_value(self.local_usage().await.ok()?).ok()?,
@@ -1599,6 +1652,50 @@ pub(crate) fn merge_rejects(all: Vec<admin::RejectTop>, limit: usize) -> Vec<adm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn report(node: &str, role: &str, connected: u32, rate: f64) -> NodeReport {
+        NodeReport {
+            node: node.into(),
+            role: role.into(),
+            time_ms: 1_000,
+            events_in_per_sec: rate,
+            hosts_by_status: [(admin::HostStatus::Connected, connected)].into(),
+            ttf_p50_ms: 3.0,
+            ttf_p99_ms: 9.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn members_add_up_across_the_cluster_and_a_down_member_is_stale() {
+        let peer = serde_json::to_vec(&report("n2", "follower", 14, 500.0)).unwrap();
+        let mut last_ok = HashMap::from([("n3".to_string(), 777)]);
+        let peers =
+            vec![("n3".to_string(), Err("no answer from n3".to_string())), ("n2".to_string(), Ok(Bytes::from(peer)))];
+        let members = gather_members(report("n1", "leader", 12, 400.0), peers, &mut last_ok);
+        let ids: Vec<&str> = members.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["n1", "n2", "n3"]);
+        let n3 = &members[2];
+        assert!(n3.is_stale());
+        assert_eq!((n3.role.as_str(), n3.last_ok_ms), ("unreachable", 777));
+        assert_eq!(last_ok["n2"], 1_000);
+
+        let o = fleet::overview(&members, 0, 2_000);
+        assert_eq!(o.hosts_connected, 26);
+        assert_eq!(o.events_in_per_sec, 900.0);
+        assert_eq!(o.by_node.len(), 3);
+        let p = crate::admin::public::project(&o, None);
+        assert_eq!((p.nodes, p.nodes_healthy, p.hosts_connected), (3, 2, 26));
+        assert_eq!(p.health, crate::admin::public::Health::Degraded);
+    }
+
+    #[test]
+    fn a_garbled_report_is_a_stale_member_not_an_error() {
+        let peers = vec![("n2".to_string(), Ok(Bytes::from_static(b"{not json")))];
+        let members = gather_members(report("n1", "leader", 1, 1.0), peers, &mut HashMap::new());
+        assert!(members[1].is_stale());
+        assert!(members[1].error.as_deref().unwrap().starts_with("a bad report"));
+    }
 
     fn view(tier: Tier, st: HostStatus, bp: Option<Backpressure>) -> HostView {
         let mut record = crate::upstream::HostRecord::new(&Host("pds.example.com".into()), tier);
