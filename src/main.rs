@@ -335,6 +335,20 @@ struct QuorumArgs {
     /// MiB, four parts blocks to one of indexes and filters.
     #[arg(long, env = "VLRELAY_SLATEDB_CACHE_MB", default_value_t = vlrelay::qlog::cache::DEFAULT_MB)]
     slatedb_cache_mb: u64,
+    /// Of --slatedb-cache-mb, MiB for indexes and filters (default: a
+    /// fifth). With --slatedb-disk-cache-dir the blocks are a local read
+    /// anyway, and a filter or index that misses is megabytes.
+    #[arg(long, env = "VLRELAY_SLATEDB_META_MB")]
+    slatedb_meta_mb: Option<u64>,
+    /// Keeps the state's and the PLC seeds' SSTs on this local disk
+    /// (SlateDB's object-store cache), so reads past the memory cache don't
+    /// go to the bucket. Unset: no disk cache.
+    #[arg(long, env = "VLRELAY_SLATEDB_DISK_CACHE_DIR")]
+    slatedb_disk_cache_dir: Option<PathBuf>,
+    /// The disk cache's size in MiB, both databases together (an eighth,
+    /// at least 64 MiB, for the state).
+    #[arg(long, env = "VLRELAY_SLATEDB_DISK_CACHE_MB", default_value_t = 16384)]
+    slatedb_disk_cache_mb: u64,
 }
 
 fn quorum_setup(q: &QuorumArgs, node_id: &str) -> anyhow::Result<vlrelay::node::quorum::QuorumSetup> {
@@ -375,7 +389,8 @@ fn quorum_setup(q: &QuorumArgs, node_id: &str) -> anyhow::Result<vlrelay::node::
     vlrelay::qlog::state::set_compactor_poll(Duration::from_millis(q.qlog_state_compactor_poll_ms));
     let bounds = vlrelay::qlog::state::Bounds::STATE.parse(&q.qlog_state_slatedb);
     vlrelay::qlog::state::set_state_bounds(bounds.map_err(|e| anyhow::anyhow!("--qlog-state-slatedb: {e}"))?);
-    vlrelay::qlog::cache::configure(q.slatedb_cache_mb);
+    vlrelay::qlog::cache::configure_split(q.slatedb_cache_mb, q.slatedb_meta_mb);
+    vlrelay::qlog::cache::configure_disk(q.slatedb_disk_cache_dir.clone(), q.slatedb_disk_cache_mb);
     if let Some(at) = q.qlog_crash_at.clone().filter(|a| !a.is_empty()) {
         use vlrelay::qlog::flush::Step;
         let only: Option<Step> = if at == "any" { None } else { Some(at.parse().map_err(anyhow::Error::msg)?) };

@@ -11,6 +11,13 @@
 //!
 //! `--keep` reopens a database left behind (`--tail-secs 0` leaves its
 //! compactions owed), the restart a node in an OOM loop goes through.
+//!
+//! `--lookups N` then reads N seeds at `--lookup-concurrency`, a share
+//! `--hit-pct` of them for DIDs the fill wrote (the DIDs are a function
+//! of their index, so `--keep --rows 0 --known <n>` looks up a database
+//! filled before), through the leader's writer or with `--reader` a
+//! member's reader, and reports p50/p99 and bucket GETs per lookup.
+//! `--disk-cache-dir` and `--meta-mb` are the node's flags.
 
 use bytes::Bytes;
 use clap::Parser;
@@ -60,6 +67,28 @@ struct Cli {
     /// The shared block cache, as `--slatedb-cache-mb`.
     #[arg(long, default_value_t = vlrelay::qlog::cache::DEFAULT_MB)]
     cache_mb: u64,
+    /// As `--slatedb-meta-mb`.
+    #[arg(long)]
+    meta_mb: Option<u64>,
+    /// As `--slatedb-disk-cache-dir` (emptied first, unless --keep).
+    #[arg(long)]
+    disk_cache_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 16384)]
+    disk_cache_mb: u64,
+    /// Seed lookups after the fill.
+    #[arg(long, default_value_t = 0)]
+    lookups: u64,
+    #[arg(long, default_value_t = 32)]
+    lookup_concurrency: usize,
+    /// Percent of lookups for DIDs the database holds.
+    #[arg(long, default_value_t = 90)]
+    hit_pct: u32,
+    /// DIDs a database reopened with --keep holds (default: --rows).
+    #[arg(long)]
+    known: Option<u64>,
+    /// Looks up through a member's reader instead of the leader's writer.
+    #[arg(long)]
+    reader: bool,
 }
 
 fn rss_kb(field: &str) -> u64 {
@@ -83,10 +112,52 @@ fn dir_bytes(d: &std::path::Path) -> u64 {
         .sum()
 }
 
-fn did(rng: &mut impl rand::Rng) -> String {
+/// The `i`th DID: random-looking, and the same in every run.
+fn did(i: u64) -> String {
     const B32: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let s: String = (0..24).map(|_| B32[rng.gen_range(0..32)] as char).collect();
+    let (mut a, mut b) = (splitmix(i), splitmix(i ^ 0x5bd1_e995_0000_0000));
+    let s: String = (0..24)
+        .map(|n| {
+            let c = if n < 12 { a & 31 } else { b & 31 };
+            if n < 12 { a >>= 5 } else { b >>= 5 }
+            B32[c as usize] as char
+        })
+        .collect();
     format!("did:plc:{s}")
+}
+
+fn splitmix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// A row shaped like the export's: a 35-byte multikey, and a host from a
+/// skewed set of ~26-character names (the real average is 26).
+fn seed(i: u64, created_ms: u64) -> Seed {
+    let h = splitmix(i ^ 0xabcd);
+    let mut key = vec![0xe7u8, 0x01];
+    key.extend((0..33u64).map(|n| (splitmix(h ^ n) & 0xff) as u8));
+    let host = match h % 100 {
+        0..=35 => "pds.example-big.com".to_string(),
+        36..=55 => format!("shroom{}.us-east.host.example.net", h % 100),
+        _ => format!("pds{}.example.org", h % 20_000),
+    };
+    Seed { created_ms, tombstone: false, key: Some(Bytes::from(key)), pds: Some(host), pds_http: false, lookup: false }
+}
+
+fn get_count() -> u64 {
+    prometheus::gather()
+        .iter()
+        .filter(|f| f.name() == "vlpds_object_store_requests_total")
+        .flat_map(|f| f.get_metric().iter())
+        .filter(|m| {
+            m.get_label().iter().any(|l| l.name() == "op" && l.value().starts_with("get"))
+                && m.get_label().iter().any(|l| l.name() == "client" && l.value() == "qlog_plc")
+        })
+        .map(|m| m.get_counter().get_value() as u64)
+        .sum()
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -97,9 +168,13 @@ async fn main() -> anyhow::Result<()> {
         s => Bounds::SEEDS.parse(s).map_err(anyhow::Error::msg)?,
     };
     vlrelay::qlog::state::set_seed_bounds(bounds);
-    vlrelay::qlog::cache::configure(a.cache_mb);
+    vlrelay::qlog::cache::configure_split(a.cache_mb, a.meta_mb);
+    vlrelay::qlog::cache::configure_disk(a.disk_cache_dir.clone(), a.disk_cache_mb);
     if !a.keep {
         let _ = std::fs::remove_dir_all(&a.dir);
+        if let Some(d) = &a.disk_cache_dir {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
     std::fs::create_dir_all(&a.dir)?;
     let fs = object_store::local::LocalFileSystem::new_with_prefix(&a.dir)?;
@@ -127,8 +202,6 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!("bounds: {bounds}");
     let w = SeedWriter::open(&store).await?;
-    let mut rng = rand::thread_rng();
-    let key = Bytes::from(vec![0xe7u8; 35]);
     let t0 = Instant::now();
     let mut written = 0u64;
     let mut since_flush = 0u64;
@@ -136,19 +209,7 @@ async fn main() -> anyhow::Result<()> {
     while written < a.rows {
         let n = (a.batch as u64).min(a.rows - written);
         let now_ms = 1_700_000_000_000 + written;
-        let rows: Vec<(String, Seed)> = (0..n)
-            .map(|_| {
-                let seed = Seed {
-                    created_ms: now_ms,
-                    tombstone: false,
-                    key: Some(key.clone()),
-                    pds: Some("pds.example.com".into()),
-                    pds_http: false,
-                    lookup: false,
-                };
-                (did(&mut rng), seed)
-            })
-            .collect();
+        let rows: Vec<(String, Seed)> = (written..written + n).map(|i| (did(i), seed(i, now_ms))).collect();
         w.apply(rows).await?;
         written += n;
         since_flush += n;
@@ -170,7 +231,13 @@ async fn main() -> anyhow::Result<()> {
     let fill_peak = peak.load(Relaxed);
     eprintln!("filled {written} rows in {fill:.1}s; holding {}s for compactions", a.tail_secs);
     tokio::time::sleep(Duration::from_secs(a.tail_secs)).await;
-    w.close().await;
+    let lookups = if a.lookups > 0 {
+        let known = a.known.unwrap_or(written).max(1);
+        Some(lookups(&a, &store, Arc::new(w), known).await?)
+    } else {
+        w.close().await;
+        None
+    };
     done.store(true, Relaxed);
     let _ = sampler.join();
     println!(
@@ -182,5 +249,67 @@ async fn main() -> anyhow::Result<()> {
         rss_kb("VmHWM:") >> 10,
         dir_bytes(&a.dir) >> 20,
     );
+    if let Some(l) = lookups {
+        println!("{l}");
+    }
     Ok(())
+}
+
+async fn lookups(a: &Cli, store: &vlsync_store::store::Store, w: Arc<SeedWriter>, known: u64) -> anyhow::Result<String> {
+    use vlrelay::plc_seed::SeedReader;
+    vlrelay::plc_seed::set_read_slots(a.lookup_concurrency);
+    let r = SeedReader::new(store.clone());
+    if a.reader {
+        w.close().await;
+    } else {
+        r.set_writer(w.clone()).await;
+    }
+    let hist = Arc::new(parking_lot::Mutex::new(hdrhistogram::Histogram::<u64>::new(3)?));
+    let (found, next) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let gets0 = get_count();
+    let t0 = Instant::now();
+    let mut tasks = Vec::new();
+    for _ in 0..a.lookup_concurrency {
+        let (r, hist, found, next) = (r.clone(), hist.clone(), found.clone(), next.clone());
+        let (n, hit_pct) = (a.lookups, a.hit_pct as u64);
+        tasks.push(tokio::spawn(async move {
+            loop {
+                let i = next.fetch_add(1, Relaxed);
+                if i >= n {
+                    return;
+                }
+                let h = splitmix(i ^ 0x1234_5678);
+                let d = if h % 100 < hit_pct { did(h % known) } else { did(u64::MAX - h % (1 << 40)) };
+                let t = Instant::now();
+                if r.get(&d).await.is_some() {
+                    found.fetch_add(1, Relaxed);
+                }
+                hist.lock().record(t.elapsed().as_micros() as u64).ok();
+            }
+        }));
+    }
+    for t in tasks {
+        t.await?;
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let gets = get_count() - gets0;
+    let h = hist.lock().clone();
+    let out = format!(
+        "LOOKUPS via={} n={} conc={} found={} per_s={:.0} p50_us={} p90_us={} p99_us={} max_us={} gets_per_lookup={:.2} rss_mb={}",
+        if a.reader { "reader" } else { "writer" },
+        a.lookups,
+        a.lookup_concurrency,
+        found.load(Relaxed),
+        a.lookups as f64 / secs,
+        h.value_at_quantile(0.5),
+        h.value_at_quantile(0.9),
+        h.value_at_quantile(0.99),
+        h.max(),
+        gets as f64 / a.lookups as f64,
+        rss_kb("VmRSS:") >> 10,
+    );
+    if !a.reader {
+        w.close().await;
+    }
+    Ok(out)
 }

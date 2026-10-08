@@ -34,6 +34,7 @@ SECTIONS = [
          "qlog-admin-token", "qlog-admin-token-file", "qlog-retain-hours", "qlog-retain-secs", "qlog-retain-every-secs",
          "qlog-host-failover-ms", "qlog-host-poll-ms", "qlog-election-ms", "qlog-heartbeat-ms",
          "qlog-state-compactor-poll-ms", "qlog-state-slatedb", "qlog-no-auto-recover", "qlog-segment-mb", "qlog-disk-retain-mb", "durability", "durability-sync-ms", "slatedb-cache-mb",
+         "slatedb-meta-mb", "slatedb-disk-cache-dir", "slatedb-disk-cache-mb",
          "qlog-memory-mb"],
     ),
     (
@@ -93,13 +94,19 @@ FOOTER = """## A small box
 A single node at ~3,400 hosts runs on ~1.3 GB of heap and half a core without `--plc-export`. On
 a 2 vCPU / 4 GB box:
 
-- Leave `--plc-export` off, or give it `--plc-export-mem-mb` (1700 under a 2300 MiB container
-  limit). Past ~35M rows the seeds' filters and indexes (~2 MiB per million rows, ~120 MiB at
-  58M) outgrow the 64 MiB metadata share of `--slatedb-cache-mb`, the leader's seed reads pull
-  40-55 MiB/s of them from the bucket, and with the export on a relay that held 1.3 GB went past
-  2.3 GB within minutes, at rate 1 as at rate 2. The budget pauses the export and the seed reads
-  while the process is over it and resumes below 85%. `--plc-export-rate` is requests a second
-  across every window, ~1,000 ops each.
+- With `--plc-export`, give the node `--slatedb-disk-cache-dir` on local disk and
+  `--plc-export-mem-mb` (1800 under a 2300 MiB container limit). Every PLC op is a seed row (~85 B
+  in SlateDB, ~2 B of filters and indexes per row), and every row is a merge, so a lookup probes
+  each sorted run's filter. Without the disk cache, once those filters and indexes outgrow the
+  metadata share (past ~35M rows) a seed lookup is ~4 bucket GETs in a row: at 99M ops and 14
+  sorted runs a relay did ~12 lookups/s at ~2.7 s each, 50 GETs/s, and its lanes backed up. With
+  it, the SSTs (8.3 GB at 99M ops) sit on local disk, and a read the memory cache misses is a
+  local one.
+- `--slatedb-meta-mb 224` of the 320: the seeds' filters and indexes (~190 MiB at 99M ops) and
+  the state's then stay in memory, and the blocks they point to are a local read anyway. Past
+  ~110M rows they don't fit any more.
+- The budget pauses the export and the seed reads while the process is over it and resumes
+  below 85%. `--plc-export-rate` is requests a second across every window, ~1,000 ops each.
 - `--qlog-disk-retain-mb 1024`: a single node has no followers to catch up, so the disk only
   serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of
   it, about 7 s for the default 4 GiB.

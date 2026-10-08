@@ -201,8 +201,12 @@ impl PlcJob {
         };
         tracing::info!(epoch, url = %self.cfg.url, "PLC export: this node leads; reading the export");
         self.seeds.paused.store(false, Relaxed);
-        *self.seeds.writer.write() = Some(w.clone());
-        let sink = Arc::new(WriterSink { w: w.clone(), cache: self.cache.clone(), feed: self.feed.lock().clone() });
+        self.seeds.set_writer(w.clone()).await;
+        let sink = Arc::new(WriterSink {
+            w: w.clone(),
+            cache: self.cache.clone(),
+            feed: self.feed.lock().clone(),
+        });
         let ing = Ingester::new(self.cfg.clone(), self.store.clone(), sink);
         *self.term.lock() = Some((epoch, ing.stats.clone()));
         let learned = {

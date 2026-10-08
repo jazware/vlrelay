@@ -353,8 +353,10 @@ impl State {
     pub async fn open_with(store: &Store, rel: &str, l0_bytes: usize) -> anyhow::Result<State> {
         let path = db_path(store, rel);
         let (cache, id) = super::cache::for_db(path.as_ref());
+        let mut st = settings(l0_bytes, state_bounds());
+        st.object_store_cache_options = super::cache::disk_options(super::cache::DiskDb::State);
         let db = Db::builder(path.clone(), store.raw.clone())
-            .with_settings(settings(l0_bytes, state_bounds()))
+            .with_settings(st)
             .with_db_cache(cache, id)
             .with_metrics_recorder(slate_metrics::recorder(DB_LABEL))
             .build()

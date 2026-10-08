@@ -390,8 +390,10 @@ impl SeedWriter {
         // 64 MiB L0s as it goes
         let path = db_path(store);
         let (cache, id) = crate::qlog::cache::for_db(path.as_ref());
+        let mut settings = crate::qlog::state::settings(64 << 20, crate::qlog::state::seed_bounds());
+        settings.object_store_cache_options = crate::qlog::cache::disk_options(crate::qlog::cache::DiskDb::Seeds);
         let db = slatedb::Db::builder(path, store.raw.clone())
-            .with_settings(crate::qlog::state::settings(64 << 20, crate::qlog::state::seed_bounds()))
+            .with_settings(settings)
             .with_db_cache(cache, id)
             .with_merge_operator(merge_operator())
             .with_metrics_recorder(slate_metrics::recorder(WRITER_LABEL))
@@ -559,6 +561,19 @@ impl SeedReader {
         }
     }
 
+    /// Reads go to `w` from now on. The reader is closed: it shares the
+    /// writer's disk cache folder, and two evictors over one folder would
+    /// each count only their own files.
+    pub async fn set_writer(&self, w: Arc<SeedWriter>) {
+        *self.writer.write() = Some(w);
+        let r = self.reader.write().await.take();
+        if let Some(r) = r
+            && let Err(e) = r.close().await
+        {
+            tracing::debug!("closing the PLC seed reader: {e}");
+        }
+    }
+
     async fn reader(&self) -> Option<Arc<slatedb::DbReader>> {
         if let Some(r) = self.reader.read().await.clone() {
             return Some(r);
@@ -577,6 +592,7 @@ impl SeedReader {
         let opts = slatedb::config::DbReaderOptions {
             manifest_poll_interval: READER_POLL,
             skip_wal_replay: true,
+            object_store_cache_options: crate::qlog::cache::disk_options(crate::qlog::cache::DiskDb::Seeds),
             ..Default::default()
         };
         let path = db_path(&self.store);

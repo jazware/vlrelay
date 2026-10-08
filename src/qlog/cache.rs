@@ -4,7 +4,13 @@
 //! metadata), ~2 GiB for three, more than a small box has.
 //! `--slatedb-cache-mb` (default 320) is the total, split four to one
 //! between blocks and metadata (indexes, filters, stats), which a node
-//! touches far more often per byte.
+//! touches far more often per byte; `--slatedb-meta-mb` moves the split.
+//!
+//! With `--slatedb-disk-cache-dir` the SSTs themselves are also kept on
+//! local disk (SlateDB's object-store cache, as vlpds runs it): a block or
+//! filter the memory cache doesn't hold is a local read instead of a
+//! bucket GET. Each database gets its own folder, since every cache runs
+//! its own evictor.
 
 use slatedb::db_cache::{DbCache, SplitCache, foyer::FoyerCache, foyer::FoyerCacheOptions};
 use std::sync::{Arc, OnceLock};
@@ -19,8 +25,13 @@ pub struct Shared {
 
 impl Shared {
     pub fn new(total_mb: u64) -> Shared {
+        Shared::with_meta(total_mb, None)
+    }
+
+    /// `meta_mb` of the total for indexes and filters (None: a fifth).
+    pub fn with_meta(total_mb: u64, meta_mb: Option<u64>) -> Shared {
         let total = total_mb.max(8) << 20;
-        let meta_bytes = total / 5;
+        let meta_bytes = meta_mb.map_or(total / 5, |m| (m.max(1) << 20).min(total - (1 << 20)));
         let block_bytes = total - meta_bytes;
         let foyer = |bytes: u64| -> Arc<dyn DbCache> {
             Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions { max_capacity: bytes, ..Default::default() }))
@@ -37,7 +48,68 @@ static SHARED: OnceLock<Shared> = OnceLock::new();
 /// Sizes the node's cache; only before the first database opens (later
 /// calls, and opens before any call, get the default).
 pub fn configure(total_mb: u64) -> &'static Shared {
-    SHARED.get_or_init(|| exported(Shared::new(total_mb)))
+    configure_split(total_mb, None)
+}
+
+/// [`configure`] with the metadata share in MiB.
+pub fn configure_split(total_mb: u64, meta_mb: Option<u64>) -> &'static Shared {
+    SHARED.get_or_init(|| exported(Shared::with_meta(total_mb, meta_mb)))
+}
+
+/// Where SSTs are kept on local disk, and how much of it each database
+/// may fill.
+#[derive(Clone, Debug)]
+pub struct Disk {
+    pub dir: std::path::PathBuf,
+    pub total_bytes: u64,
+}
+
+/// The databases a node keeps on disk, with their share of the total. The
+/// state is ~5 B a DID the relay has seen against the seeds' ~85 B a PLC op,
+/// so it gets the small share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskDb {
+    State,
+    Seeds,
+}
+
+impl DiskDb {
+    fn folder(self) -> &'static str {
+        match self {
+            DiskDb::State => "qlog_state",
+            DiskDb::Seeds => "plc_seeds",
+        }
+    }
+
+    fn share(self, total: u64) -> u64 {
+        let state = (total / 8).max(64 << 20);
+        match self {
+            DiskDb::State => state,
+            DiskDb::Seeds => total.saturating_sub(state).max(64 << 20),
+        }
+    }
+}
+
+static DISK: OnceLock<Option<Disk>> = OnceLock::new();
+
+/// Keeps SSTs under `dir` from the next database opened on; only before
+/// the first opens (later calls are ignored).
+pub fn configure_disk(dir: Option<std::path::PathBuf>, total_mb: u64) {
+    let _ = DISK.set(dir.map(|dir| Disk { dir, total_bytes: total_mb.max(128) << 20 }));
+}
+
+/// SlateDB's object-store cache options for `db`: disabled without
+/// [`configure_disk`].
+pub fn disk_options(db: DiskDb) -> slatedb::config::ObjectStoreCacheOptions {
+    let mut o = slatedb::config::ObjectStoreCacheOptions::default();
+    if let Some(Some(d)) = DISK.get() {
+        o.root_folder = Some(d.dir.join(db.folder()));
+        o.max_cache_size_bytes = Some(db.share(d.total_bytes) as usize);
+        // what a node writes it reads next; caching it skips the GET
+        o.cache_on_flush = true;
+        o.cache_on_compaction = true;
+    }
+    o
 }
 
 pub fn shared() -> &'static Shared {
@@ -80,6 +152,17 @@ mod tests {
         assert_eq!(s.meta_bytes, 20 << 20);
         let d = Shared::new(DEFAULT_MB);
         assert_eq!((d.block_bytes >> 20, d.meta_bytes >> 20), (256, 64));
+        let m = Shared::with_meta(320, Some(224));
+        assert_eq!((m.block_bytes >> 20, m.meta_bytes >> 20), (96, 224));
+        let clamped = Shared::with_meta(64, Some(1000));
+        assert_eq!((clamped.block_bytes >> 20, clamped.meta_bytes >> 20), (1, 63));
+    }
+
+    #[test]
+    fn the_disk_shares_add_up() {
+        let t = 16u64 << 30;
+        assert_eq!(DiskDb::State.share(t) + DiskDb::Seeds.share(t), t);
+        assert_eq!(DiskDb::State.share(t), 2 << 30);
     }
 
     /// The state, the seeds' writer and their reader all open with the
