@@ -425,6 +425,12 @@ impl State {
         self.applied
     }
 
+    /// The SlateDB instance is done for (fenced by a newer writer, or shut
+    /// down): nothing it writes or seals from here on can succeed.
+    pub fn closed(&self) -> bool {
+        self.db.status().close_reason.is_some()
+    }
+
     pub fn cursors(&self) -> &BTreeMap<String, u64> {
         &self.cursors
     }

@@ -187,6 +187,11 @@ The bucket holds one object that recovery trusts, `qlog/manifest`, and it's writ
 since an uncommitted one could be dropped by a takeover. A flush that lands before a new leader's
 fence is harmless: everything it names is committed, and F and R only go up.
 
+The state's SlateDB fences its own writers: the last process to open it writes it. A deposed
+leader's open that finishes after the new leader's leaves the new leader's state closed, and no
+seal can succeed there again. A leader whose flush loop stops, that way or any other, steps down,
+so the next term opens the state afresh instead of leading on with F stuck.
+
 A single object can't hold it all, because SlateDB writes its own SSTs and manifest. So the state is
 referenced by a SlateDB checkpoint, and the quorum manifest names it. Keeping segments as their own
 objects also spreads the upload over the interval and lets backfill GET a segment by name. vlpds

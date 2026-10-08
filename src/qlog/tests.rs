@@ -620,8 +620,14 @@ fn status_line(c: &Cluster) -> String {
         .values()
         .map(|r| {
             let s = r.node.status();
+            let flush = s.flush.as_ref().map_or(String::new(), |f| {
+                format!(
+                    " F {} applied {} flushes {} failed {} aborted {} fences {}",
+                    s.flushed, f.applied, f.flushes, f.failed, f.aborted, f.fences
+                )
+            });
             format!(
-                "{} {:?} e{} base {} last {} commit {} emitted {} intact {} gen {} resets {}",
+                "{} {:?} e{} base {} last {} commit {} emitted {} intact {} gen {} resets {}{flush}",
                 s.id, s.role, s.epoch, s.base, s.last, s.commit, s.emitted, s.intact, s.generation, s.resets
             )
         })
@@ -1236,6 +1242,23 @@ async fn flushing_random_chaos_keeps_every_manifest_consistent() {
     let acked = load.stop().await;
     let v = settle_and_verify(&c, &acked).await;
     eprintln!("seed {seed}: {verified} mid-run verifies, {actions:?}\n{v:?}");
+    c.shutdown();
+}
+
+/// A deposed leader whose state open finishes after the new leader's
+/// fences the new leader's writer (the test opens it, as that late open
+/// would): the leader can't seal, and F has to move on anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_whose_state_writer_is_fenced_still_flushes() {
+    let c = flushing(|_| flush_opts(), 64 << 20).await;
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    let m = wait_flushed(&c, 1, Duration::from_secs(5)).await;
+    let stale = super::state::State::open(&c.store, m.state_path()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let acked = load.stop().await;
+    settle_and_verify(&c, &acked).await;
+    stale.close().await;
     c.shutdown();
 }
 

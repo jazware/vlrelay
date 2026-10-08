@@ -413,11 +413,9 @@ pub async fn lead(node: Arc<Node>, epoch: u64, o: Options) {
     if let Err(e) = l.run().await {
         tracing::warn!(epoch, "qlog flush: stopped: {e:#}");
         l.node.flush.s.lock().failed += 1;
-        // a leader with no flush loop has no applier either: whatever needs
-        // its state would wait on it for good
-        if l.node.cfg.hooks.0.is_some() {
-            l.node.step_down_from(epoch, "the flush loop stopped");
-        }
+        // a leader with no flush loop never moves F again (and has no
+        // applier for whatever needs its state): the next term starts one
+        l.node.step_down_from(epoch, "the flush loop stopped");
     }
     if let Some(h) = &l.node.cfg.hooks.0 {
         h.term_ended(epoch);
@@ -564,6 +562,9 @@ impl Leader {
                     }
                     Ok(Outcome::Done) => true,
                     Ok(Outcome::Nothing) => false,
+                    // the state was opened over ours (a deposed leader's
+                    // open that finished late): no seal here can succeed
+                    Err(e) if st.closed() => return Err(e),
                     Err(e) => {
                         tracing::warn!(epoch = self.epoch, "qlog flush failed: {e:#}");
                         self.node.flush.s.lock().failed += 1;
