@@ -89,6 +89,7 @@ fn rss_mb() -> u64 {
         >> 10
 }
 
+#[cfg(target_os = "linux")]
 fn drop_cache(dir: &std::path::Path) {
     use std::os::fd::AsRawFd;
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -97,6 +98,10 @@ fn drop_cache(dir: &std::path::Path) {
         }
     }
 }
+
+/// macOS has no `posix_fadvise`: the cold reads here may be warm.
+#[cfg(not(target_os = "linux"))]
+fn drop_cache(_dir: &std::path::Path) {}
 
 fn main() -> anyhow::Result<()> {
     let a = Cli::parse();

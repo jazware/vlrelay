@@ -378,7 +378,9 @@ fn quorum_setup(q: &QuorumArgs, node_id: &str) -> anyhow::Result<vlrelay::node::
         anyhow::ensure!(id != node_id, "--qlog-peer {p} names this node");
         s.peers.insert(id.to_string(), addr.to_string());
     }
-    s.members = q.qlog_members.clone();
+    // BSD `seq -s,` ends its list with a comma: an empty id would be a
+    // member that never acks, and a quorum of four
+    s.members = q.qlog_members.iter().map(|m| m.trim()).filter(|m| !m.is_empty()).map(str::to_string).collect();
     s.commitlog = q.qlog_dir.clone();
     s.flush = Duration::from_millis(q.qlog_flush_ms.max(100));
     s.headroom = q.qlog_headroom.max(1);

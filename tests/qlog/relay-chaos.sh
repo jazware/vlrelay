@@ -89,7 +89,7 @@ case $scenario in replace-* | grow-shrink) SLOTS=${SLOTS:-9} ;; esac
 S=${SLOTS:-$N}
 ids=$(seq 1 "$N")
 slots=$(seq 1 "$S")
-members_flag=$(seq -s, -f 'n%g' 1 "$N")
+members_flag=$(seq -f 'n%g' 1 "$N" | paste -sd, -)
 peer() { echo $((B + $1)); }
 http() { echo $((B + 10 + $1)); }
 ctl=$((B + 29))
