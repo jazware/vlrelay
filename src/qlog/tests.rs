@@ -2628,20 +2628,48 @@ async fn page_cache_power_cuts_on_a_majority_recover_from_the_bucket() {
 /// well past the bucket's F.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_follower_reset_past_what_it_emitted_emits_the_bucket_first() {
+    follower_reset_past_emitted(false).await;
+}
+
+/// The reset's `flushed` doesn't bound what the follower hands over: it
+/// emits everything the bucket holds when it reads it, here a flush that
+/// landed after the leader's view the reset carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_reset_with_a_stale_f_emits_all_the_bucket_holds() {
+    follower_reset_past_emitted(true).await;
+}
+
+async fn follower_reset_past_emitted(stale: bool) {
     let mut c = flushing(|_| flush_opts(), 64 << 20).await;
     let l = c.wait_leader(Duration::from_secs(5)).await;
     let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
     wait_flushed(&c, 1, Duration::from_secs(5)).await;
     let f = c.ids.iter().find(|id| **id != l).unwrap().clone();
+    let t = Instant::now();
+    while c.nodes[&f].node.status().emitted == 0 {
+        assert!(t.elapsed() < Duration::from_secs(5), "{f} emitted nothing: {}", status_line(&c));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     c.isolate(&f);
     // appends already on the wire land
     tokio::time::sleep(Duration::from_millis(200)).await;
     let behind = c.nodes[&f].node.status().emitted;
-    assert!(behind > 0, "{f} emitted nothing before it was cut off");
-    let m = wait_flushed(&c, behind + 500, Duration::from_secs(10)).await;
+    let early = wait_flushed(&c, behind + 500, Duration::from_secs(10)).await;
     load.stop().await;
     let st = c.nodes[&f].node.status();
     assert_eq!(st.emitted, behind, "{f} emitted while cut off");
+    // The leader flushes on its interval, so F is only fixed once it has
+    // flushed its whole log: the follower reads the bucket as it is then.
+    let top = c.nodes[&l].node.status().commit;
+    c.nodes[&l].node.flush.request(top);
+    let m = wait_flushed(&c, top, Duration::from_secs(10)).await;
+    assert_eq!(m.flushed, top);
+    let told = if stale {
+        assert!(early.flushed < m.flushed, "nothing flushed past {}", early.flushed);
+        early.flushed
+    } else {
+        m.flushed
+    };
     let base = m.flushed + 1000;
     let rpc = super::node::Rpc::new(&f, &c.addrs[&f], Arc::new(Faults::default()));
     let reset = wire::Append {
@@ -2652,7 +2680,7 @@ async fn a_follower_reset_past_what_it_emitted_emits_the_bucket_first() {
         commit: base,
         leader_last: base,
         reset: true,
-        flushed: m.flushed,
+        flushed: told,
         reserve: m.reserve,
         generation: st.generation,
         entries: Vec::new(),
@@ -2681,6 +2709,8 @@ async fn a_follower_reset_past_what_it_emitted_emits_the_bucket_first() {
         c.emitted.lock().iter().filter(|(s, q, _)| *s == stream && *q > behind).map(|e| e.1).collect();
     assert_eq!(after, (behind + 1..=m.flushed).collect::<Vec<_>>());
     assert_eq!(c.nodes[&f].node.status().emit_gaps, base - m.flushed);
+    let r = c.finish(&[]);
+    assert!(r.ok, "checker: {r:#?}");
     c.shutdown();
 }
 
