@@ -421,7 +421,7 @@ fn env_or<T: std::str::FromStr>(k: &str, d: T) -> T {
 fn plc_requests() -> (u64, u64) {
     use prometheus::core::Collector;
     let (mut w, mut r) = (0, 0);
-    for mf in vlpds::metrics::OBJ_REQUESTS.collect() {
+    for mf in vlsync_store::metrics::OBJ_REQUESTS.collect() {
         for m in mf.get_metric() {
             let label = |k: &str| m.get_label().iter().find(|l| l.name() == k).map(|l| l.value().to_string());
             if label("client").as_deref() != Some("qlog_plc") {

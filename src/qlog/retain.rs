@@ -27,8 +27,9 @@ use object_store::path::Path;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
-use vlpds::nodelog::{self, Head};
-use vlpds::store::Store;
+use vlsync_firehose::log;
+use vlsync_firehose::log::Head;
+use vlsync_store::store::Store;
 
 #[derive(Debug, Default, Serialize)]
 pub struct SegmentPlan {
@@ -134,7 +135,7 @@ pub async fn plan(store: &Store, horizon: Duration) -> anyhow::Result<Option<Pla
     for (&ord, o) in &by_ord {
         let age = (now - o.last_modified).num_seconds().max(0) as u64;
         if ord >= m.next_ordinal {
-            if let Head::Segment(h) = nodelog::read_head(store, LOG_ID, ord).await?
+            if let Head::Segment(h) = log::read_head(store, LOG_ID, ord).await?
                 && (h.first_seq as u64) <= m.flushed
             {
                 p.stale_segments.push(ord);
@@ -145,7 +146,7 @@ pub async fn plan(store: &Store, horizon: Duration) -> anyhow::Result<Option<Pla
             prefix_open = false;
             continue;
         }
-        let Head::Segment(h) = nodelog::read_head(store, LOG_ID, ord).await? else {
+        let Head::Segment(h) = log::read_head(store, LOG_ID, ord).await? else {
             prefix_open = false;
             continue;
         };
@@ -304,7 +305,7 @@ pub async fn apply(store: &Store, plan: &Plan) -> anyhow::Result<Applied> {
         store.raw.put(&report_path(store), serde_json::to_vec_pretty(&body)?.into()).await?;
         a.pruned_seq = floor;
         for s in segs {
-            match store.raw.delete(&nodelog::segment_path(store, LOG_ID, s.ordinal)).await {
+            match store.raw.delete(&log::segment_path(store, LOG_ID, s.ordinal)).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => return Err(e.into()),
             }

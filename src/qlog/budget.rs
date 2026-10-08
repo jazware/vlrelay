@@ -182,7 +182,7 @@ fn trip(why: &str, state: Option<&PathBuf>, total: &Counts) -> ! {
 /// Checks the saved count before the node sends anything, then watches the
 /// counters on a thread of its own (a stalled runtime can't hold it up).
 /// Call before the node starts.
-pub fn start(args: &BudgetArgs, store: vlpds::store::Store) -> anyhow::Result<()> {
+pub fn start(args: &BudgetArgs, store: vlsync_store::store::Store) -> anyhow::Result<()> {
     if let Some(spec) = &args.runaway {
         runaway(spec, store)?;
     }
@@ -222,7 +222,7 @@ pub fn start(args: &BudgetArgs, store: vlpds::store::Store) -> anyhow::Result<()
     Ok(())
 }
 
-fn runaway(spec: &str, store: vlpds::store::Store) -> anyhow::Result<()> {
+fn runaway(spec: &str, store: vlsync_store::store::Store) -> anyhow::Result<()> {
     use object_store::{ObjectStoreExt, PutPayload, path::Path};
     let (op, rate) = spec.split_once(':').ok_or_else(|| anyhow::anyhow!("--runaway get:RATE or put:RATE"))?;
     let rate: f64 = rate.parse()?;

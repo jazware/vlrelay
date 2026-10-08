@@ -7,14 +7,15 @@ license = "MIT"
 publish = false
 
 [dependencies]
-# vlpds's library: the log, segments, merger, leases, store, slots, limiter,
-# crypto, MST, CAR and DID resolution. Factored into shared crates once the
-# relay settles which pieces it needs.
-# the public vlpds at the commit this one was exported against
-vlpds = { git = "https://github.com/jazware/vlpds", rev = "3d048ba07c7a647e142515a3f044d1c913a81768" }
+# What vlRelay shares with vlpds (vlsync): the store, segments and
+# slots; CBOR, CIDs, the MST, CARs, crypto and DID resolution; the log
+# layout, the firehose merger and backfill.
+vlsync-store = { git = "https://github.com/jazware/vlsync", rev = "7b4b0303b6974974263fcdcfbb93182e141fbc7c", features = ["jemalloc"] }
+vlsync-atproto = { git = "https://github.com/jazware/vlsync", rev = "7b4b0303b6974974263fcdcfbb93182e141fbc7c" }
+vlsync-firehose = { git = "https://github.com/jazware/vlsync", rev = "7b4b0303b6974974263fcdcfbb93182e141fbc7c" }
 # SlateDB metrics with a `db` label per database, and each one's shape for
 # GET /admin/api/store
-slate-metrics = { git = "https://github.com/jazware/vlpds", rev = "3d048ba07c7a647e142515a3f044d1c913a81768" }
+slate-metrics = { git = "https://github.com/jazware/vlsync", rev = "7b4b0303b6974974263fcdcfbb93182e141fbc7c" }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws", "macros", "http2"] }
@@ -25,7 +26,8 @@ parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
-slatedb = { version = "0.17", features = ["aws", "wal_disable", "zstd", "lz4"] }
+# the SlateDB fork every vlsync user builds against (its Cargo.toml lists the patches)
+slatedb = { package = "vlsync-slatedb", git = "https://github.com/jazware/vlsync", rev = "7b4b0303b6974974263fcdcfbb93182e141fbc7c" }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -87,11 +89,6 @@ tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 # differential tests against a second atproto implementation, as vlpds does
 shrike = { version = "=0.7.0", default-features = false, features = ["syntax", "cbor", "crypto", "mst", "repo", "car", "sync"] }
-
-# the fork rev vlpds pins (vlpds/Cargo.toml lists its patches)
-[patch.crates-io]
-slatedb = { git = "https://github.com/jazware/slatedb", rev = "87db9e3b3f5ba8d0473deb240990e33cb5e50208" }
-slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "87db9e3b3f5ba8d0473deb240990e33cb5e50208" }
 
 [profile.release]
 opt-level = 3

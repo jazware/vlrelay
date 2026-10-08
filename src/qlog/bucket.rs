@@ -24,7 +24,7 @@
 
 use serde::Serialize;
 use std::collections::BTreeMap;
-use vlpds::store::Store;
+use vlsync_store::store::Store;
 
 pub const PURPOSES: [&str; 9] =
     ["flush", "state", "leader", "recovery", "backfill", "retain", "plc", "discovery", "tool"];
@@ -124,7 +124,7 @@ pub struct Requests {
 pub fn requests() -> Requests {
     use prometheus::core::Collector;
     let mut r = Requests { pid: std::process::id(), ..Default::default() };
-    for mf in vlpds::metrics::OBJ_REQUESTS.collect() {
+    for mf in vlsync_store::metrics::OBJ_REQUESTS.collect() {
         for m in mf.get_metric() {
             let label = |k: &str| m.get_label().iter().find(|l| l.name() == k).map(|l| l.value().to_string());
             let (Some(op), Some(comp), Some(cl)) = (label("op"), label("component"), label("client")) else {

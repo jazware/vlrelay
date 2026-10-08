@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant};
-use vlpds::store::Store;
+use vlsync_store::store::Store;
 
 const STATE: &str = "discovery/state.json";
 /// PDS hosts from the PLC export waiting for admission (each is admitted or

@@ -9,7 +9,7 @@ use super::store::{get, if_match, is_conflict, path, put};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use vlpds::store::Store;
+use vlsync_store::store::Store;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BudgetKind {

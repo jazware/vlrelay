@@ -31,10 +31,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use vlpds::nodelog::{self, Head};
-use vlpds::segment::{self, SegmentBuilder};
-use vlpds::slots::ShardId;
-use vlpds::store::Store;
+use vlsync_firehose::log;
+use vlsync_firehose::log::Head;
+use vlsync_store::segment::{self, SegmentBuilder};
+use vlsync_store::slots::ShardId;
+use vlsync_store::store::Store;
 
 pub const LOG_ID: &str = super::emit::LOG_ID;
 
@@ -250,7 +251,7 @@ async fn cas_manifest(store: &Store, m: &Manifest, read: Option<Option<String>>)
 pub fn requests_by_op() -> BTreeMap<String, u64> {
     use prometheus::core::Collector;
     let mut out = BTreeMap::new();
-    for mf in vlpds::metrics::OBJ_REQUESTS.collect() {
+    for mf in vlsync_store::metrics::OBJ_REQUESTS.collect() {
         for m in mf.get_metric() {
             let op = m.get_label().iter().find(|l| l.name() == "op").map(|l| l.value().to_string());
             if let Some(op) = op {
@@ -740,7 +741,7 @@ impl Leader {
             })
             .await??;
             let bytes = obj.len() as u64;
-            let path = nodelog::segment_path(&self.store, LOG_ID, ord);
+            let path = log::segment_path(&self.store, LOG_ID, ord);
             let put = self
                 .store
                 .raw
@@ -756,7 +757,7 @@ impl Leader {
                     }
                 }
                 Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
-                    match nodelog::read_head(&self.store, LOG_ID, ord).await? {
+                    match log::read_head(&self.store, LOG_ID, ord).await? {
                         // A deposed leader's flush, still running when a
                         // bucket recovery moved F past it: no manifest names
                         // an ordinal at or past next_ordinal, and this one
@@ -876,7 +877,7 @@ async fn locate(
     if from == 0 || from > upto {
         return Ok(None);
     }
-    let ord = vlpds::backfill::seek(store, LOG_ID, from as i64 - 1).await?;
+    let ord = vlsync_firehose::backfill::seek(store, LOG_ID, from as i64 - 1).await?;
     let Some(seg) = load_segment(store, ord, cache).await? else { return Ok(None) };
     let Some(first) = seg.first().map(|e| e.seq) else { return Ok(None) };
     if first > from {
@@ -951,14 +952,14 @@ pub async fn read_entries(store: &Store, ord: u64) -> anyhow::Result<Option<Vec<
 /// A segment with its entries' cursors and meta (vlpds's `read_object`
 /// skips mutations).
 async fn read_segment(store: &Store, ord: u64) -> anyhow::Result<Option<(segment::SegHeader, Vec<Entry>)>> {
-    let data = match store.raw.get(&nodelog::segment_path(store, LOG_ID, ord)).await {
+    let data = match store.raw.get(&log::segment_path(store, LOG_ID, ord)).await {
         Ok(r) => r.bytes().await?,
         Err(object_store::Error::NotFound { .. }) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     match segment::parse(data, true, None)? {
         segment::LogObject::Segment(h, ents) => {
-            nodelog::check_header(&h, LOG_ID, ord)?;
+            log::check_header(&h, LOG_ID, ord)?;
             Ok(Some((h, ents.into_iter().map(entry_of).collect())))
         }
         segment::LogObject::Fence { .. } => anyhow::bail!("qlog: ordinal {ord} is a fence"),
@@ -1224,7 +1225,7 @@ pub async fn recovery_point(store: &Store) -> anyhow::Result<Option<RecoveryPoin
         let first = h.first_seq as u64;
         if first <= m.flushed {
             tracing::warn!(ord, first, f = m.flushed, "qlog recovery: deleting a stale segment past the manifest");
-            store.raw.delete(&nodelog::segment_path(store, LOG_ID, ord)).await?;
+            store.raw.delete(&log::segment_path(store, LOG_ID, ord)).await?;
             ord += 1;
             continue;
         }
@@ -1411,7 +1412,7 @@ async fn put_recovery_segment(
     store
         .raw
         .put_opts(
-            &nodelog::segment_path(store, LOG_ID, ord),
+            &log::segment_path(store, LOG_ID, ord),
             PutPayload::from(obj),
             PutOptions { mode: PutMode::Create, ..Default::default() },
         )

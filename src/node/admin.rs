@@ -178,7 +178,7 @@ impl NodeAdmin {
                 0.0
             }
         };
-        (rate, vlpds::metrics::resident_bytes().unwrap_or(0))
+        (rate, vlsync_store::metrics::resident_bytes().unwrap_or(0))
     }
 
     fn admin(&self) -> &PolicyAdmin {
@@ -1392,7 +1392,7 @@ fn class_rate(
 fn store_bytes() -> HashMap<String, (u64, u64)> {
     use prometheus::core::Collector;
     let mut out: HashMap<String, (u64, u64)> = HashMap::new();
-    for mf in vlpds::metrics::OBJ_BYTES.collect() {
+    for mf in vlsync_store::metrics::OBJ_BYTES.collect() {
         for m in mf.get_metric() {
             let label = |k: &str| m.get_label().iter().find(|l| l.name() == k).map(|l| l.value().to_string());
             let (Some(dir), Some(client)) = (label("dir"), label("client")) else { continue };
@@ -1415,7 +1415,7 @@ fn store_latency() -> Vec<admin::StoreLatency> {
     // (count, sum s, [(upper bound s, cumulative count)])
     type Hist = (u64, f64, Vec<(f64, u64)>);
     let mut by: BTreeMap<String, Hist> = BTreeMap::new();
-    for mf in vlpds::metrics::OBJ_DURATION.collect() {
+    for mf in vlsync_store::metrics::OBJ_DURATION.collect() {
         for m in mf.get_metric() {
             let Some(op) = m.get_label().iter().find(|l| l.name() == "op").map(|l| l.value().to_string()) else {
                 continue;
@@ -1542,7 +1542,7 @@ fn kick_body(token: &str, id: u64, by: &str) -> serde_json::Value {
 fn kick_request(body: &[u8], token: Option<&str>) -> Result<(u64, String), &'static str> {
     let req: serde_json::Value = serde_json::from_slice(body).map_err(|_| "bad request")?;
     let given = req["token"].as_str().unwrap_or("");
-    if !token.is_some_and(|t| vlpds::auth::token_eq(t, given)) {
+    if !token.is_some_and(|t| vlsync_atproto::xrpc::token_eq(t, given)) {
         return Err("unauthorized");
     }
     let id = req["id"].as_u64().ok_or("bad request")?;

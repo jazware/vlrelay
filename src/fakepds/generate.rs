@@ -12,13 +12,13 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use vlpds::car;
-use vlpds::cbor::{write_map_head, write_text};
-use vlpds::cid::Cid;
-use vlpds::crypto::Keypair;
-use vlpds::events::{self, Frame, RepoOp};
-use vlpds::mst::{Entry, Node, Tree};
-use vlpds::tid::{self, Tid};
+use vlsync_atproto::car;
+use vlsync_atproto::cbor::{write_map_head, write_text};
+use vlsync_atproto::cid::Cid;
+use vlsync_atproto::crypto::Keypair;
+use vlsync_atproto::events::{self, Frame, RepoOp};
+use vlsync_atproto::mst::{Entry, Node, Tree};
+use vlsync_atproto::tid::{self, Tid};
 
 /// `now_rfc3339()` is always this long (micros, `Z`), which lets the emitter
 /// overwrite a pre-built frame's `time` in place.
@@ -69,7 +69,7 @@ impl Pending {
         out.reserve(f.len_hint());
         out.extend_from_slice(&f.prefix);
         write_text(out, "seq");
-        vlpds::cbor::write_int(out, seq);
+        vlsync_atproto::cbor::write_int(out, seq);
         out.extend_from_slice(&f.suffix[..self.time_off]);
         out.extend_from_slice(now.as_bytes());
         out.extend_from_slice(&f.suffix[self.time_off + TIME_LEN..]);
@@ -326,7 +326,7 @@ fn rec_path(coll: u8, rkey: Tid) -> String {
 
 impl Rec {
     fn build(coll: u8, rkey: Tid, seed: u64, size: usize, at: u32) -> (Rec, Vec<u8>) {
-        let cid = Cid { codec: vlpds::cid::CODEC_DAG_CBOR, digest: [0; 32] };
+        let cid = Cid { codec: vlsync_atproto::cid::CODEC_DAG_CBOR, digest: [0; 32] };
         let mut r = Rec { seed, rkey, cid, size: size as u32, at, coll };
         let mut bytes = Vec::with_capacity(size + 16);
         r.write(&mut bytes);
@@ -402,7 +402,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// The whole repo as a CAR in vlpds's streamable order
-    /// (`vlpds::car_order`): the commit, then the MST in preorder, each
+    /// (`vlsync_atproto::car_order`): the commit, then the MST in preorder, each
     /// record right after its entry. Record bytes are rebuilt here.
     pub fn car(&self) -> anyhow::Result<Vec<u8>> {
         let by_cid: HashMap<Cid, &Rec> = self.recs.iter().map(|r| (r.cid, r)).collect();
@@ -423,13 +423,13 @@ fn write_node(
     out: &mut Vec<u8>,
     depth: usize,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(depth <= vlpds::mst::MAX_DEPTH, "tree too deep");
+    anyhow::ensure!(depth <= vlsync_atproto::mst::MAX_DEPTH, "tree too deep");
     let c = n.cid.ok_or_else(|| anyhow::anyhow!("unwritten MST node"))?;
     match &n.bytes {
         Some(b) if !n.dirty => car::write_block(out, &c, b),
         _ => {
             buf.clear();
-            vlpds::mst::encode_node(n, buf)?;
+            vlsync_atproto::mst::encode_node(n, buf)?;
             car::write_block(out, &c, buf);
         }
     }

@@ -86,7 +86,7 @@ mod tests {
     /// one shared cache.
     #[tokio::test]
     async fn every_database_shares_the_one_cache() {
-        let store = vlpds::store::Store::memory(None);
+        let store = vlsync_store::store::Store::memory(None);
         let st = crate::qlog::state::State::open(&store, "qlog/state-cachetest").await.unwrap();
         let w = crate::plc_seed::SeedWriter::open(&store).await.unwrap();
         w.flush().await.unwrap();

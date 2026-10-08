@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use vlpds::store::Store;
+use vlsync_store::store::Store;
 
 pub const EVIDENCE_KEPT: usize = 20;
 const CAS_RETRIES: usize = 8;

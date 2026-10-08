@@ -4,10 +4,10 @@
 
 use super::fleet::Layout;
 use std::collections::HashMap;
-use vlpds::car;
-use vlpds::cbor::{Value, ValueRef};
-use vlpds::cid::Cid;
-use vlpds::mst::Tree;
+use vlsync_atproto::car;
+use vlsync_atproto::cbor::{Value, ValueRef};
+use vlsync_atproto::cid::Cid;
+use vlsync_atproto::mst::Tree;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Fail {
@@ -125,7 +125,7 @@ impl Checker {
         };
         let unsigned = Value::Map(fields.iter().filter(|(k, _)| k != "sig").cloned().collect()).to_cbor();
         let key = self.key(layout, &did).map_err(|f| (f, "key".into()))?;
-        if !vlpds::crypto::verify_k256(&key, &unsigned, sig).unwrap_or(false) {
+        if !vlsync_atproto::crypto::verify_k256(&key, &unsigned, sig).unwrap_or(false) {
             return Err((Fail::Signature, did));
         }
         let prev = self.heads.get(&did).cloned();
@@ -250,7 +250,7 @@ pub fn check_repo(layout: &Layout, did: &str, bytes: &[u8]) -> Result<RepoCar, S
     };
     let (g, i) = layout.parse_did(did).ok_or("not a fleet DID")?;
     let unsigned = Value::Map(fields.iter().filter(|(k, _)| k != "sig").cloned().collect()).to_cbor();
-    if !vlpds::crypto::verify_k256(&layout.key(g, i).public_key_sec1(), &unsigned, sig).unwrap_or(false) {
+    if !vlsync_atproto::crypto::verify_k256(&layout.key(g, i).public_key_sec1(), &unsigned, sig).unwrap_or(false) {
         return Err("bad signature".into());
     }
     if blocks.get(1).map(|b| b.0) != Some(*data) {

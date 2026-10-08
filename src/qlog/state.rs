@@ -29,7 +29,7 @@ use slatedb::config::{CheckpointOptions, CheckpointScope, WriteOptions};
 use slatedb::{Db, DbReader, DbReaderMode, WriteBatch};
 use std::collections::BTreeMap;
 use std::time::Duration;
-use vlpds::store::Store;
+use vlsync_store::store::Store;
 
 const APPLIED: &[u8] = b"_applied";
 

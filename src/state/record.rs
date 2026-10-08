@@ -12,9 +12,9 @@
 
 use bytes::{BufMut, Bytes};
 use sha2::{Digest, Sha256};
-use vlpds::cid::{CODEC_DAG_CBOR, Cid};
-use vlpds::state::{SLOT_PREFIX_LEN, slot_prefix};
-use vlpds::tid::Tid;
+use vlsync_atproto::cid::{CODEC_DAG_CBOR, Cid};
+use vlsync_atproto::tid::Tid;
+use vlsync_store::keys::{SLOT_PREFIX_LEN, slot_prefix};
 
 pub const DID_FAMILY: u8 = b'd';
 const DID_PLC: u8 = b'p';
@@ -23,7 +23,7 @@ const PLC_PREFIX: &str = "did:plc:";
 const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
 pub fn did_key(did: &str) -> Vec<u8> {
-    did_key_in(vlpds::slots::slot_of(did), did)
+    did_key_in(vlsync_store::slots::slot_of(did), did)
 }
 
 pub fn did_key_in(slot: u16, did: &str) -> Vec<u8> {

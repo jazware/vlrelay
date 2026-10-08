@@ -21,9 +21,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
-use vlpds::cbor::{write_int, write_map_head, write_text};
-use vlpds::cid::Cid;
-use vlpds::tid::Tid;
+use vlsync_atproto::cbor::{write_int, write_map_head, write_text};
+use vlsync_atproto::cid::Cid;
+use vlsync_atproto::tid::Tid;
 
 pub type Batch = Arc<Vec<(i64, Bytes)>>;
 
@@ -214,7 +214,7 @@ pub fn run_emitter(
             }
         }
         let burst = if burst_until.is_some() { shape.burst_x } else { 1.0 };
-        let now = vlpds::events::now_rfc3339();
+        let now = vlsync_atproto::events::now_rfc3339();
         for e in es.iter_mut() {
             let f = &e.host.faults;
             if let (Some((secs, every)), Some(t)) = (f.stall, e.next_stall)
@@ -430,7 +430,7 @@ async fn stream(h: Arc<HostState>, mut sock: WebSocket, cursor: Option<i64>) {
         }
     };
     let Some((mut rx, backlog, info)) = snap else {
-        let f = vlpds::events::error_frame("FutureCursor", "Cursor in the future.");
+        let f = vlsync_atproto::events::error_frame("FutureCursor", "Cursor in the future.");
         let _ = sock.send(Message::Binary(Bytes::from(f))).await;
         let _ = sock.send(Message::Close(None)).await;
         return;
@@ -471,7 +471,7 @@ async fn stream(h: Arc<HostState>, mut sock: WebSocket, cursor: Option<i64>) {
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let f = vlpds::events::error_frame("ConsumerTooSlow", "Stream consumer too slow");
+                    let f = vlsync_atproto::events::error_frame("ConsumerTooSlow", "Stream consumer too slow");
                     let _ = sock.send(Message::Binary(Bytes::from(f))).await;
                     let _ = sock.send(Message::Close(None)).await;
                     return;

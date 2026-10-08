@@ -531,8 +531,8 @@ pub async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, rid: u64, m: &Msg) -> s
 pub fn splice_seq(prefix: &[u8], suffix: &[u8], seq: u64) -> Bytes {
     let mut out = Vec::with_capacity(prefix.len() + suffix.len() + 14);
     out.extend_from_slice(prefix);
-    vlpds::cbor::write_text(&mut out, "seq");
-    vlpds::cbor::write_int(&mut out, seq as i64);
+    vlsync_atproto::cbor::write_text(&mut out, "seq");
+    vlsync_atproto::cbor::write_int(&mut out, seq as i64);
     out.extend_from_slice(suffix);
     out.into()
 }

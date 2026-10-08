@@ -97,7 +97,7 @@ fn rss_kb(field: &str) -> u64 {
 
 /// jemalloc's stats as vlpds's /metrics reads them, in MiB.
 fn jemalloc_mb() -> HashMap<String, u64> {
-    vlpds::metrics::render()
+    vlsync_store::metrics::render()
         .lines()
         .filter_map(|l| l.strip_prefix("vlpds_jemalloc_bytes{stat=\""))
         .filter_map(|l| {
@@ -204,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move { axum::serve(lis, app).await });
 
     let fs = object_store::local::LocalFileSystem::new_with_prefix(&a.dir)?;
-    let base = vlpds::store::Store { raw: Arc::new(fs), prefix: "vlrelay".into(), latency: None };
+    let base = vlsync_store::store::Store { raw: Arc::new(fs), prefix: "vlrelay".into(), latency: None };
     let store = vlrelay::qlog::bucket::counted(&base, "plc");
 
     let peak = Arc::new(AtomicU64::new(0));
@@ -312,7 +312,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = sampler.join();
     drop(ballast);
     let secs = t0.elapsed().as_secs_f64();
-    let down: f64 = vlpds::metrics::render()
+    let down: f64 = vlsync_store::metrics::render()
         .lines()
         .filter(|l| l.starts_with("vlpds_object_store_bytes_total{") && l.contains("dir=\"down\""))
         .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())

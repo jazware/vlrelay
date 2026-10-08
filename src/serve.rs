@@ -1,6 +1,6 @@
 //! `com.atproto.sync.subscribeRepos` for consumers.
 //!
-//! This is vlpds's firehose (`vlpds::firehose::Firehose`) as is, fed the
+//! This is vlpds's firehose (`vlsync_firehose::firehose::Firehose`) as is, fed the
 //! quorum log's committed entries (`qlog::emit`) as one counted stream:
 //!
 //! - The merger cuts every 2 ms at the commit index and frames each batch
@@ -29,8 +29,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use vlpds::firehose::{self, Firehose, SubscriberView};
-use vlpds::store::Store;
+use vlsync_firehose::firehose::{self, Firehose, SubscriberView};
+use vlsync_store::store::Store;
 
 #[derive(Clone, Debug)]
 pub struct ServeConfig {
@@ -71,8 +71,8 @@ impl Default for ServeConfig {
         ServeConfig {
             ring_bytes: 512 << 20,
             max_lag_bytes: firehose::DEFAULT_MAX_LAG_BYTES,
-            readahead_bytes: vlpds::backfill::DEFAULT_READAHEAD_BYTES,
-            backfill_cache_bytes: vlpds::backfill::DEFAULT_CACHE_BYTES,
+            readahead_bytes: vlsync_firehose::backfill::DEFAULT_READAHEAD_BYTES,
+            backfill_cache_bytes: vlsync_firehose::backfill::DEFAULT_CACHE_BYTES,
             max_backfills: firehose::DEFAULT_MAX_BACKFILLS,
             max_per_ip: firehose::DEFAULT_MAX_PER_IP,
             threads: 4,

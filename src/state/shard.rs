@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use slatedb::Db;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use vlpds::slots::ShardId;
+use vlsync_store::slots::ShardId;
 
 /// Names one decided event's staged record, until the applier has it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -221,7 +221,7 @@ impl ShardState {
     }
 
     pub fn range_keys(&self) -> (Bytes, Bytes) {
-        vlpds::state::slot_range_keys(self.lo, self.hi)
+        vlsync_store::keys::slot_range_keys(self.lo, self.hi)
     }
 
     pub fn contains_slot(&self, slot: u16) -> bool {

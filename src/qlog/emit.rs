@@ -9,8 +9,8 @@ use bytes::Bytes;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use tokio::sync::mpsc;
-use vlpds::firehose::{self, Firehose};
-use vlpds::nodelog::LogBatch;
+use vlsync_firehose::firehose::{self, Firehose};
+use vlsync_firehose::log::LogBatch;
 
 pub const LOG_ID: &str = "qlog";
 
@@ -39,7 +39,7 @@ pub struct Emitter {
     /// Where the flush writes segments: cursors older than the ring are
     /// backfilled from there, and above the last flush from the node's own
     /// log (`set_local_tail`).
-    store: Option<vlpds::store::Store>,
+    store: Option<vlsync_store::store::Store>,
     owner: Arc<OnceLock<Weak<super::node::Node>>>,
     serving: Serving,
 }
@@ -75,7 +75,7 @@ impl Emitter {
         incarnation: u64,
         ring_bytes: usize,
         tap: Option<mpsc::UnboundedSender<Emitted>>,
-        store: vlpds::store::Store,
+        store: vlsync_store::store::Store,
     ) -> Arc<Emitter> {
         let mut e = Arc::into_inner(Emitter::new(node, incarnation, ring_bytes, tap)).expect("just made");
         e.store = Some(store);
@@ -206,7 +206,7 @@ impl Admin {
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "))
-                .is_some_and(|got| vlpds::auth::token_eq(t, got)),
+                .is_some_and(|got| vlsync_atproto::xrpc::token_eq(t, got)),
         }
     }
 }

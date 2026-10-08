@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use vlpds::store::Store;
+use vlsync_store::store::Store;
 
 #[derive(Clone, Debug)]
 pub struct Config {

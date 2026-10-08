@@ -103,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
     }
     std::fs::create_dir_all(&a.dir)?;
     let fs = object_store::local::LocalFileSystem::new_with_prefix(&a.dir)?;
-    let base = vlpds::store::Store { raw: Arc::new(fs), prefix: "vlrelay".into(), latency: None };
+    let base = vlsync_store::store::Store { raw: Arc::new(fs), prefix: "vlrelay".into(), latency: None };
     let store = vlrelay::qlog::bucket::counted(&base, "plc");
 
     let peak = Arc::new(AtomicU64::new(0));

@@ -3,19 +3,19 @@
 //!
 //!   cargo run --example qlog_dump -- http://127.0.0.1:3590 PREFIX [DID]
 
-use vlpds::cbor::ValueRef;
+use vlsync_atproto::cbor::ValueRef;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let s3 = vlpds::store::S3Config {
+    let s3 = vlsync_store::store::S3Config {
         endpoint: args[1].clone(),
         bucket: "vlrelay".into(),
         access_key: "minioadmin".into(),
         secret_key: "minioadmin".into(),
         region: "us-east-1".into(),
     };
-    let store = vlpds::store::Store::s3(&s3, &args[2], None, 8)?;
+    let store = vlsync_store::store::Store::s3(&s3, &args[2], None, 8)?;
     let want = args.get(3).cloned();
     let mut ord = 0;
     while let Some(es) = vlrelay::qlog::flush::read_entries(&store, ord).await? {

@@ -39,8 +39,8 @@ impl Identity {
         if doc.get("id").and_then(J::as_str) != Some(did) {
             return Err(LookupError::Failed("document id does not match DID".into()));
         }
-        let mb = vlpds::did_resolver::signing_key_multibase(doc);
-        let pds = vlpds::did_resolver::service_endpoint(doc, "atproto_pds");
+        let mb = vlsync_atproto::did_resolver::signing_key_multibase(doc);
+        let pds = vlsync_atproto::did_resolver::service_endpoint(doc, "atproto_pds");
         let handle = doc
             .get("alsoKnownAs")
             .and_then(J::as_array)
@@ -131,7 +131,7 @@ impl HttpFetch {
             if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
                 return Err(LookupError::BadDid);
             }
-            return Ok(vlpds::http::public().get(format!("{}/{did}", self.plc_url)));
+            return Ok(vlsync_atproto::http::public().get(format!("{}/{did}", self.plc_url)));
         }
         let rest = did.strip_prefix("did:web:").ok_or(LookupError::BadDid)?;
         if rest.is_empty() || rest.contains(':') || rest.contains('/') {
@@ -143,7 +143,7 @@ impl HttpFetch {
         }
         let plain = host.split(':').next() == Some("localhost");
         let url = format!("{}://{host}/.well-known/did.json", if plain { "http" } else { "https" });
-        vlpds::http::guarded(self.allow_insecure).get(&url).map_err(LookupError::Failed)
+        vlsync_atproto::http::guarded(self.allow_insecure).get(&url).map_err(LookupError::Failed)
     }
 }
 
@@ -495,7 +495,7 @@ impl<F: Fetch> IdentityCache<F> {
     }
 
     async fn fetch_now(&self, did: &str) -> Outcome {
-        if !vlpds::xrpc::syntax::valid_did(did) {
+        if !vlsync_atproto::syntax::valid_did(did) {
             return Err(LookupError::BadDid);
         }
         if let Err(e) = self.spend_budget().await {

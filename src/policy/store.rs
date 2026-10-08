@@ -13,7 +13,7 @@
 use object_store::{GetOptions, ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion, path::Path};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
-use vlpds::store::Store;
+use vlsync_store::store::Store;
 
 const CALL_DEADLINE: Duration = Duration::from_secs(5);
 

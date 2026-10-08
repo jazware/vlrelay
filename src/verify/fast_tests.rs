@@ -33,7 +33,7 @@ fn data_of(c: &ParsedCommit) -> Cid {
 fn random_create(rng: &mut StdRng) -> Op {
     const COLLECTIONS: [&str; 4] = ["app.bsky.feed.like", "app.bsky.feed.post", "app.bsky.graph.follow", "a.b.c"];
     let col = COLLECTIONS[rng.gen_range(0..COLLECTIONS.len())];
-    let tid = vlpds::tid::Tid::from_parts(rng.gen_range(1_600_000_000_000_000..1_800_000_000_000_000), 0);
+    let tid = vlsync_atproto::tid::Tid::from_parts(rng.gen_range(1_600_000_000_000_000..1_800_000_000_000_000), 0);
     Op::Put(format!("{col}/{tid}"))
 }
 
@@ -57,8 +57,13 @@ fn one_create_fast_path_matches_tree_path() {
             assert_eq!(both(&c, data, &opts), Ok(()));
             let blocks: BlockMap<'_> = c.blocks.iter().map(|(k, v)| (*k, &v[..])).collect();
             let op = &c.ops[0];
-            if vlpds::mst::single_create::undo_single_create(&blocks, data, op.path.as_bytes(), op.cid.unwrap(), true)
-                == Some(c.prev_data)
+            if vlsync_atproto::mst::single_create::undo_single_create(
+                &blocks,
+                data,
+                op.path.as_bytes(),
+                op.cid.unwrap(),
+                true,
+            ) == Some(c.prev_data)
             {
                 fast_hits += 1;
             }

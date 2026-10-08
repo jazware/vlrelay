@@ -90,15 +90,15 @@ struct S3Args {
 impl S3Args {
     /// Not counted: every user counts it once, under its purpose
     /// (`qlog::bucket`).
-    fn store(&self) -> anyhow::Result<vlpds::store::Store> {
-        let s3 = vlpds::store::S3Config {
+    fn store(&self) -> anyhow::Result<vlsync_store::store::Store> {
+        let s3 = vlsync_store::store::S3Config {
             endpoint: self.s3_endpoint.clone(),
             bucket: self.s3_bucket.clone(),
             access_key: self.s3_access_key.clone(),
             secret_key: self.s3_secret_key.clone(),
             region: "us-east-1".into(),
         };
-        vlpds::store::Store::s3(&s3, &self.prefix, None, 8)
+        vlsync_store::store::Store::s3(&s3, &self.prefix, None, 8)
     }
 }
 
@@ -878,7 +878,7 @@ fn parse_frame(b: &[u8], relay: bool) -> Option<(u64, String, i64)> {
     if !relay {
         return parse_test_frame(b);
     }
-    use vlpds::cbor::ValueRef;
+    use vlsync_atproto::cbor::ValueRef;
     let (hdr, n) = ValueRef::decode_prefix(b).ok()?;
     if !matches!(hdr.get("op"), Some(ValueRef::Int(1))) {
         return None;

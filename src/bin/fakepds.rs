@@ -482,10 +482,10 @@ async fn consume(a: ConsumeArgs) -> anyhow::Result<()> {
                     let _ = hist.lock().add(&local);
                     local.reset();
                 }
-                if let Ok((_, n)) = vlpds::cbor::ValueRef::decode_prefix(&b)
-                    && let Ok(body) = vlpds::cbor::ValueRef::decode(&b[n..])
+                if let Ok((_, n)) = vlsync_atproto::cbor::ValueRef::decode_prefix(&b)
+                    && let Ok(body) = vlsync_atproto::cbor::ValueRef::decode(&b[n..])
                 {
-                    if let Some(vlpds::cbor::ValueRef::Int(s)) = body.get("seq") {
+                    if let Some(vlsync_atproto::cbor::ValueRef::Int(s)) = body.get("seq") {
                         if *s <= last {
                             regress.fetch_add(1, Ordering::Relaxed);
                         }
@@ -643,7 +643,7 @@ async fn selftest(o: SelftestOpts) -> anyhow::Result<()> {
     let mut sizes = Vec::new();
     let mut ops: BTreeMap<usize, u64> = BTreeMap::new();
     let mut frames: Vec<Vec<(Label, Vec<u8>)>> = Vec::new();
-    let now = vlpds::events::now_rfc3339();
+    let now = vlsync_atproto::events::now_rfc3339();
     let t1 = Instant::now();
     for (h, evs) in per_host.iter().enumerate() {
         let mut c = check::Checker::default();
@@ -730,13 +730,13 @@ async fn selftest(o: SelftestOpts) -> anyhow::Result<()> {
     }
     println!("websocket replay from cursor 0: {} frames, {wire_bad} mismatches", n);
 
-    let resolver = vlpds::did_resolver::DidResolver::new(&plc_url, true);
+    let resolver = vlsync_atproto::did_resolver::DidResolver::new(&plc_url, true);
     let mut plc_bad = 0;
     for (g, i) in [(0u32, 0u32), (3, 7), (4, 39), (3, cfg.dids + 5)] {
         let did = layout.did(g, i);
         let doc = resolver.resolve(&did).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        let ep = vlpds::did_resolver::service_endpoint(&doc, "atproto_pds");
-        let key = vlpds::did_resolver::signing_key_multibase(&doc).unwrap_or_default();
+        let ep = vlsync_atproto::did_resolver::service_endpoint(&doc, "atproto_pds");
+        let key = vlsync_atproto::did_resolver::signing_key_multibase(&doc).unwrap_or_default();
         if ep.as_deref() != Some(layout.host_url(g).as_str()) || !layout.key(g, i).matches_public(&key) {
             plc_bad += 1;
         }

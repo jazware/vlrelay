@@ -8,7 +8,7 @@
 
 use serde_json::{Value as J, json};
 use sha2::{Digest, Sha256};
-use vlpds::crypto::Keypair;
+use vlsync_atproto::crypto::Keypair;
 
 #[derive(Clone, Debug)]
 pub struct Layout {
@@ -44,11 +44,11 @@ impl Layout {
         b[4..8].copy_from_slice(&g.to_be_bytes());
         b[8..12].copy_from_slice(&i.to_be_bytes());
         b[12..].copy_from_slice(&self.mac(g, i));
-        format!("did:plc:{}", vlpds::cid::base32_encode(&b))
+        format!("did:plc:{}", vlsync_atproto::cid::base32_encode(&b))
     }
 
     pub fn parse_did(&self, did: &str) -> Option<(u32, u32)> {
-        let b = vlpds::cid::base32_decode(did.strip_prefix("did:plc:")?)?;
+        let b = vlsync_atproto::cid::base32_decode(did.strip_prefix("did:plc:")?)?;
         if b.len() != 15 || b[..4] != self.tag {
             return None;
         }
@@ -113,7 +113,10 @@ mod tests {
         assert_eq!(l.parse_did(&d), Some((7, 123_456)));
         assert_eq!(Layout::new("other", "http://x", 1).parse_did(&d), None);
         let doc = l.doc(7, 123_456);
-        assert_eq!(vlpds::did_resolver::service_endpoint(&doc, "atproto_pds").unwrap(), "http://127.0.0.1:30007");
-        assert!(l.key(7, 123_456).matches_public(&vlpds::did_resolver::signing_key_multibase(&doc).unwrap()));
+        assert_eq!(
+            vlsync_atproto::did_resolver::service_endpoint(&doc, "atproto_pds").unwrap(),
+            "http://127.0.0.1:30007"
+        );
+        assert!(l.key(7, 123_456).matches_public(&vlsync_atproto::did_resolver::signing_key_multibase(&doc).unwrap()));
     }
 }

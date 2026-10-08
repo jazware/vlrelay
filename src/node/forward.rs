@@ -9,8 +9,8 @@ use bytes::{Buf, BufMut, Bytes};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use vlpds::cid::Cid;
-use vlpds::tid::Tid;
+use vlsync_atproto::cid::Cid;
+use vlsync_atproto::tid::Tid;
 
 /// What the leader did with an event.
 #[derive(Clone, Debug, PartialEq, Eq)]

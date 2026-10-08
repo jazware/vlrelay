@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
-use vlpds::store::Store;
+use vlsync_store::store::Store;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -1268,7 +1268,7 @@ impl Node {
                     .cfg
                     .admin_token
                     .as_deref()
-                    .is_some_and(|t| !t.is_empty() && vlpds::auth::token_eq(t, &r.token));
+                    .is_some_and(|t| !t.is_empty() && vlsync_atproto::xrpc::token_eq(t, &r.token));
                 if !allowed {
                     return Msg::Failed { reason: "unauthorized: the qlog admin token is required".into() };
                 }

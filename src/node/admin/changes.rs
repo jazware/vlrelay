@@ -375,14 +375,14 @@ mod tests {
     use crate::types::Host;
     use std::time::{Duration, Instant};
 
-    async fn relay(id: &str, addrs: &HashMap<String, String>, store: vlpds::store::Store) -> Arc<NodeAdmin> {
+    async fn relay(id: &str, addrs: &HashMap<String, String>, store: vlsync_store::store::Store) -> Arc<NodeAdmin> {
         relay_settling(id, addrs, store, crate::node::admin::HOST_ACTION_SETTLE).await
     }
 
     async fn relay_settling(
         id: &str,
         addrs: &HashMap<String, String>,
-        store: vlpds::store::Store,
+        store: vlsync_store::store::Store,
         settle: Duration,
     ) -> Arc<NodeAdmin> {
         relay_with(id, addrs, store, settle, |_| {}).await
@@ -391,7 +391,7 @@ mod tests {
     async fn relay_with(
         id: &str,
         addrs: &HashMap<String, String>,
-        store: vlpds::store::Store,
+        store: vlsync_store::store::Store,
         settle: Duration,
         tweak: impl FnOnce(&mut NodeConfig),
     ) -> Arc<NodeAdmin> {
@@ -438,7 +438,7 @@ mod tests {
     /// the others serve, with versions that say where they came from.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn changes_on_one_member_reach_every_members_feed() {
-        let store = vlpds::store::Store::memory(None);
+        let store = vlsync_store::store::Store::memory(None);
         let ids = ["n1", "n2", "n3"];
         let addrs: HashMap<String, String> =
             ids.iter().map(|i| (i.to_string(), format!("127.0.0.1:{}", crate::qlog::tests::free_port()))).collect();
@@ -516,7 +516,7 @@ mod tests {
     }
 
     async fn cluster(ids: &[&'static str]) -> HashMap<&'static str, Arc<NodeAdmin>> {
-        let store = vlpds::store::Store::memory(None);
+        let store = vlsync_store::store::Store::memory(None);
         let addrs: HashMap<String, String> =
             ids.iter().map(|i| (i.to_string(), format!("127.0.0.1:{}", crate::qlog::tests::free_port()))).collect();
         let mut admins = HashMap::new();
@@ -611,7 +611,7 @@ mod tests {
     /// the change is announced once it lands.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn a_single_node_reads_its_writes_and_a_lost_one_is_pending() {
-        let store = vlpds::store::Store::memory(None);
+        let store = vlsync_store::store::Store::memory(None);
         let addrs: HashMap<String, String> =
             [("s1".to_string(), format!("127.0.0.1:{}", crate::qlog::tests::free_port()))].into();
         let settle = Duration::from_millis(600);
@@ -679,7 +679,10 @@ mod tests {
                                 .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
                             let f = crate::upstream::frame::encode_message(
                                 "#commit",
-                                &[("seq", vlpds::cbor::Value::Int(seq)), ("time", vlpds::cbor::Value::Text(time))],
+                                &[
+                                    ("seq", vlsync_atproto::cbor::Value::Int(seq)),
+                                    ("time", vlsync_atproto::cbor::Value::Text(time)),
+                                ],
                             );
                             if sock.send(Message::Binary(f.into())).await.is_err() {
                                 return;
@@ -702,7 +705,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_late_host_opens_a_read_lag_case_and_its_recovery_closes_it() {
         use crate::node::lag::{LagCaseConfig, RESOLVED_NOTE};
-        let store = vlpds::store::Store::memory(None);
+        let store = vlsync_store::store::Store::memory(None);
         let addrs: HashMap<String, String> =
             [("n1".to_string(), format!("127.0.0.1:{}", crate::qlog::tests::free_port()))].into();
         let a = relay_with("n1", &addrs, store, crate::node::admin::HOST_ACTION_SETTLE, |cfg| {

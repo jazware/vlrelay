@@ -400,7 +400,7 @@ fn quorum_setup(q: &QuorumArgs, node_id: &str) -> anyhow::Result<vlrelay::node::
 /// and its file from both being set). Errors name the flag and the path,
 /// never the contents.
 fn read_secret_files(a: &mut Args) -> anyhow::Result<()> {
-    use vlpds::secret_file::resolve;
+    use vlsync_store::secret_file::resolve;
     resolve("s3-access-key-file", &a.s3_access_key_file, &mut a.s3_access_key)?;
     resolve("s3-secret-key-file", &a.s3_secret_key_file, &mut a.s3_secret_key)?;
     resolve("admin-token-file", &a.admin_token_file, &mut a.admin_token)?;
@@ -409,6 +409,7 @@ fn read_secret_files(a: &mut Args) -> anyhow::Result<()> {
 }
 
 fn main() {
+    vlsync_atproto::http::set_user_agent(concat!("vlrelay/", env!("CARGO_PKG_VERSION")));
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,slatedb=warn".into()),
@@ -438,11 +439,11 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
     let loopback_plc = a.plc_url.contains("://127.") || a.plc_url.contains("://localhost");
     let dev_mode = a.dev_mode || a.hosts.iter().any(|h| h.starts_with("http://")) || loopback_plc;
     let store = if a.memory {
-        vlpds::store::Store::memory(None)
+        vlsync_store::store::Store::memory(None)
     } else {
         let need =
             |v: &Option<String>, f: &str| v.clone().ok_or_else(|| anyhow::anyhow!("{f} is required without --memory"));
-        let cfg = vlpds::store::S3Config {
+        let cfg = vlsync_store::store::S3Config {
             endpoint: need(&a.s3_endpoint, "--s3-endpoint")?,
             bucket: need(&a.s3_bucket, "--s3-bucket")?,
             access_key: need(&a.s3_access_key, "--s3-access-key")?,
@@ -450,13 +451,13 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
             region: a.s3_region.clone(),
         };
         let unsigned = a.s3_unsigned_payload.unwrap_or(cfg.endpoint.starts_with("https://"));
-        vlpds::store::Store::s3_with(&cfg, &a.prefix, None, 256, unsigned)?
+        vlsync_store::store::Store::s3_with(&cfg, &a.prefix, None, 256, unsigned)?
     };
 
     let mut cfg = NodeConfig::new(&a.plc_url);
     cfg.node_id = a.node_id.clone();
     cfg.dev_mode = dev_mode;
-    vlpds::segment::set_compression_level(a.log_compression);
+    vlsync_store::segment::set_compression_level(a.log_compression);
     if a.max_lag_mb.is_some() && !dev_mode {
         anyhow::bail!("--max-lag-mb is for dev networks (--dev-mode)");
     }
@@ -514,7 +515,7 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
     let admin = vlrelay::qlog::emit::Admin::for_listener(a.quorum.qlog_admin_token.clone(), a.listen);
     let mut app = axum::Router::new()
         .route("/xrpc/_health", axum::routing::get(health))
-        .route("/metrics", axum::routing::get(|| async { vlpds::metrics::render() }))
+        .route("/metrics", axum::routing::get(|| async { vlsync_store::metrics::render() }))
         .merge(node.serve.router())
         .merge(vlrelay::qlog::emit::control_router(node.quorum.qnode.clone(), admin))
         .merge(vlrelay::sync_api::router(Arc::new(vlrelay::node::quorum::QuorumSync {
@@ -557,7 +558,7 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
     // Consumers (a reconnect storm's accepts and upgrades) are served on the
     // subscriber runtime, so they can't starve the pipeline and the quorum
     // log on this one. The tokio listener must be registered there too.
-    let rt = vlpds::firehose::runtime(node.cfg.serve_threads);
+    let rt = vlsync_firehose::firehose::runtime(node.cfg.serve_threads);
     let admin_server = admin_listener.map(|l| {
         let app = vlrelay::admin::proxy::admin_listener(app.clone(), admin_proxy);
         rt.spawn(async move {

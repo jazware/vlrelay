@@ -542,7 +542,7 @@ fn bench(frames: &PathBuf, keys_path: &PathBuf, passes: usize) {
                 }
             })
             .collect();
-        let blocks: Vec<(Vec<u8>, String, vlpds::tid::Tid)> = sc
+        let blocks: Vec<(Vec<u8>, String, vlsync_atproto::tid::Tid)> = sc
             .iter()
             .map(|c| (c.blocks.iter().find(|(x, _)| *x == c.commit).unwrap().1.to_vec(), c.repo.clone(), c.rev))
             .collect();

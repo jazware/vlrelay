@@ -34,7 +34,7 @@ use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use std::time::Duration;
 use store::{Fetched, Versioned, now_ms};
-use vlpds::store::Store;
+use vlsync_store::store::Store;
 
 /// A lost nudge or a node that missed a save catches up within this.
 pub const REFRESH_EVERY: Duration = Duration::from_secs(10);

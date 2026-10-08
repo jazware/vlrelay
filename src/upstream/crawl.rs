@@ -461,7 +461,7 @@ impl Crawler {
         let cfg = self.manager.config();
         let base = (cfg.endpoint)(host);
         let url = format!("{}/xrpc/com.atproto.server.describeServer", base.trim_end_matches('/'));
-        let req = vlpds::http::guarded(cfg.dev_mode).get(&url).map_err(CrawlError::Unreachable)?;
+        let req = vlsync_atproto::http::guarded(cfg.dev_mode).get(&url).map_err(CrawlError::Unreachable)?;
         let resp =
             req.timeout(timeout).send().await.map_err(|e| CrawlError::Unreachable(format!("describeServer: {e}")))?;
         if !resp.status().is_success() {

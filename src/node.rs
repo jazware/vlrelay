@@ -62,7 +62,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
-use vlpds::store::Store;
+use vlsync_store::store::Store;
 
 pub type State = StateStore<VerifyChain>;
 
@@ -763,7 +763,7 @@ impl Node {
             let ev_in: u64 = hosts.iter().map(|h| h.frames).sum();
             let bytes_in: u64 = hosts.iter().map(|h| h.bytes).sum();
             let ev_out = metrics::EVENTS_OUT.get();
-            let bytes_out = vlpds::metrics::FIREHOSE_SENT_BYTES.get();
+            let bytes_out = vlsync_firehose::metrics::FIREHOSE_SENT_BYTES.get();
             let mut rejects_now: HashMap<&'static str, u64> = HashMap::new();
             let host_rejects: HashMap<Host, u64> = {
                 let r = self.rejects.lock();
@@ -783,7 +783,7 @@ impl Node {
             };
             prev_lat = lat;
             metrics::DURABLE_LAG.set(lag_ms as i64);
-            let consumers = vlpds::metrics::FIREHOSE_SUBSCRIBERS.get();
+            let consumers = vlsync_firehose::metrics::FIREHOSE_SUBSCRIBERS.get();
             metrics::CONSUMERS.set(consumers);
             let st = &self.identity.stats;
             for (k, v) in [

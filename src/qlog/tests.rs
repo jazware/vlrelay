@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use vlpds::store::Store;
+use vlsync_store::store::Store;
 
 pub(crate) struct Running {
     rt: tokio::runtime::Runtime,
@@ -2243,7 +2243,7 @@ async fn retention_deletes_only_what_it_reports_and_recovery_still_works() {
     assert_eq!(a.pruned_seq, plan.pruned_seq_after);
     assert_eq!(retain::pruned_seq(&c.store).await.unwrap(), plan.pruned_seq_after);
     assert!(a.state_paths.contains(&lost) && !a.state_paths.contains(&running), "{a:#?}");
-    let seg = |o: u64| vlpds::nodelog::segment_path(&c.store, flush::LOG_ID, o);
+    let seg = |o: u64| vlsync_firehose::log::segment_path(&c.store, flush::LOG_ID, o);
     for s in &plan.deletable {
         assert!(matches!(c.store.raw.head(&seg(s.ordinal)).await, Err(object_store::Error::NotFound { .. })));
     }

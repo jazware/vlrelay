@@ -5,11 +5,11 @@
 use super::SigningKey;
 use bytes::Bytes;
 use std::collections::BTreeMap;
-use vlpds::cbor::Value;
-use vlpds::cid::Cid;
-use vlpds::events::{CommitFrame, RepoOp, commit_frame, encode_commit, sync_frame};
-use vlpds::mst::Tree;
-use vlpds::tid::Tid;
+use vlsync_atproto::cbor::Value;
+use vlsync_atproto::cid::Cid;
+use vlsync_atproto::events::{CommitFrame, RepoOp, commit_frame, encode_commit, sync_frame};
+use vlsync_atproto::mst::Tree;
+use vlsync_atproto::tid::Tid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Curve {
@@ -18,7 +18,7 @@ pub enum Curve {
 }
 
 pub enum Signer {
-    K256(vlpds::crypto::Keypair),
+    K256(vlsync_atproto::crypto::Keypair),
     P256(p256::ecdsa::SigningKey),
 }
 
@@ -28,7 +28,7 @@ impl Signer {
         use sha2::{Digest, Sha256};
         let sk: [u8; 32] = Sha256::digest(seed.to_be_bytes()).into();
         match curve {
-            Curve::K256 => Signer::K256(vlpds::crypto::Keypair::from_bytes(&sk).expect("k256 key")),
+            Curve::K256 => Signer::K256(vlsync_atproto::crypto::Keypair::from_bytes(&sk).expect("k256 key")),
             Curve::P256 => Signer::P256(p256::ecdsa::SigningKey::from_bytes(&sk.into()).expect("p256 key")),
         }
     }
@@ -101,7 +101,7 @@ impl Repo {
             live.insert(p, c);
         }
         tree.root_cid().expect("root");
-        let rev = Tid::from_parts(vlpds::tid::now_micros() - 60_000_000, 0);
+        let rev = Tid::from_parts(vlsync_atproto::tid::now_micros() - 60_000_000, 0);
         let mut r = Repo {
             did: did.into(),
             signer,
@@ -179,13 +179,13 @@ impl Repo {
         }
         let mut nodes = Vec::new();
         let data = self.tree.write_diff_blocks(&mut nodes).expect("diff");
-        self.rev = Tid::from_parts(self.rev.micros().max(vlpds::tid::now_micros() - 30_000_000) + 1, 0);
+        self.rev = Tid::from_parts(self.rev.micros().max(vlsync_atproto::tid::now_micros() - 30_000_000) + 1, 0);
         self.sign(data);
         let mut car = Vec::new();
-        vlpds::car::write_header(&mut car, &self.commit);
-        vlpds::car::write_block(&mut car, &self.commit, &self.commit_block);
+        vlsync_atproto::car::write_header(&mut car, &self.commit);
+        vlsync_atproto::car::write_block(&mut car, &self.commit, &self.commit_block);
         for (c, b) in nodes.iter().chain(records.iter()) {
-            vlpds::car::write_block(&mut car, c, b);
+            vlsync_atproto::car::write_block(&mut car, c, b);
         }
         let rops: Vec<RepoOp> = fops
             .iter()
@@ -216,8 +216,8 @@ impl Repo {
     /// A #sync of the current state.
     pub fn sync(&mut self) -> Bytes {
         let mut car = Vec::new();
-        vlpds::car::write_header(&mut car, &self.commit);
-        vlpds::car::write_block(&mut car, &self.commit, &self.commit_block);
+        vlsync_atproto::car::write_header(&mut car, &self.commit);
+        vlsync_atproto::car::write_block(&mut car, &self.commit, &self.commit_block);
         let f = sync_frame(&self.did, &self.rev.to_string(), &car, "2026-01-01T00:00:00.000Z");
         self.seq += 1;
         let mut out = Vec::new();

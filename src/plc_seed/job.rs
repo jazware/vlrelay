@@ -11,7 +11,7 @@ use crate::qlog::node::{Node as QNode, Role};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
-use vlpds::store::Store;
+use vlsync_store::store::Store;
 
 /// The ingester's sink on the leader: the seed database, and this node's
 /// cache dropping DIDs whose documents changed (the members' copies age out

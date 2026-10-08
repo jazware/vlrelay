@@ -9,7 +9,7 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use vlpds::xrpc::XrpcError;
+use vlsync_atproto::xrpc::XrpcError;
 
 /// What the handlers read: on the quorum log, the leader's records and the
 /// host table (`node::quorum::QuorumSync`).

@@ -24,7 +24,7 @@ pub use shard::{ShardState, Ticket};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
-use vlpds::slots::ShardId;
+use vlsync_store::slots::ShardId;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -44,8 +44,8 @@ pub enum StoreError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoRow {
     pub did: String,
-    pub head: vlpds::cid::Cid,
-    pub rev: vlpds::tid::Tid,
+    pub head: vlsync_atproto::cid::Cid,
+    pub rev: vlsync_atproto::tid::Tid,
     pub status: AccountStatus,
 }
 
@@ -124,12 +124,12 @@ impl<C: Chain> StateStore<C> {
                 k.push(0);
                 k
             }
-            _ => vlpds::state::slot_prefix(0).to_vec(),
+            _ => vlsync_store::keys::slot_prefix(0).to_vec(),
         };
         let s = self.shard_for("")?;
         let (_, end) = s.range_keys();
         let mut repos = Vec::with_capacity(limit);
-        let mut it = vlpds::state::BatchedScan::new(s.db.scan(start..end.to_vec()).await?);
+        let mut it = vlsync_store::keys::BatchedScan::new(s.db.scan(start..end.to_vec()).await?);
         while let Some(kv) = it.next().await? {
             let Some(did) = record::did_from_key(&kv.key) else { continue };
             let rec = Record::decode(&kv.value)?;

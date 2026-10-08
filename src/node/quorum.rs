@@ -49,8 +49,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
-use vlpds::slots::ShardId;
-use vlpds::store::Store;
+use vlsync_store::slots::ShardId;
+use vlsync_store::store::Store;
 
 /// What `main` gives a node on the quorum log.
 #[derive(Clone)]
@@ -1040,7 +1040,7 @@ impl Hooks for RelayHooks {
             let shard = Arc::new(ShardState::new(
                 ShardId(0),
                 0,
-                vlpds::slots::SLOTS,
+                vlsync_store::slots::SLOTS,
                 Arc::new(db.clone()),
                 self.state.config.cache_entries_per_shard,
             ));
@@ -1730,7 +1730,7 @@ impl state::HostStore for QuorumHosts {
 
     async fn list_hosts(&self, cursor: Option<&str>, limit: usize) -> anyhow::Result<state::HostPage> {
         let mut rows = self.all();
-        let key = |h: &str| (vlpds::slots::slot_of(h), h.to_string());
+        let key = |h: &str| (vlsync_store::slots::slot_of(h), h.to_string());
         rows.sort_by_key(|r| key(&r.hostname));
         if let Some(c) = cursor.filter(|c| !c.is_empty()) {
             let k = key(c);
@@ -2120,11 +2120,11 @@ impl Glue {
     /// An operator's takedown, made by the leader as an `#account` on the
     /// log.
     pub async fn takedown(&self, did: &str, takedown: bool) -> anyhow::Result<FwdOutcome> {
-        let frame = vlpds::events::account_frame(
+        let frame = vlsync_atproto::events::account_frame(
             did,
             !takedown,
             takedown.then_some("takendown"),
-            &vlpds::events::now_rfc3339(),
+            &vlsync_atproto::events::now_rfc3339(),
         );
         let item = Item {
             prefix: frame.prefix.into(),
@@ -2153,12 +2153,12 @@ pub async fn release_throttled(client: &Client, from: &str, host: &str) -> anyho
     }
     let list: Vec<Throttled> = serde_json::from_value(v["accounts"].clone())?;
     let mut released = 0u64;
-    let time = vlpds::events::now_rfc3339();
+    let time = vlsync_atproto::events::now_rfc3339();
     for chunk in list.chunks(256) {
         let items = chunk
             .iter()
             .map(|t| {
-                let frame = vlpds::events::account_frame(&t.did, t.active, t.status.as_deref(), &time);
+                let frame = vlsync_atproto::events::account_frame(&t.did, t.active, t.status.as_deref(), &time);
                 let mut op = vec![0xff, OP_RELEASE, t.active as u8];
                 put_str16(&mut op, t.status.as_deref().unwrap_or(""));
                 Item {
@@ -2231,13 +2231,13 @@ impl Glue {
             cpu = now;
             *self.hooks.local.lock() = serde_json::json!({
                 "hosts": n.manager.running(),
-                "consumers": vlpds::metrics::FIREHOSE_SUBSCRIBERS.get().max(0),
+                "consumers": vlsync_firehose::metrics::FIREHOSE_SUBSCRIBERS.get().max(0),
                 "events_in_per_sec": last.as_ref().map_or(0.0, |s| s.events_in),
                 "events_out_per_sec": last.as_ref().map_or(0.0, |s| s.events_out),
                 "bytes_out_per_sec": last.as_ref().map_or(0.0, |s| s.bytes_out),
                 "durable_lag_ms": last.as_ref().map_or(0.0, |s| s.durable_lag_ms),
                 "cpu": cores,
-                "mem_bytes": vlpds::metrics::resident_bytes(),
+                "mem_bytes": vlsync_store::metrics::resident_bytes(),
                 "stream_seq": n.serve.head(),
             });
         }
@@ -2392,7 +2392,7 @@ impl Node {
         let srv = crate::serve::Serve::counted(store.clone(), scfg.clone());
         let s2 = srv.clone();
         emitter.set_serving(
-            scfg.firehose_options(Some(vlpds::firehose::runtime(cfg.serve_threads))),
+            scfg.firehose_options(Some(vlsync_firehose::firehose::runtime(cfg.serve_threads))),
             Box::new(move |fh| s2.attach(fh)),
         );
         srv.load_takedowns().await;
@@ -2542,8 +2542,8 @@ mod tests {
     use crate::qlog::tests::{Cluster, ConfigFn, config};
     use crate::state::tests::MapIdentity;
     use crate::verify::{Verified, VerifiedKind};
-    use vlpds::cid::Cid;
-    use vlpds::tid::Tid;
+    use vlsync_atproto::cid::Cid;
+    use vlsync_atproto::tid::Tid;
 
     const HOST: &str = "h0";
 
@@ -2793,11 +2793,11 @@ mod tests {
         let from = owner(&client).await;
         assert!(matches!(submit_one(&client, identity(&did, &from)).await, Outcome::Appended(_)));
         let operator = |takedown: bool| {
-            let frame = vlpds::events::account_frame(
+            let frame = vlsync_atproto::events::account_frame(
                 &did,
                 !takedown,
                 takedown.then_some("takendown"),
-                &vlpds::events::now_rfc3339(),
+                &vlsync_atproto::events::now_rfc3339(),
             );
             Item {
                 prefix: frame.prefix.into(),

@@ -1,7 +1,7 @@
 //! Just enough of a subscribeRepos frame to route it: the header and the
 //! body's `seq`. Everything else is the verify workstream's.
 
-use vlpds::cbor::ValueRef;
+use vlsync_atproto::cbor::ValueRef;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Peek<'a> {
@@ -63,8 +63,8 @@ pub fn peek(frame: &[u8]) -> Result<Peek<'_>, PeekError> {
 }
 
 /// A frame as a PDS would write it, for tests and the local fan.
-pub fn encode_message(t: &str, body: &[(&str, vlpds::cbor::Value)]) -> Vec<u8> {
-    use vlpds::cbor::{Value, write_int, write_map_head, write_text};
+pub fn encode_message(t: &str, body: &[(&str, vlsync_atproto::cbor::Value)]) -> Vec<u8> {
+    use vlsync_atproto::cbor::{Value, write_int, write_map_head, write_text};
     let mut out = Vec::with_capacity(64);
     write_map_head(&mut out, 2);
     write_text(&mut out, "t");
@@ -72,19 +72,19 @@ pub fn encode_message(t: &str, body: &[(&str, vlpds::cbor::Value)]) -> Vec<u8> {
     write_text(&mut out, "op");
     write_int(&mut out, 1);
     let mut m: Vec<(String, Value)> = body.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
-    m.sort_by(|a, b| vlpds::cbor::key_cmp(&a.0, &b.0));
+    m.sort_by(|a, b| vlsync_atproto::cbor::key_cmp(&a.0, &b.0));
     Value::Map(m).encode(&mut out);
     out
 }
 
 pub fn encode_error(error: &str, message: &str) -> Vec<u8> {
-    vlpds::events::error_frame(error, message)
+    vlsync_atproto::events::error_frame(error, message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vlpds::cbor::Value;
+    use vlsync_atproto::cbor::Value;
 
     #[test]
     fn peeks() {

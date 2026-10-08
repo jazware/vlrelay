@@ -1,177 +1,21 @@
-//! Upstream subscriptions against real upstreams: an in-process vlpds for
-//! real sync 1.1 frames, and a synthetic fan for rates, stalls and errors.
+//! Upstream subscriptions against a synthetic fan of upstreams, for rates,
+//! stalls and errors. Real sync 1.1 frames from an in-process vlpds are in
+//! interop/tests/vlpds.
 
+mod common;
 mod fan;
-mod pds;
 mod scale;
 
+use common::*;
 use fan::{Fan, HostSpec, Stamp};
-use pds::Pds;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-use vlrelay::types::{Host, UpstreamFrame};
+use vlrelay::types::Host;
 use vlrelay::upstream::flow::FlowLimits;
 use vlrelay::upstream::{
-    Backpressure, CrawlPolicy, Crawler, DomainAction, DomainRule, HostRecord, HostStatus, HostStore, Limits, Manager,
-    MemHostStore, Tier, TierLimits, UpstreamConfig,
+    Backpressure, HostRecord, HostStatus, HostStore, Limits, Manager, MemHostStore, Tier, TierLimits, UpstreamConfig,
 };
-
-fn dev_config() -> UpstreamConfig {
-    let mut c = UpstreamConfig::new(true);
-    c.endpoint = Arc::new(|h: &Host| format!("http://{}", h.0));
-    c.backoff_base = Duration::from_millis(50);
-    c.backoff_max = Duration::from_millis(400);
-    c.connect_timeout = Duration::from_secs(2);
-    c.flush_interval = Duration::from_millis(100);
-    c
-}
-
-/// Routes `*.fan.test` to the fan, anything else to `http://{host}`.
-fn fan_config(fan: &Arc<Fan>) -> UpstreamConfig {
-    let mut c = dev_config();
-    let f = fan.clone();
-    c.endpoint = Arc::new(move |h: &Host| match h.0.strip_suffix(".fan.test") {
-        Some(name) => f.url(name),
-        None => format!("http://{}", h.0),
-    });
-    c
-}
-
-/// A store holding `host` at `tier` with an acked cursor.
-async fn seeded(host: &Host, tier: Tier, acked: Option<i64>) -> Arc<MemHostStore> {
-    let store = Arc::new(MemHostStore::default());
-    let mut r = HostRecord::new(host, tier);
-    r.acked_seq = acked;
-    store.put(vec![r]).await.unwrap();
-    store
-}
-
-async fn wait_for(what: &str, timeout: Duration, mut f: impl FnMut() -> bool) {
-    let t = Instant::now();
-    while !f() {
-        assert!(t.elapsed() < timeout, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-/// Frames until none arrive for `quiet`.
-async fn drain(rx: &mut mpsc::Receiver<UpstreamFrame>, quiet: Duration) -> Vec<UpstreamFrame> {
-    let mut out = Vec::new();
-    while let Ok(Some(f)) = tokio::time::timeout(quiet, rx.recv()).await {
-        out.push(f);
-    }
-    out
-}
-
-/// Frames for `d`, for streams that never go quiet.
-async fn collect_for(rx: &mut mpsc::Receiver<UpstreamFrame>, d: Duration) -> Vec<UpstreamFrame> {
-    let mut out = Vec::new();
-    let end = tokio::time::Instant::now() + d;
-    while let Ok(Some(f)) = tokio::time::timeout_at(end, rx.recv()).await {
-        out.push(f);
-    }
-    out
-}
-
-fn seqs(frames: &[UpstreamFrame]) -> Vec<i64> {
-    frames.iter().map(|f| f.upstream_seq).collect()
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subscribes_to_vlpds() {
-    let pds = Pds::spawn().await;
-    let alice = pds.create_account().await;
-    for i in 0..5 {
-        pds.post_text(&alice, &format!("post {i}")).await;
-    }
-    let host = Host(pds.hostname());
-    let store = seeded(&host, Tier::Default, Some(0)).await;
-    let (m, mut rx) = Manager::new(dev_config(), store.clone(), None);
-    m.start().await.unwrap();
-
-    let want = pds.seqs_after(0).await;
-    assert!(want.len() >= 6, "account + 5 posts: {want:?}");
-    let got = drain(&mut rx, Duration::from_millis(800)).await;
-    assert_eq!(seqs(&got), want);
-    assert!(got.iter().all(|f| f.host == host));
-    let kinds: Vec<_> = got
-        .iter()
-        .map(|f| match vlrelay::upstream::frame::peek(&f.frame).unwrap() {
-            vlrelay::upstream::frame::Peek::Message { t, .. } => t.to_string(),
-            p => panic!("{p:?}"),
-        })
-        .collect();
-    assert!(kinds.iter().filter(|t| *t == "#commit").count() >= 5, "{kinds:?}");
-
-    // live events keep coming on the same socket
-    pds.post_text(&alice, "live").await;
-    let live = drain(&mut rx, Duration::from_millis(500)).await;
-    assert_eq!(seqs(&live), pds.seqs_after(*want.last().unwrap()).await);
-    let v = m.host(&host).unwrap();
-    assert_eq!((v.connects, v.record.status), (1, HostStatus::Active));
-    assert_eq!(v.received_seq, live.last().map(|f| f.upstream_seq));
-    // received isn't acked until the relay says so
-    assert_eq!(v.record.acked_seq, Some(0));
-    m.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn resumes_from_acked_cursor() {
-    let pds = Pds::spawn().await;
-    let alice = pds.create_account().await;
-    let host = Host(pds.hostname());
-    let store = seeded(&host, Tier::Default, Some(0)).await;
-    let (m, mut rx) = Manager::new(dev_config(), store.clone(), None);
-    m.start().await.unwrap();
-    let mut delivered = drain(&mut rx, Duration::from_millis(500)).await;
-    let first = seqs(&delivered);
-    m.ack(&host, *first.last().unwrap());
-
-    // everything acked: a reconnect replays nothing and misses nothing
-    m.kick(&host);
-    wait_for("reconnect", Duration::from_secs(5), || {
-        m.host(&host).is_some_and(|v| v.connects == 2 && v.record.status == HostStatus::Active)
-    })
-    .await;
-    for i in 0..5 {
-        pds.post_text(&alice, &format!("a{i}")).await;
-    }
-    let second = drain(&mut rx, Duration::from_millis(500)).await;
-    assert_eq!(seqs(&second), pds.seqs_after(*first.last().unwrap()).await);
-    assert_eq!(second.len(), 5);
-    delivered.extend(second.iter().cloned());
-
-    // ack only the first two of those: the other three come again, once
-    let acked = second[1].upstream_seq;
-    m.ack(&host, acked);
-    m.kick(&host);
-    wait_for("second reconnect", Duration::from_secs(5), || m.host(&host).is_some_and(|v| v.connects == 3)).await;
-    for i in 0..3 {
-        pds.post_text(&alice, &format!("b{i}")).await;
-    }
-    let third = drain(&mut rx, Duration::from_millis(500)).await;
-    let want = pds.seqs_after(acked).await;
-    assert_eq!(seqs(&third), want, "resume from the acked cursor exactly");
-    assert_eq!(want.len(), 6);
-    for f in &third {
-        m.ack(&host, f.upstream_seq);
-    }
-    // durable, so a fresh manager on the same store resumes after it
-    m.shutdown().await.unwrap();
-    assert_eq!(store.get(&host.0).unwrap().acked_seq, Some(*want.last().unwrap()));
-
-    let (m2, mut rx2) = Manager::new(dev_config(), store.clone(), None);
-    m2.start().await.unwrap();
-    pds.post_text(&alice, "after restart").await;
-    let fourth = drain(&mut rx2, Duration::from_millis(500)).await;
-    // vlpds seqs aren't dense, so compare with what the PDS has after it
-    let after = pds.seqs_after(*want.last().unwrap()).await;
-    assert_eq!(after.len(), 1);
-    assert_eq!(seqs(&fourth), after);
-    m2.shutdown().await.unwrap();
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backs_off_a_dead_host() {
@@ -579,73 +423,6 @@ async fn live_upstream() {
     );
     assert!(!got.is_empty());
     assert!(got.windows(2).all(|w| w[1].upstream_seq > w[0].upstream_seq));
-    m.shutdown().await.unwrap();
-}
-
-async fn serve_crawler(c: &Arc<Crawler>) -> String {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", l.local_addr().unwrap());
-    let r = c.router();
-    tokio::spawn(async move { axum::serve(l, r).await.unwrap() });
-    url
-}
-
-async fn crawl(url: &str, hostname: &str) -> (u16, serde_json::Value) {
-    let r = reqwest::Client::new()
-        .post(format!("{url}/xrpc/com.atproto.sync.requestCrawl"))
-        .json(&serde_json::json!({"hostname": hostname}))
-        .send()
-        .await
-        .unwrap();
-    (r.status().as_u16(), r.json().await.unwrap_or_default())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn request_crawl() {
-    let pds = Pds::spawn().await;
-    let fan = Fan::spawn().await;
-    fan.set("second", HostSpec::rate(0.0, 0));
-    fan.set("listed", HostSpec::rate(0.0, 0));
-    let (m, _rx) = Manager::new(fan_config(&fan), Arc::new(MemHostStore::default()), None);
-    m.start().await.unwrap();
-    let policy = CrawlPolicy {
-        allow: vec!["listed.fan.test".into()],
-        rules: vec![DomainRule { suffix: "spam.test".into(), action: DomainAction::Ban }],
-        new_hosts_per_hour: 1,
-        probe_timeout_secs: 2,
-        ..Default::default()
-    };
-    let c = Crawler::new(m.clone(), policy);
-    let url = serve_crawler(&c).await;
-
-    let (s, j) = crawl(&url, "not a host!").await;
-    assert_eq!((s, j["error"].as_str()), (400, Some("InvalidRequest")));
-    let (s, j) = crawl(&url, "pds7.spam.test").await;
-    assert_eq!((s, j["error"].as_str()), (400, Some("HostBanned")));
-    // nothing there: refused, and it doesn't spend the budget
-    let (s, j) = crawl(&url, "missing.fan.test").await;
-    assert_eq!((s, j["error"].as_str()), (400, Some("InvalidRequest")), "{j}");
-
-    // a real PDS is probed and admitted at tier new
-    let pds_host = Host(pds.hostname());
-    let (s, j) = crawl(&url, &format!("http://{}/", pds.hostname())).await;
-    assert_eq!(s, 200, "{j}");
-    let v = m.host(&pds_host).unwrap();
-    assert_eq!(v.record.tier, Tier::New);
-    wait_for("subscribed", Duration::from_secs(5), || m.host(&pds_host).unwrap().connects == 1).await;
-
-    // asking again is fine and doesn't spend anything
-    assert_eq!(crawl(&url, &pds.hostname()).await.0, 200);
-    // the hourly budget is one new host
-    let (s, j) = crawl(&url, "second.fan.test").await;
-    assert_eq!((s, j["error"].as_str()), (429, Some("RateLimitExceeded")));
-    // the allow list skips it
-    assert_eq!(crawl(&url, "listed.fan.test").await.0, 200);
-
-    // banned by hand: refused even though it's known
-    m.set_tier(&pds_host, Tier::Banned).await.unwrap();
-    assert_eq!(crawl(&url, &pds.hostname()).await.1["error"], "HostBanned");
-    assert_eq!(m.running(), 1);
     m.shutdown().await.unwrap();
 }
 

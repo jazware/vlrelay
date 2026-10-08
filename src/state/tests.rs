@@ -2,9 +2,9 @@ use super::*;
 use crate::types::Host;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-use vlpds::cid::Cid;
-use vlpds::store::Store;
-use vlpds::tid::Tid;
+use vlsync_atproto::cid::Cid;
+use vlsync_atproto::tid::Tid;
+use vlsync_store::store::Store;
 
 pub(crate) struct MapIdentity {
     pub docs: Mutex<HashMap<String, Identity>>,
@@ -49,7 +49,7 @@ pub(crate) async fn attach_memory_shard<C: Chain>(st: &StateStore<C>) {
     st.attach_shard(Arc::new(ShardState::new(
         ShardId(0),
         0,
-        vlpds::slots::SLOTS,
+        vlsync_store::slots::SLOTS,
         Arc::new(db),
         st.config.cache_entries_per_shard,
     )));

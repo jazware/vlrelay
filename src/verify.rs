@@ -10,10 +10,10 @@ use crate::event::{Action, ParsedCommit, ParsedSync, RepoOp, split_signed_commit
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use vlpds::cbor::ValueRef;
-use vlpds::cid::Cid;
-use vlpds::mst::{MstError, Tree};
-use vlpds::tid::Tid;
+use vlsync_atproto::cbor::ValueRef;
+use vlsync_atproto::cid::Cid;
+use vlsync_atproto::mst::{MstError, Tree};
+use vlsync_atproto::tid::Tid;
 
 /// Why an event was dropped. [`Reject::reason`] is a stable label for
 /// metrics and per-host error budgets.
@@ -340,7 +340,7 @@ pub type BlockMap<'a> = HashMap<Cid, &'a [u8], foldhash::fast::RandomState>;
 pub fn block_map(blocks: &[(Cid, Bytes)]) -> Result<BlockMap<'_>, Reject> {
     let mut m = BlockMap::with_capacity_and_hasher(blocks.len(), Default::default());
     for (c, b) in blocks {
-        if !vlpds::car::block_matches(c, b) {
+        if !vlsync_atproto::car::block_matches(c, b) {
             return Err(Reject::BlockHashMismatch);
         }
         m.insert(*c, &b[..]);
@@ -379,7 +379,7 @@ pub fn verify_commit_with(c: &ParsedCommit, key: &SigningKey, opts: &Options) ->
         commit: c.commit,
         data: obj.data,
         prev_data: c.prev_data,
-        created: c.since.is_none() && c.prev_data.is_none_or(|p| p == *vlpds::recent_writes::EMPTY_ROOT),
+        created: c.since.is_none() && c.prev_data.is_none_or(|p| p == *vlsync_atproto::mst::EMPTY_ROOT),
     })
 }
 
@@ -405,7 +405,7 @@ pub fn check_ops(c: &ParsedCommit, data: Cid, blocks: &BlockMap<'_>, opts: &Opti
         && let Some(cid) = op.cid
         && FAST_PATH.get()
     {
-        match vlpds::mst::single_create::undo_single_create(
+        match vlsync_atproto::mst::single_create::undo_single_create(
             blocks,
             data,
             op.path.as_bytes(),
@@ -514,7 +514,7 @@ pub fn verify_sync_with(s: &ParsedSync, key: &SigningKey, opts: &Options) -> Res
     check_future_rev(s.rev, opts)?;
     let commit = *s.car_roots.first().ok_or(Reject::BadCar)?;
     let (_, block) = s.blocks.iter().find(|(c, _)| *c == commit).ok_or(Reject::MissingCommitBlock)?;
-    if !vlpds::car::block_matches(&commit, block) {
+    if !vlsync_atproto::car::block_matches(&commit, block) {
         return Err(Reject::BlockHashMismatch);
     }
     let obj = check_commit_block(block, &s.did, s.rev, key)?;
@@ -537,7 +537,7 @@ pub struct ChainState {
     pub commit: Cid,
 }
 
-pub const CHAIN_STATE_BYTES: usize = 8 + 2 * vlpds::cid::CID_BYTES_LEN;
+pub const CHAIN_STATE_BYTES: usize = 8 + 2 * vlsync_atproto::cid::CID_BYTES_LEN;
 
 impl ChainState {
     pub fn to_bytes(&self) -> [u8; CHAIN_STATE_BYTES] {

@@ -10,8 +10,8 @@ use super::shard::{ShardState, Ticket};
 use super::{StateStore, StoreError};
 use crate::types::Host;
 use std::sync::Arc;
-use vlpds::cid::{CODEC_DAG_CBOR, Cid};
-use vlpds::tid::Tid;
+use vlsync_atproto::cid::{CODEC_DAG_CBOR, Cid};
+use vlsync_atproto::tid::Tid;
 
 /// The verify workstream's chain check, behind a trait until
 /// `verify::check_chain(prev, &Verified) -> Result<ChainState, ChainError>`
@@ -221,7 +221,7 @@ pub enum Reject {
     #[error("CID is not dag-cbor")]
     BadCid,
     #[error("shard {0} is not owned here")]
-    NotOwner(vlpds::slots::ShardId),
+    NotOwner(vlsync_store::slots::ShardId),
     #[error(transparent)]
     Identity(#[from] IdentityError),
     #[error("state store: {0}")]

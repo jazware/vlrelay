@@ -617,7 +617,7 @@ mod tests {
     use crate::node::adapters::VerifyChain;
     use crate::policy::{FixedNodes, Rule, RuleEffect, RuleSet};
     use crate::state::{AccountGate, ApplyConfig, StateStore, Tier};
-    use vlpds::store::Store;
+    use vlsync_store::store::Store;
 
     async fn setup() -> (Arc<PolicyHooks>, Arc<State>) {
         let store = Store::memory(None);

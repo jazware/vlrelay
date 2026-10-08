@@ -10,10 +10,10 @@
 
 use crate::verify::Reject;
 use bytes::{BufMut, Bytes, BytesMut};
-use vlpds::cbor::ValueRef;
-use vlpds::cid::Cid;
-use vlpds::tid::Tid;
-use vlpds::xrpc::syntax;
+use vlsync_atproto::cbor::ValueRef;
+use vlsync_atproto::cid::Cid;
+use vlsync_atproto::syntax;
+use vlsync_atproto::tid::Tid;
 
 /// Above the largest legal frame (a #commit with a 2 MB CAR plus 200 ops) with
 /// room for the envelope. Upstream sockets should use the same limit.
@@ -511,7 +511,7 @@ fn parse_op(o: &ValueRef<'_>) -> Result<RepoOp, Reject> {
 type Car = (Vec<Cid>, Vec<(Cid, Bytes)>);
 
 fn read_car(frame: &Bytes, car: &[u8], max_blocks: usize) -> Result<Car, Reject> {
-    let (roots, raw) = vlpds::car::read_car(car).map_err(|_| Reject::BadCar)?;
+    let (roots, raw) = vlsync_atproto::car::read_car(car).map_err(|_| Reject::BadCar)?;
     if raw.len() > max_blocks {
         return Err(Reject::TooManyBlocks);
     }
