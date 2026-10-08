@@ -24,6 +24,8 @@
 use super::log::Entry;
 use super::node::{Node, Quantiles};
 use super::state::{self, State, StateRef};
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use object_store::path::Path;
 use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use parking_lot::Mutex;
@@ -408,8 +410,18 @@ async fn fence(store: &Store, id: &str, epoch: u64, headroom: u64) -> anyhow::Re
 pub async fn lead(node: Arc<Node>, epoch: u64, o: Options) {
     let store = node.bucket().flush.clone();
     let state_store = node.bucket().state.clone();
-    let mut l =
-        Leader { node, epoch, o, store, state_store, man: Manifest::default(), etag: String::new(), crashed: false };
+    let mut l = Leader {
+        node,
+        epoch,
+        o,
+        store,
+        state_store,
+        man: Manifest::default(),
+        etag: String::new(),
+        crashed: false,
+        pending: BTreeMap::new(),
+        probed: false,
+    };
     if let Err(e) = l.run().await {
         tracing::warn!(epoch, "qlog flush: stopped: {e:#}");
         l.node.flush.s.lock().failed += 1;
@@ -433,6 +445,10 @@ struct Leader {
     etag: String,
     /// Cut short by the crash hook: leave everything as a dead process would.
     crashed: bool,
+    /// Segments past the manifest's `next_ordinal` that this term knows of.
+    pending: BTreeMap<u64, Pending>,
+    /// Whether this term looked past the manifest yet ([`Leader::probe`]).
+    probed: bool,
 }
 
 enum Outcome {
@@ -592,13 +608,29 @@ impl Leader {
         }
         let t0 = Instant::now();
         let req0 = requests_by_op();
-        // the applier is this task: nothing above F is written until it returns
-        let sref = st.seal().await?;
-        let seal_us = t0.elapsed().as_micros() as u64;
+        // The applier is this task: nothing above F is written until it
+        // returns. The segments don't depend on the seal, so they upload
+        // while it runs.
+        let (sealed, segs) = tokio::join!(
+            async {
+                let r = st.seal().await;
+                (r, t0.elapsed().as_micros() as u64)
+            },
+            self.put_segments(f)
+        );
+        let (sref, seal_us) = match sealed {
+            (Ok(s), us) => (s, us),
+            (Err(e), _) => {
+                if matches!(&segs, Err(x) if x.is::<Crash>()) {
+                    return Ok(Outcome::Stop);
+                }
+                return Err(e);
+            }
+        };
         if self.crash(Step::Sealed) {
             return Ok(Outcome::Stop);
         }
-        let segs = match self.put_segments(f).await {
+        let segs = match segs {
             Ok(Some(s)) => s,
             r => {
                 let _ = state::delete_checkpoint(&self.store, &sref).await;
@@ -648,6 +680,8 @@ impl Leader {
         }
         let old = std::mem::replace(&mut self.man, next);
         self.etag = etag;
+        let next_ordinal = self.man.next_ordinal;
+        self.pending.retain(|&o, _| o >= next_ordinal);
         self.node.set_flushed(self.man.flushed, self.man.reserve);
         if let Some(o) = old.state.filter(|o| o.checkpoint != sref.checkpoint)
             && let Err(e) = state::delete_checkpoint(&self.store, &o).await
@@ -715,19 +749,60 @@ impl Leader {
         }
     }
 
-    /// Uploads (man.flushed, f] as segments from `man.next_ordinal`. None:
-    /// an existing segment there reaches past `f` (try again later).
+    /// Uploads (man.flushed, f] as segments from `man.next_ordinal`, up to
+    /// [`PUT_WINDOW`] at once. None: an existing segment there reaches past
+    /// `f` (try again later).
     #[allow(clippy::type_complexity)]
     async fn put_segments(&mut self, f: u64) -> anyhow::Result<Option<(Vec<SegRef>, (u64, u64))>> {
-        let mut out = Vec::new();
+        if !self.probed {
+            self.probe().await?;
+            self.probed = true;
+        }
+        let start = self.man.next_ordinal;
+        let mut done: BTreeMap<u64, SegRef> = BTreeMap::new();
         let (mut raw, mut n) = (0u64, 0u64);
-        let mut ord = self.man.next_ordinal;
+        let mut ord = start;
         let mut from = self.man.flushed + 1;
-        while from <= f {
+        let mut puts = FuturesUnordered::new();
+        let r = 'flush: loop {
+            // every ordinal below `open` is durable
+            let open = (start..ord).find(|o| !done.contains_key(o)).unwrap_or(ord);
+            if from > f || ord >= open + PUT_WINDOW {
+                let Some(p) = puts.next().await else { break Ok(true) };
+                match self.landed(p, f, &mut done, &mut raw, &mut n).await {
+                    Ok(true) => continue,
+                    other => break other,
+                }
+            }
+            match self.pending.get(&ord).copied() {
+                Some(p) if p.durable && p.first == from => {
+                    if p.last > f {
+                        break Ok(false);
+                    }
+                    self.adopt(ord, p, &mut done);
+                    (ord, from) = (ord + 1, p.last + 1);
+                    continue;
+                }
+                Some(_) => match self.existing(ord, from, f).await {
+                    Ok(Existing::Adopt(p)) => {
+                        self.adopt(ord, p, &mut done);
+                        (ord, from) = (ord + 1, p.last + 1);
+                        continue;
+                    }
+                    Ok(Existing::PastF) => break Ok(false),
+                    Ok(Existing::Free) => {}
+                    Err(e) => break Err(e),
+                },
+                None => {}
+            }
             let mut b = SegmentBuilder::for_log(LOG_ID);
             let mut last = from - 1;
             'fill: while last < f {
-                for e in self.node.committed_chunk(last + 1, f, 4 << 20).await? {
+                let chunk = match self.node.committed_chunk(last + 1, f, 4 << 20).await {
+                    Ok(c) => c,
+                    Err(e) => break 'flush Err(e),
+                };
+                for e in chunk {
                     push(&mut b, &e);
                     last = e.seq;
                     if b.len() >= self.o.segment_bytes {
@@ -735,82 +810,288 @@ impl Leader {
                     }
                 }
             }
+            // one segment is compressed at a time: the PUTs in flight hold
+            // only their compressed bodies
             let body_len = b.len() as u64;
-            let obj = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-                let obj = b.seal(LOG_ID, ord, ord);
-                Ok(segment::compress(&obj, segment::compression_level())?.unwrap_or(obj))
-            })
-            .await??;
-            let bytes = obj.len() as u64;
-            let path = log::segment_path(&self.store, LOG_ID, ord);
-            let put = self
-                .store
-                .raw
-                .put_opts(&path, PutPayload::from(obj), PutOptions { mode: PutMode::Create, ..Default::default() })
-                .await;
-            match put {
-                Ok(_) => {
-                    out.push(SegRef { ordinal: ord, first: from, last, bytes });
-                    raw += body_len;
-                    n += last - from + 1;
-                    if self.crash(Step::SegmentPut) {
-                        return Err(Crash.into());
-                    }
+            let obj = match seal(b, ord, open).await {
+                Ok(o) => o,
+                Err(e) => break Err(e),
+            };
+            self.pending.insert(ord, Pending { first: from, last, bytes: 0, durable: false, ours: true });
+            puts.push(put_segment(self.store.clone(), obj, body_len, ord, from, last));
+            (ord, from) = (ord + 1, last + 1);
+        };
+        // every PUT this flush started has its answer before it returns, so
+        // `pending` knows what the next attempt will find
+        if !matches!(r, Ok(true)) {
+            while let Some(p) = puts.next().await {
+                if let Ok(Put::Created(s)) = &p.result {
+                    self.pending.insert(
+                        s.ordinal,
+                        Pending { first: s.first, last: s.last, bytes: s.bytes, durable: true, ours: true },
+                    );
                 }
-                Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
-                    match log::read_head(&self.store, LOG_ID, ord).await? {
-                        // A deposed leader's flush, still running when a
-                        // bucket recovery moved F past it: no manifest names
-                        // an ordinal at or past next_ordinal, and this one
-                        // doesn't continue the log, so it's nobody's.
-                        Head::Segment(h) if (h.first_seq as u64) <= self.man.flushed => {
-                            tracing::warn!(
-                                ord,
-                                first = h.first_seq,
-                                f = self.man.flushed,
-                                "qlog flush: deleting a stale segment in the way"
-                            );
-                            self.store.raw.delete(&path).await?;
-                            continue;
-                        }
-                        Head::Segment(h) if h.first_seq as u64 == from => {
-                            if h.last_seq as u64 > f {
-                                tracing::info!(
-                                    ord,
-                                    last = h.last_seq,
-                                    f,
-                                    "qlog flush: an existing segment reaches past F"
-                                );
-                                return Ok(None);
-                            }
-                            tracing::info!(
-                                ord,
-                                first = h.first_seq,
-                                last = h.last_seq,
-                                "qlog flush: adopted a segment an unfinished flush wrote"
-                            );
-                            self.node.flush.s.lock().adopted += 1;
-                            last = h.last_seq as u64;
-                            out.push(SegRef { ordinal: ord, first: from, last, bytes: 0 });
-                        }
-                        h => anyhow::bail!(
-                            "qlog flush: ordinal {ord} is taken by {} where seq {from} should start",
-                            match h {
-                                Head::Segment(h) => format!("a segment from {}", h.first_seq),
-                                Head::Fence => "a fence".into(),
-                                Head::Missing => "nothing (deleted?)".into(),
-                            }
-                        ),
-                    }
+            }
+        }
+        match r {
+            Ok(true) => Ok(Some((done.into_values().collect(), (raw, n)))),
+            Ok(false) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// One segment PUT's answer. False: the segment there reaches past `f`.
+    async fn landed(
+        &mut self,
+        p: PutDone,
+        f: u64,
+        done: &mut BTreeMap<u64, SegRef>,
+        raw: &mut u64,
+        n: &mut u64,
+    ) -> anyhow::Result<bool> {
+        match p.result? {
+            Put::Created(s) => {
+                self.pending.insert(
+                    s.ordinal,
+                    Pending { first: s.first, last: s.last, bytes: s.bytes, durable: true, ours: true },
+                );
+                *raw += p.body_len;
+                *n += s.last - s.first + 1;
+                done.insert(s.ordinal, s);
+                if self.crash(Step::SegmentPut) {
+                    return Err(Crash.into());
                 }
-                Err(e) => return Err(e.into()),
+                Ok(true)
+            }
+            Put::Exists => match self.existing(p.ord, p.first, f).await? {
+                Existing::Adopt(x) if x.last == p.last => {
+                    self.adopt(p.ord, x, done);
+                    Ok(true)
+                }
+                Existing::Adopt(x) => {
+                    // the ordinals after it were cut where ours ended: the
+                    // next attempt adopts this one and rewrites those
+                    self.pending.insert(p.ord, x);
+                    anyhow::bail!("qlog flush: segment {} there ends at {}, not {}", p.ord, x.last, p.last)
+                }
+                Existing::PastF => Ok(false),
+                Existing::Free => anyhow::bail!("qlog flush: segment {} was taken, then gone", p.ord),
+            },
+        }
+    }
+
+    fn adopt(&mut self, ord: u64, p: Pending, done: &mut BTreeMap<u64, SegRef>) {
+        if !p.ours {
+            tracing::info!(
+                ord,
+                first = p.first,
+                last = p.last,
+                "qlog flush: adopted a segment an unfinished flush wrote"
+            );
+            self.node.flush.s.lock().adopted += 1;
+        }
+        self.pending.insert(ord, Pending { durable: true, ..p });
+        done.insert(ord, SegRef { ordinal: ord, first: p.first, last: p.last, bytes: p.bytes });
+    }
+
+    /// Reads what's at `ord`, where this flush's segment would start at
+    /// `from`, and clears it if it's in the way.
+    async fn existing(&mut self, ord: u64, from: u64, f: u64) -> anyhow::Result<Existing> {
+        let ours = self.pending.remove(&ord).is_some_and(|p| p.ours);
+        let path = log::segment_path(&self.store, LOG_ID, ord);
+        match log::read_head(&self.store, LOG_ID, ord).await? {
+            Head::Missing => Ok(Existing::Free),
+            // A deposed leader's flush, still running when a bucket
+            // recovery moved F past it: no manifest names an ordinal at or
+            // past next_ordinal, and this one doesn't continue the log, so
+            // it's nobody's.
+            Head::Segment(h) if (h.first_seq as u64) <= self.man.flushed => {
+                tracing::warn!(
+                    ord,
+                    first = h.first_seq,
+                    f = self.man.flushed,
+                    "qlog flush: deleting a stale segment in the way"
+                );
+                self.store.raw.delete(&path).await?;
+                Ok(Existing::Free)
+            }
+            Head::Segment(h) if h.first_seq as u64 == from => {
+                let p = Pending { first: from, last: h.last_seq as u64, bytes: 0, durable: true, ours: false };
+                if p.last > f {
+                    tracing::info!(ord, last = p.last, f, "qlog flush: an existing segment reaches past F");
+                    self.pending.insert(ord, p);
+                    return Ok(Existing::PastF);
+                }
+                Ok(Existing::Adopt(p))
+            }
+            // this leader's, cut after a segment that turned out to end
+            // elsewhere: unnamed by any manifest
+            Head::Segment(h) if ours => {
+                tracing::info!(
+                    ord,
+                    first = h.first_seq,
+                    from,
+                    "qlog flush: rewriting a segment cut at the wrong place"
+                );
+                self.store.raw.delete(&path).await?;
+                Ok(Existing::Free)
+            }
+            h => anyhow::bail!(
+                "qlog flush: ordinal {ord} is taken by {} where seq {from} should start",
+                match h {
+                    Head::Segment(h) => format!("a segment from {}", h.first_seq),
+                    Head::Fence => "a fence".into(),
+                    Head::Missing => "nothing (deleted?)".into(),
+                }
+            ),
+        }
+    }
+
+    /// This term's first look past the manifest: what a flush that died
+    /// before its CAS left there. Its PUTs were windowed, so nothing lies
+    /// past [`PUT_WINDOW`] missing ordinals in a row.
+    async fn probe(&mut self) -> anyhow::Result<()> {
+        let mut ord = self.man.next_ordinal;
+        let mut missing = 0;
+        while missing < PUT_WINDOW {
+            match log::read_head(&self.store, LOG_ID, ord).await? {
+                Head::Missing => missing += 1,
+                Head::Segment(h) => {
+                    missing = 0;
+                    let (first, last) = (h.first_seq as u64, h.last_seq as u64);
+                    self.pending.insert(ord, Pending { first, last, bytes: 0, durable: true, ours: false });
+                }
+                Head::Fence => {
+                    missing = 0;
+                    self.pending.insert(ord, Pending { first: 0, last: 0, bytes: 0, durable: false, ours: false });
+                }
             }
             ord += 1;
-            from = last + 1;
         }
-        Ok(Some((out, (raw, n))))
+        Ok(())
     }
 }
+
+/// Segment PUTs a flush has in flight, as a window over ordinals: a PUT
+/// starts only once every ordinal this far below it is durable, so a crash
+/// leaves holes only within it (the segments' `prefix_end`).
+const PUT_WINDOW: u64 = 4;
+
+/// Tries per segment PUT. A create isn't idempotent, so object_store
+/// doesn't retry one that timed out, and one slow PUT shouldn't cost the
+/// whole flush.
+const PUT_TRIES: u32 = 3;
+
+/// A segment past the manifest this leader knows of: written by one of its
+/// flushes that didn't reach the CAS (`ours`), or found by [`Leader::probe`].
+#[derive(Clone, Copy, Debug)]
+struct Pending {
+    first: u64,
+    last: u64,
+    bytes: u64,
+    /// False: a PUT whose answer was lost, so it may or may not exist.
+    durable: bool,
+    ours: bool,
+}
+
+enum Existing {
+    Free,
+    Adopt(Pending),
+    PastF,
+}
+
+enum Put {
+    Created(SegRef),
+    Exists,
+}
+
+struct PutDone {
+    ord: u64,
+    first: u64,
+    last: u64,
+    body_len: u64,
+    result: anyhow::Result<Put>,
+}
+
+/// Seals and compresses segment `ord`, off the runtime.
+async fn seal(b: SegmentBuilder, ord: u64, prefix_end: u64) -> anyhow::Result<bytes::Bytes> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<bytes::Bytes> {
+        let obj = b.seal(LOG_ID, ord, prefix_end);
+        let mut obj = segment::compress(&obj, segment::compression_level())?.unwrap_or(obj);
+        // compress leaves a buffer as big as its worst case
+        obj.shrink_to_fit();
+        Ok(obj.into())
+    })
+    .await?
+}
+
+/// Creates segment `ord`.
+fn put_segment(
+    store: Store,
+    obj: bytes::Bytes,
+    body_len: u64,
+    ord: u64,
+    first: u64,
+    last: u64,
+) -> futures::future::BoxFuture<'static, PutDone> {
+    use futures::FutureExt;
+    async move {
+        let result = async {
+            let bytes = obj.len() as u64;
+            let path = log::segment_path(&store, LOG_ID, ord);
+            let put = || {
+                let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
+                store.raw.put_opts(&path, PutPayload::from(obj.clone()), opts)
+            };
+            let hedge_after = HEDGE_AFTER + Duration::from_secs_f64(bytes as f64 / HEDGE_RATE);
+            let mut tries = 0;
+            loop {
+                tries += 1;
+                let one = put();
+                tokio::pin!(one);
+                let r = match tokio::time::timeout(hedge_after, &mut one).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // A PUT this slow is likelier stuck than slow: a
+                        // second one races it, and whichever lands first
+                        // wins (the other finds the segment there).
+                        tracing::info!(ord, bytes, "qlog flush: segment PUT is slow, sending it again alongside");
+                        let two = put();
+                        tokio::pin!(two);
+                        tokio::select! {
+                            r = &mut one => if done_put(&r) { r } else { two.await },
+                            r = &mut two => if done_put(&r) { r } else { one.await },
+                        }
+                    }
+                };
+                match r {
+                    Ok(_) => return Ok(Put::Created(SegRef { ordinal: ord, first, last, bytes })),
+                    Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
+                        return Ok(Put::Exists);
+                    }
+                    Err(e) if tries < PUT_TRIES => {
+                        tracing::warn!(ord, tries, "qlog flush: segment PUT failed, trying again: {e}");
+                    }
+                    Err(e) => return Err(anyhow::Error::from(e).context(format!("segment {ord}"))),
+                }
+            }
+        }
+        .await;
+        PutDone { ord, first, last, body_len, result }
+    }
+    .boxed()
+}
+
+/// Whether a segment PUT has its answer: created, or found there.
+fn done_put(r: &object_store::Result<object_store::PutResult>) -> bool {
+    matches!(r, Ok(_) | Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }))
+}
+
+/// A segment PUT gets a second copy racing it after this, plus its bytes
+/// at [`HEDGE_RATE`]: well past a healthy PUT, well short of the client's
+/// 30 s timeout.
+const HEDGE_AFTER: Duration = Duration::from_secs(5);
+const HEDGE_RATE: f64 = 4e6;
 
 /// A segment read back from the bucket: (ordinal, its entries).
 pub(crate) type SegCache = Option<(u64, Arc<Vec<Entry>>)>;
@@ -1183,7 +1464,6 @@ pub async fn verify(store: &Store) -> anyhow::Result<Verified> {
 }
 
 async fn oldest_segment(store: &Store) -> anyhow::Result<Option<u64>> {
-    use futures::StreamExt;
     let p = Path::from(format!("{}/log/{LOG_ID}", store.prefix));
     let mut l = store.raw.list(Some(&p));
     let mut min = None;
@@ -1221,6 +1501,14 @@ pub async fn recovery_point(store: &Store) -> anyhow::Result<Option<RecoveryPoin
     let mut ord = m.next_ordinal;
     loop {
         let Some((h, es)) = read_segment(store, ord).await? else {
+            // a flush's PUTs past this hole: they can't be adopted, and
+            // the recovery writes these ordinals
+            for o in ord + 1..ord + PUT_WINDOW {
+                if let Head::Segment(h) = log::read_head(store, LOG_ID, o).await? {
+                    tracing::warn!(ord = o, first = h.first_seq, "qlog recovery: deleting a segment past a hole");
+                    store.raw.delete(&log::segment_path(store, LOG_ID, o)).await?;
+                }
+            }
             break;
         };
         let first = h.first_seq as u64;
@@ -1404,11 +1692,7 @@ async fn put_recovery_segment(
     first: u64,
     last: u64,
 ) -> anyhow::Result<SegRef> {
-    let obj = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-        let obj = b.seal(LOG_ID, ord, ord);
-        Ok(segment::compress(&obj, segment::compression_level())?.unwrap_or(obj))
-    })
-    .await??;
+    let obj = seal(b, ord, ord).await?;
     let bytes = obj.len() as u64;
     store
         .raw
@@ -1522,6 +1806,26 @@ mod tests {
             got.extend(seqs(&es));
         }
         assert_eq!(got, (6..=10).chain(21..=30).chain(51..=55).collect::<Vec<_>>());
+    }
+
+    /// A flush that died with a PUT missing below ones that landed: the
+    /// recovery adopts up to the hole and clears what's past it, so its
+    /// salvage can take those ordinals.
+    #[tokio::test]
+    async fn recovery_stops_at_a_hole_and_clears_past_it() {
+        let store = Store::memory(None);
+        put(&store, 0, 1..=10, 1).await;
+        put(&store, 1, 11..=20, 1).await;
+        // ordinal 2 (21..=30) never landed
+        put(&store, 3, 31..=40, 1).await;
+        put(&store, 2 + PUT_WINDOW, 99..=99, 1).await;
+        put_test_manifest(&store, &Manifest { flushed: 10, reserve: 1000, next_ordinal: 1, ..Default::default() })
+            .await;
+        let p = recovery_point(&store).await.unwrap().unwrap();
+        assert_eq!((p.orphans.len(), p.flushed), (1, 20));
+        assert!(matches!(log::read_head(&store, LOG_ID, 3).await.unwrap(), Head::Missing));
+        // past the window: no flush put it there
+        assert!(matches!(log::read_head(&store, LOG_ID, 2 + PUT_WINDOW).await.unwrap(), Head::Segment(_)));
     }
 
     /// Why an emitter crosses a gap before reading the bucket: a deposed

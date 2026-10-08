@@ -1041,6 +1041,138 @@ async fn crashes_at_every_flush_step_leave_a_consistent_manifest() {
     c.shutdown();
 }
 
+/// Segment PUTs that fail outright, or land with their answer lost (a
+/// timeout): the flush tries the PUT again or adopts what landed, and every
+/// manifest stays whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flush_rides_out_failed_and_lost_segment_puts() {
+    let o = commitlog::Options {
+        segment_bytes: 256 << 10,
+        retain_bytes: 1 << 20,
+        memory_bytes: 64 << 10,
+        ..commitlog::Options::default()
+    };
+    let cfg = move |id: &str, addrs: &HashMap<String, String>| {
+        let mut k = config(id, addrs);
+        k.retain_bytes = 64 << 10;
+        k.flush = Some(flush_opts());
+        k
+    };
+    let mut c =
+        Cluster::with_spares(0, 3, Some((tempfile::tempdir().unwrap(), o)), Some(Arc::new(cfg)), 64 << 20).await;
+    let flaky =
+        Arc::new(FlakySegments { inner: c.store.raw.clone(), failed: AtomicU64::new(0), lost: AtomicU64::new(0) });
+    c.store = Store { raw: flaky.clone(), ..c.store.clone() };
+    for id in c.ids.clone() {
+        c.start(&id).await;
+    }
+    c.wait_leader(Duration::from_secs(5)).await;
+    let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let acked = load.stop().await;
+    let v = settle_and_verify(&c, &acked).await;
+    let (failed, lost) = (flaky.failed.load(Ordering::Relaxed), flaky.lost.load(Ordering::Relaxed));
+    eprintln!("{v:?} failed {failed} lost {lost}");
+    assert!(failed > 0 && lost > 0, "no faults injected: failed {failed} lost {lost}");
+    assert!(v.segments > 10, "{v:?}");
+    assert_eq!(v.orphans, 0, "{v:#?}");
+    c.shutdown();
+}
+
+/// Fails a quarter of segment PUTs before they're written, and loses the
+/// answer of another sixth after they are.
+#[derive(Debug)]
+struct FlakySegments {
+    inner: Arc<dyn object_store::ObjectStore>,
+    failed: AtomicU64,
+    lost: AtomicU64,
+}
+
+impl std::fmt::Display for FlakySegments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FlakySegments({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for FlakySegments {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        let injected = |what: &str| object_store::Error::Generic { store: "flaky", source: what.to_string().into() };
+        if location.as_ref().ends_with(".seg") {
+            let r: f64 = rand::random();
+            if r < 0.25 {
+                self.failed.fetch_add(1, Ordering::Relaxed);
+                return Err(injected("injected: failed"));
+            }
+            if r < 0.4 {
+                self.inner.put_opts(location, payload, opts).await?;
+                self.lost.fetch_add(1, Ordering::Relaxed);
+                return Err(injected("injected: timed out"));
+            }
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+        offset: &object_store::path::Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
 /// A leader cut off mid-flush (stalled just before its manifest CAS) while
 /// the others take over: the new leader's fence makes the old flush lose
 /// its CAS, and the old leader deletes the checkpoint it made.
