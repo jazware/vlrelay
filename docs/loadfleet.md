@@ -101,8 +101,8 @@ getRepo rebuilds the record bytes on each request instead of storing them (see
 commit records) is about 165 KB and takes 0.2-0.4 ms of one core to build on a laptop. It's built
 on the host's tokio threads, so a bootstrap storm costs the fleet process CPU.
 
-Every account has a real secp256k1 key and a real MST built with vlpds's `mst::Tree`. A commit is
-built the way vlpds's own repo worker builds one. The ops go into the tree, `write_diff_blocks`
+Every account has a real secp256k1 key and a real MST built with vlatproto's `mst::Tree`, the
+one vlpds uses. A commit is built the way vlpds's own repo worker builds one. The ops go into the tree, `write_diff_blocks`
 gives the new nodes and the proof nodes, the commit is signed with `crypto::Keypair`, and the CAR
 carries the signed commit, those nodes and the new records. The frame comes from
 `events::commit_frame` with `since` and `prevData` set. So a commit passes the full sync 1.1
@@ -123,7 +123,7 @@ compute any account's document (its key and its `atproto_pds` endpoint, `--adver
 That's why this beat the [dev network](devloop.md)'s real PLC, where registering 100k DIDs one
 operation at a time would take a while, and did:web, which needs a resolvable hostname per account.
 
-`selftest` resolves fleet DIDs through vlpds's own `DidResolver` against the fake PLC and checks
+`selftest` resolves fleet DIDs through vlatproto's `DidResolver` (vlpds's too) against the fake PLC and checks
 the endpoint and the key, so a relay using that resolver with a `--plc-url` override should take
 them as is.
 

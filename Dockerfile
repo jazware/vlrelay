@@ -42,12 +42,14 @@ ENV CARGO_PROFILE_RELEASE_DEBUG=0
 # firehose consumer, docs/loadfleet.md) and e2e_check (docs/devloop.md). One
 # cargo invocation, so they reuse the compiled lib.
 ARG VLRELAY_TOOLS=""
+# --build-arg VLRELAY_FEATURES=heap-profiling: jemalloc heap profiles on demand
+ARG VLRELAY_FEATURES=""
 # vlsync and vlatproto are git dependencies on jazware/vlsync and
 # jazware/vlatproto (Cargo.toml), fetched here.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked --bin vlrelay ${VLRELAY_TOOLS:+--bin fakepds --bin e2e_check} \
+    cargo build --release --locked --bin vlrelay ${VLRELAY_TOOLS:+--bin fakepds --bin e2e_check} ${VLRELAY_FEATURES:+--features $VLRELAY_FEATURES} \
     && mkdir -p /out \
     && cp target/release/vlrelay /out/ \
     && if [ -n "$VLRELAY_TOOLS" ]; then cp target/release/fakepds target/release/e2e_check /out/; fi \

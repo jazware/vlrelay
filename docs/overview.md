@@ -95,6 +95,9 @@ The leader keeps the host table: every PDS, its tier and the member that reads i
 is the live member with the highest rendezvous hash for it. So when a node goes quiet for 2 s
 (`--qlog-host-failover-ms`), only its own hosts move, and they resume from their cursors. `--host`
 and `requestCrawl` work on any node, since a host admitted anywhere goes into the leader's table.
+The leader can also find hosts on its own, from other relays' `listHosts` (`--bootstrap-relay`) and,
+with `--plc-export`, the PDSes the PLC export names. It only reads those lists and never asks another relay to crawl
+anything ([Policy](policy.md#discovering-hosts)).
 
 The leader also holds every account's record (rev, data CID, host, status, signing key). The
 records live in one SlateDB that only committed entries write, and each flush seals it at exactly
@@ -120,7 +123,7 @@ the seqs, and the PDSes send the rest again. Details: [Subscribe to the firehose
 - { value: "~350", unit: events/s, label: Bluesky's average today, note: "the leader needs ~0.1 vCPU for it (modeled)", tone: amber }
 - { value: "200k", unit: events/s, label: the quorum log's ceiling, note: "measured, 3 nodes, commitlogs on tmpfs; the leader used 1.8 cores", tone: violet }
 - { value: "~1.6", unit: Gb/s, label: per full-firehose consumer, note: "at 33k events/s; a NIC runs out long before the CPU", tone: blue }
-- { value: "~$19", unit: /mo, label: three nodes at today's load, note: "modeled, 3 OVH VPS-1 + R2, 30 s flush", tone: rust }
+- { value: "~$18", unit: /mo, label: three nodes at today's load, note: "modeled, 3 OVH VPS-1 + R2, 30 s flush", tone: rust }
 ```
 
 CPU is cheap at relay rates. Verifying an event is the biggest cost, and every node does its own
@@ -160,9 +163,10 @@ page) with no migration. See [Cluster](cluster.md#changing-the-members) and
 
 ## What isn't built
 
-- With `--plc-export`, a cold relay seeds its DID documents from the PLC directory's export, which
-  at 2 requests a second takes about 11 hours for today's ~80M ops. Without it, each account is
-  resolved once at the PLC budget.
+- A cold relay resolves each account's DID document once, at the PLC budget. With `--plc-export`
+  it seeds them from the PLC directory's export instead, at 2 requests a second of ~1,000 ops each
+  (~7M ops an hour), and a 4 GB node needs the settings in
+  [A small box](operations/configuration.md#a-small-box) for that.
 - The sync API's repo endpoints answer on the leader, and a follower names it.
 - There are no alert rules, Grafana dashboards or Ansible kit for vlRelay yet.
   [Operations](operations/index.md) says what there is.

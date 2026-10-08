@@ -21,7 +21,7 @@ diagram:
     - "nodes.r -> cons.l: $0 on OVH · ~$4.1k on AWS"
 facts:
   - { value: "~$18", unit: /mo, label: 3 nodes at today's load, note: "OVH VPS-1 + R2, 30 s flush, 10 consumers", tone: accent }
-  - { value: "~$10", unit: /mo, label: one node, note: "OVH VPS-1 + R2, no HA", tone: violet }
+  - { value: "~$9", unit: /mo, label: one node, note: "OVH VPS-1 + R2, no HA", tone: violet }
   - { value: "~$1", unit: /mo, label: of bucket requests, note: "R2 after its free tier · ~$7 before it (measured over an hour)", tone: amber }
   - { value: "~$4.1k", unit: /mo, label: of egress on AWS, note: "10 consumers × the whole stream, today", tone: rust }
 ```
@@ -42,11 +42,11 @@ consumers, R2 after its free tier:
 | 3 x OVH VPS-1, commitlog | 30 s | ~$18 | hosts $14, bucket requests $0, storage $5 |
 | 3 x OVH VPS-1, commitlog | 60 s | ~$18 | hosts $14, bucket requests $0, storage $5 |
 | 3 x OVH VPS-1, commitlog, 24 h of log in the bucket | 60 s | ~$15 | hosts $14, storage $2 |
-| 3 x Hetzner CAX21 (ARM), commitlog | 30 s | ~$43 | hosts $37, bucket $6 |
-| 3 x Hetzner AX42, commitlog | 30 s | ~$333 | hosts $327, bucket $6 |
-| 3 x OVH ADVANCE-2, commitlog | 30 s | ~$600 | hosts $594, bucket $6 |
-| 3 x AWS c7gd.large + S3, consumers outside AWS | 30 s | ~$4.5k | egress and cross-AZ $4.3k, hosts $199, bucket $15 |
-| One node, OVH VPS-1, NVMe commitlog + R2 | 30 s | ~$10 | host $5, bucket requests $1, storage $5 |
+| 3 x Hetzner CAX21 (ARM), commitlog | 30 s | ~$42 | hosts $37, bucket $5 |
+| 3 x Hetzner AX42, commitlog | 30 s | ~$332 | hosts $327, bucket $5 |
+| 3 x OVH ADVANCE-2, commitlog | 30 s | ~$599 | hosts $594, bucket $5 |
+| 3 x AWS c7gd.large + S3, consumers outside AWS | 30 s | ~$4.5k | egress and cross-AZ $4.3k, hosts $199, bucket $14 |
+| One node, OVH VPS-1, NVMe commitlog + R2 | 30 s | ~$9 | host $5, storage $5 |
 | One node, OVH VPS-1, NVMe commitlog + R2 | 60 s | ~$9 | host $5, storage $5 |
 
 What the numbers say, in order of size:
@@ -59,8 +59,8 @@ What the numbers say, in order of size:
   (measured over an hour at today's rate). What's left is storage for 72 h of log (~$5 on R2).
 - So hosts are the bill. At today's load the leader needs ~0.1 vCPU at the sized rate, and the
   smallest NVMe VPS carries a node. Three OVH VPS-1 come to $14 a month. On 8 GB VPSes, for more
-  headroom, the cluster is ~$31.
-- At 10x the cheapest three nodes are ~$123 (three VPS-4s, where disk and the port run out first).
+  headroom, the cluster is ~$30.
+- At 10x the cheapest three nodes are ~$121 (three VPS-4s, where disk and the port run out first).
   At 100x it's ~$3.4k, and ~$2.4k of that is edge boxes for 10 consumers' 14.8 Gb/s. The bucket is
   ~$500 a month of storage there, still not requests.
 
@@ -132,24 +132,24 @@ with R2, or S3 on AWS):
 | Host | $/mo each | today | 10x | 100x |
 |---|---|---|---|---|
 | OVH VPS-1 | $5 | $18 | no: disk 138/40 GB, port 841 Mb/s/0.5 Gb/s | no: CPU, disk, port |
-| OVH VPS-2 | $8 | $31 | no: disk 138/75 GB, port 841 Mb/s/1 Gb/s | no: CPU, disk, port |
-| OVH VPS-4 | $23 | $76 | $123 | no: CPU 10.3/8, disk 1,291/200 GB, port 8.4/3 Gb/s |
-| OVH ADVANCE-2 | $198 | $600 | $647 | no: disk 1,291/960 GB, port 5.4/3 Gb/s |
-| Hetzner CAX21 (ARM) | $12 | $43 | no: disk 138/80 GB, port 841 Mb/s/1 Gb/s | no: CPU, disk, port |
-| Hetzner AX42 | $109 | $333 | $707, 3 edges | no: port 8.4/1 Gb/s |
+| OVH VPS-2 | $8 | $30 | no: disk 138/75 GB, port 841 Mb/s/1 Gb/s | no: CPU, disk, port |
+| OVH VPS-4 | $23 | $75 | $121 | no: CPU 10.3/8, disk 1,291/200 GB, port 8.4/3 Gb/s |
+| OVH ADVANCE-2 | $198 | $599 | $645 | no: disk 1,291/960 GB, port 5.4/3 Gb/s |
+| Hetzner CAX21 (ARM) | $12 | $42 | no: disk 138/80 GB, port 841 Mb/s/1 Gb/s | no: CPU, disk, port |
+| Hetzner AX42 | $109 | $332 | $705, 3 edges | no: port 8.4/1 Gb/s |
 | Hetzner AX42 + 10G | $157 | $476 | $1,035 | $3,385, 22 edges |
-| AWS c7gd.large | $66 | $4,540 | no: disk 138/118 GB, port 841 Mb/s/0.94 Gb/s | no: CPU, disk, port |
-| AWS c7gd.xlarge | $132 | $4,739 | ~$30k | no: CPU, disk, port |
+| AWS c7gd.large | $66 | $4,538 | no: disk 138/118 GB, port 841 Mb/s/0.94 Gb/s | no: CPU, disk, port |
+| AWS c7gd.xlarge | $132 | $4,737 | ~$30k | no: CPU, disk, port |
 
 One node, NVMe commitlog, a 30 s flush, 10 consumers, R2 holding 72 h:
 
 | Host | $/mo | today | 10x | 100x |
 |---|---|---|---|---|
-| OVH VPS-1 | $5 | $10 (4 h on disk) | no: disk 138/40 GB, port 1.6/0.5 Gb/s | no |
-| OVH VPS-4 | $23 | $29 (35 h on disk) | $76 (2 h on disk) | no |
-| Hetzner AX42 | $109 | $115 (72 h on disk) | $489, 3 edges (36 h on disk) | no: port 16.3/1 Gb/s |
+| OVH VPS-1 | $5 | $9 (4 h on disk) | no: disk 138/40 GB, port 1.6/0.5 Gb/s | no |
+| OVH VPS-4 | $23 | $28 (35 h on disk) | $74 (2 h on disk) | no |
+| Hetzner AX42 | $109 | $114 (72 h on disk) | $487, 3 edges (36 h on disk) | no: port 16.3/1 Gb/s |
 | Hetzner AX42 + 10G | $157 | $196 (72 h on disk) | $769 (36 h on disk) | $3,071, 22 edges (2 h on disk) |
-| OVH ADVANCE-2 | $198 | $204 (72 h on disk) | $251 (17 h on disk) | no: disk, port |
+| OVH ADVANCE-2 | $198 | $203 (72 h on disk) | $249 (17 h on disk) | no: disk, port |
 
 ## The bucket
 

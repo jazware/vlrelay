@@ -629,7 +629,7 @@ manifest exactly as a leader does.
 | kernel crash or power loss | the same, since everything emitted was fsynced | the same |
 | the disk or the box is gone | bucket recovery: manifest, state at F, seqs from R + 1, re-ingest from the cursors | a jump to R + 1, repeated commits since F |
 
-The relay always has a bucket (`--s3-endpoint` and `--s3-bucket` are required). The cost model also
+The relay always has a bucket (`--s3-endpoint` and `--s3-bucket` are required, and `--memory` keeps one in memory). The cost model also
 prices a node with no bucket and a bucket holding only the state and cursors, to show what the bucket
 is worth. Neither mode is built. A state-and-cursors bucket would turn "losing the disk" from a gap
 into a re-ingest and fit inside R2's free tier at a 60 s flush:
@@ -726,7 +726,7 @@ retries or sets the members back). `POST /qlog/members` needs `Authorization: Be
 
 ## Serving and backfill
 
-Consumers are served by vlpds's `Firehose` as it is. The quorum log feeds it as one followed log
+Consumers are served by vlpds's `Firehose` as it is (it's in vlsync's `vlsync-firehose` now, which both build on). The quorum log feeds it as one followed log
 (`qlog`) whose watermark is the commit index, and it's handed only committed entries, in seq order
 (`src/qlog/emit.rs`). With one log the k-way merge degenerates to "emit up to the watermark", which is
 exactly the hold-until-quorum rule. Every node runs the same merger over its own commit index, so a
@@ -748,7 +748,7 @@ Reads come from three tiers:
 
 vlpds's backfill assumes every emitted event is already in the bucket. The quorum log emits up to a
 flush interval before it flushes, so a cursor between F and the ring floor would skip silently. The
-one vlpds change is `firehose::LocalTail`, opt-in and for counted streams only: backfill reads the
+one change to that firehose is `firehose::LocalTail`, opt-in and for counted streams only: backfill reads the
 bucket up to the tail's floor, then the node's own log up to the ring. A node creates its firehose at
 the first entry it emits, so a node wiped past a recovery gap serves old cursors from the bucket across
 every gap.

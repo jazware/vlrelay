@@ -53,7 +53,9 @@ docker build -t vlrelay:local .
 docker build -t vlrelay:dev --build-arg VLRELAY_TOOLS=1 .   # with fakepds and e2e_check too
 ```
 
-The crate pulls vlpds as a git dependency, so the repository root is the whole build context. The
+The crate pulls [vlsync](https://github.com/jazware/vlsync) and
+[vlatproto](https://github.com/jazware/vlatproto) as git dependencies, so the repository root is
+the whole build context. The
 image has three stages. A node stage builds the dashboard and the docs into
 `/usr/share/vlrelay/ui`. A Rust stage builds the release binary (fat LTO and no
 `target-cpu=native`). The runtime is `debian:bookworm-slim` running as uid 10001 under `tini`. The
@@ -72,7 +74,8 @@ docker run --rm -p 2980:2980 ghcr.io/jazware/vlrelay:main \
 
 ## The bucket
 
-vlRelay uses vlpds's store, so a bucket that works for vlpds works here. It needs strongly
+vlRelay uses the same object-store layer as vlpds (vlsync's `vlsync-store`), so a bucket that
+works for vlpds works here. It needs strongly
 consistent conditional writes (`If-None-Match: *` and `If-Match`), which the flush manifest, the
 leader record and the policy use. S3, R2, GCS, Tigris and MinIO all qualify. vlpds's
 [object store page](https://github.com/jazware/vlpds/blob/main/docs/operations/object-store.md)
@@ -157,9 +160,9 @@ To run the published image instead, set `VLRELAY_IMAGE=ghcr.io/jazware/vlrelay:m
 For a real deployment, swap MinIO for your bucket (`VLRELAY_S3_*`), drop the `minio` services,
 and mount a local disk for `--qlog-dir` (`VLRELAY_QLOG_DIR`), writable by uid 10001.
 
-A 2 vCPU / 4 GB box carries a single node at a few thousand hosts, but not the PLC export's
-first fill at its default rate on top. [Configuration](configuration.md#a-small-box) has the
-settings for one.
+A 2 vCPU / 4 GB box carries a single node at a few thousand hosts. With `--plc-export` on top it
+needs local disk for the seed table (`--plc-seeds-dir`) and a memory budget for the export
+(`--plc-export-mem-mb`). [Configuration](configuration.md#a-small-box) has the settings.
 
 ## A cluster
 

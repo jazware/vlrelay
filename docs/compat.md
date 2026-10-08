@@ -112,7 +112,7 @@ Run on 2026-10-04 on a laptop (dev build): 60 s at 30 writes/s, 30 accounts on t
 
 Should vlRelay support relay-as-upstream? Not as an upstream mode. Host authority ([Cluster](cluster.md#the-path-of-an-event)) is what keeps a host from speaking for accounts it doesn't hold, and a relay upstream is exactly that, for every account. To support it, we'd need to trust the relay for authority (signatures prove who wrote a commit, not that it's the newest), to re-check every `#account` and `#identity` at the PDS (they aren't signed), and to dedupe against the same accounts arriving directly. The original design's optional "other relays" input is better served by the two cheaper things it's really for:
 
-- Bootstrap a host list by reading another relay's `listHosts` and crawling those PDSes directly. This needs no trust in the relay.
+- Bootstrap a host list by reading another relay's `listHosts` and subscribing to those PDSes directly. This needs no trust in the relay, and it's built: `--bootstrap-relay` and the policy's `discovery.seedRelays` read the list and never ask the other relay to crawl anything ([Policy](policy.md#discovering-hosts)).
 - Mirror a vlRelay, which every member of a cluster already does.
 
 ## Follow-ups from the first run

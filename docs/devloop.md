@@ -42,10 +42,9 @@ Bluesky's reference PDS and two [vlpds](https://github.com/jazware/vlpds) server
 - `just`, `curl`, `lsof` and `python3` (the chaos harnesses' fault proxy and reports).
 - Go and Node, only for `just compat`.
 
-You don't need a checkout of vlpds: `dev-up` installs its binary from github.com/jazware/vlpds into
-this crate's target dir (`dev/vlpds-bin.sh`; `VLPDS_REV` picks a commit, `VLPDS_BIN` skips the
-build), which costs a few minutes once. In the monorepo it builds vlpds from the tree instead. The first `dev-up` also builds
-two images: MinIO from source (`vlpds-minio:local`, since MinIO no longer publishes container
+You don't need a checkout of vlpds. `dev-up` installs its binary from github.com/jazware/vlpds into
+this crate's target dir (`dev/vlpds-bin.sh`, where `VLPDS_REV` picks a commit and `VLPDS_BIN` skips
+the build), which costs a few minutes once. The first `dev-up` also builds two images: MinIO from source (`vlpds-minio:local`, since MinIO no longer publishes container
 images) and the PLC directory from did-method-plc's repo at a pinned commit. The reference PDS is
 pulled from `ghcr.io/bluesky-social/pds`.
 
@@ -163,8 +162,8 @@ One listener serves `GET /xrpc/_health` (`{"version"}`), `subscribeRepos`, the s
 (`listRepos`, `getRepoStatus`, `getLatestCommit`, `listHosts`, `getHostStatus`), `requestCrawl`
 (with `--crawl`), `/admin` and Prometheus `/metrics`. Every response carries
 `Server: vlrelay/… (atproto-relay)`, so other relays won't crawl it. The relay's own series are
-`vlrelay_*` ([Monitoring](operations/monitoring.md)), and vlpds's firehose and process series come
-with them.
+`vlrelay_*` ([Monitoring](operations/monitoring.md)), and the `vlpds_` firehose and process series
+from vlsync come with them.
 
 ## e2e_check
 
@@ -324,7 +323,9 @@ PDSes.
 Measured with `scripts/buildtime.sh`, median of 3 (2 for the big-crate rows), on a laptop with
 other builds running (load average 25-85, so treat these as upper bounds). The relay crate was
 still a stub then, so its own rows are all link and cargo overhead. The row that matters is the
-vlpds-sized one, which is about the size the relay has grown to since.
+vlpds-sized one, which is about the size the relay has grown to since. The relay depended on vlpds
+then, so the cold build compiled all of it. It builds on vlsync and vlatproto now, and the cold
+build hasn't been timed again.
 
 | Step | Before | After |
 |---|---|---|

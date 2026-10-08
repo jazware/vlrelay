@@ -39,7 +39,7 @@ SECTIONS = [
     ),
     (
         "Chaos",
-        "For the chaos harness (`tests/qlog/relay-chaos.sh`); never on a production node.",
+        "For the chaos harness (`tests/qlog/relay-chaos.sh`). Never set them on a production node.",
         ["qlog-crash-at", "qlog-crash-prob", "qlog-crash-stop-file", "qlog-power-cut-on-usr1", "qlog-fsync-delay-us", "qlog-unsafe-trust-log"],
     ),
 ]
@@ -80,9 +80,9 @@ Every flag of `vlrelay`, generated from `vlrelay --help` by `just config-doc` (`
 Flags with an env var can be set either way, and the flag wins. Each secret (`--s3-access-key`,
 `--s3-secret-key`, `--admin-token`, `--qlog-admin-token`) has a `-file` twin (`VLRELAY_ADMIN_TOKEN_FILE`
 and so on) that reads it from a file once at start, less one trailing newline. A file keeps the secret
-out of the container's env, which `docker inspect` and a rendered compose file show. Setting a secret
-and its file is an error, so is an empty file, and no error prints a secret. `--help` never prints
-their values either.
+out of the container's env, which `docker inspect` and a rendered compose file show. Setting both a
+secret and its file is an error, and so is an empty file. No error prints a secret, and `--help`
+never prints their values either.
 
 The image sets `VLRELAY_LISTEN=0.0.0.0:2980` and passes `--ui-dir /usr/share/vlrelay/ui` in its
 entrypoint ([Deploy](deploy.md#the-image)).
@@ -111,16 +111,16 @@ a 2 vCPU / 4 GB box:
   `--slatedb-disk-cache-mb` with `--plc-seeds-dir`). The seeder reads the account's record
   beside the seed, so both should be local.
 - Give it `--plc-export-mem-mb` (1800 under a 2300 MiB container limit). The budget pauses the
-  export and the seed reads while the process is over it and resumes below 85%.
-  `--plc-export-rate` is requests a second across every window, ~1,000 ops each.
-- `--qlog-disk-retain-mb 1024`: a single node has no followers to catch up, so the disk only
-  serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of
-  it, about 7 s for the default 4 GiB.
-- Keep `--slatedb-cache-mb` at 320. The state's and the seeds' databases share it.
+  export and the seed reads while the process is over it, and resumes them below 85%.
+  `--plc-export-rate` counts requests a second across every window, at ~1,000 ops each.
+- Set `--qlog-disk-retain-mb 1024`. A single node has no followers to catch up, so its disk only
+  serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of it,
+  about 7 s for the default 4 GiB.
+- Keep `--slatedb-cache-mb` at its default of 320. The state's and the seeds' databases share it.
 - To see where the heap goes, build with `--features heap-profiling` (the Dockerfile's
   `VLRELAY_FEATURES` build argument) and start the node with
-  `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19,prof_gdump:true,prof_prefix:<dir>/heap`: jemalloc
-  writes a profile at each new peak, which `jeprof --text <binary> <file>` reads.
+  `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19,prof_gdump:true,prof_prefix:<dir>/heap`. jemalloc
+  then writes a profile at each new peak, which `jeprof --text <binary> <file>` reads.
 """
 
 
@@ -139,23 +139,20 @@ def parse(text):
         s = line.strip()
         if not s:
             continue
-        if m := re.match(r"^\[env: ([A-Z0-9_]+)", s):
-            cur["env"] = m.group(1)
-        elif m := re.match(r"^\[default: (.*)\]$", s):
-            cur["default"] = m.group(1)
-        elif m := re.match(r"^- ([a-z0-9-]+):\s+(.*)$", s):
+        if m := re.match(r"^- ([a-z0-9-]+):\s+(.*)$", s):
             cur["values"].append((m.group(1), m.group(2)))
         elif s == "Possible values:":
             pass
         else:
-            # a one-line help ends with its tags
+            # a help line ends with its tags, and a flag with no help has only the tags
             if m := re.search(r"\s*\[env: ([A-Z0-9_]+)=?[^\]]*\]", s):
                 cur["env"] = m.group(1)
                 s = s[: m.start()] + s[m.end():]
             if m := re.search(r"\s*\[default: ([^\]]*)\]", s):
                 cur["default"] = m.group(1)
                 s = s[: m.start()] + s[m.end():]
-            cur["help"].append(s.strip())
+            if s.strip():
+                cur["help"].append(s.strip())
     for f in ("help", "version"):
         flags.pop(f, None)
     return flags
@@ -173,6 +170,7 @@ FALLBACK = {
     "s3-secret-key": "Secret access key",
     "s3-region": "The bucket's region",
     "plc-url": "The PLC directory `did:plc` documents are resolved against",
+    "lag-case-sustain-secs": "How long a host's reader stays --lag-case-minutes behind, while the relay has room for it, before a read-lag case opens",
 }
 
 

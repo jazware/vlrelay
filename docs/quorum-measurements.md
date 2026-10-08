@@ -295,7 +295,7 @@ but raw bytes aren't.
 | worst per-second ack p99, seconds with a flush / without | 2.36 / 2.55 ms | 3.11 / 2.54 | 9.71 / 6.26 |
 | submit to first consumer p50, off / on | 3.32 / 3.37 ms | 2.53 / 2.52 | 4.05 / 3.89 |
 
-Requests per flush, counted by vlpds's object-store counters over each flush's window (which includes
+Requests per flush, counted by the object-store counters vlRelay shares with vlpds over each flush's window (which includes
 the state's own background work):
 
 | per flush | 350/s, 30 s | 3,500/s, 30 s | 35,000/s, 10 s |
@@ -448,7 +448,7 @@ What it showed:
 
 ## Counting requests
 
-Every request the quorum log sends goes through vlpds's `Store::counted`, which counts it at the bottom
+Every request the quorum log sends goes through `Store::counted` (vlsync's `vlsync-store`, shared with vlpds), which counts it at the bottom
 of the stack (retries and SlateDB's own traffic included) in `vlpds_object_store_requests_total` by op,
 key component and client. A node holds one counted client per purpose, so each request is billed to
 what sent it:

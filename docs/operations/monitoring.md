@@ -30,8 +30,9 @@ facts:
 
 Every node serves Prometheus metrics at `GET /metrics` on its `--listen` port, with no auth (keep
 it off the public side of your proxy, see [Deploy](deploy.md#in-front-of-it)). The relay's own
-series start with `vlrelay_`. vlpds's firehose, object store and process series come with them,
-since vlRelay runs vlpds's code for those parts.
+series start with `vlrelay_`. The firehose, object store and process series come with them from
+[vlsync](https://github.com/jazware/vlsync), the crates vlRelay shares with vlpds, and keep vlpds's
+`vlpds_` prefix.
 
 The quorum log has no Prometheus series of its own. Each node reports it as JSON at
 `GET /qlog/status` on the same port, and the dashboard's Quorum page shows every member's.
@@ -100,7 +101,7 @@ Label values:
   Verification failures carry the verifier's own names (`bad_op`, `commit_rev_mismatch` and
   others, `src/verify.rs`). [Policy](../policy.md) says which of them count against a host.
 
-Of vlpds's series, the firehose ones apply as they are: `vlpds_firehose_subscribers`,
+Of the `vlpds_` series, the firehose ones apply as they are: `vlpds_firehose_subscribers`,
 `vlpds_firehose_disconnects_total{reason}`, `vlpds_firehose_backfills{state}` and
 `vlpds_firehose_backfill_events_total` for consumers reading old cursors from the bucket, and
 `vlpds_object_store_requests_total` for every bucket request by `op` and `result`.
@@ -130,7 +131,7 @@ SlateDB's other `slatedb_db_*`, `slatedb_compactor_*`, `slatedb_wal_*` and
 `slatedb_memtable_flush_*` series carry `db` too. Its object store calls, GC and the SST filter
 counts (`slatedb_object_store_*`, `slatedb_gc_*`, `slatedb_db_sst_filter_*`) are node-wide,
 summed over the databases, without `db`. The `slatedb_lsm_*` series are read from each database's manifest in
-memory when `/metrics` is scraped, so they cover readers too; nothing polls in between.
+memory when `/metrics` is scraped, so they cover readers too, and nothing polls in between.
 
 ## The quorum log
 

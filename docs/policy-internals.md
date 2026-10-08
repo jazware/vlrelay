@@ -176,8 +176,9 @@ tier rides the node's next submit to the leader as a proposed row. Everything el
     in one entry). So its consumers never see the `#account` and then the account's old commits.
     A poll that listed the objects before that local apply can't undo it, and the object is
     fetched again on the next poll.
-  - The set is vlpds's `FrameFilter` on the firehose (`Firehose::set_filter`). vlpds reads each
-    frame's type and DID straight from the CBOR (`frame_meta`: `repo` for a `#commit`, `did` for
+  - The set is a `FrameFilter` on the firehose (`Firehose::set_filter`, vlsync's
+    `vlsync-firehose`, shared with vlpds). The firehose reads each frame's type and DID straight
+    from the CBOR (`frame_meta`: `repo` for a `#commit`, `did` for
     the rest, the same keys `event::route` uses). A ring batch computes its verdicts once per set
     generation, and every subscriber shares them. Backfill checks each frame it reads. An empty
     set does no parsing at all. With a non-empty set, a 2,000-event batch costs 88 ns an event

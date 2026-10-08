@@ -34,9 +34,9 @@ Every flag of `vlrelay`, generated from `vlrelay --help` by `just config-doc` (`
 Flags with an env var can be set either way, and the flag wins. Each secret (`--s3-access-key`,
 `--s3-secret-key`, `--admin-token`, `--qlog-admin-token`) has a `-file` twin (`VLRELAY_ADMIN_TOKEN_FILE`
 and so on) that reads it from a file once at start, less one trailing newline. A file keeps the secret
-out of the container's env, which `docker inspect` and a rendered compose file show. Setting a secret
-and its file is an error, so is an empty file, and no error prints a secret. `--help` never prints
-their values either.
+out of the container's env, which `docker inspect` and a rendered compose file show. Setting both a
+secret and its file is an error, and so is an empty file. No error prints a secret, and `--help`
+never prints their values either.
 
 The image sets `VLRELAY_LISTEN=0.0.0.0:2980` and passes `--ui-dir /usr/share/vlrelay/ui` in its
 entrypoint ([Deploy](deploy.md#the-image)).
@@ -68,7 +68,7 @@ Without `--memory`, the four `--s3-*` values are required (the keys directly or 
 | `--s3-access-key-file <S3_ACCESS_KEY_FILE>` | `VLRELAY_S3_ACCESS_KEY_FILE` |  | --s3-access-key from a file, less one trailing newline |
 | `--s3-secret-key <S3_SECRET_KEY>` | `VLRELAY_S3_SECRET_KEY` |  | Secret access key |
 | `--s3-secret-key-file <S3_SECRET_KEY_FILE>` | `VLRELAY_S3_SECRET_KEY_FILE` |  | --s3-secret-key from a file, less one trailing newline |
-| `--s3-region <S3_REGION>` | `VLRELAY_S3_REGION` |  | The bucket's region |
+| `--s3-region <S3_REGION>` | `VLRELAY_S3_REGION` | `auto` | The bucket's region |
 | `--s3-unsigned-payload <S3_UNSIGNED_PAYLOAD>` | `VLRELAY_S3_UNSIGNED_PAYLOAD` |  | Send PUT bodies as SigV4 UNSIGNED-PAYLOAD instead of hashing each one (default: on for an https endpoint, where TLS covers the body) [possible values: true, false] |
 | `--prefix <PREFIX>` | `VLRELAY_PREFIX` | `vlrelay` | Key prefix in the bucket: one relay per prefix |
 
@@ -81,7 +81,7 @@ Without `--memory`, the four `--s3-*` values are required (the keys directly or 
 | `--host <HOSTS>` |  |  | An upstream to subscribe to (repeatable). `http://` means plain `ws://` (dev mode); a bare hostname means `wss://` |
 | `--crawl` |  |  | Accept com.atproto.sync.requestCrawl |
 | `--host-tier <HOST_TIER>` |  | `trusted` | The tier a --host upstream starts at the first time it's seen. After that its record's tier holds (operators, auto-throttle) |
-| `--plc-url <PLC_URL>` | `VLRELAY_PLC_URL` |  | The PLC directory `did:plc` documents are resolved against |
+| `--plc-url <PLC_URL>` | `VLRELAY_PLC_URL` | `https://plc.directory` | The PLC directory `did:plc` documents are resolved against |
 | `--plc-export` | `VLRELAY_PLC_EXPORT` |  | Seed DID documents in bulk from the PLC directory's /export: the quorum log's leader reads the history, then follows the tail, into a database in the bucket every member reads, so a cold relay doesn't resolve each account |
 | `--plc-export-url <PLC_EXPORT_URL>` | `VLRELAY_PLC_EXPORT_URL` |  | The directory --plc-export reads (default: --plc-url) |
 | `--plc-export-rate <PLC_EXPORT_RATE>` |  | `2` | /export requests per second, all streams together (a 429 waits out its Retry-After on top) |
@@ -111,7 +111,7 @@ Without `--memory`, the four `--s3-*` values are required (the keys directly or 
 | `--log-compression <LOG_COMPRESSION>` |  | `-1` | zstd level for log segments: 0 stores them uncompressed, negative levels are zstd's fast ones. Firehose frames are mostly hashes: on production frames -1 compresses 1.8x faster than 1 for 0.6% more bytes (docs/perf.md, "Compression") |
 | `--event-horizon-secs <EVENT_HORIZON_SECS>` |  | `86400` | Per-host limits and spam signals count a host's events by the time it stamped on them, so a replayed backlog costs what the traffic did; a time older than this counts at this horizon |
 | `--lag-case-minutes <LAG_CASE_MINUTES>` |  | `10` | A host's reader this far behind its stream (in minutes) opens a read-lag case, once it has stayed there --lag-case-sustain-secs while the relay had room for it |
-| `--lag-case-sustain-secs <LAG_CASE_SUSTAIN_SECS>` |  | `120` |  |
+| `--lag-case-sustain-secs <LAG_CASE_SUSTAIN_SECS>` |  | `120` | How long a host's reader stays --lag-case-minutes behind, while the relay has room for it, before a read-lag case opens |
 | `--lag-case-grace-secs <LAG_CASE_GRACE_SECS>` |  | `180` | After the relay held a host back (backpressure), or this node was over --lag-case-pressure-pct, its lag doesn't open a case for this long |
 | `--lag-case-pressure-pct <LAG_CASE_PRESSURE_PCT>` |  | `50` | This node's in-flight caps or busiest lane this full (percent) count as the relay's own lag |
 | `--lag-case-resolve-secs <LAG_CASE_RESOLVE_SECS>` |  | `600` | An open read-lag case resolves itself once its host's lag has been under the threshold this long |
@@ -153,7 +153,7 @@ Every member uses the same bucket and `--prefix`. A node with no `--qlog-peer` i
 
 ## Chaos
 
-For the chaos harness (`tests/qlog/relay-chaos.sh`); never on a production node.
+For the chaos harness (`tests/qlog/relay-chaos.sh`). Never set them on a production node.
 
 | Flag | Env | Default | What |
 |---|---|---|---|
@@ -186,13 +186,13 @@ a 2 vCPU / 4 GB box:
   `--slatedb-disk-cache-mb` with `--plc-seeds-dir`). The seeder reads the account's record
   beside the seed, so both should be local.
 - Give it `--plc-export-mem-mb` (1800 under a 2300 MiB container limit). The budget pauses the
-  export and the seed reads while the process is over it and resumes below 85%.
-  `--plc-export-rate` is requests a second across every window, ~1,000 ops each.
-- `--qlog-disk-retain-mb 1024`: a single node has no followers to catch up, so the disk only
-  serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of
-  it, about 7 s for the default 4 GiB.
-- Keep `--slatedb-cache-mb` at 320. The state's and the seeds' databases share it.
+  export and the seed reads while the process is over it, and resumes them below 85%.
+  `--plc-export-rate` counts requests a second across every window, at ~1,000 ops each.
+- Set `--qlog-disk-retain-mb 1024`. A single node has no followers to catch up, so its disk only
+  serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of it,
+  about 7 s for the default 4 GiB.
+- Keep `--slatedb-cache-mb` at its default of 320. The state's and the seeds' databases share it.
 - To see where the heap goes, build with `--features heap-profiling` (the Dockerfile's
   `VLRELAY_FEATURES` build argument) and start the node with
-  `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19,prof_gdump:true,prof_prefix:<dir>/heap`: jemalloc
-  writes a profile at each new peak, which `jeprof --text <binary> <file>` reads.
+  `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19,prof_gdump:true,prof_prefix:<dir>/heap`. jemalloc
+  then writes a profile at each new peak, which `jeprof --text <binary> <file>` reads.

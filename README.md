@@ -4,7 +4,7 @@ vlRelay is an atproto relay on a replicated log. It subscribes to PDSes, checks 
 against sync 1.1, and serves one combined firehose from one node or three, with an S3, R2, GCS or
 MinIO bucket as its long-term copy.
 
-![The vlRelay dashboard's overview on real traffic: one node of a three-node cluster reading ten Bluesky and independent PDSes, with events in and out, time to firehose, rejects, hosts and consumers](docs/assets/dashboard-real-overview.jpg)
+![The operator console's overview on the demo backend: a simulated three-node relay reading 5,000 PDSes, with firehose rate, time to firehose, quorum and flush health, rejects, how each PDS stream flows through the members to the leader, and consumers](docs/assets/dashboard-real-overview.jpg)
 
 It's built from the parts of [vlpds](https://github.com/jazware/vlpds) that worked, now crates both
 build on, [vlsync](https://github.com/jazware/vlsync) and [vlatproto](https://github.com/jazware/vlatproto):
@@ -30,8 +30,13 @@ its log segments, firehose serving and SlateDB state, and its atproto code. Cons
   `prevData`, rev order and host authority, and keeps per-account chain state. Signature
   verification is ~33 µs of CPU per event, so one core checks ~30k events/s.
 - The quorum log commits 200k events/s on three nodes with their commitlogs on tmpfs (measured),
-  and at today's ~350 events/s three small VPSes and R2 come to ~$19 a month (modeled).
+  and at today's ~350 events/s three small VPSes and R2 come to ~$18 a month (modeled).
   → [Performance](docs/perf.md), [Cost](docs/cost.md)
+- A cold relay finds its hosts. The leader reads other relays' `listHosts` (`--bootstrap-relay`)
+  and, with `--plc-export`, the PDSes the PLC directory's export names. Each goes through the
+  relay's own admission checks, and it never asks another relay to crawl anything. The export also
+  seeds every DID document, so a cold start doesn't resolve each account on its own.
+  → [Policy](docs/policy.md#discovering-hosts)
 - Policy is data in the bucket. Host tiers, per-host and per-account limits, domain rules,
   requestCrawl admission, cluster-wide budgets, auto-throttling and spam counters that open cases
   are one versioned document that every node reloads. The defaults follow indigo's relay wherever it
@@ -46,8 +51,8 @@ its log segments, firehose serving and SlateDB state, and its atproto code. Cons
   same upstreams, and the seqs are dense (1, 2, 3, …) and the same on every node.
   → [Compatibility](docs/compat.md), [Subscribe to the firehose](docs/subscribing.md)
 
-The overview at the top is real traffic, from the [shadow run](docs/shadow.md) against ten PDSes.
-The demo backend's simulated 5,000-host relay shows the busy end of the hosts page:
+The screenshots here come from the demo backend (`cargo run --bin admin_demo`), a simulated
+5,000-host relay on three nodes. The hosts page at the busy end:
 
 ![The hosts page on the demo backend: thousands of hosts by events per second, with tiers, error rates and throttles](docs/assets/dashboard-hosts.jpg)
 
@@ -55,10 +60,11 @@ The public page, on the demo backend:
 
 ![The public page: the relay's host name, how to subscribe to the firehose, live events in and out, time to firehose, connected hosts and consumers, and node and quorum health](docs/assets/dashboard-public-dark.jpg)
 
-The console's quorum log page, with each member's acked, committed and emitted seq, the flush
-point F and reserve R, membership changes and bucket recoveries:
+The console's quorum and cluster page, with each member's acked, committed and emitted seq, the
+flush point F and reserve R, leadership changes, bucket recoveries and which member reads each
+host:
 
-![The quorum log page on the demo backend: epoch, leader, members answering, commit index, F and R, per-member lag, flush stats, counters, membership changes and a typed-confirm membership editor](docs/assets/dashboard-quorum-dark.jpg)
+![The quorum and cluster page on the demo backend: epoch, leader, members answering, commit index, F and R, each member's log, leadership changes, per-member lag and durability, flushes, counters, the ack backlog and host owners](docs/assets/dashboard-quorum-dark.jpg)
 
 ## Quickstart
 
@@ -99,7 +105,7 @@ local MinIO:
 ```sh
 cd deploy/single
 UPSTREAM=morel.us-east.host.bsky.network VLRELAY_ADMIN_TOKEN=$(openssl rand -hex 16) \
-  docker compose up -d
+  docker compose up -d --build
 ```
 
 For three nodes, [Cluster](docs/cluster.md#running-one) has the bucket, the peer network and the
