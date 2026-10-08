@@ -8,7 +8,7 @@ use crate::verify::{Verified, VerifiedKind};
 use bytes::{Buf, BufMut, Bytes};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vlatproto::cid::Cid;
 use vlatproto::tid::Tid;
 
@@ -57,6 +57,17 @@ impl Fence {
     }
 }
 
+/// An event handed to the leader, as its host owner remembers it.
+pub(super) struct Sent {
+    pub host: Host,
+    pub did: String,
+    pub useq: i64,
+    pub epoch: u64,
+    pub kind: &'static str,
+    /// When its frame arrived, for the time to firehose.
+    pub received: Instant,
+}
+
 impl Node {
     /// The host owner's end of a forward: count it and move the host's
     /// cursor, or, if the leader never answered, hold the cursor and have
@@ -64,15 +75,13 @@ impl Node {
     pub(super) async fn forwarded(
         self: Arc<Self>,
         rx: tokio::sync::oneshot::Receiver<Result<Outcome, ForwardError>>,
-        host: Host,
-        did: String,
-        useq: i64,
-        epoch: u64,
-        kind: &'static str,
+        s: Sent,
     ) {
+        let Sent { host, did, useq, epoch, kind, received } = s;
         match rx.await {
             Ok(Ok(Outcome::Appended(seq))) => {
                 metrics::ACCEPTED_BY_KIND.inc(kind);
+                self.ttf.durable_batch([(std::slice::from_ref(&seq), received)]);
                 {
                     let mut p = self.passed.lock();
                     if p.len() >= metrics::PASSED_KEPT {

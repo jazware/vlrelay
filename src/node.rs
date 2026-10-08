@@ -481,6 +481,7 @@ impl Node {
             };
             let did = checked.did.clone();
             let kind = checked.kind.label();
+            let received = checked.received;
             match self.owner.submit(checked).await {
                 Submitted::Rejected(r) => {
                     self.reject(&host, &did, useq, r);
@@ -491,7 +492,7 @@ impl Node {
                     acks.push(
                         async move {
                             let _permit = permit;
-                            node.forwarded(rx, host, did, useq, epoch, kind).await;
+                            node.forwarded(rx, forward::Sent { host, did, useq, epoch, kind, received }).await;
                         }
                         .boxed(),
                     );

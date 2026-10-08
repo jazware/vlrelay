@@ -260,3 +260,26 @@ pub struct Dash {
     pub history: VecDeque<Sample>,
     pub hosts: HashMap<Host, HostSeries>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ttf_pairs_durability_with_emission_in_either_order() {
+        let t = Ttf::default();
+        let t0 = Instant::now();
+        // committed first, then emitted 5 ms after arrival
+        t.durable_batch([(&[1i64][..], t0)]);
+        t.emitted_batch([1], t0 + Duration::from_millis(5));
+        // emitted first, then its commit came back with an arrival 20 ms before
+        t.emitted_batch([2], t0 + Duration::from_millis(20));
+        t.durable_batch([(&[2i64][..], t0)]);
+        // another node's event: emitted here, never durable here
+        t.emitted_batch([3], t0);
+        let (p50, p99) = t.roll();
+        assert!((4.9..5.2).contains(&p50), "p50 {p50}");
+        assert!((19.8..20.3).contains(&p99), "p99 {p99}");
+        assert_eq!(t.roll(), (0.0, 0.0), "a roll starts a new window");
+    }
+}
