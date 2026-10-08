@@ -4,7 +4,7 @@ vlRelay is an atproto relay on a replicated log. It subscribes to PDSes, checks 
 against sync 1.1, and serves one combined firehose from one node or three, with an S3, R2, GCS or
 MinIO bucket as its long-term copy.
 
-![The operator console's overview on the demo backend: a simulated three-node relay reading 5,000 PDSes, with firehose rate, time to firehose, quorum and flush health, rejects, how each PDS stream flows through the members to the leader, and consumers](docs/assets/dashboard-real-overview.jpg)
+![The operator console's overview on a local three-node cluster with fake accounts: n1 leads, with firehose rate, time to firehose, quorum and flush health, rejects, the PDS streams n1 reads flowing to the leader, and consumers](docs/assets/dashboard-real-overview.jpg)
 
 It's built from the parts of [vlpds](https://github.com/jazware/vlpds) that worked, now crates both
 build on, [vlsync](https://github.com/jazware/vlsync) and [vlatproto](https://github.com/jazware/vlatproto):
@@ -51,12 +51,14 @@ its log segments, firehose serving and SlateDB state, and its atproto code. Cons
   same upstreams, and the seqs are dense (1, 2, 3, …) and the same on every node.
   → [Compatibility](docs/compat.md), [Subscribe to the firehose](docs/subscribing.md)
 
-The screenshots here come from the demo backend (`cargo run --bin admin_demo`), a simulated
-5,000-host relay on three nodes. The hosts page at the busy end:
+The screenshots here come from a local three-node cluster (a leader and two followers) reading a
+`fakepds` fleet of 40 fake PDSes with ~12,000 fake accounts and its own PLC, at ~1.5k events/s.
+[Load fleet](docs/loadfleet.md) shows how to run one. Two of the hosts send a few bad signatures
+on purpose, so there are rejects. The hosts page, busiest first:
 
-![The hosts page on the demo backend: thousands of hosts by events per second, with tiers, error rates and throttles](docs/assets/dashboard-hosts.jpg)
+![The hosts page on the local cluster: the fake PDSes n1 reads, by events per second, with tiers, error rates, account counts and read lag](docs/assets/dashboard-hosts.jpg)
 
-The public page, on the demo backend:
+The public page on the same cluster:
 
 ![The public page: the relay's host name, how to subscribe to the firehose, live events in and out, time to firehose, connected hosts and consumers, and node and quorum health](docs/assets/dashboard-public-dark.jpg)
 
@@ -64,7 +66,7 @@ The console's quorum and cluster page, with each member's acked, committed and e
 flush point F and reserve R, leadership changes, bucket recoveries and which member reads each
 host:
 
-![The quorum and cluster page on the demo backend: epoch, leader, members answering, commit index, F and R, each member's log, leadership changes, per-member lag and durability, flushes, counters, the ack backlog and host owners](docs/assets/dashboard-quorum-dark.jpg)
+![The quorum and cluster page on the local cluster: epoch, leader, members answering, commit index, F and R, each member's log, the election that made n1 leader, per-member lag and durability, flushes, counters and host owners](docs/assets/dashboard-quorum-dark.jpg)
 
 ## Quickstart
 

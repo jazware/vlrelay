@@ -327,11 +327,9 @@ Not a vlRelay bug: eurosky's migration `#sync`
 
 ## Dashboard screenshots
 
-Screenshots taken during the run, on the earlier designs' dashboard, are in the repository as
-`docs/assets/dashboard-real-*.jpg`: the overview, consumers and cluster pages from n1 during the
-cluster phase, the hosts page from the single node 15 minutes in (three hosts auto-throttled, and
-their "errors" are the throttled accounts' drops), and the hosts page on a cluster node, which
-shows bug 4.
+The run's screenshots were of the earlier designs' dashboard, and they've left the repository
+with it. The README's screenshots are today's console on a local three-node cluster reading a
+[`fakepds`](loadfleet.md) fleet.
 
 ## Running one yourself
 
