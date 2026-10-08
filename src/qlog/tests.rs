@@ -9,7 +9,7 @@ use super::commitlog::{self, CommitLog};
 use super::emit::{Emitted, Emitter};
 use super::flush;
 use super::log::encode_cursors;
-use super::node::{Config, Durability, Faults, LeaderRecord, MemoryOnly, Node, Role, SwitchStats, read_leader};
+use super::node::{Config, Durability, Faults, LeaderRecord, MemoryOnly, Node, Role, Status, SwitchStats, read_leader};
 use super::wire;
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -1293,7 +1293,8 @@ struct HostLoad {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Each host's highest event number sent.
     sent: Arc<Mutex<HashMap<String, u64>>>,
-    rewinds: Arc<AtomicU64>,
+    /// Each host's generation, as of its last rewind.
+    rewound: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl HostLoad {
@@ -1301,11 +1302,11 @@ impl HostLoad {
         let stop = Arc::new(AtomicBool::new(false));
         let acked: Arc<Mutex<Vec<(u64, u64, u64)>>> = Arc::default();
         let sent: Arc<Mutex<HashMap<String, u64>>> = Arc::default();
-        let rewinds = Arc::new(AtomicU64::new(0));
+        let rewound: Arc<Mutex<HashMap<String, u64>>> = Arc::default();
         let tasks = (0..n)
             .map(|w| {
                 let client = c.client();
-                let (stop, acked, sent, rewinds) = (stop.clone(), acked.clone(), sent.clone(), rewinds.clone());
+                let (stop, acked, sent, rewound) = (stop.clone(), acked.clone(), sent.clone(), rewound.clone());
                 tokio::spawn(async move {
                     let host = format!("t{w}");
                     // every event up to n is acked (and, after a rewind, in the log)
@@ -1338,14 +1339,29 @@ impl HostLoad {
                             let (g, cur) = client.recovery_cursors(a.generation).await;
                             n = cur.get(&host).copied().unwrap_or(0);
                             client.rewound(g);
-                            rewinds.fetch_add(1, Ordering::Relaxed);
+                            rewound.lock().insert(host.clone(), g);
                         }
                         tokio::time::sleep(pause).await;
                     }
                 })
             })
             .collect();
-        HostLoad { stop, acked, tasks, sent, rewinds }
+        HostLoad { stop, acked, tasks, sent, rewound }
+    }
+
+    /// Until each of the `hosts` has rewound to `generation` or past it.
+    async fn wait_rewound(&self, hosts: usize, generation: u64, within: Duration) {
+        let t = Instant::now();
+        loop {
+            {
+                let r = self.rewound.lock();
+                if r.values().filter(|g| **g >= generation).count() == hosts {
+                    return;
+                }
+                assert!(t.elapsed() < within, "hosts not rewound to generation {generation} within {within:?}: {r:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// (acks, every event's DID content id).
@@ -1419,9 +1435,10 @@ async fn wiping_every_disk_recovers_from_the_bucket_at_r_plus_one() {
     let mut c = flushing(|_| flush::Options { headroom: 5_000, ..flush_opts() }, 64 << 20).await;
     c.wait_leader(Duration::from_secs(5)).await;
     let load = HostLoad::start(&c, 4, 10, Duration::from_millis(2));
+    let (mut generation, mut floor) = (0, 0);
     for round in 0..2 {
-        wait_flushed(&c, 1, Duration::from_secs(5)).await;
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        // the log has grown, and been flushed, past the last jump
+        wait_flushed(&c, floor + 500, Duration::from_secs(10)).await;
         let before = flush::read_manifest(&c.store).await.unwrap().unwrap().0;
         for id in c.ids.clone() {
             c.wipe(&id);
@@ -1429,29 +1446,45 @@ async fn wiping_every_disk_recovers_from_the_bucket_at_r_plus_one() {
         for id in c.ids.clone() {
             c.start(&id).await;
         }
-        let l = c.wait_leader(Duration::from_secs(10)).await;
-        let st = c.nodes[&l].node.status();
-        eprintln!(
-            "round {round}: {}
-{:?}",
-            status_line(&c),
-            c.recoveries()
-        );
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        eprintln!("round {round} +300ms: {}", status_line(&c));
-        assert_eq!(st.generation, round + 1, "{st:?}");
-        let m = flush::read_manifest(&c.store).await.unwrap().unwrap().0;
+        let (st, m) = settle_after_wipe(&c, Duration::from_secs(20)).await;
+        eprintln!("round {round}: {}\n{:?}", status_line(&c), c.recoveries());
         let rec = m.recovery.clone().unwrap();
+        // Usually one recovery per wipe. Under load another member's
+        // election can depose the recovered leader before any wiped follower
+        // has caught up from it, and with no quorum of intact logs that's
+        // one more.
+        assert!(rec.generation > generation, "{rec:?} after generation {generation}");
+        assert_eq!(st.generation, rec.generation, "{st:?}");
         assert!(rec.base >= before.reserve && rec.after >= before.flushed, "{rec:?} after {before:?}");
         assert!(st.commit >= rec.base, "{st:?}");
+        (generation, floor) = (rec.generation, rec.base);
+        load.wait_rewound(4, generation, Duration::from_secs(20)).await;
     }
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    let rewinds = load.rewinds.load(Ordering::Relaxed);
     let (v, r, m) = settle_recovered(&c, load).await;
-    eprintln!("{v:?}\n{r:?}\ngaps {:?} rewinds {rewinds} {:#?}", m.gaps, c.recoveries());
-    assert_eq!(m.gaps.len(), 2, "{m:?}");
-    assert!(rewinds >= 4 && r.reingested + r.duplicates > 0, "{r:?}");
+    eprintln!("{v:?}\n{r:?}\ngaps {:?} {:#?}", m.gaps, c.recoveries());
+    assert_eq!(m.gaps.len() as u64, generation, "{m:?}");
+    assert!(r.reingested + r.duplicates > 0, "{r:?}");
     c.shutdown();
+}
+
+/// After every disk was wiped: the leader's status and the manifest, once
+/// every log is intact again (so no further recovery can follow) and the
+/// leader has adopted the manifest's latest recovery.
+async fn settle_after_wipe(c: &Cluster, within: Duration) -> (Status, flush::Manifest) {
+    let t = Instant::now();
+    loop {
+        if let Some(l) = c.leader()
+            && c.nodes.values().all(|r| r.node.status().intact)
+        {
+            let st = c.nodes[&l].node.status();
+            let m = flush::read_manifest(&c.store).await.unwrap().unwrap().0;
+            if st.role == Role::Leader && m.recovery.is_some() && st.generation == m.generation() {
+                return (st, m);
+            }
+        }
+        assert!(t.elapsed() < within, "no intact cluster on a recovery within {within:?}: {}", status_line(c));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Two disks gone, one survivor. If the survivor leads and the others are
