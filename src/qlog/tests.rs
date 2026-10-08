@@ -320,6 +320,13 @@ impl Cluster {
     /// Waits until every running member has emitted the same, full commit
     /// (a removed node stops where it was removed).
     pub(crate) async fn converge(&self, within: Duration) {
+        if let Err(e) = self.try_converge(within).await {
+            panic!("{e}");
+        }
+    }
+
+    /// As `converge`, saying why it didn't.
+    pub(crate) async fn try_converge(&self, within: Duration) -> Result<(), String> {
         let t = Instant::now();
         loop {
             let members = self.members();
@@ -338,10 +345,12 @@ impl Cluster {
                 };
                 if seen {
                     tokio::time::sleep(Duration::from_millis(50)).await;
-                    return;
+                    return Ok(());
                 }
             }
-            assert!(t.elapsed() < within, "no convergence within {within:?}: {st:#?}");
+            if t.elapsed() >= within {
+                return Err(format!("no convergence within {within:?}: {st:#?}"));
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -2555,6 +2564,16 @@ async fn trusting_a_short_log_after_a_power_loss_is_caught() {
     for _ in 0..3 {
         wait_flushed(&c, 1, Duration::from_secs(5)).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
+        // a cut just after the nodes' syncs (or while the load waits on a
+        // leader) loses nothing acked, and there's nothing to catch
+        let t = Instant::now();
+        while !c.nodes.values().all(|r| {
+            let d = r.node.status().durability;
+            d.unsynced_bytes > 0 && d.since_sync_ms.is_some_and(|ms| ms >= 100)
+        }) {
+            assert!(t.elapsed() < Duration::from_secs(10), "no node went 100 ms unsynced: {}", status_line(&c));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         for id in c.ids.clone() {
             c.power_cut_all_unsynced(&id);
         }
@@ -2565,7 +2584,12 @@ async fn trusting_a_short_log_after_a_power_loss_is_caught() {
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
     let (acked, expected) = load.stop().await;
-    c.converge(Duration::from_secs(20)).await;
+    // logs that diverged for good are caught too
+    if let Err(e) = c.try_converge(Duration::from_secs(20)).await {
+        eprintln!("caught: {e}");
+        c.shutdown();
+        return;
+    }
     let m = flush::read_manifest(&c.store).await.unwrap().map(|(m, _)| m).unwrap_or_default();
     let r = c.finish_recovered(&acked, &m.gaps, &expected);
     eprintln!("{r:?}");
