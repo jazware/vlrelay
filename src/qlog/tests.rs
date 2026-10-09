@@ -2916,18 +2916,35 @@ async fn trusting_a_short_log_after_a_power_loss_is_caught() {
 /// running: nothing flushes over the bucket the test then plays recoveries
 /// into. Returns it, what it emitted and the manifest.
 async fn a_lone_follower_behind_the_bucket() -> (Cluster, String, u64, flush::Manifest) {
-    let mut c = flushing(|_| flush_opts(), 64 << 20).await;
+    // one leader throughout, even when fsyncs crawl: its commit is the top
+    // of the log
+    let tune = |k: &mut Config| k.election_timeout = Duration::from_secs(3);
+    let mut c = flushing_tuned(3, |_| flush_opts(), 64 << 20, commitlog::Options::default(), tune).await;
     let l = c.wait_leader(Duration::from_secs(5)).await;
     let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
-    tokio::time::sleep(Duration::from_millis(300)).await;
     let f = c.ids.iter().find(|id| **id != l).unwrap().clone();
+    let t = Instant::now();
+    while c.nodes[&f].node.status().emitted == 0 {
+        assert!(t.elapsed() < Duration::from_secs(15), "{f} emitted nothing: {}", status_line(&c));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     c.isolate(&f);
+    // appends already on the wire land
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let behind = c.nodes[&f].node.status().emitted;
-    assert!(behind > 0, "{f} emitted nothing before it was cut off");
+    // and it emits what they committed once its fsync of them returns
+    let t = Instant::now();
+    let behind = loop {
+        let st = c.nodes[&f].node.status();
+        if st.emitted == st.commit && st.durability.unsynced_bytes == 0 {
+            break st.emitted;
+        }
+        assert!(t.elapsed() < Duration::from_secs(15), "{f} didn't settle: {}", status_line(&c));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     load.stop().await;
+    assert_eq!(c.nodes[&l].node.status().role, Role::Leader, "{}", status_line(&c));
     let top = c.nodes[&l].node.status().commit;
-    let m = wait_flushed(&c, top, Duration::from_secs(10)).await;
+    let m = wait_flushed(&c, top, Duration::from_secs(30)).await;
     for id in c.ids.clone() {
         if id != f {
             c.kill(&id);
@@ -2963,8 +2980,19 @@ async fn reset_and_emit(c: &Cluster, f: &str, behind: u64, to: u64, m: &flush::M
         assert!(t.elapsed() < Duration::from_secs(10), "{:?}", c.nodes[f].node.status());
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // the tap is asynchronous: wait for every seq the stream got rather
+    // than skipped past
+    let want = to - behind - (c.nodes[f].node.status().emit_gaps - st.emit_gaps);
     let stream = format!("{f}#{}", c.incarnations[f]);
-    c.emitted.lock().iter().filter(|(s, q, _)| *s == stream && *q > behind).map(|e| e.1).collect()
+    let t = Instant::now();
+    loop {
+        let got: Vec<u64> =
+            c.emitted.lock().iter().filter(|(s, q, _)| *s == stream && *q > behind).map(|e| e.1).collect();
+        if got.len() as u64 >= want || t.elapsed() > Duration::from_secs(10) {
+            return got;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// A deposed leader's flush, still running when a recovery moved F past
@@ -2983,7 +3011,7 @@ async fn a_follower_reset_across_a_gap_never_emits_a_deposed_leaders_segment() {
         (s + 1..=s + 5).map(|q| super::log::Entry::new(1, q, Bytes::from(format!("stale{q}")))).collect();
     flush::put_test_segment(&c.store, m.next_ordinal, &stale).await;
     let got = reset_and_emit(&c, &f, behind, r + 10, &m2).await;
-    assert_eq!(got, (behind + 1..=s).collect::<Vec<_>>(), "emitted seqs in the gap ({s}, {r}]");
+    assert_eq!(got, (behind + 1..=s).collect::<Vec<_>>(), "the stream past {behind}, around the gap ({s}, {r}]");
     c.shutdown();
 }
 
