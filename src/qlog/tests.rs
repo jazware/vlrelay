@@ -26,6 +26,8 @@ pub(crate) struct Running {
     pub(crate) node: Arc<Node>,
     faults: Arc<Faults>,
     cl: Option<Arc<CommitLog>>,
+    /// The last seq its commitlog replayed at start.
+    recovered: u64,
 }
 
 pub(crate) type ConfigFn = Arc<dyn Fn(&str, &HashMap<String, String>) -> Config + Send + Sync>;
@@ -186,6 +188,7 @@ impl Cluster {
             }
             None => (None, None),
         };
+        let replayed = recovered.as_ref().map_or(0, |r| r.log.last_seq());
         let durability: Arc<dyn Durability> = match &cl {
             Some(cl) => Arc::new(cl.clone()),
             None => Arc::new(MemoryOnly),
@@ -213,7 +216,7 @@ impl Cluster {
             let _ = tx.send(n);
         });
         let node = rx.await.unwrap();
-        self.nodes.insert(id.to_string(), Running { rt, node, faults, cl });
+        self.nodes.insert(id.to_string(), Running { rt, node, faults, cl, recovered: replayed });
     }
 
     /// kill -9: the runtime goes, with every task, socket and byte of memory.
@@ -240,9 +243,18 @@ impl Cluster {
         }
     }
 
-    /// A power cut that loses everything written since the last fsync.
-    pub(crate) fn power_cut_all_unsynced(&mut self, id: &str) {
-        if let Some(r) = self.nodes.remove(id) {
+    /// The power goes out on `ids` at once, each losing everything written
+    /// since its last fsync. Every writer stops before any log is cut: a
+    /// cut's own fsyncs can take long enough on a busy disk for the nodes
+    /// still running to sync what the cut was meant to lose.
+    pub(crate) fn power_cut_all_unsynced(&mut self, ids: &[String]) {
+        let cut: Vec<Running> = ids.iter().filter_map(|id| self.nodes.remove(id)).collect();
+        for r in &cut {
+            if let Some(cl) = &r.cl {
+                cl.halt();
+            }
+        }
+        for r in cut {
             if let Some(cl) = &r.cl {
                 cl.power_cut(0.0, &[0xde, 0xad]).unwrap();
             }
@@ -884,6 +896,29 @@ async fn flushing_tuned(
     tune: impl Fn(&mut Config) + Send + Sync + 'static,
 ) -> Cluster {
     let o = commitlog::Options { segment_bytes: 256 << 10, retain_bytes: 1 << 20, memory_bytes: 64 << 10, ..base };
+    flushing_on(n, opts, ring_bytes, o, tune).await
+}
+
+/// As [`flushing`], on disks a quarter the size: a wait for a disk to trim
+/// its oldest segment gets there after a quarter of the writes, which
+/// counts when fsyncs (and the load with them) crawl.
+async fn flushing_small_disks(opts: impl Fn(&str) -> flush::Options + Send + Sync + 'static) -> Cluster {
+    let o = commitlog::Options {
+        segment_bytes: 64 << 10,
+        retain_bytes: 256 << 10,
+        memory_bytes: 64 << 10,
+        ..commitlog::Options::default()
+    };
+    flushing_on(3, opts, 64 << 20, o, |_| {}).await
+}
+
+async fn flushing_on(
+    n: usize,
+    opts: impl Fn(&str) -> flush::Options + Send + Sync + 'static,
+    ring_bytes: usize,
+    o: commitlog::Options,
+    tune: impl Fn(&mut Config) + Send + Sync + 'static,
+) -> Cluster {
     let cfg = move |id: &str, addrs: &HashMap<String, String>| {
         let mut k = config(id, addrs);
         k.retain_bytes = 64 << 10;
@@ -1438,14 +1473,19 @@ async fn a_leader_whose_state_writer_is_fenced_still_flushes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fetch_behind_the_disk_resets_to_its_oldest_entry_not_past_f() {
     let stop = Arc::new(AtomicBool::new(false));
-    let s = stop.clone();
-    let c = flushing(
-        move |_| {
-            let s = s.clone();
-            flush::Options { crash: Some(Arc::new(move |_| s.load(Ordering::Acquire))), ..flush_opts() }
-        },
-        64 << 20,
-    )
+    let stopped = Arc::new(AtomicU64::new(0));
+    let (s, n) = (stop.clone(), stopped.clone());
+    let c = flushing_small_disks(move |_| {
+        let (s, n) = (s.clone(), n.clone());
+        let crash = move |_| {
+            let stop = s.load(Ordering::Acquire);
+            if stop {
+                n.fetch_add(1, Ordering::Release);
+            }
+            stop
+        };
+        flush::Options { crash: Some(Arc::new(crash)), ..flush_opts() }
+    })
     .await;
     let l = c.wait_leader(Duration::from_secs(5)).await;
     let f = c.ids.iter().find(|id| **id != l).unwrap().clone();
@@ -1457,8 +1497,13 @@ async fn a_fetch_behind_the_disk_resets_to_its_oldest_entry_not_past_f() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     stop.store(true, Ordering::Release);
-    // the flush in flight, if any, commits or crashes
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // the leader's flusher stops at its next step, after the CAS of the
+    // flush in flight if it's past its last check
+    let t = Instant::now();
+    while stopped.load(Ordering::Acquire) == 0 {
+        assert!(t.elapsed() < Duration::from_secs(30), "the flusher never stopped: {}", status_line(&c));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let m = flush::read_manifest(&c.store).await.unwrap().unwrap().0;
     let t = Instant::now();
     while node.status().base <= m.flushed + 1000 {
@@ -1494,7 +1539,7 @@ async fn a_fetch_behind_the_disk_resets_to_its_oldest_entry_not_past_f() {
 /// would be a gap in its stream).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_follower_behind_the_leaders_disk_catches_up_from_the_bucket() {
-    let mut c = flushing(|_| flush_opts(), 64 << 20).await;
+    let mut c = flushing_small_disks(|_| flush_opts()).await;
     for id in c.ids.clone() {
         c.kill(&id);
     }
@@ -1513,11 +1558,12 @@ async fn a_follower_behind_the_leaders_disk_catches_up_from_the_bucket() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let behind = c.nodes[&f].node.status().last;
     c.kill(&f);
-    // until the leader can't serve it from memory or disk, however fast
-    // this box fills and trims the leader's commitlog
+    // until no node can serve it from memory or disk (the other one may
+    // lead by the time it's back), however fast this box fills and trims
+    // their commitlogs
     let t = Instant::now();
-    while c.nodes[&l].node.readable_floor() <= behind + 1 {
-        assert!(t.elapsed() < Duration::from_secs(30), "the leader's disk still reaches {behind}: {}", status_line(&c));
+    while c.nodes.values().any(|r| r.node.readable_floor() <= behind + 1) {
+        assert!(t.elapsed() < Duration::from_secs(30), "a disk still reaches {behind}: {}", status_line(&c));
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     wait_flushed(&c, behind + 1, Duration::from_secs(10)).await;
@@ -2638,9 +2684,7 @@ async fn page_cache_power_cuts_on_a_majority_recover_from_the_bucket() {
         // the leader and as many others as it takes
         let mut ids = vec![l.clone()];
         ids.extend(c.ids.iter().filter(|i| **i != l).take(cut - 1).cloned());
-        for id in &ids {
-            c.power_cut_all_unsynced(id);
-        }
+        c.power_cut_all_unsynced(&ids);
         for id in &ids {
             c.start(id).await;
         }
@@ -2755,15 +2799,23 @@ async fn follower_reset_past_emitted(stale: bool) {
 /// (acked events lost, or seqs emitted twice with other contents).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn trusting_a_short_log_after_a_power_loss_is_caught() {
-    let mut c =
-        flushing_with(3, |_| flush::Options { headroom: 50_000, ..flush_opts() }, 64 << 20, page_cache(true)).await;
+    // one segment each, so the background fsync every 400 ms decides what a
+    // cut loses (a rollover fsyncs too, every ~150 ms at this load)
+    let o = commitlog::Options { segment_bytes: 64 << 20, memory_bytes: 64 << 10, ..page_cache(true) };
+    let opts = |_: &str| flush::Options { headroom: 50_000, ..flush_opts() };
+    let mut c = flushing_on(3, opts, 64 << 20, o, |_| {}).await;
     c.wait_leader(Duration::from_secs(5)).await;
     let load = HostLoad::start(&c, 4, 10, Duration::from_millis(2));
-    for _ in 0..3 {
+    // a cut just after the nodes' syncs (or while the load waits on a
+    // leader, or while a node's fsync is under way) loses nothing acked, and
+    // there's nothing to catch: only cuts that took acked entries off every
+    // log count
+    let (mut lossy, mut rounds) = (0, 0);
+    while lossy < 3 {
+        assert!(rounds < 20, "{lossy} of {rounds} power cuts lost acked entries: {}", status_line(&c));
+        rounds += 1;
         wait_flushed(&c, 1, Duration::from_secs(5)).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        // a cut just after the nodes' syncs (or while the load waits on a
-        // leader) loses nothing acked, and there's nothing to catch
         let t = Instant::now();
         while !c.nodes.values().all(|r| {
             let d = r.node.status().durability;
@@ -2772,11 +2824,13 @@ async fn trusting_a_short_log_after_a_power_loss_is_caught() {
             assert!(t.elapsed() < Duration::from_secs(10), "no node went 100 ms unsynced: {}", status_line(&c));
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        for id in c.ids.clone() {
-            c.power_cut_all_unsynced(&id);
-        }
+        let acked = load.acked.lock().iter().map(|a| a.0).max().unwrap_or(0);
+        c.power_cut_all_unsynced(&c.ids.clone());
         for id in c.ids.clone() {
             c.start(&id).await;
+        }
+        if c.nodes.values().all(|r| r.recovered < acked) {
+            lossy += 1;
         }
         c.wait_leader(Duration::from_secs(10)).await;
     }
@@ -2784,13 +2838,13 @@ async fn trusting_a_short_log_after_a_power_loss_is_caught() {
     let (acked, expected) = load.stop().await;
     // logs that diverged for good are caught too
     if let Err(e) = c.try_converge(Duration::from_secs(20)).await {
-        eprintln!("caught: {e}");
+        eprintln!("caught after {rounds} cuts: {e}");
         c.shutdown();
         return;
     }
     let m = flush::read_manifest(&c.store).await.unwrap().map(|(m, _)| m).unwrap_or_default();
     let r = c.finish_recovered(&acked, &m.gaps, &expected);
-    eprintln!("{r:?}");
+    eprintln!("{rounds} cuts: {r:?}");
     assert!(
         !r.ok || r.acked_missing > 0 || r.events_lost > 0 || r.holes > 0,
         "trusting short logs after power losses went unnoticed: {r:?}"
