@@ -1039,8 +1039,12 @@ pub struct DiscoverySource {
     pub refresh_interval_secs: Option<u64>,
     /// When its next run starts (now while one is in progress).
     pub next_run_ms: Option<i64>,
-    /// `plc`: hosts waiting for admission.
+    /// Hosts waiting for admission.
     pub pending: u64,
+    /// A seed relay admitting its queue: the `accountCount` of the next
+    /// host in line (largest first).
+    #[serde(default)]
+    pub next_accounts: Option<u64>,
     #[serde(flatten)]
     pub state: crate::discovery::SourceState,
 }

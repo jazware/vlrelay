@@ -22,9 +22,18 @@
 //! starts live, with no backfill. Admissions are paced by their own budget
 //! (`connectsPerMin`), not the daily new-host one requestCrawl spends.
 //!
-//! Each source's progress (its cursor in the list it's reading, its last
-//! and next runs, its counts) is saved in the bucket after every page, so a
-//! new leader resumes a list where the old one stopped.
+//! A seed relay's run reads its whole list first, queueing the hosts this
+//! relay doesn't have, then admits the queue largest first by the relay's
+//! `accountCount`, the uncounted ones last in list order. On a cold start
+//! that pace is ~an hour for a big network, and a host starts live when its
+//! turn comes, so the hosts carrying most of the network's events have to
+//! come first. While a queue still holds a counted host, PLC export hosts
+//! wait.
+//!
+//! Each source's progress (its cursor in the list it's reading, its queue,
+//! its last and next runs, its counts) is saved in the bucket after every
+//! page and every batch of admissions, so a new leader resumes a run where
+//! the old one stopped.
 
 use crate::policy::doc::Discovery;
 use crate::policy::{Engine, tiers};
@@ -44,6 +53,10 @@ const STATE: &str = "discovery/state.json";
 /// PDS hosts from the PLC export waiting for admission (each is admitted or
 /// refused once; a refused one isn't retried until it's named again).
 const PLC_PENDING_MAX: usize = 50_000;
+/// A seed relay's hosts queued for admission in one run.
+const QUEUE_MAX: usize = 50_000;
+/// Admissions between saves of the state.
+const BATCH: usize = PROBES * 4;
 const PAGE: usize = 1000;
 const MAX_PAGE_BYTES: usize = 16 << 20;
 /// Admissions (probes included) in flight at once.
@@ -62,6 +75,11 @@ pub struct SourceState {
     /// Where the run in progress reads next (None: no run in progress).
     pub cursor: Option<String>,
     pub in_progress: bool,
+    /// The run has read the whole list and is admitting its queue.
+    pub admitting: bool,
+    /// This run (or the last) passed every page's counts to seeding: false
+    /// on a run from before seeding, or with `seedAccounts` off for a page.
+    pub seed_pass: bool,
     pub run_requested: bool,
     /// This run's (or the last one's) counts.
     pub hosts_seen: u64,
@@ -87,6 +105,9 @@ pub struct SourceState {
 pub struct State {
     pub sources: BTreeMap<String, SourceState>,
     pub plc_pending: BTreeSet<String>,
+    /// Each seed relay's run's hosts new to this relay, waiting for
+    /// admission: in list order while listing, largest first after.
+    pub queued: BTreeMap<String, Vec<Listed>>,
 }
 
 /// PDS hosts the PLC export reader saw, for the leader's discovery.
@@ -115,7 +136,7 @@ pub fn source_key(url: &str) -> String {
 }
 
 /// One host in a `listHosts` page.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Listed {
     pub hostname: String,
     /// Its `accountCount`, or 0 when the relay doesn't list it as active or
@@ -247,7 +268,23 @@ impl DiscoveryJob {
     /// A run of `source` (or every enabled source) now, rather than at its
     /// interval.
     pub fn request(&self, source: Option<String>) {
-        self.requested.lock().insert(source);
+        self.requested.lock().insert(source.clone());
+        // the term takes it between batches; the view shows it now
+        let d = self.policy();
+        if let Some(st) = self.state.lock().as_mut() {
+            mark_requested(st, &d, &HashSet::from([source]));
+        }
+    }
+
+    fn publish(&self, st: &State, d: &Discovery) {
+        let asked = self.requested.lock().clone();
+        let mut v = st.clone();
+        mark_requested(&mut v, d, &asked);
+        *self.state.lock() = Some(v);
+    }
+
+    fn seeding(&self, d: &Discovery) -> bool {
+        d.seed_accounts.enabled && self.hosts.is_some()
     }
 
     fn policy(&self) -> Discovery {
@@ -286,12 +323,14 @@ impl DiscoveryJob {
             } else {
                 Some(s.last_finished_ms.map_or(now, |f| f + r.refresh_interval_secs as i64 * 1000))
             };
+            let q = st.queued.get(&key);
             sources.push(crate::admin::DiscoverySource {
-                key,
                 enabled: r.enabled,
                 refresh_interval_secs: Some(r.refresh_interval_secs),
                 next_run_ms: next,
-                pending: 0,
+                pending: q.map_or(0, |q| q.len() as u64),
+                next_accounts: q.filter(|_| s.admitting).and_then(|q| q.first()).map(|l| l.accounts),
+                key,
                 state: s,
             });
         }
@@ -302,6 +341,7 @@ impl DiscoveryJob {
             refresh_interval_secs: None,
             next_run_ms: None,
             pending: st.plc_pending.len() as u64,
+            next_accounts: None,
             state: s,
         });
         crate::admin::DiscoveryView {
@@ -353,22 +393,37 @@ impl DiscoveryJob {
         }
         *self.state.lock() = Some(st.clone());
         self.running.store(true, Relaxed);
+        let mut worked_view = false;
         tracing::info!(epoch, "discovery: this node leads; running the sources");
         let mut last_request: BTreeMap<String, Instant> = BTreeMap::new();
+        let mut reseeded: HashSet<String> = HashSet::new();
         while keep() {
             let d = self.policy();
             let now = crate::policy::store::now_ms();
             let asked: HashSet<Option<String>> = std::mem::take(&mut *self.requested.lock());
             for r in &d.seed_relays {
-                let key = source_key(&r.url);
-                let s = st.sources.entry(key.clone()).or_default();
+                let s = st.sources.entry(source_key(&r.url)).or_default();
                 s.url = Some(r.url.clone());
-                if asked.contains(&None) || asked.contains(&Some(key.clone())) {
-                    s.run_requested = true;
-                }
             }
-            if asked.contains(&Some(PLC_SOURCE.to_string())) || asked.contains(&None) {
-                st.sources.entry(PLC_SOURCE.into()).or_default().run_requested = true;
+            mark_requested(&mut st, &d, &asked);
+            // A stored run that didn't seed (an upgrade, seedAccounts turned
+            // on) would leave the counts off the records until its refresh,
+            // hours away. Once a term: a run that seeds sets seed_pass even
+            // when the relay lists no counts.
+            if self.seeding(&d) {
+                for r in d.seed_relays.iter().filter(|r| r.enabled) {
+                    let key = source_key(&r.url);
+                    let s = st.sources.get_mut(&key).expect("made above");
+                    let ran = s.in_progress || s.last_finished_ms.is_some();
+                    if ran && !s.seed_pass && !s.run_requested && reseeded.insert(key.clone()) {
+                        tracing::info!(
+                            source = key,
+                            "discovery: the last run didn't seed account counts; running one now"
+                        );
+                        s.run_requested = true;
+                        worked_view = true;
+                    }
+                }
             }
             // the first due source gets a page
             let due = d.seed_relays.iter().filter(|r| r.enabled).find(|r| {
@@ -377,11 +432,15 @@ impl DiscoveryJob {
                     || s.run_requested
                     || s.last_finished_ms.is_none_or(|f| now >= f + r.refresh_interval_secs as i64 * 1000)
             });
-            let mut worked = false;
+            st.queued.retain(|k, _| d.seed_relays.iter().any(|r| source_key(&r.url) == *k));
+            let mut worked = !asked.is_empty() || std::mem::take(&mut worked_view);
             if let Some(r) = due {
                 let key = source_key(&r.url);
                 let wait = Duration::from_secs_f64(1.0 / d.requests_per_sec.max(0.01));
-                if last_request.get(&key).is_none_or(|t| t.elapsed() >= wait) {
+                if st.sources[&key].admitting {
+                    self.admit_queued(&mut st, &key, &d).await;
+                    worked = true;
+                } else if last_request.get(&key).is_none_or(|t| t.elapsed() >= wait) {
                     last_request.insert(key.clone(), Instant::now());
                     self.page(&mut st, &key, &r.url, &d).await;
                     worked = true;
@@ -396,7 +455,12 @@ impl DiscoveryJob {
                 }
                 let s = st.sources.entry(PLC_SOURCE.into()).or_default();
                 s.run_requested = false;
-                if !st.plc_pending.is_empty() {
+                let counted_waiting = d
+                    .seed_relays
+                    .iter()
+                    .filter(|r| r.enabled)
+                    .any(|r| st.queued.get(&source_key(&r.url)).is_some_and(|q| q.iter().any(|l| l.accounts > 0)));
+                if !st.plc_pending.is_empty() && !counted_waiting {
                     let batch: Vec<String> = st.plc_pending.iter().take(PROBES * 4).cloned().collect();
                     for h in &batch {
                         st.plc_pending.remove(h);
@@ -412,7 +476,7 @@ impl DiscoveryJob {
                 self.feed.take();
             }
             if worked {
-                *self.state.lock() = Some(st.clone());
+                self.publish(&st, &d);
                 if let Err(e) = self.save(&st).await {
                     tracing::warn!("discovery: saving its state: {e:#}");
                 }
@@ -424,21 +488,24 @@ impl DiscoveryJob {
         Ok(())
     }
 
-    /// One page of `key`'s list, and its hosts through admission.
+    /// One page of `key`'s list: the hosts this relay has are counted (and
+    /// their seeded counts refreshed), the rest queued.
     async fn page(&self, st: &mut State, key: &str, url: &str, d: &Discovery) {
         let s = st.sources.get_mut(key).expect("made before");
+        let queue = st.queued.entry(key.to_string()).or_default();
         if !s.in_progress {
+            queue.clear();
             *s = SourceState {
                 url: s.url.clone(),
                 runs: s.runs + 1,
                 last_finished_ms: s.last_finished_ms,
                 last_started_ms: Some(crate::policy::store::now_ms()),
                 in_progress: true,
+                seed_pass: self.seeding(d),
                 resumed: 0,
                 ..SourceState::default()
             };
         }
-        s.run_requested = false;
         match list_hosts(&self.http, url, s.cursor.as_deref()).await {
             Ok(Page::Later(after)) => {
                 s.throttled += 1;
@@ -449,21 +516,40 @@ impl DiscoveryJob {
                 s.pages += 1;
                 s.hosts_seen += hosts.len() as u64;
                 s.last_error = None;
-                let names: Vec<String> = hosts.iter().map(|h| h.hostname.clone()).collect();
-                self.admit_all(s, &names, key, d).await;
+                let mut queued: HashSet<String> = queue.iter().map(|l| l.hostname.clone()).collect();
+                let mut over = 0;
+                for h in &hosts {
+                    if self.crawler.knows(&h.hostname) {
+                        s.known += 1;
+                    } else if queue.len() >= QUEUE_MAX {
+                        over += 1;
+                    } else if queued.insert(h.hostname.clone()) {
+                        s.new += 1;
+                        queue.push(h.clone());
+                    }
+                }
+                if over > 0 {
+                    s.errors += 1;
+                    s.last_error = Some(format!("over {QUEUE_MAX} new hosts in one run: {over} wait for the next"));
+                }
                 s.seeded += self.seed(&hosts, key, d).await;
+                s.seed_pass &= self.seeding(d);
                 let done = hosts.is_empty() || cursor.is_none() || cursor == s.cursor;
                 if done {
                     s.cursor = None;
-                    s.in_progress = false;
-                    s.last_finished_ms = Some(crate::policy::store::now_ms());
+                    // stable: the uncounted keep the list's order
+                    queue.sort_by_key(|l| std::cmp::Reverse(l.accounts));
+                    s.admitting = true;
                     tracing::info!(
                         source = key,
                         seen = s.hosts_seen,
                         new = s.new,
-                        admitted = s.admitted,
-                        "discovery: a run finished"
+                        largest = queue.first().map_or(0, |l| l.accounts),
+                        "discovery: listed; admitting the new hosts largest first"
                     );
+                    if queue.is_empty() {
+                        finish(s, key);
+                    }
                 } else {
                     s.cursor = cursor;
                 }
@@ -474,6 +560,29 @@ impl DiscoveryJob {
                 tracing::warn!(source = key, "discovery: listHosts failed: {e:#}");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
+        }
+    }
+
+    /// The next batch of `key`'s queue through admission, and the admitted
+    /// hosts' counts seeded.
+    async fn admit_queued(&self, st: &mut State, key: &str, d: &Discovery) {
+        let s = st.sources.get_mut(key).expect("made before");
+        let queue = st.queued.entry(key.to_string()).or_default();
+        let batch: Vec<Listed> = queue.drain(..queue.len().min(BATCH)).collect();
+        let mut fresh = Vec::new();
+        for l in &batch {
+            // admitted since it was listed (a requestCrawl, another source)
+            if self.crawler.knows(&l.hostname) {
+                s.known += 1;
+                s.new = s.new.saturating_sub(1);
+            } else {
+                fresh.push(l.hostname.clone());
+            }
+        }
+        self.admit(s, fresh, key, d).await;
+        s.seeded += self.seed(&batch, key, d).await;
+        if queue.is_empty() {
+            finish(s, key);
         }
     }
 
@@ -540,9 +649,20 @@ impl DiscoveryJob {
             }
         }
         s.new += fresh.len() as u64;
-        let results: Vec<Result<bool, CrawlError>> = futures::stream::iter(fresh)
+        self.admit(s, fresh, source, d).await;
+    }
+
+    /// `hosts` through admission, started in their order at the pace.
+    async fn admit(&self, s: &mut SourceState, hosts: Vec<String>, source: &str, d: &Discovery) {
+        // fair, so the pace's tokens go out in the hosts' order
+        let turn = tokio::sync::Mutex::new(());
+        let turn = &turn;
+        let results: Vec<Result<bool, CrawlError>> = futures::stream::iter(hosts)
             .map(|h| async move {
-                self.take_connect(d.connects_per_min).await;
+                {
+                    let _t = turn.lock().await;
+                    self.take_connect(d.connects_per_min).await;
+                }
                 self.crawler.admit_from(&h, source).await
             })
             .buffer_unordered(PROBES)
@@ -555,6 +675,37 @@ impl DiscoveryJob {
             }
         }
     }
+}
+
+/// Marks the enabled sources `asked` names (None: all) requested, and
+/// clears a disabled one's request, which nothing would ever take.
+fn mark_requested(st: &mut State, d: &Discovery, asked: &HashSet<Option<String>>) {
+    let all = asked.contains(&None);
+    for r in &d.seed_relays {
+        let key = source_key(&r.url);
+        if let Some(s) = st.sources.get_mut(&key) {
+            if !r.enabled {
+                s.run_requested = false;
+            } else if all || asked.contains(&Some(key)) {
+                s.run_requested = true;
+            }
+        }
+    }
+    let plc = all || asked.contains(&Some(PLC_SOURCE.to_string()));
+    if !d.plc {
+        if let Some(s) = st.sources.get_mut(PLC_SOURCE) {
+            s.run_requested = false;
+        }
+    } else if plc {
+        st.sources.entry(PLC_SOURCE.into()).or_default().run_requested = true;
+    }
+}
+
+fn finish(s: &mut SourceState, key: &str) {
+    s.in_progress = false;
+    s.admitting = false;
+    s.last_finished_ms = Some(crate::policy::store::now_ms());
+    tracing::info!(source = key, seen = s.hosts_seen, new = s.new, admitted = s.admitted, "discovery: a run finished");
 }
 
 #[cfg(test)]

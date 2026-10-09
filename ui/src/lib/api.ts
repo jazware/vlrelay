@@ -737,13 +737,19 @@ export type DiscoverySource = {
   refreshIntervalSecs: number | null
   /** now while a run is in progress */
   nextRunMs: number | null
-  /** plc: hosts waiting for admission */
+  /** hosts waiting for admission (a seed relay: this run's new hosts, largest first) */
   pending: number
+  /** a seed relay admitting its queue: the accountCount of the next host in line */
+  nextAccounts?: number | null
   runs: number
   lastStartedMs: number | null
   lastFinishedMs: number | null
   cursor: string | null
   inProgress: boolean
+  /** the run has read the whole list and is admitting its queue, largest first */
+  admitting?: boolean
+  /** this run (or the last) passed every page's counts to seeding */
+  seedPass?: boolean
   runRequested: boolean
   /** this run's (or the last one's) counts */
   hostsSeen: number

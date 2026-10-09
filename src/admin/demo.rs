@@ -2127,6 +2127,7 @@ impl AdminSource for Demo {
                         .enabled
                         .then(|| state.last_finished_ms.unwrap_or(now) + r.refresh_interval_secs as i64 * 1000),
                     pending: 0,
+                    next_accounts: None,
                     state,
                 }
             })
@@ -2137,6 +2138,7 @@ impl AdminSource for Demo {
             refresh_interval_secs: None,
             next_run_ms: None,
             pending: if d.plc { 3 } else { 0 },
+            next_accounts: None,
             state: crate::discovery::SourceState {
                 runs: 1,
                 last_started_ms: d.plc.then_some(now - 26 * hour),

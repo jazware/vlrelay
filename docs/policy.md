@@ -171,15 +171,34 @@ requestCrawl's: they're paced by their own `discovery.connectsPerMin` (120), so 
 isn't held to the daily budget.
 
 That pace makes a cold start's first run long: a seed list of several thousand hosts takes about
-an hour to admit, in the seed relay's order, which isn't by size. A big PDS listed late starts
-live when its turn comes, so the relay has none of its events from before that. A completeness
+an hour to admit. A host starts live when its turn comes, so the relay has none of its events from
+before that, and the turn order decides how much of the network's traffic the first hour misses.
+So a seed relay's run reads its whole list first (a page per `requestsPerSec`, a few seconds for
+ten thousand hosts) and queues the hosts this relay doesn't have, then admits the queue largest
+first by the seed relay's `accountCount` (active or idle hosts only, as for seeding). Hosts with no
+count, or a status the seed relay doesn't vouch for, come after every counted one, in list order.
+The relay's own shards and the big independent PDSes connect in the first minutes rather than
+wherever the list happened to put them. While any enabled seed relay's queue still holds a counted
+host, the PLC export's hosts wait, since they share `connectsPerMin` and carry no count. The order
+is all that changes: each host still passes the admission above, at the same pace, and a banned or
+suspended host is refused (or counted as known) however big the seed relay says it is. A
+requestCrawl doesn't wait in the queue: it has its own budget. `GET /admin/api/discovery` shows a
+run `admitting` its queue, the hosts `pending`, and the `nextAccounts` in line; the dashboard calls
+it "admitting by size". A queue holds at most 50,000 hosts; any past that wait for the next run.
+
+A completeness
 check against another relay's firehose during that hour reports them missing, and an alias's
 copies count as duplicates from when its main name is admitted until the alias is confirmed.
 Wait for the first run's `lastFinishedMs` in `GET /admin/api/discovery` before measuring, or
 compare each host only from its `connectedSinceMs`.
 
-Each source's progress is saved in the bucket (`discovery/state.json`) after every page: a new
-leader resumes a list where the old one stopped. Each host's source (`requestCrawl`,
+Each source's progress (its cursor, its queue, its counts) is saved in the bucket
+(`discovery/state.json`) after every page and every 32 admissions: a new leader resumes a run
+where the old one stopped. A run that didn't pass its counts to seeding (one from a build before
+it, or with `seedAccounts.enabled` off for a page) is run again when a node starts leading with
+seeding on, rather than at its refresh hours later, once a term: the run that seeds settles it,
+counts or not. A requested run (`POST /admin/api/discovery/run`) shows `runRequested` at once; asked
+during a run, it starts another when that one finishes. A disabled source is never marked. Each host's source (`requestCrawl`,
 `bootstrap:<relay>`, `plc`, `cli`) is kept in the leader's host table and shown on the host and in
 the admission log. `GET /admin/api/discovery` shows each source's last and next run and its counts,
 and `POST /admin/api/discovery/run` starts one now ([Admin API](admin-api.md)).
