@@ -239,9 +239,7 @@ a 2 vCPU / 4 GB box:
   serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of it,
   about 7 s for the default 4 GiB.
 - Keep `--slatedb-cache-mb` at its default of 320. The state's and the seeds' databases share it.
-- To see where the heap goes, build with `--features heap-profiling` (the Dockerfile's
-  `VLRELAY_FEATURES` build argument) and start the node with
-  `_RJEM_MALLOC_CONF=prof:true,lg_prof_sample:19,prof_gdump:true,prof_prefix:<dir>/heap`. jemalloc
-  then writes a profile at each new peak, which `jeprof --text <binary> <file>` reads. Under a
-  growing load that's thousands of files a minute: `lg_prof_interval:33` instead of
-  `prof_gdump:true` writes one every 8 GiB allocated.
+- To see where the heap goes, read `GET /debug/pprof/heap` ([Monitoring](monitoring.md#heap-profiles)):
+  the heap in use as pprof, from jemalloc's sampler, which runs from the start. First check
+  `vlpds_jemalloc_bytes`: a growing `allocated` is live data, and a growing gap between
+  `resident` and `allocated` is pages jemalloc holds.

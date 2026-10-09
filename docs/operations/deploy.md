@@ -239,7 +239,7 @@ minimal Caddyfile for a node on the same machine:
 
 ```caddyfile
 relay.example.com {
-	@private path /metrics /qlog/*
+	@private path /metrics /qlog/* /debug/*
 	respond @private 404
 	reverse_proxy 127.0.0.1:2980 {
 		flush_interval -1
@@ -252,6 +252,10 @@ proxy:
 
 - `/metrics` and `/qlog/status` have no auth. Keep them off the public side of the proxy and
   scrape them on the private address.
+- `/debug/pprof/heap` ([Monitoring](monitoring.md#heap-profiles)) answers a loopback peer that
+  no proxy forwarded, and anyone else with the admin token. A proxy on the same machine connects
+  from loopback, so it must send `X-Forwarded-For` (Caddy does by default, nginx with
+  `proxy_set_header X-Forwarded-For`), and it's simplest not to proxy `/debug/` at all.
 - `POST /qlog/members` is on `--listen` too, behind the bearer `--qlog-admin-token`. Don't proxy
   `/qlog/` at all.
 - `/admin` is behind the admin token (HTTP basic, user `admin`). It's fine to expose, but there's
