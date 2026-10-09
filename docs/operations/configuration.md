@@ -89,7 +89,7 @@ Without `--memory`, the four `--s3-*` values are required (the keys directly or 
 | `--plc-seeds-slatedb <PLC_SEEDS_SLATEDB>` | `VLRELAY_PLC_SEEDS_SLATEDB` | `compactions=1,subcompactions=1,fetch-tasks=2,fetch-kb=1024,sst-mb=64,memtable-mb=128,codec=zstd` | Memory bounds of the PLC seeds' SlateDB on the leader, as `key=value,...`: compactions at once, subcompactions each, fetch-tasks and fetch-kb of read-ahead per input SST, sst-mb per output SST, memtable-mb unflushed, and codec (zstd, lz4 or none) for new SSTs (each SST records its own, so changing it needs no wipe). Keys left out keep the defaults shown. A compaction holds about subcompactions x 8 x fetch-tasks x fetch-kb, plus its output's upload buffers |
 | `--plc-seeds-dir <PLC_SEEDS_DIR>` | `VLRELAY_PLC_SEEDS_DIR` |  | With --plc-export: keeps this member's copy of the PLC seeds in a table on this local disk (~58 B a DID), built from the bucket's seed database and kept current from its changelog. A seed lookup is then one local read with nothing per DID in memory. Unset: lookups read the seed database |
 | `--plc-seed-reads <PLC_SEED_READS>` | `VLRELAY_PLC_SEED_READS` | `32` | PLC seed reads in flight at once (the identity cache's misses; the rest wait). Each can load megabytes of the seeds' filters and indexes from the bucket once they outgrow the metadata cache |
-| `--plc-export-mem-mb <PLC_EXPORT_MEM_MB>` | `VLRELAY_PLC_EXPORT_MEM_MB` | `0` | The leader pauses the PLC export (and its seed reads) while the process has more than this many MiB allocated, and resumes below 85% of it; 0: no limit. Size it under the container's limit with room for the kernel's socket buffers and the allocator's slack |
+| `--plc-export-mem-mb <PLC_EXPORT_MEM_MB>` | `VLRELAY_PLC_EXPORT_MEM_MB` | `0` | The leader pauses the PLC export (and its seed reads) while the process has more than this many MiB allocated, and resumes below 85% of it, or under it after waiting a minute (doubling to 16) without getting there; 0: no limit. Size it under the container's limit with room for the kernel's socket buffers and the allocator's slack |
 | `--bootstrap-relay <BOOTSTRAP_RELAYS>` | `VLRELAY_BOOTSTRAP_RELAYS` |  | A relay whose com.atproto.sync.listHosts seeds host discovery (read only; repeatable): added to the policy's discovery.seedRelays when it has none yet. The dashboard edits the list after that |
 | `--dev-mode` |  |  | Allows plain ws://, IPs, localhost and ports for upstreams and DID documents. Implied by an http:// --host or a loopback --plc-url |
 | `--did-lookups-per-sec <DID_LOOKUPS_PER_SEC>` |  | `50` | DID document fetches per second, all DIDs together |
@@ -106,7 +106,7 @@ Without `--memory`, the four `--s3-*` values are required (the keys directly or 
 | `--host-inflight-mb <HOST_INFLIGHT_MB>` |  | `64` | The same cap in bytes |
 | `--inflight-events <INFLIGHT_EVENTS>` |  | `32768` | The same over every host together |
 | `--inflight-mb <INFLIGHT_MB>` |  | `384` | The same cap over every host, in bytes |
-| `--ingest-mem-mb <INGEST_MEM_MB>` | `VLRELAY_INGEST_MEM_MB` | `0` | No host is read while the process holds more than this many MiB of anonymous memory (its cgroup's anon; jemalloc's resident bytes outside a cgroup), until it's back under 90%. 0: no limit. Size it under the container's limit with room for the hosts' socket buffers (--upstream-rcvbuf-kb) and the page cache the log reads |
+| `--ingest-mem-mb <INGEST_MEM_MB>` | `VLRELAY_INGEST_MEM_MB` | `0` | While the process holds more than this many MiB of anonymous memory (its cgroup's anon; jemalloc's resident bytes outside a cgroup), until it's back under 90%, hosts are read only while the pipeline holds under 10% of the in-flight caps, and paused ones read again under 5%. 0: no limit. Size it under the container's limit with room for the hosts' socket buffers (--upstream-rcvbuf-kb) and the page cache the log reads |
 | `--upstream-rcvbuf-kb <UPSTREAM_RCVBUF_KB>` | `VLRELAY_UPSTREAM_RCVBUF_KB` | `256` | Each upstream socket's receive buffer, KiB (SO_RCVBUF, which the kernel doubles for its overhead). A paused host's backlog waits in it, so it's what every connected host can hold in kernel memory. 0: the kernel's autotuning (up to tcp_rmem's max, 6 MiB by default) |
 | `--ring-mb <RING_MB>` |  |  | The firehose's in-memory ring of recent events, in MiB (default 512); older cursors read the node's log, then the bucket |
 | `--max-lag-mb <MAX_LAG_MB>` |  |  | Dev mode only: how far a live consumer may fall behind before `ConsumerTooSlow`, in MiB (default 128) |
@@ -195,19 +195,26 @@ a 2 vCPU / 4 GB box:
 - `--slatedb-disk-cache-dir` keeps the state's SSTs on local disk too (all of
   `--slatedb-disk-cache-mb` with `--plc-seeds-dir`). The seeder reads the account's record
   beside the seed, so both should be local.
-- Give it `--ingest-mem-mb` (1500 under a 2300 MiB container limit). No host is read while the
-  process's anonymous memory is over it, until it's back under 90%. The in-flight caps count
-  frames, not what the heap holds around them (the ring, the log's memory, a flush, the state's
-  memtables, the PLC export), so on their own they don't bound the heap. What's already in flight
-  still lands after a pause, so leave ~300 MB above the budget for it.
+- Give it `--ingest-mem-mb` (1500 under a 2300 MiB container limit). While the process's
+  anonymous memory is over it, until it's back under 90%, the node purges jemalloc's freed pages
+  every second and reads hosts only while the pipeline holds under a tenth of the in-flight caps;
+  paused hosts read again under a twentieth. The in-flight caps count frames, not what the heap
+  holds around them (the ring, the log's memory, a flush, the state's memtables, the PLC export),
+  so on their own they don't bound the heap. What's already in flight still lands after a pause,
+  so leave ~300 MB above the budget for it. A drained pipeline always reads: memory that stays
+  over the budget with nothing in flight isn't the pipeline's, and stopping the hosts can't free
+  it. `vlrelay_upstream_memory_over` says the process is over the budget, and
+  `vlrelay_upstream_memory_paused` that it's holding reads.
 - Keep `--upstream-rcvbuf-kb` at its default of 256. A paused host's backlog waits in its socket's
   receive buffer, outside the in-flight caps and the ingest budget, and the kernel's autotuning
   grows each one to 6 MiB: 200 busy hosts held ~500 MB of socket memory that way. At 256 KiB a
   host holds at most ~512 KiB in the kernel and still reads ~3.5 MB/s at a 70 ms round trip.
 - Give it `--plc-export-mem-mb` under `--ingest-mem-mb` (1200 with the numbers above), so the
   export yields before the hosts do. The budget pauses the export and the seed reads while the
-  process is over it, and resumes them below 85%. `--plc-export-rate` counts requests a second
-  across every window, at ~1,000 ops each.
+  process is over it, and resumes them below 85%. A paused export holds nothing, so if the memory
+  stays between 85% and the budget for a minute it isn't the export's: the export runs again then,
+  and waits twice as long the next time, up to 16 minutes. `--plc-export-rate` counts requests a
+  second across every window, at ~1,000 ops each.
 - Set `--qlog-disk-retain-mb 1024`. A single node has no followers to catch up, so its disk only
   serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of it,
   about 7 s for the default 4 GiB.

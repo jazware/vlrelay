@@ -19,8 +19,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// freed, so every segment buffer and its compressed copy were faulted in
 /// afresh (~3% of a loaded node's CPU). Without the oversize arena they
 /// reuse dirty pages within the normal decay time.
+///
+/// jemalloc decays freed pages as it allocates, so a node that paused its
+/// reads (`--ingest-mem-mb`) and went quiet kept them counted against the
+/// budget it was waiting to get under. Its background thread decays them on
+/// time instead.
 #[unsafe(export_name = "_rjem_malloc_conf")]
-pub static MALLOC_CONF: &[u8; 21] = b"oversize_threshold:0\0";
+pub static MALLOC_CONF: &[u8; 44] = b"oversize_threshold:0,background_thread:true\0";
 
 #[derive(Parser, Debug)]
 #[command(version, about = "An atproto relay whose only durable state is an object store")]
@@ -74,8 +79,9 @@ struct Args {
     plc_export_streams: usize,
     /// The leader pauses the PLC export (and its seed reads) while the
     /// process has more than this many MiB allocated, and resumes below 85%
-    /// of it; 0: no limit. Size it under the container's limit with room
-    /// for the kernel's socket buffers and the allocator's slack.
+    /// of it, or under it after waiting a minute (doubling to 16) without
+    /// getting there; 0: no limit. Size it under the container's limit
+    /// with room for the kernel's socket buffers and the allocator's slack.
     #[arg(long, env = "VLRELAY_PLC_EXPORT_MEM_MB", default_value_t = 0)]
     plc_export_mem_mb: u64,
     /// Memory bounds of the PLC seeds' SlateDB on the leader, as
@@ -187,11 +193,13 @@ struct Args {
     /// The same cap over every host, in bytes.
     #[arg(long, default_value_t = 384)]
     inflight_mb: usize,
-    /// No host is read while the process holds more than this many MiB of
-    /// anonymous memory (its cgroup's anon; jemalloc's resident bytes
-    /// outside a cgroup), until it's back under 90%. 0: no limit. Size it
-    /// under the container's limit with room for the hosts' socket buffers
-    /// (--upstream-rcvbuf-kb) and the page cache the log reads.
+    /// While the process holds more than this many MiB of anonymous memory
+    /// (its cgroup's anon; jemalloc's resident bytes outside a cgroup),
+    /// until it's back under 90%, hosts are read only while the pipeline
+    /// holds under 10% of the in-flight caps, and paused ones read again
+    /// under 5%. 0: no limit. Size it under the container's limit with room
+    /// for the hosts' socket buffers (--upstream-rcvbuf-kb) and the page
+    /// cache the log reads.
     #[arg(long, env = "VLRELAY_INGEST_MEM_MB", default_value_t = 0)]
     ingest_mem_mb: u64,
     /// Each upstream socket's receive buffer, KiB (SO_RCVBUF, which the

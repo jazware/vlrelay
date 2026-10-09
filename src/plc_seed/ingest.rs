@@ -49,6 +49,10 @@ pub struct Config {
     /// The leader stops its term of the export (and its seed reads) while
     /// the process has more than this allocated, MiB; 0: no limit.
     pub mem_budget_mb: u64,
+    /// How long a held-back export waits for the memory to fall under its
+    /// resume mark before it runs anyway, under the budget; doubled each
+    /// time up to 16x while the memory stays there.
+    pub mem_hold_retry: Duration,
 }
 
 impl Config {
@@ -64,6 +68,7 @@ impl Config {
             checkpoint_every: Duration::from_secs(10),
             start_ms: 1_668_643_200_000,
             mem_budget_mb: 0,
+            mem_hold_retry: Duration::from_secs(60),
         }
     }
 }

@@ -90,16 +90,19 @@ pub enum Backpressure {
     /// durable (`--host-inflight-events`, `--host-inflight-mb`).
     InflightFull,
     /// The node's in-flight cap over every host (`--inflight-events`,
-    /// `--inflight-mb`), or its memory budget (`--ingest-mem-mb`).
+    /// `--inflight-mb`).
     NodeInflightFull,
     /// Its fair-queue slot is full: the lanes aren't taking frames, usually
     /// while they wait on identity lookups.
     QueueFull,
+    /// The process is over its memory budget (`--ingest-mem-mb`) and the
+    /// pipeline holds its share of the in-flight caps.
+    MemoryFull,
 }
 
 impl Backpressure {
-    const ALL: [Backpressure; 3] =
-        [Backpressure::InflightFull, Backpressure::NodeInflightFull, Backpressure::QueueFull];
+    const ALL: [Backpressure; 4] =
+        [Backpressure::InflightFull, Backpressure::NodeInflightFull, Backpressure::QueueFull, Backpressure::MemoryFull];
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

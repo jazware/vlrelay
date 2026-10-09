@@ -84,7 +84,14 @@ it reads, the events it submits and its own consumers.
 | `vlrelay_upstream_inflight_bytes` | gauge | | The same in bytes |
 | `vlrelay_upstream_host_inflight_events_max` | gauge | | The most frames any one host has in flight |
 | `vlrelay_upstream_paused_hosts` | gauge | | Hosts whose socket isn't read because of an in-flight cap (`--host-inflight-events`, `--inflight-events`) |
-| `vlrelay_upstream_pauses_total` | counter | `cap` | Socket reads paused at an in-flight cap |
+| `vlrelay_upstream_pauses_total` | counter | `cap` | Socket reads paused at a cap: `host`, `global` (the in-flight caps) or `memory` (`--ingest-mem-mb`) |
+| `vlrelay_upstream_paused_hosts_by_cap` | gauge | `cap` | Paused hosts by the cap that paused them |
+| `vlrelay_process_memory_bytes` | gauge | | The process's anonymous memory as `--ingest-mem-mb` counts it (its cgroup's `anon`, or jemalloc's resident bytes), after any purge |
+| `vlrelay_upstream_memory_mark_bytes` | gauge | `mark` | `--ingest-mem-mb`'s marks: `pause` (the budget) and `resume` (90% of it) |
+| `vlrelay_upstream_memory_over` | gauge | | 1 from when the process passes `--ingest-mem-mb` until it's back under 90% of it |
+| `vlrelay_upstream_memory_paused` | gauge | | 1 while the budget holds reads: over it, with the pipeline holding a tenth of the in-flight caps or more. `memory_over` at 1 with this at 0 is memory the pipeline doesn't hold |
+| `vlrelay_upstream_memory_purges_total` | counter | | jemalloc purges of freed pages while over `--ingest-mem-mb` (at most one a second) |
+| `vlrelay_plc_export_memory_held` | gauge | | 1 while the leader holds the PLC export back at `--plc-export-mem-mb` |
 | `vlrelay_new_accounts_total` | counter | | Newly created accounts the account gate admitted (what `cluster.newAccountsPerMin` budgets) |
 | `vlrelay_accounts_throttled_total` | counter | `why` | New accounts created throttled by policy (`host_cap`) |
 | `vlrelay_accounts_deferred_total` | counter | `why` | Events of new accounts dropped while a new-account budget was spent (`host_rate`, `cluster_budget`) |

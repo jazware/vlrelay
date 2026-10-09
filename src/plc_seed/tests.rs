@@ -337,6 +337,46 @@ async fn the_export_waits_out_the_memory_budget() {
     c.shutdown();
 }
 
+static ALLOCATED_HELD_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Memory that stays between the resume mark and the budget while the
+/// export is held back isn't the export's: it runs again after
+/// `mem_hold_retry`, under the budget, instead of waiting for good. Over the
+/// budget itself it stays held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_back_export_runs_again_under_the_budget() {
+    use crate::qlog::tests::Cluster;
+    let f = fake(2, 1_000).await;
+    let c = Cluster::with_cfg(1, None, None, 64 << 20).await;
+    let store = crate::qlog::bucket::counted(&c.store, "plc");
+    let mut cfg = f.cfg(2);
+    cfg.rate = 50.0;
+    cfg.mem_budget_mb = 1_000;
+    cfg.mem_hold_retry = Duration::from_secs(2);
+    ALLOCATED_HELD_MB.store(1_500, Relaxed);
+    let j = PlcJob::new(cfg, store.clone(), SeedReader::new(store.clone()), cache(&f.url))
+        .with_allocated(|| Some(ALLOCATED_HELD_MB.load(Relaxed)));
+    let id = c.nodes.keys().next().unwrap().clone();
+    tokio::spawn(j.clone().run(Arc::downgrade(&c.nodes[&id].node)));
+    c.wait_leader(Duration::from_secs(5)).await;
+    wait(|| j.mem_pauses.load(Relaxed) >= 1, "the held-back term").await;
+    // over the budget: held past the retry
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    assert!(j.stats().is_none(), "a term started over the budget");
+
+    // the memory falls under the budget, not under the resume mark
+    ALLOCATED_HELD_MB.store(900, Relaxed);
+    wait(|| j.stats().is_some_and(|s| s.ops.load(Relaxed) > 0), "the term under the budget").await;
+    assert!(!j.seeds.paused.load(Relaxed));
+    assert_eq!(j.mem_pauses.load(Relaxed), 1);
+
+    ALLOCATED_HELD_MB.store(1_500, Relaxed);
+    wait(|| j.stats().is_none(), "the term ending over the budget").await;
+    assert!(j.seeds.paused.load(Relaxed));
+    j.stop();
+    c.shutdown();
+}
+
 /// The job on a three-node quorum log: the leader reads the export, dies
 /// mid-export, and the new leader's job resumes it from the checkpoint; a
 /// member's identity cache then fills from the seeds without asking PLC.

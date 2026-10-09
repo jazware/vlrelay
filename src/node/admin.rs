@@ -274,6 +274,7 @@ fn backpressure_reason(h: &HostView) -> Option<admin::BackpressureReason> {
         Backpressure::InflightFull => admin::BackpressureReason::InflightFull,
         Backpressure::NodeInflightFull => admin::BackpressureReason::NodeInflightFull,
         Backpressure::QueueFull => admin::BackpressureReason::QueueFull,
+        Backpressure::MemoryFull => admin::BackpressureReason::MemoryFull,
     })
 }
 

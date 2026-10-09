@@ -12,9 +12,20 @@
 //! let them all through on the first free slot: the busy ones overfilled
 //! the cap together and the rest flapped between paused and reading, with
 //! every paused host polled again on every frame done.
+//!
+//! The memory budget (`--ingest-mem-mb`) is a ceiling on the process's
+//! memory, not a cap the pipeline counts, so it can't be the only way back
+//! to reading: freed memory the allocator keeps, or memory held outside the
+//! pipeline, doesn't fall when the hosts stop. Over it the node may hold
+//! [`MEM_HOLD`] of its in-flight caps, and paused hosts read again once it
+//! holds under [`MEM_DRAINED`]: a drained pipeline always reads, whatever
+//! the process's memory says.
 
 use parking_lot::Mutex;
-use prometheus::{IntCounterVec, IntGauge, register_int_counter_vec, register_int_gauge};
+use prometheus::{
+    IntCounter, IntCounterVec, IntGauge, IntGaugeVec, register_int_counter, register_int_counter_vec,
+    register_int_gauge, register_int_gauge_vec,
+};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -32,6 +43,14 @@ static PAUSED_HOSTS: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!("vlrelay_upstream_paused_hosts", "Hosts whose socket isn't read because of an in-flight cap")
         .unwrap()
 });
+static PAUSED_BY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "vlrelay_upstream_paused_hosts_by_cap",
+        "Paused hosts by the cap that paused them: host, global (in-flight caps) or memory (--ingest-mem-mb)",
+        &["cap"]
+    )
+    .unwrap()
+});
 static PAUSES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!("vlrelay_upstream_pauses_total", "Socket reads paused at an in-flight cap", &["cap"])
         .unwrap()
@@ -43,9 +62,34 @@ static MEMORY: LazyLock<IntGauge> = LazyLock::new(|| {
     )
     .unwrap()
 });
+static MEMORY_OVER: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "vlrelay_upstream_memory_over",
+        "1 from when the process's memory passes --ingest-mem-mb until it's back under 90% of it"
+    )
+    .unwrap()
+});
 static MEMORY_PAUSED: LazyLock<IntGauge> = LazyLock::new(|| {
-    register_int_gauge!("vlrelay_upstream_memory_paused", "1 while upstream reads are paused at --ingest-mem-mb")
-        .unwrap()
+    register_int_gauge!(
+        "vlrelay_upstream_memory_paused",
+        "1 while --ingest-mem-mb holds upstream reads: over it, with the pipeline past its share of the in-flight caps"
+    )
+    .unwrap()
+});
+static MEMORY_MARKS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "vlrelay_upstream_memory_mark_bytes",
+        "--ingest-mem-mb's marks: pause (the budget) and resume (90% of it)",
+        &["mark"]
+    )
+    .unwrap()
+});
+static MEMORY_PURGES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "vlrelay_upstream_memory_purges_total",
+        "Freed pages handed back to the OS because the process was over --ingest-mem-mb"
+    )
+    .unwrap()
 });
 pub static HOST_INFLIGHT_MAX: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!("vlrelay_upstream_host_inflight_events_max", "The most frames any one host has in flight")
@@ -58,6 +102,16 @@ pub const RESUME: f64 = 0.9;
 /// Under this share of the node's caps every paused host is woken: the
 /// pipeline has drained, and one at a time would leave it idle.
 const DRAINED: f64 = 0.5;
+
+/// The share of the node's caps it may hold while over its memory budget.
+pub const MEM_HOLD: f64 = 0.1;
+
+/// Under this share of the node's caps paused hosts read again, over the
+/// memory budget or not: what's left isn't the pipeline's to give back.
+pub const MEM_DRAINED: f64 = 0.05;
+
+/// How often a node over its memory budget purges the allocator.
+const PURGE_EVERY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlowLimits {
@@ -113,6 +167,26 @@ pub struct Flow {
     waiters: AtomicUsize,
     /// Over `FlowLimits::memory` ([`Flow::watch_memory`]).
     mem_over: AtomicBool,
+    probe: Arc<dyn MemoryProbe>,
+}
+
+/// What [`Flow::watch_memory`] reads the process's memory with.
+pub trait MemoryProbe: Send + Sync + 'static {
+    fn sample(&self) -> Option<u64>;
+    /// Hands freed pages the allocator keeps back to the OS.
+    fn purge(&self) {}
+}
+
+struct ProcessMemory;
+
+impl MemoryProbe for ProcessMemory {
+    fn sample(&self) -> Option<u64> {
+        process_memory()
+    }
+
+    fn purge(&self) {
+        crate::qlog::flush::release_freed();
+    }
 }
 
 impl Flow {
@@ -123,7 +197,14 @@ impl Flow {
             notify: Notify::new(),
             waiters: AtomicUsize::new(0),
             mem_over: AtomicBool::new(false),
+            probe: Arc::new(ProcessMemory),
         })
+    }
+
+    pub fn with_probe(limits: FlowLimits, probe: Arc<dyn MemoryProbe>) -> Arc<Flow> {
+        let mut f = Flow::new(limits);
+        Arc::get_mut(&mut f).expect("just made").probe = probe;
+        f
     }
 
     /// Samples the process's memory against `FlowLimits::memory`, if set.
@@ -137,27 +218,53 @@ impl Flow {
         if budget == 0 {
             return None;
         }
+        MEMORY_MARKS.with_label_values(&["pause"]).set(budget as i64);
+        MEMORY_MARKS.with_label_values(&["resume"]).set((budget as f64 * RESUME) as i64);
         let me = Arc::downgrade(self);
         Some(tokio::spawn(async move {
             let mut t = tokio::time::interval(Duration::from_millis(200));
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut purged: Option<std::time::Instant> = None;
             loop {
                 t.tick().await;
                 let Some(f) = me.upgrade() else { return };
-                let Some(m) = process_memory() else { continue };
-                MEMORY.set(m as i64);
+                let Some(mut m) = f.probe.sample() else { continue };
                 let was = f.mem_over.load(Ordering::Acquire);
-                let over = if was { m as f64 >= budget as f64 * RESUME } else { m > budget };
+                let past = |m: u64| if was { m as f64 >= budget as f64 * RESUME } else { m > budget };
+                // jemalloc decays freed pages only as it allocates, and a
+                // paused node allocates little, so what it freed would stay
+                // counted
+                if past(m) && purged.is_none_or(|t| t.elapsed() >= PURGE_EVERY) {
+                    f.probe.purge();
+                    MEMORY_PURGES.inc();
+                    purged = Some(std::time::Instant::now());
+                    m = f.probe.sample().unwrap_or(m);
+                }
+                MEMORY.set(m as i64);
+                let over = past(m);
                 if over != was {
                     f.mem_over.store(over, Ordering::Release);
-                    MEMORY_PAUSED.set(over as i64);
-                    tracing::info!(memory_mb = m >> 20, budget_mb = budget >> 20, over, "upstream: memory budget");
+                    MEMORY_OVER.set(over as i64);
+                    tracing::info!(
+                        memory_mb = m >> 20,
+                        budget_mb = budget >> 20,
+                        over,
+                        inflight_mb = f.counts.bytes.load(Ordering::Relaxed) >> 20,
+                        "upstream: memory budget"
+                    );
                     if !over {
                         f.notify.notify_waiters();
                     }
                 }
+                MEMORY_PAUSED.set(f.mem_holds(&f.limits(), MEM_HOLD) as i64);
             }
         }))
+    }
+
+    /// Whether the memory budget holds reads: the process is over it and
+    /// the node holds at least `share` of its caps.
+    fn mem_holds(&self, l: &FlowLimits, share: f64) -> bool {
+        self.mem_over.load(Ordering::Acquire) && !self.node_under(l, share)
     }
 
     pub fn limits(&self) -> FlowLimits {
@@ -185,7 +292,7 @@ impl Flow {
             || self.counts.bytes.load(Ordering::Relaxed) >= l.bytes.max(1)
         {
             Some("global")
-        } else if self.mem_over.load(Ordering::Acquire) {
+        } else if self.mem_holds(&l, MEM_HOLD) {
             Some("memory")
         } else {
             None
@@ -208,13 +315,14 @@ impl Flow {
         under(h.events(), l.host_events, RESUME)
             && under(h.bytes(), l.host_bytes, RESUME)
             && self.node_under(&l, RESUME)
-            && !self.mem_over.load(Ordering::Acquire)
+            && !self.mem_holds(&l, MEM_DRAINED)
     }
 
     /// The cap `h` is at, as the host's status reports it.
     pub fn backpressure(&self, h: &HostFlow) -> Option<super::Backpressure> {
         self.full(h).map(|cap| match cap {
             "host" => super::Backpressure::InflightFull,
+            "memory" => super::Backpressure::MemoryFull,
             _ => super::Backpressure::NodeInflightFull,
         })
     }
@@ -230,23 +338,26 @@ impl Flow {
         Arc::new(Permit { flow: self.clone(), host: h.clone(), len })
     }
 
-    /// Returns once `h` and the node are under [`RESUME`] of their caps.
+    /// Returns once `h` and the node are under [`RESUME`] of their caps
+    /// (and under [`MEM_DRAINED`] of them while over the memory budget).
     /// Cancel-safe.
     pub async fn wait_room(&self, h: &HostFlow) {
         let Some(cap) = self.full(h) else { return };
         PAUSES.with_label_values(&[cap]).inc();
-        struct Waiting<'a>(&'a Flow, &'a HostFlow);
+        struct Waiting<'a>(&'a Flow, &'a HostFlow, &'static str);
         impl Drop for Waiting<'_> {
             fn drop(&mut self) {
                 self.0.waiters.fetch_sub(1, Ordering::AcqRel);
                 self.1.waiting.store(false, Ordering::Release);
                 PAUSED_HOSTS.dec();
+                PAUSED_BY.with_label_values(&[self.2]).dec();
             }
         }
         self.waiters.fetch_add(1, Ordering::AcqRel);
         h.waiting.store(true, Ordering::Release);
         PAUSED_HOSTS.inc();
-        let _w = Waiting(self, h);
+        PAUSED_BY.with_label_values(&[cap]).inc();
+        let _w = Waiting(self, h, cap);
         loop {
             let global = self.notify.notified();
             let host = h.notify.notified();
@@ -295,9 +406,15 @@ impl Drop for Permit {
         }
         if f.waiters.load(Ordering::Acquire) > 0 {
             let l = f.limits();
-            if f.node_under(&l, DRAINED) {
+            // over the memory budget no waiter goes until the pipeline has
+            // drained, so waking them sooner would only poll them all
+            let (drained, one) = match f.mem_over.load(Ordering::Acquire) {
+                true => (MEM_DRAINED, false),
+                false => (DRAINED, f.node_under(&l, RESUME)),
+            };
+            if f.node_under(&l, drained) {
                 f.notify.notify_waiters();
-            } else if f.node_under(&l, RESUME) {
+            } else if one {
                 f.notify.notify_one();
             }
         }
@@ -392,19 +509,133 @@ mod tests {
         }
     }
 
+    /// Over the memory budget the node holds a tenth of its caps, and
+    /// paused hosts read again under a twentieth: a drained pipeline reads
+    /// whatever the memory says.
     #[tokio::test]
-    async fn over_the_memory_budget_no_host_is_read() {
-        let f = Flow::new(FlowLimits { memory: 1, ..FlowLimits::default() });
-        let h = Arc::new(HostFlow::default());
-        assert!(f.has_room(&h));
+    async fn over_the_memory_budget_the_pipeline_drains_before_hosts_read() {
+        let f = Flow::new(FlowLimits { events: 40, memory: 1, ..FlowLimits::default() });
+        let a = Arc::new(HostFlow::default());
+        let b = Arc::new(HostFlow::default());
+        let mut held: Vec<_> = (0..3).map(|_| f.acquire(&a, 10)).collect();
+        assert!(f.has_room(&b));
         f.mem_over.store(true, Ordering::Release);
-        assert_eq!(f.backpressure(&h), Some(super::super::Backpressure::NodeInflightFull));
+        assert!(f.has_room(&b), "under the memory share");
+        held.push(f.acquire(&a, 10));
+        assert!(!f.has_room(&b));
+        assert_eq!(f.backpressure(&b), Some(super::super::Backpressure::MemoryFull));
+        let (f2, b2) = (f.clone(), b.clone());
+        let w = tokio::spawn(async move { f2.wait_room(&b2).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!w.is_finished() && b.paused());
+        // under the share it paused at, not under the one it resumes at
+        held.truncate(2);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(f.has_room(&b) && !w.is_finished());
+        held.pop();
+        tokio::time::timeout(Duration::from_millis(100), w).await.expect("woken by the last frame done").unwrap();
+    }
+
+    /// Under 90% of the budget the memory pause ends however full the
+    /// pipeline is (its own caps still apply).
+    #[tokio::test]
+    async fn memory_back_under_the_resume_mark_wakes_every_host() {
+        let probe = Arc::new(Probe::default());
+        probe.set(2_000, 2_000);
+        let f = Flow::with_probe(FlowLimits { events: 40, memory: 1_000, ..FlowLimits::default() }, probe.clone());
+        let _watch = f.watch_memory().unwrap();
+        let busy = Arc::new(HostFlow::default());
+        let _held: Vec<_> = (0..10).map(|_| f.acquire(&busy, 10)).collect();
+        wait_for("the memory pause", || f.mem_over.load(Ordering::Acquire)).await;
+        let hosts: Vec<_> = (0..3).map(|_| Arc::new(HostFlow::default())).collect();
+        let waiters: Vec<_> = hosts
+            .iter()
+            .map(|h| {
+                let (f, h) = (f.clone(), h.clone());
+                tokio::spawn(async move { f.wait_room(&h).await })
+            })
+            .collect();
+        // between the marks: still over
+        probe.set(950, 950);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(f.mem_over.load(Ordering::Acquire));
+        assert!(waiters.iter().all(|w| !w.is_finished()));
+        probe.set(800, 800);
+        for w in waiters {
+            tokio::time::timeout(Duration::from_secs(1), w).await.expect("woken").unwrap();
+        }
+        assert!(!f.mem_over.load(Ordering::Acquire));
+    }
+
+    /// Memory past the budget is purged first, and only what's still over
+    /// it then pauses.
+    #[tokio::test]
+    async fn memory_the_allocator_gives_back_never_pauses() {
+        let probe = Arc::new(Probe::default());
+        let f = Flow::with_probe(FlowLimits { memory: 1_000, ..FlowLimits::default() }, probe.clone());
+        let _watch = f.watch_memory().unwrap();
+        probe.set(1_200, 700);
+        wait_for("a purge", || probe.purges.load(Ordering::Relaxed) > 0).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!f.mem_over.load(Ordering::Acquire));
+        assert_eq!(probe.purges.load(Ordering::Relaxed), 1, "under the budget nothing is purged");
+        probe.set(1_200, 1_100);
+        wait_for("the memory pause", || f.mem_over.load(Ordering::Acquire)).await;
+    }
+
+    /// The process's memory as a test sets it; a purge takes it down to
+    /// `after_purge`.
+    #[derive(Default)]
+    struct Probe {
+        now: std::sync::atomic::AtomicU64,
+        after_purge: std::sync::atomic::AtomicU64,
+        purges: AtomicUsize,
+    }
+
+    impl Probe {
+        fn set(&self, now: u64, after_purge: u64) {
+            self.now.store(now, Ordering::Relaxed);
+            self.after_purge.store(after_purge, Ordering::Relaxed);
+        }
+    }
+
+    impl MemoryProbe for Probe {
+        fn sample(&self) -> Option<u64> {
+            Some(self.now.load(Ordering::Relaxed))
+        }
+
+        fn purge(&self) {
+            self.purges.fetch_add(1, Ordering::Relaxed);
+            self.now.fetch_min(self.after_purge.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
+    async fn wait_for(what: &str, f: impl Fn() -> bool) {
+        let t0 = std::time::Instant::now();
+        while !f() {
+            assert!(t0.elapsed() < Duration::from_secs(5), "{what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A pause at the memory budget whose memory doesn't come back (the
+    /// allocator keeps freed pages, or it's held outside the pipeline)
+    /// stopped every host for good: nothing was in flight to finish, and
+    /// reads resumed only under 90% of the budget.
+    #[tokio::test]
+    async fn memory_over_the_resume_mark_with_nothing_in_flight_resumes() {
+        let probe = Arc::new(Probe::default());
+        probe.set(2_000, 2_000);
+        let f = Flow::with_probe(FlowLimits { memory: 1_000, ..FlowLimits::default() }, probe.clone());
+        let _watch = f.watch_memory().unwrap();
+        let h = Arc::new(HostFlow::default());
+        let p = f.acquire(&h, 10);
+        wait_for("the memory pause", || f.mem_over.load(Ordering::Acquire)).await;
+        // what the pipeline held is done; the memory stays over the resume mark
+        probe.set(950, 950);
+        drop(p);
         let (f2, h2) = (f.clone(), h.clone());
         let w = tokio::spawn(async move { f2.wait_room(&h2).await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!w.is_finished() && h.paused());
-        f.mem_over.store(false, Ordering::Release);
-        f.notify.notify_waiters();
-        tokio::time::timeout(Duration::from_millis(100), w).await.expect("woken").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), w).await.expect("a drained pipeline reads again").unwrap();
     }
 }

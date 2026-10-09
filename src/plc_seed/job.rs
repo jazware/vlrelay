@@ -77,6 +77,14 @@ pub fn jemalloc_allocated_mb() -> Option<u64> {
 /// limit doesn't reopen the seeds every few seconds.
 const MEM_RESUME: f64 = 0.85;
 
+static MEM_HELD: std::sync::LazyLock<prometheus::IntGauge> = std::sync::LazyLock::new(|| {
+    prometheus::register_int_gauge!(
+        "vlrelay_plc_export_memory_held",
+        "1 while the leader holds the PLC export back at --plc-export-mem-mb"
+    )
+    .unwrap()
+});
+
 /// How often a member checks whether it leads.
 const WATCH: Duration = Duration::from_millis(500);
 const CHECKPOINT_TTL: Duration = Duration::from_secs(10);
@@ -136,7 +144,8 @@ impl PlcJob {
     /// node leads.
     pub async fn run(self: Arc<Self>, qnode: std::sync::Weak<QNode>) {
         let mut tick = tokio::time::interval(WATCH);
-        let mut held = false;
+        let mut held: Option<Instant> = None;
+        let mut retry = self.cfg.mem_hold_retry;
         loop {
             tick.tick().await;
             if self.stopped.load(Relaxed) {
@@ -145,25 +154,45 @@ impl PlcJob {
             let Some(q) = qnode.upgrade() else { return };
             let st = q.status();
             if st.role != Role::Leader {
+                if held.take().is_some() {
+                    MEM_HELD.set(0);
+                }
                 continue;
             }
             let epoch = st.epoch;
             drop(q);
             if let Some(mb) = self.over_budget(MEM_RESUME) {
-                self.seeds.paused.store(true, Relaxed);
-                if !held {
-                    held = true;
+                let since = *held.get_or_insert_with(|| {
                     self.mem_pauses.fetch_add(1, Relaxed);
+                    MEM_HELD.set(1);
                     tracing::warn!(
                         epoch,
                         allocated_mb = mb,
                         budget_mb = self.cfg.mem_budget_mb,
                         "PLC export: held back, the node is over its memory budget"
                     );
+                    Instant::now()
+                });
+                // a held-back export holds nothing, so memory that stays over
+                // the resume mark isn't the export's and waiting can't bring
+                // it down: run while the node is under the budget itself
+                if since.elapsed() < retry || self.over_budget(1.0).is_some() {
+                    self.seeds.paused.store(true, Relaxed);
+                    continue;
                 }
-                continue;
+                tracing::info!(
+                    epoch,
+                    allocated_mb = mb,
+                    budget_mb = self.cfg.mem_budget_mb,
+                    held_secs = since.elapsed().as_secs(),
+                    "PLC export: resuming under the budget; the memory over its resume mark isn't the export's"
+                );
+                retry = (retry * 2).min(self.cfg.mem_hold_retry * 16);
+            } else {
+                retry = self.cfg.mem_hold_retry;
             }
-            held = false;
+            held = None;
+            MEM_HELD.set(0);
             if let Err(e) = self.clone().term(qnode.clone(), epoch).await {
                 self.restarts.fetch_add(1, Relaxed);
                 tracing::warn!(epoch, "PLC export: the term's reader stopped: {e:#}");

@@ -1030,7 +1030,7 @@ async fn seal(b: SegmentBuilder, ord: u64, prefix_end: u64) -> anyhow::Result<by
 /// freed large pages for reuse until they decay (main.rs's malloc conf),
 /// so a backlog flush's 64 MiB buffers, a few freed a second, held ~600 MB
 /// of RSS past what was allocated for ~10 s.
-fn release_freed() {
+pub(crate) fn release_freed() {
     // MALLCTL_ARENAS_ALL
     let name = b"arena.4096.purge\0";
     // SAFETY: a NUL-terminated name, and purge reads and writes nothing

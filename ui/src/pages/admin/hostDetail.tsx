@@ -56,6 +56,7 @@ const BP_SHORT: Record<BackpressureReason, string> = {
   inflight_full: 'its in-flight cap',
   node_inflight_full: 'the node’s in-flight cap',
   queue_full: 'lane queue full',
+  memory_full: 'the node’s memory budget',
 }
 
 /** Why-it's-held for a host the relay pauses: the title and what's going on, by what's full. */
@@ -71,6 +72,10 @@ const BP_WHY: Record<BackpressureReason | 'unknown', [string, string]> = {
   node_inflight_full: [
     'Paused: the relay is at its in-flight cap across every host',
     'This node has as many frames read and not yet durable as it allows over all its hosts (--inflight-events, --inflight-mb), so every host it reads waits for commits. The node is behind, not this host.',
+  ],
+  memory_full: [
+    'Paused: the relay is over its memory budget',
+    'The process holds more memory than --ingest-mem-mb allows, so this node reads only while its pipeline holds a tenth of its in-flight caps or less. Hosts read again as that drains, or once the memory is back under 90% of the budget. The node is short of memory, not this host.',
   ],
   unknown: ['Paused by the relay, which is behind', 'Its reader resumes on its own once the relay catches up, and its PDS buffers meanwhile.'],
 }

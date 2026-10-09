@@ -117,19 +117,26 @@ a 2 vCPU / 4 GB box:
 - `--slatedb-disk-cache-dir` keeps the state's SSTs on local disk too (all of
   `--slatedb-disk-cache-mb` with `--plc-seeds-dir`). The seeder reads the account's record
   beside the seed, so both should be local.
-- Give it `--ingest-mem-mb` (1500 under a 2300 MiB container limit). No host is read while the
-  process's anonymous memory is over it, until it's back under 90%. The in-flight caps count
-  frames, not what the heap holds around them (the ring, the log's memory, a flush, the state's
-  memtables, the PLC export), so on their own they don't bound the heap. What's already in flight
-  still lands after a pause, so leave ~300 MB above the budget for it.
+- Give it `--ingest-mem-mb` (1500 under a 2300 MiB container limit). While the process's
+  anonymous memory is over it, until it's back under 90%, the node purges jemalloc's freed pages
+  every second and reads hosts only while the pipeline holds under a tenth of the in-flight caps;
+  paused hosts read again under a twentieth. The in-flight caps count frames, not what the heap
+  holds around them (the ring, the log's memory, a flush, the state's memtables, the PLC export),
+  so on their own they don't bound the heap. What's already in flight still lands after a pause,
+  so leave ~300 MB above the budget for it. A drained pipeline always reads: memory that stays
+  over the budget with nothing in flight isn't the pipeline's, and stopping the hosts can't free
+  it. `vlrelay_upstream_memory_over` says the process is over the budget, and
+  `vlrelay_upstream_memory_paused` that it's holding reads.
 - Keep `--upstream-rcvbuf-kb` at its default of 256. A paused host's backlog waits in its socket's
   receive buffer, outside the in-flight caps and the ingest budget, and the kernel's autotuning
   grows each one to 6 MiB: 200 busy hosts held ~500 MB of socket memory that way. At 256 KiB a
   host holds at most ~512 KiB in the kernel and still reads ~3.5 MB/s at a 70 ms round trip.
 - Give it `--plc-export-mem-mb` under `--ingest-mem-mb` (1200 with the numbers above), so the
   export yields before the hosts do. The budget pauses the export and the seed reads while the
-  process is over it, and resumes them below 85%. `--plc-export-rate` counts requests a second
-  across every window, at ~1,000 ops each.
+  process is over it, and resumes them below 85%. A paused export holds nothing, so if the memory
+  stays between 85% and the budget for a minute it isn't the export's: the export runs again then,
+  and waits twice as long the next time, up to 16 minutes. `--plc-export-rate` counts requests a
+  second across every window, at ~1,000 ops each.
 - Set `--qlog-disk-retain-mb 1024`. A single node has no followers to catch up, so its disk only
   serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of it,
   about 7 s for the default 4 GiB.

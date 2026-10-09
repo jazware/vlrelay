@@ -66,6 +66,9 @@ pub enum BackpressureReason {
     /// Its fair-queue slot: the lanes aren't taking frames, usually while
     /// they wait on identity lookups.
     QueueFull,
+    /// The node's memory budget: the process is over it while the pipeline
+    /// holds its share of the in-flight caps.
+    MemoryFull,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

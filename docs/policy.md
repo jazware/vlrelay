@@ -102,8 +102,8 @@ A throttled host's reads are paused down to a low rate, so the PDS buffers inste
 dropping. Its status says `throttled` whenever its own limits (its tier's, a domain rule's or an
 operator's throttle) pause the reader, in any tier. A host the relay pauses because the relay is
 behind shows `backpressure` instead, with what's full: its in-flight cap (`inflight_full`), the
-node's (`node_inflight_full`) or its lane queue (`queue_full`, usually an identity-lookup
-backlog). That's never the host's doing, and no tier or throttle change releases it: it resumes
+node's (`node_inflight_full`), its lane queue (`queue_full`, usually an identity-lookup
+backlog) or the node's memory budget (`memory_full`). That's never the host's doing, and no tier or throttle change releases it: it resumes
 as the relay catches up. A suspended host is disconnected. A banned one is never connected, and its
 `requestCrawl` is refused. `--host` upstreams start at `--host-tier` (`trusted` by default) the
 first time they're seen. After that the host record's tier holds.

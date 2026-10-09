@@ -18,7 +18,7 @@ export class ApiError extends Error {
 /** `throttled`: held at its own limits (tier, rule or operator). `backpressure`: paused by the relay, which is behind. */
 export type HostStatus = 'connected' | 'idle' | 'backoff' | 'offline' | 'throttled' | 'backpressure' | 'suspended' | 'banned'
 /** What's full while a host is in `backpressure`: its in-flight cap, the node's, or its lane queue (usually an identity backlog). */
-export type BackpressureReason = 'inflight_full' | 'node_inflight_full' | 'queue_full'
+export type BackpressureReason = 'inflight_full' | 'node_inflight_full' | 'queue_full' | 'memory_full'
 export type Severity = 'info' | 'warn' | 'high' | 'critical'
 export type RejectReason =
   | 'bad-signature'
