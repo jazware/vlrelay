@@ -67,7 +67,7 @@ crc32fast = "1"
 # SlateDB checkpoint ids (the qlog flush manifest names one)
 uuid = "1"
 
-# tokio-console (TOKIO_CONSOLE_BIND, docs/operations/tokio-console.md) in
+# tokio-console (TOKIO_CONSOLE_BIND, docs/operations/monitoring.md) in
 # builds with --cfg tokio_unstable: the images set it. Plain builds don't
 # compile it in.
 [target.'cfg(tokio_unstable)'.dependencies]
