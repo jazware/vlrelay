@@ -285,6 +285,46 @@ async fn wrong_host_reresolves_once_then_follows_migration() {
 }
 
 #[tokio::test]
+async fn migration_inside_the_reresolve_window_follows_the_new_identity() {
+    let id = MapIdentity::new();
+    let did = plc(6);
+    id.set(&did, "pds.a", 1);
+    let st = open(2, id.clone(), ApplyConfig { reresolve_after_secs: 30, ..Default::default() }).await;
+    let (a, b) = (host("pds.a"), host("pds.b"));
+    let ev = |h: &Host, now, kind| {
+        let st = st.clone();
+        let (did, h) = (did.clone(), h.clone());
+        async move { st.apply(Incoming { did: &did, host: &h, now, kind }).await }
+    };
+    let acct = |active: bool, status: Option<&str>| EventKind::Account { active, status: status.map(String::from) };
+    commit(&st, &did, &a, claim(&did, 1), NOW).await.unwrap();
+
+    // the new PDS creates the account: its document still names the old one
+    let r = ev(&b, NOW + 100, EventKind::Identity).await;
+    assert!(matches!(r, Ok(Applied::Append(_))), "{r:?}");
+    let r = ev(&b, NOW + 101, acct(false, Some("deactivated"))).await;
+    assert!(matches!(r, Err(Reject::WrongHost { .. })), "{r:?}");
+    let fresh = id.fresh.load(Relaxed);
+
+    // the PLC op lands and the new PDS activates, all inside the window
+    id.set(&did, "pds.b", 2);
+    let r = ev(&b, NOW + 105, EventKind::Identity).await;
+    assert!(matches!(r, Ok(Applied::Append(_))), "{r:?}");
+    assert_eq!(id.fresh.load(Relaxed), fresh, "the #identity itself fetches nothing");
+    let r = ev(&b, NOW + 106, acct(true, None)).await;
+    assert!(matches!(r, Ok(Applied::Append(_))), "{r:?}");
+    let r = commit(&st, &did, &b, claim(&did, 2), NOW + 107).await;
+    assert!(matches!(r, Ok(Applied::Append(_))), "{r:?}");
+
+    // the old PDS's deactivation is not the account's
+    let r = ev(&a, NOW + 108, acct(false, Some("deactivated"))).await;
+    assert!(matches!(r, Err(Reject::WrongHost { .. })), "{r:?}");
+    let rec = st.get(&did).await.unwrap().unwrap();
+    assert_eq!((rec.host, rec.status()), (HostKey::of("pds.b"), AccountStatus::Active));
+    assert_eq!(id.fresh.load(Relaxed), fresh + 1);
+}
+
+#[tokio::test]
 async fn new_did_from_wrong_host_tries_fresh_and_creates_nothing() {
     let id = MapIdentity::new();
     let did = plc(4);

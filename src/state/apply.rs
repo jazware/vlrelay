@@ -504,8 +504,9 @@ impl<C: Chain> StateStore<C> {
     /// The event's host must be the PDS the DID document names. A mismatch
     /// re-resolves once (if the stored document isn't brand new). An
     /// `#identity` re-resolves when its host is the account's PDS, or the
-    /// stored document isn't brand new. Fresh lookups spend the sending
-    /// host's budget ([`AccountGate::forced_lookup`]).
+    /// stored document isn't brand new; otherwise it marks the document
+    /// stale, so the next event re-resolves. Fresh lookups (and that mark)
+    /// spend the sending host's budget ([`AccountGate::forced_lookup`]).
     async fn check_authority(
         &self,
         rec: &mut Record,
@@ -517,13 +518,21 @@ impl<C: Chain> StateStore<C> {
         let owner = rec.fetched_at != 0 && rec.pds == Some(hk);
         let recent = rec.fetched_at != 0 && ev.now.saturating_sub(rec.fetched_at) < self.config.reresolve_after_secs;
         let force = identity && (owner || !recent);
+        let budget = |host: &str| self.account_gate().is_none_or(|g| g.forced_lookup(host));
         if !force && !new_account && owner {
             return Ok(Authority::Ok);
         }
         if !force && !new_account && recent {
+            // A migrating account's new PDS sends the new document's
+            // #identity seconds after the one announcing the account there,
+            // whose lookup still found the old PDS. Trusting that lookup for
+            // another 30 s drops the new PDS's #account and first commits,
+            // and takes the old PDS's deactivation as the account's.
+            if identity && budget(&ev.host.0) {
+                rec.fetched_at = 0;
+            }
             return Ok(Authority::Wrong);
         }
-        let budget = |host: &str| self.account_gate().is_none_or(|g| g.forced_lookup(host));
         // a new DID tries the cache first, then one fresh lookup
         let mut fresh = (force || !new_account) && budget(&ev.host.0);
         loop {

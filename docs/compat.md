@@ -115,6 +115,13 @@ Should vlRelay support relay-as-upstream? Not as an upstream mode. Host authorit
 - Bootstrap a host list by reading another relay's `listHosts` and subscribing to those PDSes directly. This needs no trust in the relay, and it's built: `--bootstrap-relay` and the policy's `discovery.seedRelays` read the list and never ask the other relay to crawl anything ([Policy](policy.md#discovering-hosts)).
 - Mirror a vlRelay, which every member of a cluster already does.
 
+### Host authority
+
+indigo checks the account's host on `#commit`, `#sync` and `#account`, and passes `#identity` from any host. On a mismatch it purges the DID document and resolves it again, on every mismatched event. `#identity` purges it too. vlRelay checks the same events, and re-resolves a mismatch at most once per DID per 30 s, so a host sending events for accounts it doesn't hold can't spend PLC lookups per event.
+
+- Migration inside that window: was ours wrong, fixed. The new PDS sends `#identity` when it creates the account (the document still names the old PDS, and vlRelay looks it up), then again after the PLC op, then `#account` active and its first commit. A quick migration does all that within 30 s, so vlRelay trusted the first lookup: it dropped the new PDS's `#account` and commits as `wrong_host`, and took the old PDS's `#account` deactivated as the account's, which indigo rejects. Now an `#identity` from another host inside the window marks the document stale, paid from the sender's lookup budget, and the next event resolves it again. Regression test: `state::tests::migration_inside_the_reresolve_window_follows_the_new_identity`.
+- One PDS under several hostnames: the same on both. A PDS whose name, wildcard certificate and DNS answer for other names shows up in `listHosts` under each of them, and a relay subscribes to each. Every name streams the same events, and the DID documents name one of them. The copies from the other names are `wrong_host` when they win the race to the relay, and duplicates when they lose it. Nothing is lost while the canonical name is subscribed. On a production relay, these copies were most of its `wrong_host` rejects, by the aliases' event rates.
+
 ## Follow-ups from the first run
 
 1. Seqs above 2^53: fixed. vlRelay serves a dense counter that the leader assigns in commit order ([Cluster](cluster.md#the-path-of-an-event)). It's the same on every node, and kept across restarts and takeovers by the quorum log and its flushes to the bucket. `@atproto/sync` passes with 0 errors, and the seqs equal indigo's on the same run. vlpds's own PDS firehose is unchanged.
