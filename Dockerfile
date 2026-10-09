@@ -45,7 +45,7 @@ ARG RUSTFLAGS="--cfg tokio_unstable"
 # firehose consumer, docs/loadfleet.md) and e2e_check (docs/devloop.md). One
 # cargo invocation, so they reuse the compiled lib.
 ARG VLRELAY_TOOLS=""
-# --build-arg VLRELAY_FEATURES=heap-profiling: jemalloc heap profiles on demand
+# --build-arg VLRELAY_FEATURES=<features>: more cargo features (heap profiles are always in)
 ARG VLRELAY_FEATURES=""
 # vlsync and vlatproto are git dependencies on jazware/vlsync and
 # jazware/vlatproto (Cargo.toml), fetched here.

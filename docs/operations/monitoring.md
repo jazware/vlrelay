@@ -179,6 +179,42 @@ fsync, so `disk.fsync_us` in `/qlog/status` sets much of it there.
 stage. About a third of a node's CPU per event is signature verification
 ([Performance](../perf.md)).
 
+## Heap profiles
+
+Every node runs jemalloc's heap sampler from the start. One allocation in every 512 KiB allocated
+keeps its stack until it's freed, as Go's heap profiler does. `GET /debug/pprof/heap` writes out
+the sampled allocations still live, scaled up to estimate the whole heap, as a gzipped pprof
+profile with Go's `inuse_space` and `inuse_objects`, so the tools that read a Go service's heap
+read it too:
+
+```bash
+curl -s -u admin:$ADMIN_TOKEN http://<node>:2980/debug/pprof/heap > heap.pb.gz
+go tool pprof -top heap.pb.gz                     # who holds the heap now
+go tool pprof -top -diff_base before.pb.gz heap.pb.gz   # what grew between two
+```
+
+- **Who may ask.** A peer on the node's own loopback that sent no forwarding header
+  (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) gets it without auth: that's a scraper in the
+  node's network namespace. Anyone else needs the admin token (Basic or Bearer) or, on
+  `--admin-listen`, an operator the proxy signed in. Keep `/debug/*` off the public side of your
+  proxy too, as `/metrics` is.
+- **What it costs.** On the node bench (a fakepds fleet at 20k events/s, 8 pinned cores), a `perf`
+  profile of the release build put the sampler at 1.2-1.4% of the node's CPU, nearly all of it
+  unwinding the stack of each sampled allocation. Its memory is part of jemalloc's `metadata`,
+  which stayed at about 135 MB with the sampler on or off. With the sampler off, or with no
+  profiling compiled in, CPU per event matched within the bench's run-to-run noise (±2%). A dump
+  takes 2-10 ms, during which sampled allocations can wait on it, and comes to about 30 KB.
+- **What it shows.** Live allocations only: there are no `alloc_*` totals, which jemalloc keeps
+  only with `prof_accum`, whose memory grows with every stack it ever sampled. Shares under a few
+  percent rest on a handful of samples. Frames are named from the binary's symbol table, so a
+  release build (symbols, no DWARF) shows whole functions without inlined callees or lines.
+- **Is it the heap?** Check `vlpds_jemalloc_bytes{stat}` before reading stacks. A growing
+  `allocated` is live data, and the profile names it. `resident` growing past `allocated` is
+  pages jemalloc holds (fragmentation, or freed pages it hasn't purged), which no stack shows.
+  `retained` is address space jemalloc keeps unmapped, not memory.
+- **Off.** `_RJEM_MALLOC_CONF=prof_active:false` at start turns the sampler off, and the
+  endpoint then answers 503. `lg_prof_sample:21` there samples every 2 MiB instead.
+
 ## tokio-console
 
 The image carries [tokio-console](https://github.com/tokio-rs/console)'s subscriber, off by

@@ -3,7 +3,7 @@
 
 use axum::http::{HeaderValue, header};
 use axum::middleware;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -17,18 +17,21 @@ mod tokio_console;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// Segments are ~8 MiB, jemalloc's default oversize threshold: allocations
-/// that size get an arena that returns pages to the OS as soon as they're
-/// freed, so every segment buffer and its compressed copy were faulted in
-/// afresh (~3% of a loaded node's CPU). Without the oversize arena they
-/// reuse dirty pages within the normal decay time.
-///
-/// jemalloc decays freed pages as it allocates, so a node that paused its
-/// reads (`--ingest-mem-mb`) and went quiet kept them counted against the
-/// budget it was waiting to get under. Its background thread decays them on
-/// time instead.
-#[unsafe(export_name = "_rjem_malloc_conf")]
-pub static MALLOC_CONF: &[u8; 44] = b"oversize_threshold:0,background_thread:true\0";
+// Segments are ~8 MiB, jemalloc's default oversize threshold: allocations
+// that size get an arena that returns pages to the OS as soon as they're
+// freed, so every segment buffer and its compressed copy were faulted in
+// afresh (~3% of a loaded node's CPU). Without the oversize arena they
+// reuse dirty pages within the normal decay time.
+//
+// jemalloc decays freed pages as it allocates, so a node that paused its
+// reads (`--ingest-mem-mb`) and went quiet kept them counted against the
+// budget it was waiting to get under. Its background thread decays them on
+// time instead.
+//
+// The macro adds the heap sampler, on from the start: one allocation in
+// every 512 KiB keeps its stack for GET /debug/pprof/heap
+// (docs/operations/monitoring.md, "Heap profiles").
+vlsync_heapprof::malloc_conf!("oversize_threshold:0,background_thread:true");
 
 #[derive(Parser, Debug)]
 #[command(version, about = "An atproto relay whose only durable state is an object store")]
@@ -522,6 +525,7 @@ fn main() {
     let matches = cmd.clone().get_matches();
     let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     init_logging(args.log_format);
+    vlsync_heapprof::log_status();
     // reqwest, tungstenite and object_store each pull rustls; with more than
     // one provider compiled in, nothing picks one unless we do
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -627,6 +631,7 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
     let mut app = axum::Router::new()
         .route("/xrpc/_health", axum::routing::get(health))
         .route("/metrics", axum::routing::get(|| async { vlsync_store::metrics::render() }))
+        .merge(heap_profile_route(a.admin_token.clone().filter(|t| !t.is_empty())))
         .merge(node.serve.router())
         .merge(vlrelay::qlog::emit::control_router(node.quorum.qnode.clone(), admin))
         .merge(vlrelay::sync_api::router(Arc::new(vlrelay::node::quorum::QuorumSync {
@@ -690,6 +695,39 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
         s.abort();
     }
     r
+}
+
+/// `GET /debug/pprof/heap` (docs/operations/monitoring.md, "Heap profiles"):
+/// for a peer on the container's loopback (yeetd's scrapes and forwards),
+/// the admin token, or an operator the admin listener's proxy signed in.
+fn heap_profile_route(token: Option<String>) -> axum::Router {
+    let route = move |req: axum::extract::Request| {
+        let allowed = heap_profile_allowed(token.as_deref(), &req);
+        async move {
+            if !allowed {
+                return (axum::http::StatusCode::UNAUTHORIZED, "admin token required\n").into_response();
+            }
+            vlsync_heapprof::handler().await
+        }
+    };
+    axum::Router::new().route("/debug/pprof/heap", axum::routing::get(route))
+}
+
+fn heap_profile_allowed(token: Option<&str>, req: &axum::extract::Request) -> bool {
+    if vlsync_heapprof::from_loopback(req) {
+        return true;
+    }
+    if let Some(h) = req.headers().get(header::AUTHORIZATION) {
+        let h = h.to_str().unwrap_or_default();
+        return token.is_some_and(|t| {
+            h.strip_prefix("Basic ").is_some_and(|b| vlatproto::xrpc::basic_admin_ok(b, t))
+                || h.strip_prefix("Bearer ").is_some_and(|b| vlatproto::xrpc::token_eq(t, b))
+        });
+    }
+    matches!(
+        req.extensions().get::<vlrelay::admin::proxy::ProxyIdentity>(),
+        Some(vlrelay::admin::proxy::ProxyIdentity::Operator(_))
+    )
 }
 
 /// `--admin-proxy-header` and its company, checked before anything starts.
