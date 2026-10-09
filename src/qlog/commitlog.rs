@@ -140,6 +140,10 @@ const BOOT_FILE: &str = "boot";
 /// Left by an emulated power cut ([`CommitLog::power_cut`]): the next open
 /// treats it as a reboot.
 const POWER_LOST: &str = "power-lost";
+/// Left by an emulated process crash ([`CommitLog::crash`]): the active
+/// segment and its length as of its last fsync, the rest being only in the
+/// page cache.
+const CRASHED: &str = "crashed";
 
 fn boot_id() -> String {
     if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
@@ -286,8 +290,8 @@ struct Seg {
     no: u64,
     base_seq: u64,
     bytes: u64,
-    /// Its length as of its last fdatasync, once it's no longer the active
-    /// segment (the active one's is `Shared::durable_len`).
+    /// Its length as of its last fdatasync, for the power-cut emulation (the
+    /// writer goes by `Shared::durable_len` for the active segment).
     durable: u64,
     /// Kept open so a read survives the file's deletion.
     file: Arc<File>,
@@ -484,6 +488,13 @@ impl CommitLog {
         let t = Instant::now();
         std::fs::create_dir_all(dir)?;
         let power_lost = power_lost_since_last_run(dir, &opts)?;
+        let crashed = std::fs::read_to_string(dir.join(CRASHED)).ok().and_then(|t| {
+            let (no, len) = t.trim().split_once(' ')?;
+            Some((no.parse::<u64>().ok()?, len.parse::<u64>().ok()?))
+        });
+        if crashed.is_some() {
+            std::fs::remove_file(dir.join(CRASHED))?;
+        }
         let mut nos: Vec<u64> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
             .filter_map(|e| e.file_name().to_str()?.strip_suffix(".qlog")?.parse().ok())
@@ -582,7 +593,8 @@ impl CommitLog {
                 f.sync_all()?;
                 tracing::warn!(path = %path.display(), at = off, dropped = b.len() - off, "qlog commitlog: truncated a torn tail");
             }
-            segs.push(Seg { no, base_seq, bytes: off as u64, durable: off as u64, file: Arc::new(File::open(&path)?) });
+            let durable = crashed.filter(|&(c, _)| c == no).map_or(off as u64, |(_, d)| d.min(off as u64));
+            segs.push(Seg { no, base_seq, bytes: off as u64, durable, file: Arc::new(File::open(&path)?) });
         }
         let fresh = segs.is_empty();
         if fresh {
@@ -755,13 +767,27 @@ impl CommitLog {
             }
         }
         let seg = s.segs.last().expect("one segment");
-        let keep = s.durable_len + ((s.written_len - s.durable_len) as f64 * keep_frac.clamp(0.0, 1.0)) as u64;
+        let synced = seg.durable.min(s.durable_len);
+        let keep = synced + ((s.written_len - synced) as f64 * keep_frac.clamp(0.0, 1.0)) as u64;
         let f = OpenOptions::new().write(true).open(seg_path(&self.dir, seg.no))?;
         f.set_len(keep)?;
         f.write_all_at(garbage, keep)?;
         f.sync_all()?;
         // the machine reboots: what the next open sees of /proc's boot id
         File::create(self.dir.join(POWER_LOST))?.sync_all()?;
+        fsync_dir(&self.dir)
+    }
+
+    /// Tests: a process crash. [`CommitLog::halt`], and a note of what in
+    /// the active segment was never fsynced, for a power cut after the
+    /// restart to lose.
+    pub fn crash(&self) -> std::io::Result<()> {
+        self.halt();
+        let s = self.shared.lock();
+        let seg = s.segs.last().expect("one segment");
+        let mut f = File::create(self.dir.join(CRASHED))?;
+        f.write_all(format!("{} {}\n", seg.no, seg.durable.min(s.durable_len)).as_bytes())?;
+        f.sync_all()?;
         fsync_dir(&self.dir)
     }
 
@@ -822,9 +848,13 @@ enum IdxOp {
 
 impl Writer {
     fn new(cl: &CommitLog, promised: Promised) -> std::io::Result<Writer> {
-        let s = cl.shared.lock();
-        let seg = s.segs.last().expect("one segment");
+        let mut s = cl.shared.lock();
+        let seg = s.segs.last_mut().expect("one segment");
         let file = OpenOptions::new().append(true).open(seg_path(&cl.dir, seg.no))?;
+        // the last run's page-cache tail: `durable_len` counts it, so
+        // nothing else would fsync it before a rollover leaves it behind
+        file.sync_data()?;
+        seg.durable = seg.bytes;
         Ok(Writer { file, no: seg.no, len: seg.bytes, promised, buf: Vec::with_capacity(8 << 20) })
     }
 
@@ -957,6 +987,7 @@ impl Writer {
         s.synced_at = Instant::now();
         if let Some(seg) = s.segs.last_mut() {
             seg.bytes = self.len;
+            seg.durable = self.len;
         }
         Ok(())
     }
@@ -1041,10 +1072,6 @@ impl Writer {
             s.index.truncate_after(base);
             for (seq, loc) in idx {
                 assert!(s.index.push(seq, loc), "qlog commitlog: rollover tail out of order");
-            }
-            let durable = s.durable_len;
-            if let Some(old) = s.segs.last_mut() {
-                old.durable = durable;
             }
             s.segs.push(Seg { no, base_seq: base, bytes: len, durable: len, file: Arc::new(File::open(&path)?) });
             s.written_len = len;
@@ -1324,6 +1351,44 @@ mod tests {
         std::fs::write(dir.path().join(BOOT_FILE), "another-boot page-cache\n").unwrap();
         let (_, r) = CommitLog::open(dir.path(), page_cache(10_000)).unwrap();
         assert!(r.power_lost, "a reboot after page-cache writes went unnoticed");
+    }
+
+    /// A restart in page-cache mode fsyncs the segment it reopens: the last
+    /// run's tail may be only in the page cache, and a rollover before
+    /// anything is written would leave it behind unsynced, so a power cut
+    /// would take committed entries no other segment holds.
+    #[tokio::test]
+    async fn a_power_cut_after_a_restart_and_a_rollover_keeps_the_last_runs_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = Options { segment_bytes: 1 << 20, ..page_cache(60_000) };
+        let (cl, r) = CommitLog::open(dir.path(), big).unwrap();
+        let mut log = r.log;
+        log.journal();
+        for _ in 0..20 {
+            log.append(1, Bytes::from(vec![7u8; 500]));
+            log.set_commit(log.last_seq());
+            cl.note_commit(log.commit());
+            let t = cl.stage(log.take_journal());
+            cl.wait(t).await.unwrap();
+        }
+        assert!(cl.unsynced().0 > 0);
+        cl.crash().unwrap();
+        drop(cl);
+        let (cl, r) = CommitLog::open(dir.path(), page_cache(60_000)).unwrap();
+        assert_eq!(r.log.last_seq(), 20);
+        let t = Instant::now();
+        while cl.stats.rollovers.load(Ordering::Relaxed) == 0 {
+            assert!(t.elapsed() < Duration::from_secs(10), "no rollover");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cl.power_cut(0.0, &[1, 2, 3]).unwrap();
+        drop(cl);
+        let (cl, r) = CommitLog::open(dir.path(), page_cache(60_000)).unwrap();
+        assert_eq!(r.log.last_seq(), 20);
+        for s in 1..=20 {
+            assert_eq!(r.log.get(s), log.get(s));
+        }
+        cl.halt();
     }
 
     /// A rollover in page-cache mode fsyncs what the old segment holds past
