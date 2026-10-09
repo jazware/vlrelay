@@ -2673,7 +2673,8 @@ impl Node {
                 *j.feed.lock() = Some(feed.clone());
             }
             let st = crate::qlog::bucket::counted(&store, "discovery");
-            let d = crate::discovery::DiscoveryJob::new(h.engine.clone(), crawler.clone(), st, feed);
+            let d =
+                crate::discovery::DiscoveryJob::new(h.engine.clone(), crawler.clone(), Some(h.hosts.clone()), st, feed);
             let _ = hooks.discovery.set(d.clone());
             tokio::spawn(d.run(Arc::downgrade(&qnode)));
         }

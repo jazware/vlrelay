@@ -473,6 +473,8 @@ impl PolicyHooks {
                 tracing::warn!(host = %e.host.0, "policy sync: {err:#}");
             }
         }
+        let seeded = self.cache.lock().values().filter(|s| s.limits.seeded_accounts.is_some()).count();
+        super::metrics::HOSTS_SEEDED.set(seeded as i64);
     }
 
     async fn sync_loop(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<String>) {
@@ -1004,6 +1006,25 @@ pub(crate) mod tests {
         let now = policy::store::now_ms();
         assert_eq!(hooks.engine.signals.snapshot(host, None, now).get("new-accounts"), None);
         assert!(hooks.deferred.lock().is_empty());
+    }
+
+    /// A seeded record, loaded as a restarted node loads its hosts, reaches
+    /// the host's socket limits and its account cap.
+    #[tokio::test]
+    async fn a_seeded_host_reads_at_its_seeded_limits() {
+        let (hooks, _) = setup().await;
+        let mut r = HostRecord::new("big.example", Tier::New, state::now_secs());
+        let mut p = policy::tiers::host_policy(&r);
+        p.seeded = Some(policy::tiers::Seeded {
+            accounts: 50_000,
+            from: "bootstrap:relay.example".into(),
+            at: state::now_secs(),
+        });
+        policy::tiers::set_host_policy(&mut r, &p);
+        hooks.hosts.put_host(&r).await.unwrap();
+        hooks.load().await.unwrap();
+        assert_eq!(hp(&hooks, "big.example").limits.unwrap().events_per_hour, 203_500.0);
+        assert_eq!(hooks.limits("big.example").unwrap().limits.unwrap().max_accounts, 201_000);
     }
 
     #[tokio::test]

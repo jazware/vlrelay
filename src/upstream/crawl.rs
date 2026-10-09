@@ -246,6 +246,11 @@ impl Crawler {
         self.log.lock().iter().rev().cloned().collect()
     }
 
+    /// `hostname` as this relay keys its hosts.
+    pub fn normalize(&self, hostname: &str) -> Option<Host> {
+        normalize_hostname(hostname, self.manager.config().dev_mode).ok()
+    }
+
     /// Whether `hostname` is one of this relay's hosts already.
     pub fn knows(&self, hostname: &str) -> bool {
         normalize_hostname(hostname, self.manager.config().dev_mode)

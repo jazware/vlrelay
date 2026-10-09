@@ -1069,6 +1069,7 @@ impl Sim {
                 1 => "plc".into(),
                 _ => "bootstrap:relay1.us-east.bsky.network".into(),
             }),
+            seeded_accounts: None,
             rule: self.rule_for(&h.name).map(|r| r.id),
             node: self.host_shards[h.shard].clone().unwrap_or_default(),
             version: h.version.clone(),

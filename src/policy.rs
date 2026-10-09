@@ -68,6 +68,9 @@ pub struct HostLimits {
     pub alias_of: Option<String>,
     /// The operator's backfill choice for the host (`tiers::HostPolicy`).
     pub backfill: Option<bool>,
+    /// The account count a seed relay reported that `limits` were raised
+    /// for (`tiers::Seeded`): set only while it counts.
+    pub seeded_accounts: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -341,7 +344,19 @@ impl Engine {
                 _ => {}
             }
         }
+        let sa = &p.discovery.seed_accounts;
+        // `throttled` is meant to be slow, and `trusted` has more already
+        let seeded = hp
+            .seeded
+            .as_ref()
+            .filter(|s| {
+                sa.enabled && matches!(tier, Tier::New | Tier::Default) && s.fresh(sa, crate::state::now_secs())
+            })
+            .map(|s| s.accounts);
         let limits = p.tiers.get(tier).cloned().map(|mut l| {
+            if let Some(n) = seeded {
+                tiers::add_seeded(&mut l, sa.allowance(n));
+            }
             if let Some(c) = cap {
                 l.events_per_sec = l.events_per_sec.min(c);
             }
@@ -359,6 +374,7 @@ impl Engine {
             policy_version: snap.policy.version,
             alias_of,
             backfill: hp.backfill,
+            seeded_accounts: seeded,
         }
     }
 

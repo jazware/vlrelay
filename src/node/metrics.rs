@@ -43,6 +43,7 @@ lazy!(ACCOUNTS_THROTTLED: IntCounterVec = register_int_counter_vec!("vlrelay_acc
 lazy!(ACCOUNTS_DEFERRED: IntCounterVec = register_int_counter_vec!("vlrelay_accounts_deferred_total", "Events of new accounts dropped while a new-account budget was spent, by which (host_rate, cluster_budget)", &["why"]));
 lazy!(FORCED_LOOKUPS_REFUSED: IntCounter = register_int_counter!("vlrelay_forced_lookups_refused_total", "Fresh DID document fetches an event asked for that its host's budget refused (the cached document was used)"));
 lazy!(ALIAS_WATCHES: IntCounterVec = register_int_counter_vec!("vlrelay_alias_watches_total", "Host pairs the leader watched for one PDS under two names, by outcome (started, same, differ, marked)", &["outcome"]));
+lazy!(HOSTS_SEEDED: IntGauge = register_int_gauge!("vlrelay_hosts_seeded", "Hosts whose limits are raised for the account count a seed relay's listHosts reported"));
 lazy!(HOST_ALIASES: IntGauge = register_int_gauge!("vlrelay_host_aliases", "Hosts marked another name for a host the relay reads (no socket of their own)"));
 lazy!(UPSTREAM_CONNECTS: IntCounterVec = register_int_counter_vec!("vlrelay_upstream_connects_total", "Upstream sockets opened, by where they started (head: no cursor, the live stream; cursor: a saved cursor; start: cursor 0, a backfill or a restarted sequence)", &["from"]));
 lazy!(RESYNCS: IntCounterVec = register_int_counter_vec!("vlrelay_resyncs_total", "Desynchronized accounts fetched from their PDS and sent as a #sync, by outcome (synced, unchanged, rejected, fetch_failed, dropped)", &["outcome"]));

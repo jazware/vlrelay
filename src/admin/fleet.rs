@@ -332,6 +332,7 @@ mod tests {
             throttled_accounts: 0,
             alias_of: None,
             source: None,
+            seeded_accounts: None,
             top_reason: None,
             version: None,
             updated_at_ms: None,

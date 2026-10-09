@@ -76,6 +76,7 @@ reports why.
 | Trusted domains (`crawl.trustedDomains`) | `*.host.bsky.network` | same |
 | New hosts per day (`cluster.newHostsPerDay`) | 50, shared across the cluster | 50, per process |
 | New host tier | `new` for 7 clean days, then `default` | no tiers |
+| Seeded account counts (`discovery.seedAccounts`) | on: a `new` or `default` host's limits are indigo's for 4× the `accountCount` a seed relay lists, at most 1,000,000 more accounts, for 2 days after the last listing | none |
 
 The relay-only defaults are guesses to tune against real traffic. Auto-throttle trips at 50%
 failed frames over a sweep interval with at least 200 frames, and a throttled host recovers after
@@ -163,7 +164,8 @@ section of the policy document adds two sources, both run by the leader in the b
 
 Every host found goes through the admission above: the crawl switch aside, the same hostname
 rules, domain bans, allow-list mode, starting tier and `describeServer` probe. Nothing comes from
-the other relay but the name: not its status, bans, tiers or `seq`. A new host starts live, with no
+the other relay but the name and its `accountCount`: not its status, bans, tiers or `seq`. The
+count only raises a host's limits ([Seeded account counts](#seeded-account-counts)). A new host starts live, with no
 backfill ([Starting a host](#starting-a-host)). Discovery's admissions don't spend `cluster.newHostsPerDay`, which stays
 requestCrawl's: they're paced by their own `discovery.connectsPerMin` (120), so a cold start
 isn't held to the daily budget.
@@ -361,6 +363,53 @@ raising it releases up to that many throttled accounts. In vlRelay:
   (untakedown). indigo releases them.
 - For a host you already know is real, raise its cap (or add a `tier` domain rule) before or right
   after adding it, so the first wave of accounts isn't throttled.
+
+A relay that seeds its hosts from another relay's `listHosts` doesn't need that for the hosts the
+other relay already carries: their limits start from the other relay's account count.
+
+### Seeded account counts
+
+A host's tier limits are indigo's formula for 1,000 accounts: 3,500 events an hour and 30,000 a
+day, whatever the host is. On a fresh relay that held the big independent PDSes (eurosky.social,
+blacksky.app and the like, 35-65k accounts each) to 0.3-1 events a second, against the ~6 a second
+eurosky sends. In a soak one of them was 73 minutes behind after an hour, and about 2.4% of the
+network's commits were missing. Every active account is one the relay hasn't seen, so the seen
+count can't tell a 50k-account PDS from a new one for hours.
+
+A seed relay can. Its `listHosts` has each host's `accountCount`, and discovery already reads it,
+so nothing new is asked of the other relay:
+
+- **Kept on the record.** After admission, each listed host with an `accountCount` above 0 gets it
+  on its host record (`seeded`: the count, the source and when), a host-table write like a tier
+  change. It's written again only when the count moves by more than 10% or half its lifetime has
+  gone, so a 6-hour refresh doesn't rewrite every host.
+- **Applied to `new` and `default`.** A seeded host's limits are its tier's plus indigo's formula
+  for `headroom` (4) × the count more accounts, at most `max` (1,000,000): n/1000 more events a
+  second, n an hour, 10n a day and n on the account cap. A 50,000-account host gets 251 events a
+  second, 203,500 an hour, 2.03M a day and a cap of 201,000. indigo's per-day 10n is about 1.2e-4
+  events a second per account, and eurosky sends 1.6e-4, so the 4× keeps a busy day inside the
+  day's window. `throttled` and `trusted` hosts ignore the seed: one is meant to be slow, the
+  other already has more.
+- **Lapses.** A count no seed relay has listed again for `ttlSecs` (2 days, 8 refreshes) stops
+  counting, and the tier's limits hold again. A host the seed relay drops, or a relay removed from
+  `seedRelays`, takes the host back to its tier within two days. The seed follows the other
+  relay's count both ways, so a host that shrinks there shrinks here.
+
+What it trusts and what it doesn't:
+
+| Source | Seeds? |
+|---|---|
+| A relay in `discovery.seedRelays` (an operator put it there) listing the host `active` or `idle` | yes |
+| The same relay listing it `throttled`, `banned` or `offline` | no: a relay that throttled a host doesn't vouch for it |
+| The PDS itself (`describeServer`, requestCrawl), the PLC export, a relay that isn't a seed | no: they carry no count, and none is asked for |
+| A second seed relay with a lower count than a fresh one already kept | no: the higher fresh count stays |
+
+A farm can't use it to grow faster: `newAccountsPerHour`, the cluster's new-account budget, the spam
+thresholds and the error budget don't change, and a host they throttle drops to `throttled`, which
+ignores the seed. Operators still win: an operator's `set-account-limit` replaces the seeded cap,
+an operator or rule throttle caps the seeded rate, and `discovery.seedAccounts.enabled: false`
+turns every seed off at the next policy poll. The host's `seededAccounts` (host row and detail),
+each source's `seeded` count ([Admin API](admin-api.md)) and `vlrelay_hosts_seeded` show it.
 
 ## When a throttled host falls behind
 

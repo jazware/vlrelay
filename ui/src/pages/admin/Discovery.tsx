@@ -259,6 +259,7 @@ registerDetail('dsource', {
             ['new', fmtNum(s.new)],
             ['admitted', fmtNum(s.admitted)],
             ['refused', fmtNum(s.refused)],
+            ...(s.seeded != null && s.key !== 'plc' ? [['seeded', fmtNum(s.seeded)] as [string, string]] : []),
           ]}
         />
         {p && v && (
