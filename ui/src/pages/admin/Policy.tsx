@@ -714,6 +714,10 @@ export function DiscoveryPolicy() {
         <Knob path="discovery.aliases" label="Find host aliases" why="Read a PDS listed under several hostnames under one of them: a name that streams another's events at the same seqs, with the same describeServer DID, gets no socket of its own." />
         <Knob path="discovery.connectsPerMin" label="Discovery connects" why="New hosts discovery may connect a minute, cluster-wide. Its own budget: requestCrawl keeps the daily one." unit="/min" />
         <Knob path="discovery.requestsPerSec" label="listHosts requests" why="Pages a second to any one seed relay; a 429 or 5xx waits out its Retry-After on top." unit="/s" />
+        <Knob path="discovery.seedAccounts.enabled" label="Seed account counts" why="A new or default host's limits start from the accountCount a seed relay lists it with (active or idle only), not from the accounts this relay has seen." />
+        <Knob path="discovery.seedAccounts.headroom" label="Seed headroom" why="Limits are indigo's formula for this many times the listed count, so a busy day fits the per-day window." unit="×" />
+        <Knob path="discovery.seedAccounts.max" label="Seed cap" why="The most accounts a seed adds to a host's limits, after the headroom." />
+        <Knob path="discovery.seedAccounts.ttlSecs" label="Seed lifetime" why="A count no seed relay has listed again in this long stops counting." unit="s" />
       </div>
     </>
   )

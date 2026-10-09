@@ -352,7 +352,8 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
   const banRule = rule?.effect.kind === 'ban' ? rule : undefined
   const thr = throttleOf(d, rule)
   const tierCap = pol.data?.policy.tiers[r.tier]?.maxAccounts
-  const ownCap = tierCap != null && d.limits.maxAccounts !== tierCap
+  const seeded = r.seededAccounts ?? 0
+  const ownCap = tierCap != null && d.limits.maxAccounts !== tierCap && !(seeded > 0 && d.limits.maxAccounts > tierCap)
   const cap = d.limits.maxAccounts
   const atCap = cap > 0 && r.accounts >= cap
   const reasons = (Object.entries(d.rejectsByReason) as [RejectReason, number][]).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1])
@@ -409,7 +410,7 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
       </Minis>
       <Sec
         title="Limits in force"
-        digest={`${r.tier} tier${thr.opThr ? ` · operator throttle ${fmtNum(r.throttle!)}/s` : ''}${thr.ruleThr !== undefined ? ` · rule throttle ${fmtNum(thr.ruleThr)}/s` : ''}${ownCap ? ' · own account cap' : ''}`}
+        digest={`${r.tier} tier${thr.opThr ? ` · operator throttle ${fmtNum(r.throttle!)}/s` : ''}${thr.ruleThr !== undefined ? ` · rule throttle ${fmtNum(thr.ruleThr)}/s` : ''}${ownCap ? ' · own account cap' : ''}${seeded ? ` · seeded for ${fmtNum(seeded)} accounts` : ''}`}
         open
         flush
       >
@@ -555,7 +556,7 @@ function Body({ d, page }: { d: HostDetail; page: boolean }) {
               {thr.ruleThr !== undefined && ruleButtons(rule!)}
             </span>
           </Act>
-          <Act title="Account cap" desc={`${ownCap ? 'Its own cap' : 'The tier cap'}: ${cap ? fmtNum(cap) : 'none'}.`}>
+          <Act title="Account cap" desc={`${ownCap ? 'Its own cap' : seeded ? `The tier cap, raised for the ${fmtNum(seeded)} accounts a seed relay lists` : 'The tier cap'}: ${cap ? fmtNum(cap) : 'none'}.`}>
             <span className="cx-form-row">
               {cap < BIG_HOST_CAP && (
                 <button type="button" className="cx-btn sm" onClick={() => hostActionDialog('raisecap', r)}>

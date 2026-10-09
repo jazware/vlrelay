@@ -342,11 +342,50 @@ pub struct Discovery {
     /// each such PDS under one name (docs/policy.md, "Host aliases").
     /// Operators' aliases hold either way.
     pub aliases: bool,
+    pub seed_accounts: SeedAccounts,
 }
 
 impl Default for Discovery {
     fn default() -> Self {
-        Discovery { seed_relays: Vec::new(), plc: false, connects_per_min: 120.0, requests_per_sec: 2.0, aliases: true }
+        Discovery {
+            seed_relays: Vec::new(),
+            plc: false,
+            connects_per_min: 120.0,
+            requests_per_sec: 2.0,
+            aliases: true,
+            seed_accounts: SeedAccounts::default(),
+        }
+    }
+}
+
+/// A `new` or `default` host's limits start from the `accountCount` a seed
+/// relay's `listHosts` reports for it, not from the accounts this relay has
+/// seen (docs/policy.md, "Seeded account counts").
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SeedAccounts {
+    pub enabled: bool,
+    /// The limits are indigo's for `headroom` times the reported count, so
+    /// a host's busy days fit: indigo's per-day 20,000 + 10n is about 1.2e-4
+    /// events a second per account, and a busy independent PDS sends 1.6e-4.
+    pub headroom: f64,
+    /// The most accounts a seed adds, after `headroom`.
+    pub max: u64,
+    /// A count no seed relay has reported again in this long no longer
+    /// counts.
+    pub ttl_secs: u64,
+}
+
+impl Default for SeedAccounts {
+    fn default() -> Self {
+        SeedAccounts { enabled: true, headroom: 4.0, max: 1_000_000, ttl_secs: 2 * 86_400 }
+    }
+}
+
+impl SeedAccounts {
+    /// The accounts a reported count adds to a host's limits.
+    pub fn allowance(&self, reported: u64) -> u64 {
+        ((reported as f64 * self.headroom) as u64).min(self.max)
     }
 }
 
@@ -421,6 +460,13 @@ pub fn validate(p: &PolicyBody) -> Result<(), Vec<String>> {
         if let Err(e) = super::rules::normalize_pattern(d) {
             errs.push(format!("crawl.trustedDomains: {e}"));
         }
+    }
+    let sa = &p.discovery.seed_accounts;
+    if !(sa.headroom.is_finite() && (1.0..=100.0).contains(&sa.headroom)) {
+        errs.push("discovery.seedAccounts.headroom must be 1..100".into());
+    }
+    if sa.ttl_secs < 3_600 {
+        errs.push("discovery.seedAccounts.ttlSecs must be at least an hour".into());
     }
     if errs.is_empty() { Ok(()) } else { Err(errs) }
 }

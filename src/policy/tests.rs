@@ -424,6 +424,104 @@ async fn for_host_and_admission_apply_rules_and_budgets() {
 
 // ---------------------------------------------------------------- budgets
 
+fn seeded(r: &mut HostRecord, accounts: u64, at: u32) {
+    let mut hp = tiers::host_policy(r);
+    hp.seeded = Some(tiers::Seeded { accounts, from: "bootstrap:relay.example.com".into(), at });
+    tiers::set_host_policy(r, &hp);
+}
+
+/// A seed relay's count raises a `new` or `default` host's limits by
+/// indigo's formula for headroom × the count, capped; `throttled` and
+/// `trusted` ignore it, it lapses after its TTL or with seeding off, and an
+/// operator's cap and throttle still win.
+#[tokio::test]
+async fn a_seeded_account_count_raises_new_and_default_limits() {
+    let store = Store::memory(None);
+    let e = engine(&store, "a");
+    let now = crate::state::now_secs();
+    let mut r = rec("big.example.com", Tier::New, now);
+    let base = e.for_host(&r).limits.unwrap();
+    assert_eq!((base.events_per_hour, base.max_accounts), (3_500, 1_000));
+    seeded(&mut r, 50_000, now);
+    let l = e.for_host(&r);
+    assert_eq!(l.seeded_accounts, Some(50_000));
+    let lim = l.limits.unwrap();
+    // 4 × 50,000 accounts more than the tier's 1,000
+    assert_eq!(lim.max_accounts, 201_000);
+    assert_eq!(lim.events_per_hour, 203_500);
+    assert_eq!(lim.events_per_day, 2_030_000);
+    assert_eq!(lim.events_per_sec, 251.0);
+    assert_eq!(lim.new_accounts_per_hour, base.new_accounts_per_hour, "a farm creates no faster");
+    // a busy 50k-account PDS (~1.6e-4 events/s an account, 8/s) fits every window
+    let real = 50_000.0 * 1.6e-4;
+    assert!(lim.events_per_day as f64 / 86_400.0 > 2.0 * real && lim.events_per_hour as f64 / 3_600.0 > 2.0 * real);
+
+    r.tier = Tier::Default;
+    assert_eq!(e.for_host(&r).limits.unwrap().max_accounts, 201_000);
+    for t in [Tier::Throttled, Tier::Trusted] {
+        r.tier = t;
+        let l = e.for_host(&r);
+        assert_eq!((l.seeded_accounts, l.limits), (None, e.snapshot().policy.body.tiers.get(t).cloned()));
+    }
+    r.tier = Tier::New;
+
+    // capped at seedAccounts.max
+    let mut huge = rec("huge.example.com", Tier::New, now);
+    seeded(&mut huge, 5_000_000, now);
+    assert_eq!(e.for_host(&huge).limits.unwrap().max_accounts, 1_001_000);
+
+    // stale: no seed relay reported it in ttlSecs
+    let mut old = rec("old.example.com", Tier::New, now);
+    seeded(&mut old, 50_000, now - 2 * 86_400);
+    assert_eq!((e.for_host(&old).seeded_accounts, e.for_host(&old).limits.unwrap().max_accounts), (None, 1_000));
+
+    // operators: their throttle caps the rate, their account cap replaces the seeded one
+    tiers::apply_manual(&mut r, &Manual::Throttle(Some(3.0)), now).unwrap();
+    tiers::apply_manual(&mut r, &Manual::AccountLimit(Some(7)), now).unwrap();
+    let lim = e.for_host(&r).limits.unwrap();
+    assert_eq!((lim.events_per_sec, lim.max_accounts, lim.events_per_hour), (3.0, 7, 203_500));
+
+    // the switch turns every seed off at once
+    let cur = e.snapshot().policy.clone();
+    let mut body = cur.body.clone();
+    body.discovery.seed_accounts.enabled = false;
+    e.save_policy(cur.version, body, "t", "").await.unwrap();
+    assert_eq!(e.for_host(&huge).limits.unwrap().max_accounts, 1_000);
+    assert_eq!(e.for_host(&huge).seeded_accounts, None);
+}
+
+#[test]
+fn seed_updates_are_capped_to_what_changed() {
+    let sa = super::doc::SeedAccounts::default();
+    let a = "bootstrap:a.example.com";
+    let now = 1_000_000;
+    let s = tiers::seed_update(None, 50_000, a, &sa, now).unwrap();
+    assert_eq!((s.accounts, s.at), (50_000, now));
+    assert_eq!(tiers::seed_update(None, 0, a, &sa, now), None, "nothing reported");
+    let off = super::doc::SeedAccounts { enabled: false, ..sa.clone() };
+    assert_eq!(tiers::seed_update(None, 50_000, a, &off, now), None);
+    // the same relay, a close count, recently: no write
+    assert_eq!(tiers::seed_update(Some(&s), 52_000, a, &sa, now + 3_600), None);
+    // a real change, or half the TTL gone: rewritten
+    assert_eq!(tiers::seed_update(Some(&s), 60_000, a, &sa, now + 3_600).unwrap().accounts, 60_000);
+    assert_eq!(tiers::seed_update(Some(&s), 50_000, a, &sa, now + 86_400).unwrap().at, now + 86_400);
+    // another relay's lower count doesn't replace a fresh higher one; a higher one does
+    let b = "bootstrap:b.example.com";
+    assert_eq!(tiers::seed_update(Some(&s), 10_000, b, &sa, now + 60), None);
+    assert_eq!(tiers::seed_update(Some(&s), 70_000, b, &sa, now + 60).unwrap().from, b);
+    // past the TTL anyone's count replaces it
+    assert_eq!(tiers::seed_update(Some(&s), 10_000, b, &sa, now + 3 * 86_400).unwrap().accounts, 10_000);
+    // a seeded record keeps it across a write and read (the host table's JSON)
+    let mut r = rec("big.example.com", Tier::New, now);
+    seeded(&mut r, 50_000, now);
+    let back: HostRecord = serde_json::from_slice(&serde_json::to_vec(&r).unwrap()).unwrap();
+    assert_eq!(tiers::host_policy(&back).seeded.map(|s| s.accounts), Some(50_000));
+    let mut bad = p();
+    bad.discovery.seed_accounts.headroom = 0.5;
+    bad.discovery.seed_accounts.ttl_secs = 60;
+    assert_eq!(super::doc::validate(&bad).unwrap_err().len(), 2);
+}
+
 #[test]
 fn budget_shares_follow_live_nodes() {
     let store = Store::memory(None);

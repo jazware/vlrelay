@@ -9,6 +9,12 @@
 //! - **The PLC export** (`plc`, with `--plc-export`): the distinct PDS hosts
 //!   the documents the export reader reads name.
 //!
+//! A seed relay's `accountCount` for a host it lists as active or idle is
+//! kept on the host's record (`tiers::Seeded`), and a `new` or `default`
+//! host's limits start from it rather than from the accounts this relay has
+//! seen so far. It comes only from the relays the policy names, never from
+//! the PDS or the PLC export, and lapses unless a run reports it again.
+//!
 //! Every host found goes through this relay's own admission
 //! ([`Crawler::admit_from`]: domain rules, bans, the allow list, the
 //! describeServer probe, the starting tier), as a requestCrawl does. Nothing
@@ -20,9 +26,10 @@
 //! and next runs, its counts) is saved in the bucket after every page, so a
 //! new leader resumes a list where the old one stopped.
 
-use crate::policy::Engine;
 use crate::policy::doc::Discovery;
+use crate::policy::{Engine, tiers};
 use crate::qlog::node::{Node as QNode, Role};
+use crate::state::{HostStore, Tier};
 use crate::upstream::{CrawlError, Crawler};
 use futures::StreamExt;
 use parking_lot::Mutex;
@@ -64,6 +71,8 @@ pub struct SourceState {
     pub new: u64,
     pub admitted: u64,
     pub refused: u64,
+    /// Hosts whose seeded account count this run wrote.
+    pub seeded: u64,
     pub errors: u64,
     /// 429s and 5xxs waited out.
     pub throttled: u64,
@@ -105,9 +114,18 @@ pub fn source_key(url: &str) -> String {
     format!("bootstrap:{host}")
 }
 
+/// One host in a `listHosts` page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listed {
+    pub hostname: String,
+    /// Its `accountCount`, or 0 when the relay doesn't list it as active or
+    /// idle: a relay that throttled or banned a host doesn't vouch for it.
+    pub accounts: u64,
+}
+
 pub enum Page {
     Hosts {
-        hosts: Vec<String>,
+        hosts: Vec<Listed>,
         cursor: Option<String>,
     },
     /// 429 or 5xx: wait this long.
@@ -140,8 +158,13 @@ pub async fn list_hosts(http: &reqwest::Client, url: &str, cursor: Option<&str>)
         body.extend_from_slice(&c);
     }
     #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct Row {
         hostname: String,
+        #[serde(default)]
+        account_count: Option<i64>,
+        #[serde(default)]
+        status: Option<String>,
     }
     #[derive(Deserialize)]
     struct Out {
@@ -151,7 +174,15 @@ pub async fn list_hosts(http: &reqwest::Client, url: &str, cursor: Option<&str>)
     }
     let o: Out = serde_json::from_slice(&body)?;
     Ok(Page::Hosts {
-        hosts: o.hosts.into_iter().map(|r| r.hostname).collect(),
+        hosts: o
+            .hosts
+            .into_iter()
+            .map(|r| {
+                let vouched = r.status.as_deref().is_none_or(|s| matches!(s, "active" | "idle"));
+                let accounts = if vouched { r.account_count.unwrap_or(0).max(0) as u64 } else { 0 };
+                Listed { hostname: r.hostname, accounts }
+            })
+            .collect(),
         cursor: o.cursor.filter(|c| !c.is_empty()),
     })
 }
@@ -165,6 +196,8 @@ struct Pace {
 pub struct DiscoveryJob {
     engine: Arc<Engine>,
     crawler: Arc<Crawler>,
+    /// The host records, for seeded account counts (None: not kept).
+    hosts: Option<Arc<dyn HostStore>>,
     /// The bucket, counted as `qlog_discovery`.
     store: Store,
     http: reqwest::Client,
@@ -180,7 +213,13 @@ pub struct DiscoveryJob {
 const WATCH: Duration = Duration::from_millis(500);
 
 impl DiscoveryJob {
-    pub fn new(engine: Arc<Engine>, crawler: Arc<Crawler>, store: Store, feed: Arc<Feed>) -> Arc<DiscoveryJob> {
+    pub fn new(
+        engine: Arc<Engine>,
+        crawler: Arc<Crawler>,
+        hosts: Option<Arc<dyn HostStore>>,
+        store: Store,
+        feed: Arc<Feed>,
+    ) -> Arc<DiscoveryJob> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .user_agent(concat!("vlrelay/", env!("CARGO_PKG_VERSION")))
@@ -189,6 +228,7 @@ impl DiscoveryJob {
         Arc::new(DiscoveryJob {
             engine,
             crawler,
+            hosts,
             store,
             http,
             feed,
@@ -409,7 +449,9 @@ impl DiscoveryJob {
                 s.pages += 1;
                 s.hosts_seen += hosts.len() as u64;
                 s.last_error = None;
-                self.admit_all(s, &hosts, key, d).await;
+                let names: Vec<String> = hosts.iter().map(|h| h.hostname.clone()).collect();
+                self.admit_all(s, &names, key, d).await;
+                s.seeded += self.seed(&hosts, key, d).await;
                 let done = hosts.is_empty() || cursor.is_none() || cursor == s.cursor;
                 if done {
                     s.cursor = None;
@@ -433,6 +475,41 @@ impl DiscoveryJob {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
+    }
+
+    /// Keeps each listed host's reported account count on its record. A
+    /// host admission refused has no record and isn't seeded.
+    async fn seed(&self, listed: &[Listed], from: &str, d: &Discovery) -> u64 {
+        let Some(store) = &self.hosts else { return 0 };
+        let sa = &d.seed_accounts;
+        let mut wrote = 0;
+        for l in listed.iter().filter(|l| l.accounts > 0 && sa.enabled) {
+            let Some(host) = self.crawler.normalize(&l.hostname) else { continue };
+            let now = crate::state::now_secs();
+            let (n, from) = (l.accounts, from.to_string());
+            let sa = sa.clone();
+            let r = store
+                .update_host(
+                    &host.0,
+                    Box::new(move |rec| {
+                        let mut rec = rec?;
+                        if matches!(rec.tier, Tier::Trusted | Tier::Suspended | Tier::Banned) {
+                            return None;
+                        }
+                        let mut hp = tiers::host_policy(&rec);
+                        hp.seeded = Some(tiers::seed_update(hp.seeded.as_ref(), n, &from, &sa, now)?);
+                        tiers::set_host_policy(&mut rec, &hp);
+                        Some(rec)
+                    }),
+                )
+                .await;
+            match r {
+                Ok(Some(_)) => wrote += 1,
+                Ok(None) => {}
+                Err(e) => tracing::warn!(host = %host.0, "discovery: seeding its account count: {e:#}"),
+            }
+        }
+        wrote
     }
 
     async fn take_connect(&self, per_min: f64) {

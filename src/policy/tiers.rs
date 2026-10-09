@@ -17,7 +17,7 @@
 //! state module's record format doesn't change and old records read as
 //! "never tripped".
 
-use super::doc::{PolicyBody, tier_name};
+use super::doc::{PolicyBody, SeedAccounts, TierLimits, tier_name};
 use crate::admin::{HostAction, HostActionRecord};
 use crate::state::{HostRecord, Tier};
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,9 @@ pub struct HostPolicy {
     /// `--backfill-new-hosts`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backfill: Option<bool>,
+    /// The account count a seed relay's `listHosts` last reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seeded: Option<Seeded>,
     /// The last tier actions, the operators' and the relay's own, newest
     /// last.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -72,6 +75,59 @@ pub struct Alias {
     pub at: u32,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub by_operator: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Seeded {
+    pub accounts: u64,
+    /// The discovery source that reported it (`bootstrap:<relay>`).
+    pub from: String,
+    /// When it was last reported (unix seconds).
+    pub at: u32,
+}
+
+impl Seeded {
+    pub fn fresh(&self, sa: &SeedAccounts, now: u32) -> bool {
+        (now.saturating_sub(self.at) as u64) < sa.ttl_secs
+    }
+}
+
+/// The seed to write for a host `from` reports `accounts` for. None:
+/// nothing to write (seeding is off, nothing reported, another relay's
+/// fresh report is higher, or the stored one is close and recent enough).
+pub fn seed_update(cur: Option<&Seeded>, accounts: u64, from: &str, sa: &SeedAccounts, now: u32) -> Option<Seeded> {
+    if !sa.enabled || accounts == 0 {
+        return None;
+    }
+    if let Some(c) = cur.filter(|c| c.fresh(sa, now)) {
+        if c.from != from && c.accounts >= accounts {
+            return None;
+        }
+        // a host's count moves every day: rewriting it on every run would
+        // be a host-table write per host per refresh
+        let close = c.accounts.abs_diff(accounts) * 10 <= c.accounts;
+        if c.from == from && close && (now.saturating_sub(c.at) as u64) < sa.ttl_secs / 2 {
+            return None;
+        }
+    }
+    Some(Seeded { accounts, from: from.to_string(), at: now })
+}
+
+/// Raises `l` as indigo's untrusted formula would for `n` more accounts:
+/// n/1000 a second, n an hour, 10n a day, n on the cap. 0 (unlimited)
+/// stays unlimited.
+pub fn add_seeded(l: &mut TierLimits, n: u64) {
+    l.events_per_sec += n as f64 / 1000.0;
+    if l.events_per_hour > 0 {
+        l.events_per_hour = l.events_per_hour.saturating_add(n);
+    }
+    if l.events_per_day > 0 {
+        l.events_per_day = l.events_per_day.saturating_add(n.saturating_mul(10));
+    }
+    if l.max_accounts > 0 {
+        l.max_accounts = l.max_accounts.saturating_add(n);
+    }
 }
 
 /// How far an alias of an alias is followed to the host the relay reads.

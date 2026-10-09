@@ -59,6 +59,8 @@ export type HostRow = {
   aliasOf?: string | null
   /** How the relay found it: requestCrawl, bootstrap:<relay>, plc or cli. */
   source: string | null
+  /** The account count a seed relay's listHosts reported that its limits are raised for, while that counts. Absent otherwise, and on an older relay. */
+  seededAccounts?: number | null
   /** The reject reason with the most of its recent rejects (last 5 min), or null. */
   topReason: RejectReason | null
   /** Events/s, 1 s apart, oldest first: only on the overview's top hosts. */
@@ -749,6 +751,8 @@ export type DiscoverySource = {
   new: number
   admitted: number
   refused: number
+  /** hosts whose seeded account count this run wrote (absent on an older relay) */
+  seeded?: number
   errors: number
   throttled: number
   pages: number

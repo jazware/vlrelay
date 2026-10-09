@@ -31,7 +31,7 @@ async fn list_hosts_pages_through_and_reports_429s() {
                 later += 1;
             }
             Page::Hosts { hosts, cursor: next } => {
-                seen.extend(hosts);
+                seen.extend(hosts.into_iter().map(|h| h.hostname));
                 cursor = next;
                 if cursor.is_none() {
                     break;
@@ -57,6 +57,7 @@ async fn policy(engine: &Engine, url: &str) {
         connects_per_min: 6_000.0,
         requests_per_sec: 4.0,
         aliases: true,
+        ..Default::default()
     };
     engine.save_policy(cur.version, body, "test", "").await.unwrap();
 }
@@ -80,7 +81,7 @@ async fn a_new_leader_resumes_discovery_mid_list() {
     let start = |c: &Cluster, id: &str| {
         let (m, _rx) = Manager::new(UpstreamConfig::new(true), Arc::new(MemHostStore::default()), None);
         let crawler = Crawler::new(m.clone(), CrawlPolicy { probe_timeout_secs: 1, ..Default::default() });
-        let j = DiscoveryJob::new(engine.clone(), crawler, store.clone(), Arc::new(Feed::default()));
+        let j = DiscoveryJob::new(engine.clone(), crawler, None, store.clone(), Arc::new(Feed::default()));
         tokio::spawn(j.clone().run(Arc::downgrade(&c.nodes[id].node)));
         (j, m)
     };
@@ -152,7 +153,7 @@ async fn plc_hosts_go_through_admission_as_plc() {
     let crawler = Crawler::new(m, CrawlPolicy { probe_timeout_secs: 1, ..Default::default() });
     let feed = Arc::new(Feed::default());
     let store = crate::qlog::bucket::counted(&c.store, "discovery");
-    let j = DiscoveryJob::new(engine, crawler.clone(), store, feed.clone());
+    let j = DiscoveryJob::new(engine, crawler.clone(), None, store, feed.clone());
     let id = c.nodes.keys().next().unwrap().clone();
     tokio::spawn(j.clone().run(Arc::downgrade(&c.nodes[&id].node)));
     for h in ["known.fakepds.invalid", "a.fakepds.invalid", "b.fakepds.invalid", "a.fakepds.invalid"] {
@@ -172,5 +173,101 @@ async fn plc_hosts_go_through_admission_as_plc() {
     let log = crawler.admissions();
     assert!(log.iter().all(|a| a.source == "plc") && log.len() == 2, "{log:?}");
     j.stop();
+    c.shutdown();
+}
+
+/// A seed relay's listHosts, one page: (hostname, accountCount, status).
+async fn seed_relay(rows: &'static [(&'static str, i64, &'static str)]) -> String {
+    let body = serde_json::json!({
+        "hosts": rows.iter().map(|(h, n, st)| serde_json::json!({"hostname": h, "accountCount": n, "status": st, "seq": 1})).collect::<Vec<_>>(),
+    });
+    let app = axum::Router::new().route(
+        "/xrpc/com.atproto.sync.listHosts",
+        axum::routing::get(move || std::future::ready(axum::Json(body.clone()))),
+    );
+    let lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", lis.local_addr().unwrap());
+    tokio::spawn(axum::serve(lis, app).into_future());
+    url
+}
+
+/// A host a seed relay lists with 50,000 accounts gets limits for them from
+/// the first run, before this relay has seen any of its accounts. What the
+/// seed relay throttled or banned, a trusted host, a host admission
+/// refused, and anything past `seedAccounts.max` aren't seeded (or are
+/// capped). The count is on the host record, so a restarted engine reading
+/// it back applies it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seed_relays_account_count_seeds_a_hosts_limits() {
+    use crate::policy::tiers;
+    use crate::qlog::tests::Cluster;
+    use crate::state::{HostRecord, HostStore, Tier};
+    const ROWS: &[(&str, i64, &str)] = &[
+        ("big.fakepds.invalid", 50_000, "active"),
+        ("huge.fakepds.invalid", 5_000_000, "active"),
+        ("spammy.fakepds.invalid", 40_000, "throttled"),
+        ("trusted.fakepds.invalid", 900_000, "active"),
+        ("small.fakepds.invalid", 0, "active"),
+        ("refused.fakepds.invalid", 30_000, "active"),
+    ];
+    let url = seed_relay(ROWS).await;
+    let c = Cluster::with_cfg(1, None, None, 64 << 20).await;
+    let engine = Engine::new(c.store.clone(), "test", Arc::new(crate::policy::budget::FixedNodes::new(1)));
+    policy(&engine, &url).await;
+    let (m, _rx) = Manager::new(UpstreamConfig::new(true), Arc::new(MemHostStore::default()), None);
+    let hosts = Arc::new(crate::state::tests::MemHosts::default());
+    let now = crate::state::now_secs();
+    for (h, _, _) in &ROWS[..5] {
+        let tier = if h.starts_with("trusted") { Tier::Trusted } else { Tier::New };
+        m.admit(&crate::types::Host(h.to_string()), crate::upstream::host::Tier::New).await.unwrap();
+        hosts.put_host(&HostRecord::new(h, tier, now)).await.unwrap();
+    }
+    let before = engine.for_host(&hosts.get_host("big.fakepds.invalid").await.unwrap().unwrap());
+    assert_eq!(before.limits.unwrap().events_per_hour, 3_500);
+    let crawler = Crawler::new(m, CrawlPolicy { probe_timeout_secs: 1, ..Default::default() });
+    let store = crate::qlog::bucket::counted(&c.store, "discovery");
+    let dyn_hosts: Arc<dyn HostStore> = hosts.clone();
+    let j = DiscoveryJob::new(engine.clone(), crawler, Some(dyn_hosts), store, Arc::new(Feed::default()));
+    let id = c.nodes.keys().next().unwrap().clone();
+    tokio::spawn(j.clone().run(Arc::downgrade(&c.nodes[&id].node)));
+    let t = Instant::now();
+    let s = loop {
+        let v = j.view();
+        let s = v.sources[0].state.clone();
+        if s.last_finished_ms.is_some() && !s.in_progress {
+            break s;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "{v:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    j.stop();
+    assert_eq!((s.known, s.refused, s.seeded), (5, 1, 2), "{s:?}");
+    let seed = |h: &str| {
+        let hosts = hosts.clone();
+        let h = h.to_string();
+        async move { hosts.get_host(&h).await.unwrap().map(|r| tiers::host_policy(&r).seeded) }
+    };
+    let big = seed("big.fakepds.invalid").await.unwrap().unwrap();
+    assert_eq!((big.accounts, big.from.as_str()), (50_000, crate::discovery::source_key(&url).as_str()));
+    assert_eq!(seed("huge.fakepds.invalid").await.unwrap().unwrap().accounts, 5_000_000);
+    for h in ["spammy.fakepds.invalid", "trusted.fakepds.invalid", "small.fakepds.invalid"] {
+        assert_eq!(seed(h).await.unwrap(), None, "{h}");
+    }
+    assert_eq!(seed("refused.fakepds.invalid").await, None, "no record");
+
+    // a restart: a new engine over the same bucket, the records as stored
+    let engine2 = Engine::new(c.store.clone(), "test", Arc::new(crate::policy::budget::FixedNodes::new(1)));
+    engine2.refresh().await.unwrap();
+    let l = engine2.for_host(&hosts.get_host("big.fakepds.invalid").await.unwrap().unwrap());
+    assert_eq!(l.seeded_accounts, Some(50_000));
+    let lim = l.limits.unwrap();
+    // ~8 events/s, a busy 50k-account PDS, fits every window from the start
+    assert!(
+        lim.events_per_sec >= 8.0 && lim.events_per_hour >= 8 * 3_600 && lim.events_per_day >= 8 * 86_400,
+        "{lim:?}"
+    );
+    assert_eq!(lim.max_accounts, 201_000);
+    let huge = engine2.for_host(&hosts.get_host("huge.fakepds.invalid").await.unwrap().unwrap());
+    assert_eq!(huge.limits.unwrap().max_accounts, 1_001_000, "capped at seedAccounts.max");
     c.shutdown();
 }

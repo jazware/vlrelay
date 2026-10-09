@@ -243,6 +243,11 @@ pub struct HostRow {
     /// or `cli` (None: before sources were recorded).
     #[serde(default)]
     pub source: Option<String>,
+    /// The account count a seed relay's `listHosts` reported that its
+    /// limits are raised for, while that counts (docs/policy.md, "Seeded
+    /// account counts").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeded_accounts: Option<u64>,
     /// The reject reason with the most of its recent rejects (the last
     /// five minutes), if any.
     #[serde(default)]
