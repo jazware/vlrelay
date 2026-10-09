@@ -42,6 +42,8 @@ lazy!(NEW_ACCOUNTS: IntCounter = register_int_counter!("vlrelay_new_accounts_tot
 lazy!(ACCOUNTS_THROTTLED: IntCounterVec = register_int_counter_vec!("vlrelay_accounts_throttled_total", "New accounts created throttled by policy, by why (host_cap)", &["why"]));
 lazy!(ACCOUNTS_DEFERRED: IntCounterVec = register_int_counter_vec!("vlrelay_accounts_deferred_total", "Events of new accounts dropped while a new-account budget was spent, by which (host_rate, cluster_budget)", &["why"]));
 lazy!(FORCED_LOOKUPS_REFUSED: IntCounter = register_int_counter!("vlrelay_forced_lookups_refused_total", "Fresh DID document fetches an event asked for that its host's budget refused (the cached document was used)"));
+lazy!(ALIAS_WATCHES: IntCounterVec = register_int_counter_vec!("vlrelay_alias_watches_total", "Host pairs the leader watched for one PDS under two names, by outcome (started, same, differ, marked)", &["outcome"]));
+lazy!(HOST_ALIASES: IntGauge = register_int_gauge!("vlrelay_host_aliases", "Hosts marked another name for a host the relay reads (no socket of their own)"));
 lazy!(RESYNCS: IntCounterVec = register_int_counter_vec!("vlrelay_resyncs_total", "Desynchronized accounts fetched from their PDS and sent as a #sync, by outcome (synced, unchanged, rejected, fetch_failed, dropped)", &["outcome"]));
 lazy!(LANE_QUEUED: IntGauge = register_int_gauge!("vlrelay_lane_queued", "Events queued in front of the pipeline lanes"));
 

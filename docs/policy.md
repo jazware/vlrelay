@@ -174,6 +174,61 @@ leader resumes a list where the old one stopped. Each host's source (`requestCra
 the admission log. `GET /admin/api/discovery` shows each source's last and next run and its counts,
 and `POST /admin/api/discovery/run` starts one now ([Admin API](admin-api.md)).
 
+## Host aliases
+
+Some PDSes answer under several hostnames: a wildcard certificate and DNS that send other names to
+the same server. `listHosts` on other relays carries each name, discovery and requestCrawl admit
+each one, and the relay reads every name's socket. Each streams the same events at the same seqs,
+and the DID documents name one of them. The other names' copies are `wrong_host` rejects when they
+win the race to the relay and duplicates when they lose it. They cost verification, a DID document
+fetch per account per 30 s charged to the alias's lookup budget, and the alias's error budget,
+which can throttle it. One group of five names for one PDS was most of a production relay's
+`wrong_host` rejects.
+
+The leader finds them and reads each such PDS under one name:
+
+1. **A suspect pair.** A host's event is rejected `wrong_host`, or is a duplicate of one another
+   host's event already applied. The sender and the host the record names become a pair to watch,
+   unless the sender is an alias already or an operator said it isn't one. At most 16 pairs are
+   watched at once.
+2. **One stream.** For each pair, every event either side sends is keyed by its upstream seq and
+   DID. A key both send is a match. A key one side sends and the other doesn't, once the other's
+   seq has passed it and two minutes have gone by, means the two aren't one stream, and the watch
+   ends. A side that's behind (throttled, reconnecting) is waited for. The first two minutes only
+   warm up: the other side may have sent its copy before the watch began. 20 matches after that
+   make the pair one stream. A watch with too few events in 2 h gives up, and a pair isn't watched
+   again for 6 h after a watch ends.
+3. **One service.** Both names must answer `describeServer` with the same service DID. Two
+   separately run PDSes with the same events at the same seqs would be a mirror, and are left
+   alone.
+4. **Marked.** The sender is marked an alias of the host its accounts' documents name (or of the
+   host that one is an alias of). It's an action on the host's record by `relay (service)`, kept
+   in its trail like a tier change. The alias's socket closes. Its tier, limits and cursor stay.
+
+While a host is an alias, an event from either name counts as from the PDS for an account whose
+document names the other. So accounts whose documents name the alias still come through, from the
+name the relay reads. A third host is still a stranger to both. The dashboard shows the host as
+`alias` with the host it's an alias of, and `vlrelay_host_aliases` counts them.
+
+**Rechecks.** A day after the relay last confirmed an alias, the leader asks both names'
+`describeServer` again. The same service DID renews it. Another one clears it: the name is a
+different PDS now, so its socket opens again from its own cursor, and its own events go through
+the usual checks. A name that doesn't answer keeps its alias. An operator's alias isn't rechecked.
+
+**No failover.** If the name the relay reads goes down, the alias doesn't take over. The two names
+are one server, so it's usually down too. Following the alias's events for the other name's
+accounts would let a name that changed hands speak for them, and nothing in an `#account` event
+is signed. An operator clears the alias to read it again.
+
+**A ban covers both.** Banning or suspending the name the relay reads leaves the alias closed, so
+another name isn't a way around the ban.
+
+**Operators.** `{"action": "alias", "of": host}` marks a host an alias by hand. It's never
+rechecked, and it may name a host that's an alias itself, as long as the chain doesn't loop.
+`{"action": "unalias"}` clears an alias, and `"pin": true` also keeps the relay from finding it
+again ([Admin API](admin-api.md)). `discovery.aliases` (on by default) turns the finding off.
+Aliases already marked hold either way.
+
 ## Limits and signals
 
 Each host gets token buckets for events per second, bytes per second, and events per hour and per

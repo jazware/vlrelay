@@ -338,11 +338,15 @@ pub struct Discovery {
     pub connects_per_min: f64,
     /// `listHosts` requests a second to any one relay.
     pub requests_per_sec: f64,
+    /// Find hosts that are other names for a PDS the relay reads, and read
+    /// each such PDS under one name (docs/policy.md, "Host aliases").
+    /// Operators' aliases hold either way.
+    pub aliases: bool,
 }
 
 impl Default for Discovery {
     fn default() -> Self {
-        Discovery { seed_relays: Vec::new(), plc: false, connects_per_min: 120.0, requests_per_sec: 2.0 }
+        Discovery { seed_relays: Vec::new(), plc: false, connects_per_min: 120.0, requests_per_sec: 2.0, aliases: true }
     }
 }
 

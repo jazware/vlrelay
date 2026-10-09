@@ -1030,3 +1030,50 @@ fn the_wire_policy_and_the_document_name_the_same_tiers() {
     assert_eq!(wire, doc);
     assert_eq!(wire, ["default", "new", "throttled", "trusted"].iter().map(|s| s.to_string()).collect());
 }
+
+#[tokio::test]
+async fn alias_actions_disconnect_and_refuse_loops() {
+    let store = Store::memory(None);
+    let e = engine(&store, "a");
+    let hosts = Arc::new(MemHosts::default());
+    for h in ["pds.example.com", "alias.example.com", "other.example.com"] {
+        hosts.put_host(&rec(h, Tier::Default, 0)).await.unwrap();
+    }
+    let a = PolicyAdmin::new(e.clone(), hosts.clone());
+    let get = |h: &'static str| {
+        let hosts = hosts.clone();
+        async move { hosts.get_host(h).await.unwrap().unwrap() }
+    };
+
+    // the relay's alias: no socket, the tier kept
+    let alias = HostAction::Alias { of: "PDS.example.com".into() };
+    a.host_action("alias.example.com", alias, tiers::RELAY_ACTOR).await.unwrap();
+    let r = get("alias.example.com").await;
+    let al = tiers::host_policy(&r).alias.unwrap();
+    assert_eq!((al.of.as_str(), al.by_operator), ("pds.example.com", false));
+    let l = e.for_host(&r);
+    assert_eq!((l.tier, l.connect, l.alias_of.as_deref()), (Tier::Default, false, Some("pds.example.com")));
+    assert!(e.for_host(&get("pds.example.com").await).connect);
+
+    // no loops, no self-aliases, no unknown hosts
+    let back = HostAction::Alias { of: "alias.example.com".into() };
+    assert!(a.host_action("pds.example.com", back, "op").await.is_err());
+    let me = HostAction::Alias { of: "other.example.com".into() };
+    assert!(a.host_action("other.example.com", me, "op").await.is_err());
+    let gone = HostAction::Alias { of: "gone.example.com".into() };
+    assert!(a.host_action("other.example.com", gone, "op").await.is_err());
+
+    // an operator's pin keeps the relay from marking it again
+    a.host_action("alias.example.com", HostAction::Unalias { pin: true }, "op").await.unwrap();
+    let r = get("alias.example.com").await;
+    assert!(tiers::host_policy(&r).alias.is_none() && tiers::host_policy(&r).not_alias);
+    assert!(e.for_host(&r).connect);
+    let again = HostAction::Alias { of: "pds.example.com".into() };
+    assert!(a.host_action("alias.example.com", again.clone(), tiers::RELAY_ACTOR).await.is_err());
+    // an operator can still say it is one, and that alias is theirs
+    a.host_action("alias.example.com", again, "op").await.unwrap();
+    let r = get("alias.example.com").await;
+    let hp = tiers::host_policy(&r);
+    assert!(hp.alias.unwrap().by_operator && !hp.not_alias);
+    assert_eq!(PolicyAdmin::host_actions(&r).len(), 3);
+}

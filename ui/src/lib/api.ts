@@ -16,7 +16,7 @@ export class ApiError extends Error {
 // ---------------------------------------------------------------- wire types
 
 /** `throttled`: held at its own limits (tier, rule or operator). `backpressure`: paused by the relay, which is behind. */
-export type HostStatus = 'connected' | 'idle' | 'backoff' | 'offline' | 'throttled' | 'backpressure' | 'suspended' | 'banned'
+export type HostStatus = 'connected' | 'idle' | 'backoff' | 'offline' | 'throttled' | 'backpressure' | 'suspended' | 'banned' | 'alias'
 /** What's full while a host is in `backpressure`: its in-flight cap, the node's, or its lane queue (usually an identity backlog). */
 export type BackpressureReason = 'inflight_full' | 'node_inflight_full' | 'queue_full' | 'memory_full'
 export type Severity = 'info' | 'warn' | 'high' | 'critical'
@@ -55,6 +55,8 @@ export type HostRow = {
   maxAccounts: number
   /** Accounts it created that the relay throttled past its cap (the leader's count). */
   throttledAccounts: number
+  /** While `status` is `alias`: the host this one is another name for. */
+  aliasOf?: string | null
   /** How the relay found it: requestCrawl, bootstrap:<relay>, plc or cli. */
   source: string | null
   /** The reject reason with the most of its recent rejects (last 5 min), or null. */
@@ -200,6 +202,8 @@ export type HostAction =
   | { action: 'unban' }
   | { action: 'reconnect' }
   | { action: 'set-account-limit'; maxAccounts: number | null }
+  | { action: 'alias'; of: string }
+  | { action: 'unalias'; pin?: boolean }
 
 export type HostDetail = {
   row: HostRow

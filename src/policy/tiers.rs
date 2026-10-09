@@ -44,11 +44,33 @@ pub struct HostPolicy {
     /// Operator account cap in place of the tier's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_accounts: Option<u64>,
+    /// Set while the host is another name for a PDS the relay reads under
+    /// `of`: no socket, and `of`'s events speak for its accounts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<Alias>,
+    /// An operator said this host is its own PDS: the relay never marks it
+    /// an alias.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub not_alias: bool,
     /// The last tier actions, the operators' and the relay's own, newest
     /// last.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<serde_json::Value>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Alias {
+    pub of: String,
+    /// When the relay last confirmed it (unix seconds): it checks again a
+    /// day later. An operator's alias isn't rechecked.
+    pub at: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub by_operator: bool,
+}
+
+/// How far an alias of an alias is followed to the host the relay reads.
+pub const ALIAS_HOPS: usize = 4;
 
 pub const ACTIONS_KEPT: usize = 20;
 /// Who the trail says moved a host when the relay did it on its own.
@@ -194,6 +216,16 @@ pub enum Manual {
     Ban(String),
     /// Lifts a suspension or a ban.
     Unban,
+    /// Marks the host another name for `of`'s PDS (`by_operator`: pinned,
+    /// never rechecked).
+    Alias {
+        of: String,
+        by_operator: bool,
+    },
+    /// Clears an alias; `pin` also keeps the relay from finding it again.
+    Unalias {
+        pin: bool,
+    },
 }
 
 /// Applies an operator action to a record. Errors are the operator's (a
@@ -238,6 +270,20 @@ pub fn apply_manual(rec: &mut HostRecord, m: &Manual, now: u32) -> Result<(), St
             rec.tier = s.restore_tier.take().unwrap_or(Tier::Default);
             s.throttled_at = None;
             s.reason = Some(format!("restored to {} by an operator", tier_name(rec.tier)));
+        }
+        Manual::Alias { of, by_operator } => {
+            if of.eq_ignore_ascii_case(&rec.hostname) {
+                return Err(format!("{} can't be an alias of itself", rec.hostname));
+            }
+            if s.not_alias && !by_operator {
+                return Err(format!("an operator marked {} not an alias", rec.hostname));
+            }
+            s.not_alias = false;
+            s.alias = Some(Alias { of: of.clone(), at: now, by_operator: *by_operator });
+        }
+        Manual::Unalias { pin } => {
+            s.alias = None;
+            s.not_alias = *pin;
         }
     }
     set_host_policy(rec, &s);

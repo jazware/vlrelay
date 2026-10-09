@@ -775,3 +775,39 @@ async fn foreign_identity_creates_no_account() {
     commit(&st, &dids[0], &victim, claim(&dids[0], 3), NOW).await.unwrap();
     assert_eq!(*gate.0.lock(), vec![(dids[0].clone(), Arrival::FirstSeen)]);
 }
+
+#[tokio::test]
+async fn an_alias_and_the_host_it_names_speak_for_each_other() {
+    let id = MapIdentity::new();
+    let (did, other) = (plc(41), plc(42));
+    id.set(&did, "alias.example", 1);
+    id.set(&other, "pds.example", 2);
+    let st = open(2, id.clone(), ApplyConfig { reresolve_after_secs: 30, ..Default::default() }).await;
+    let (alias, pds) = (host("alias.example"), host("pds.example"));
+
+    // before: the document names the alias, so the other name's copy is wrong_host
+    let r = commit(&st, &did, &pds, claim(&did, 1), NOW).await;
+    assert!(matches!(r, Err(Reject::WrongHost { .. })), "{r:?}");
+
+    st.set_host_aliases(HashMap::from([(HostKey::of("alias.example"), HostKey::of("pds.example"))]));
+    let a = commit(&st, &did, &pds, claim(&did, 1), NOW + 60).await.unwrap();
+    persist(&st, &[accepted(&a)]).await;
+    let lookups = id.lookups();
+    let a = commit(&st, &did, &pds, claim(&did, 2), NOW + 61).await.unwrap();
+    persist(&st, &[accepted(&a)]).await;
+    assert_eq!(id.lookups(), lookups, "owned: no lookup per event");
+    // and the alias's own copy (a failover, a recheck) the other way round
+    let a = commit(&st, &did, &alias, claim(&did, 3), NOW + 62).await.unwrap();
+    persist(&st, &[accepted(&a)]).await;
+    let a = commit(&st, &other, &alias, claim(&other, 1), NOW + 63).await.unwrap();
+    assert!(matches!(a, Applied::Append(_)));
+
+    // a third host is still a stranger to both
+    let r = commit(&st, &did, &host("elsewhere.example"), claim(&did, 4), NOW + 64).await;
+    assert!(matches!(r, Err(Reject::WrongHost { .. })), "{r:?}");
+
+    // cleared: the documents' own names again
+    st.set_host_aliases(HashMap::new());
+    let r = commit(&st, &other, &alias, claim(&other, 2), NOW + 200).await;
+    assert!(matches!(r, Err(Reject::WrongHost { .. })), "{r:?}");
+}

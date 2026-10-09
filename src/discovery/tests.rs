@@ -56,6 +56,7 @@ async fn policy(engine: &Engine, url: &str) {
         plc: false,
         connects_per_min: 6_000.0,
         requests_per_sec: 4.0,
+        aliases: true,
     };
     engine.save_policy(cur.version, body, "test", "").await.unwrap();
 }

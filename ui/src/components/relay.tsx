@@ -14,9 +14,10 @@ const STATUS_LABEL: Record<HostStatus, string> = {
   backpressure: 'backpressure',
   suspended: 'suspended',
   banned: 'banned',
+  alias: 'alias',
 }
 
-export const HOST_STATUSES: HostStatus[] = ['connected', 'idle', 'throttled', 'backpressure', 'backoff', 'offline', 'suspended', 'banned']
+export const HOST_STATUSES: HostStatus[] = ['connected', 'idle', 'throttled', 'backpressure', 'backoff', 'offline', 'suspended', 'banned', 'alias']
 
 export function StatusPill({ status }: { status: HostStatus }) {
   return <span className={`sp sp-${status}`}>{STATUS_LABEL[status]}</span>

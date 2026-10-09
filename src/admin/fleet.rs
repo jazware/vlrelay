@@ -330,6 +330,7 @@ mod tests {
             max_accounts: 100,
             history: Vec::new(),
             throttled_accounts: 0,
+            alias_of: None,
             source: None,
             top_reason: None,
             version: None,

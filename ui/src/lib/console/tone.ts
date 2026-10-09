@@ -8,10 +8,11 @@ export type Tone = 'ok' | 'warn' | 'err' | 'info' | 'idle'
 export const GLYPH: Record<Tone, string> = { ok: '●', warn: '▲', err: '■', info: '◆', idle: '○' }
 
 // backpressure is the relay's own state, not the host's: info, so it never reads as a throttle
-const HOST: Record<HostStatus, Tone> = { connected: 'ok', idle: 'idle', backoff: 'warn', offline: 'err', throttled: 'warn', backpressure: 'info', suspended: 'err', banned: 'err' }
+const HOST: Record<HostStatus, Tone> = { connected: 'ok', idle: 'idle', backoff: 'warn', offline: 'err', throttled: 'warn', backpressure: 'info', suspended: 'err', banned: 'err', alias: 'idle' }
 export const HOST_TITLE: Partial<Record<HostStatus, string>> = {
   throttled: 'Held at its own limits: its tier, a domain rule or an operator throttle',
   backpressure: 'Paused by the relay, which is behind: not this host’s limits',
+  alias: 'Another name for a PDS the relay reads under its own name: no socket of its own',
 }
 export const hostTone = (s: string): Tone => HOST[s as HostStatus] ?? 'idle'
 

@@ -248,6 +248,7 @@ pub fn host_status_label(h: &HostView) -> &'static str {
         admin::HostStatus::Backpressure => "backpressure",
         admin::HostStatus::Suspended => "suspended",
         admin::HostStatus::Banned => "banned",
+        admin::HostStatus::Alias => "alias",
     }
 }
 
@@ -311,10 +312,16 @@ impl NodeAdmin {
         rejects: Option<&super::metrics::HostRejects>,
     ) -> admin::HostRow {
         let (rate, ratio) = series.map_or((0.0, 0.0), |s| (s.rate(), s.reject_ratio()));
+        let alias_of = self.policy.alias_of(&h.record.hostname);
         admin::HostRow {
             host: h.record.hostname.clone(),
             tier: h.record.tier.as_str().into(),
-            status: status(h),
+            status: match status(h) {
+                s @ (admin::HostStatus::Banned | admin::HostStatus::Suspended) => s,
+                _ if alias_of.is_some() => admin::HostStatus::Alias,
+                s => s,
+            },
+            alias_of,
             backpressure_reason: backpressure_reason(h),
             events_per_sec: rate,
             error_rate: ratio,
@@ -1816,6 +1823,7 @@ mod tests {
             max_accounts: 0,
             history: Vec::new(),
             throttled_accounts: 0,
+            alias_of: None,
             source: None,
             top_reason: None,
             version: None,

@@ -515,7 +515,7 @@ impl<C: Chain> StateStore<C> {
         identity: bool,
     ) -> Result<Authority, Reject> {
         let hk = HostKey::of(&ev.host.0);
-        let owner = rec.fetched_at != 0 && rec.pds == Some(hk);
+        let owner = rec.fetched_at != 0 && rec.pds.is_some_and(|p| self.same_host(p, hk));
         let recent = rec.fetched_at != 0 && ev.now.saturating_sub(rec.fetched_at) < self.config.reresolve_after_secs;
         let force = identity && (owner || !recent);
         let budget = |host: &str| self.account_gate().is_none_or(|g| g.forced_lookup(host));
@@ -549,7 +549,7 @@ impl<C: Chain> StateStore<C> {
             if rec.pds.is_none() {
                 return Err(Reject::NoIdentity);
             }
-            if rec.pds == Some(hk) {
+            if rec.pds.is_some_and(|p| self.same_host(p, hk)) {
                 return Ok(Authority::Ok);
             }
             if fresh || !budget(&ev.host.0) {
