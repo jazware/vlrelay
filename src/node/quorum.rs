@@ -104,6 +104,8 @@ pub struct QuorumSetup {
     /// With `plc_export`: this member's copy of the seeds on local disk
     /// (`plc_seed::local`).
     pub plc_seeds_dir: Option<std::path::PathBuf>,
+    /// How the leader decides two hostnames are one PDS.
+    pub aliases: super::aliases::AliasConfig,
 }
 
 impl QuorumSetup {
@@ -135,6 +137,7 @@ impl QuorumSetup {
             trust_after_power_loss: false,
             plc_export: None,
             plc_seeds_dir: None,
+            aliases: Default::default(),
         }
     }
 }
@@ -528,6 +531,8 @@ pub struct RelayHooks {
     pub answers: std::sync::OnceLock<Arc<dyn LocalAsk>>,
     /// The admin change feed: committed takedowns and throttle lifts.
     pub changes: std::sync::OnceLock<Arc<crate::admin::changes::ChangeFeed>>,
+    /// Watches host pairs that look like one PDS under two names.
+    pub aliases: std::sync::OnceLock<Arc<super::aliases::AliasWatch>>,
     /// Tests: each decision of every other batch (at random) takes this
     /// long (µs), as a batch with slow identity lookups does.
     #[cfg(test)]
@@ -577,9 +582,15 @@ impl RelayHooks {
             discovery: std::sync::OnceLock::new(),
             answers: std::sync::OnceLock::new(),
             changes: std::sync::OnceLock::new(),
+            aliases: std::sync::OnceLock::new(),
             #[cfg(test)]
             slow_us: AtomicU64::new(0),
         })
+    }
+
+    /// Whether this node leads a term now.
+    pub fn leading(&self) -> bool {
+        self.term.read().is_some()
     }
 
     fn current(&self, epoch: u64) -> Option<Arc<Term>> {
@@ -681,6 +692,28 @@ impl RelayHooks {
             Verdict::Append { meta: Meta { writes, ext: ext.encode() }.encode(), ticket: tk }
         };
         let _ = it;
+        if let Some(w) = self.aliases.get()
+            && useq > 0
+        {
+            let named = match &r {
+                Err(state::Reject::WrongHost { expected, .. }) => *expected,
+                // another host's copy came first: an alias that lost the race
+                Ok(Applied::Duplicate) => term
+                    .shard
+                    .load(&did)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|rec| rec.host)
+                    .filter(|k| *k != state::HostKey::of(&host.0)),
+                _ => None,
+            };
+            let now = Instant::now();
+            if let Some(of) = named.and_then(|k| self.state.host_name(k)) {
+                w.suspect(&host.0, &of, now);
+            }
+            w.observe(&host.0, useq, &did, now);
+        }
         match r {
             Ok(Applied::Append(a)) => {
                 ext.key_changed = a.key_changed;
@@ -2588,6 +2621,19 @@ impl Node {
             let _ = hosts.changed.set(h.changed_sender());
             h.install(&manager, &crawler, &identity);
             h.load().await?;
+            let (w, found) = super::aliases::AliasWatch::new(q.aliases.clone());
+            let ph = h.clone();
+            w.set_eligible(Arc::new(move |host: &str, of: &str| {
+                ph.engine.snapshot().policy.body.discovery.aliases && ph.alias_candidate(host, of).is_some()
+            }));
+            let _ = hooks.aliases.set(w);
+            let rh = Arc::downgrade(&hooks);
+            super::aliases::spawn(
+                h.clone(),
+                Arc::new(manager.config().clone()),
+                found,
+                Arc::new(move || rh.upgrade().is_some_and(|r| r.leading())),
+            );
         }
         if let Some(h) = &policy {
             let feed = Arc::new(crate::discovery::Feed::default());

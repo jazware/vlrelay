@@ -53,6 +53,9 @@ pub enum HostStatus {
     Suspended,
     /// Banned: no socket, its events are dropped, requestCrawl refused.
     Banned,
+    /// Another name for a PDS the relay reads under [`HostRow::alias_of`]:
+    /// no socket of its own.
+    Alias,
 }
 
 /// What's full while a host is in [`HostStatus::Backpressure`].
@@ -233,6 +236,9 @@ pub struct HostRow {
     /// operator has released, as the leader counts them.
     #[serde(default)]
     pub throttled_accounts: u64,
+    /// The host this one is another name for, while it's an alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_of: Option<String>,
     /// How the relay found it: `requestCrawl`, `bootstrap:<relay>`, `plc`
     /// or `cli` (None: before sources were recorded).
     #[serde(default)]
@@ -355,6 +361,16 @@ pub enum HostAction {
     SetAccountLimit {
         #[serde(rename = "maxAccounts")]
         max_accounts: Option<u64>,
+    },
+    /// Marks the host another name for `of`'s PDS: its socket closes and
+    /// `of`'s events speak for its accounts.
+    Alias {
+        of: String,
+    },
+    /// Clears an alias. `pin`: the relay won't mark it one again.
+    Unalias {
+        #[serde(default)]
+        pin: bool,
     },
 }
 

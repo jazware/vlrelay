@@ -32,6 +32,10 @@ function describe(a: HostAction): string {
       return 'reconnect'
     case 'set-account-limit':
       return a.maxAccounts == null ? "account cap back to the tier's" : `set-account-limit ${fmtNum(a.maxAccounts)}`
+    case 'alias':
+      return `alias of ${a.of}`
+    case 'unalias':
+      return a.pin ? 'not an alias (pinned)' : 'alias cleared'
   }
 }
 
@@ -49,7 +53,7 @@ const cols = (page: boolean, a: ReactNode, b: ReactNode) =>
   )
 
 type Acted = HostDetail['actions'][number]
-const HELD = new Set(['throttled', 'backpressure', 'backoff', 'suspended', 'banned'])
+const HELD = new Set(['throttled', 'backpressure', 'backoff', 'suspended', 'banned', 'alias'])
 
 /** What's full while the relay pauses a host, in a few words, for the Upstream panel. */
 const BP_SHORT: Record<BackpressureReason, string> = {
@@ -196,6 +200,17 @@ function WhyHeld({ d, policy, rules, cases }: { d: HostDetail; policy?: Policy; 
         </button>,
       )
     if (byRule) outs.push(...ruleOut)
+  } else if (r.status === 'alias') {
+    tone = 'info'
+    const act = last('alias')
+    title = <>Alias of {r.aliasOf}</>
+    lines.push(<>It streams {r.aliasOf}'s events at the same seqs, so the relay reads that name only, and {r.aliasOf}'s events speak for accounts whose DID documents name this one.</>)
+    if (act) lines.push(<>Marked by {by(act)}.</>)
+    outs.push(
+      <button key="unalias" type="button" className="cx-btn sm" onClick={() => hostActionDialog('unalias', r)}>
+        Not an alias…
+      </button>,
+    )
   } else if (r.status === 'backpressure') {
     tone = 'info'
     const [t, what] = BP_WHY[r.backpressureReason ?? 'unknown']

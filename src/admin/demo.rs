@@ -252,6 +252,7 @@ struct SimHost {
     shard: usize,
     version: Option<String>,
     updated_at: Option<i64>,
+    alias_of: Option<String>,
 }
 
 struct Sample {
@@ -384,6 +385,7 @@ impl Sim {
                 recent: VecDeque::with_capacity(RECENT_REJECTS),
                 by_reason: BTreeMap::new(),
                 actions: Vec::new(),
+                alias_of: None,
             });
         };
         for (i, m) in MUSHROOMS.iter().enumerate() {
@@ -1060,6 +1062,7 @@ impl Sim {
             max_accounts: if h.tier == "trusted" { 10_000_000 } else { 100 },
             history: Vec::new(),
             throttled_accounts: if h.tier == "trusted" { 0 } else { h.accounts.saturating_sub(100).min(5_000) },
+            alias_of: h.alias_of.clone(),
             top_reason: h.by_reason.iter().filter(|(_, n)| **n > 0).max_by_key(|(_, n)| **n).map(|(r, _)| *r),
             source: Some(match hash(&h.name) % 5 {
                 0 => "requestCrawl".into(),
@@ -1469,6 +1472,19 @@ impl AdminSource for Demo {
                 }
             }
             HostAction::SetAccountLimit { .. } => {}
+            HostAction::Alias { of } => {
+                if !matches!(h.status, HostStatus::Banned | HostStatus::Suspended) {
+                    h.status = HostStatus::Alias;
+                }
+                h.alias_of = Some(of.clone());
+                h.connected_since = None;
+            }
+            HostAction::Unalias { .. } => {
+                if h.alias_of.take().is_some() && h.status == HostStatus::Alias {
+                    h.status = HostStatus::Backoff;
+                    h.redial_at = Some(now + 2_000);
+                }
+            }
             HostAction::Reconnect => {
                 if matches!(h.status, HostStatus::Banned | HostStatus::Suspended) {
                     return Err(AdminError::BadRequest(

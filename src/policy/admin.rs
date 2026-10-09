@@ -362,6 +362,11 @@ impl PolicyAdmin {
             HostAction::Ban { reason } => Manual::Ban(reason.clone()),
             HostAction::Unban => Manual::Unban,
             HostAction::SetAccountLimit { max_accounts } => Manual::AccountLimit(*max_accounts),
+            HostAction::Alias { of } => {
+                let of = self.alias_target(host, of).await?;
+                Manual::Alias { of, by_operator: by != tiers::RELAY_ACTOR }
+            }
+            HostAction::Unalias { pin } => Manual::Unalias { pin: *pin },
             HostAction::Reconnect => {
                 return Err(AdminError::BadRequest("reconnect is an upstream action, not a policy one".into()));
             }
@@ -416,6 +421,27 @@ impl PolicyAdmin {
             "host action"
         );
         Ok(rec)
+    }
+
+    /// `of` as a host the relay knows, refusing an alias that would lead
+    /// back to `host`.
+    async fn alias_target(&self, host: &str, of: &str) -> AdminResult<String> {
+        // a known host's name, as the host table spells it
+        let of = of.trim().trim_start_matches("https://").trim_end_matches('/').to_ascii_lowercase();
+        let mut at = of.clone();
+        for _ in 0..=tiers::ALIAS_HOPS {
+            if at == host {
+                return Err(AdminError::BadRequest(format!("{of} leads back to {host}")));
+            }
+            let Some(rec) = self.hosts.get_host(&at).await? else {
+                return Err(AdminError::NotFound(format!("no host {at}")));
+            };
+            match tiers::host_policy(&rec).alias {
+                Some(a) => at = a.of,
+                None => return Ok(of),
+            }
+        }
+        Err(AdminError::BadRequest(format!("{of} is an alias more than {} hops deep", tiers::ALIAS_HOPS)))
     }
 
     /// The operator actions recorded on a host, oldest first.

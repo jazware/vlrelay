@@ -72,6 +72,8 @@ struct HostState {
     /// drain the node's PLC budget that every host's lookups wait on.
     forced_lookups: Hourly,
     throttle_eps: Option<f64>,
+    alias: Option<policy::tiers::Alias>,
+    not_alias: bool,
 }
 
 /// A per-hour limit with an hour's allowance as its depth, the way the
@@ -152,6 +154,26 @@ impl HostStore for Notifying {
         }
         Ok(r)
     }
+}
+
+/// Where `host`'s alias chain ends: the host the relay reads it as. None
+/// for a host it doesn't know, or a chain past `ALIAS_HOPS` or in a loop.
+fn resolve_alias(c: &HashMap<String, HostState>, host: &str) -> Option<String> {
+    let mut at = host;
+    for _ in 0..=policy::tiers::ALIAS_HOPS {
+        match &c.get(at)?.alias {
+            Some(a) => at = &a.of,
+            None => return Some(at.to_string()),
+        }
+    }
+    None
+}
+
+fn alias_map(c: &HashMap<String, HostState>) -> HashMap<HostKey, HostKey> {
+    c.iter()
+        .filter(|(_, s)| s.alias.is_some())
+        .filter_map(|(h, _)| Some((HostKey::of(h), HostKey::of(&resolve_alias(c, h)?))))
+        .collect()
 }
 
 pub fn tier_to_upstream(t: state::Tier) -> upstream::Tier {
@@ -292,16 +314,23 @@ impl PolicyHooks {
 
     fn remember(&self, rec: &HostRecord) -> HostLimits {
         let limits = self.engine.for_host(rec);
-        let throttle_eps = policy::tiers::host_policy(rec).throttle_eps;
+        let hp = policy::tiers::host_policy(rec);
         let mut c = self.cache.lock();
-        match c.get_mut(&rec.hostname) {
+        let aliases_moved = match c.get_mut(&rec.hostname) {
             Some(st) => {
                 st.limits = limits.clone();
-                st.throttle_eps = throttle_eps;
+                st.throttle_eps = hp.throttle_eps;
                 st.accounts = rec.account_count + st.admitted_since_sync;
                 st.admitted_since_sync = 0;
+                st.not_alias = hp.not_alias;
+                let moved = st.alias.as_ref().map(|a| &a.of) != hp.alias.as_ref().map(|a| &a.of);
+                st.alias = hp.alias;
+                moved
             }
             None => {
+                // an alias remembered before the host it names
+                let moved =
+                    hp.alias.is_some() || c.values().any(|s| s.alias.as_ref().is_some_and(|a| a.of == rec.hostname));
                 c.insert(
                     rec.hostname.clone(),
                     HostState {
@@ -311,12 +340,47 @@ impl PolicyHooks {
                         new_accounts: Hourly::new(),
                         identity_events: Hourly::new(),
                         forced_lookups: Hourly::new(),
-                        throttle_eps,
+                        throttle_eps: hp.throttle_eps,
+                        alias: hp.alias,
+                        not_alias: hp.not_alias,
                     },
                 );
+                moved
             }
+        };
+        if aliases_moved {
+            let m = alias_map(&c);
+            super::metrics::HOST_ALIASES.set(m.len() as i64);
+            self.state.set_host_aliases(m);
         }
         limits
+    }
+
+    /// The host `host` is an alias of, if it's one.
+    pub fn alias_of(&self, host: &str) -> Option<String> {
+        self.cache.lock().get(host).and_then(|s| s.alias.as_ref().map(|a| a.of.clone()))
+    }
+
+    /// Whether the relay may mark `host` an alias of `of` (neither is one
+    /// already, no operator said otherwise), and the host to name: `of`,
+    /// or what it's an alias of.
+    pub fn alias_candidate(&self, host: &str, of: &str) -> Option<String> {
+        let c = self.cache.lock();
+        let st = c.get(host)?;
+        if st.alias.is_some() || st.not_alias {
+            return None;
+        }
+        let root = resolve_alias(&c, of)?;
+        (root != host).then_some(root)
+    }
+
+    /// The relay's own aliases (not an operator's), with when each was
+    /// last confirmed.
+    pub fn relay_aliases(&self) -> Vec<(String, policy::tiers::Alias)> {
+        let c = self.cache.lock();
+        c.iter()
+            .filter_map(|(h, s)| s.alias.as_ref().filter(|a| !a.by_operator).map(|a| (h.clone(), a.clone())))
+            .collect()
     }
 
     /// The limits in force for a host, as last synced.
@@ -611,7 +675,7 @@ impl Admission for PolicyHooks {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::admin::HostAction;
     use crate::node::adapters::VerifyChain;
@@ -619,7 +683,7 @@ mod tests {
     use crate::state::{AccountGate, ApplyConfig, StateStore, Tier};
     use vlsync_store::store::Store;
 
-    async fn setup() -> (Arc<PolicyHooks>, Arc<State>) {
+    pub(crate) async fn setup() -> (Arc<PolicyHooks>, Arc<State>) {
         let store = Store::memory(None);
         let id = crate::state::tests::MapIdentity::new();
         let state = Arc::new(StateStore::new(VerifyChain, id, ApplyConfig::default()));
@@ -656,7 +720,7 @@ mod tests {
         assert!(state::AccountGate::forced_lookup(&*hooks, "quiet.example"));
     }
 
-    async fn add_host(hosts: &dyn HostStore, h: &str, tier: Tier) {
+    pub(crate) async fn add_host(hosts: &dyn HostStore, h: &str, tier: Tier) {
         hosts.put_host(&HostRecord::new(h, tier, state::now_secs())).await.unwrap();
     }
 

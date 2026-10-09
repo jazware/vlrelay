@@ -63,6 +63,9 @@ pub struct StateStore<C: Chain = StubChain> {
     host_names: RwLock<HashMap<HostKey, Arc<str>>>,
     host_counts: Mutex<HashMap<HostKey, HostCounts>>,
     gate: RwLock<Option<Arc<dyn AccountGate>>>,
+    /// Alias host -> the host the relay reads it as (the policy's host
+    /// aliases, resolved to the end of each chain).
+    aliases: RwLock<HashMap<HostKey, HostKey>>,
 }
 
 impl<C: Chain> StateStore<C> {
@@ -75,7 +78,26 @@ impl<C: Chain> StateStore<C> {
             host_names: Default::default(),
             host_counts: Default::default(),
             gate: Default::default(),
+            aliases: Default::default(),
         }
+    }
+
+    /// Replaces the host aliases: a DID document naming an alias is
+    /// answered by the host it's an alias of, and the other way round.
+    pub fn set_host_aliases(&self, m: HashMap<HostKey, HostKey>) {
+        *self.aliases.write() = m;
+    }
+
+    /// Whether `a` and `b` are one PDS: the same host, or aliases of one.
+    pub fn same_host(&self, a: HostKey, b: HostKey) -> bool {
+        if a == b {
+            return true;
+        }
+        let m = self.aliases.read();
+        if m.is_empty() {
+            return false;
+        }
+        m.get(&a).copied().unwrap_or(a) == m.get(&b).copied().unwrap_or(b)
     }
 
     /// The policy's say on new accounts. Without one every account is

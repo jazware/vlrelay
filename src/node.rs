@@ -39,6 +39,7 @@
 pub mod acks;
 pub mod adapters;
 pub mod admin;
+pub mod aliases;
 pub mod forward;
 pub mod lag;
 pub mod metrics;

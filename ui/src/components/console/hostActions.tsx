@@ -11,7 +11,7 @@ import { confirmAction, type ConfirmSpec } from './dialogs'
 /** The one-click account cap for a real PDS: above every independent PDS today, below what a trusted tier usually allows. */
 export const BIG_HOST_CAP = 1_000_000
 
-export type HostVerb = 'settier' | 'throttle' | 'unthrottle' | 'suspend' | 'ban' | 'unban' | 'reconnect' | 'raisecap' | 'tiercap'
+export type HostVerb = 'settier' | 'throttle' | 'unthrottle' | 'suspend' | 'ban' | 'unban' | 'reconnect' | 'raisecap' | 'tiercap' | 'unalias'
 
 function spec(verb: HostVerb, h: HostRow, arg?: string): ConfirmSpec | undefined {
   const name = h.host
@@ -117,6 +117,19 @@ function spec(verb: HostVerb, h: HostRow, arg?: string): ConfirmSpec | undefined
         call: call(a),
         run: () => run(a),
         done: `Raised ${name} to ${fmtNum(BIG_HOST_CAP)} accounts`,
+      }
+    }
+    case 'unalias': {
+      const a: HostAction = { action: 'unalias', pin: true }
+      return {
+        tone: 'warn',
+        primary: true,
+        title: `Read ${name} as its own PDS?`,
+        items: [`Its socket opens again and resumes from its own cursor; whatever ${h.aliasOf ?? 'the other name'} already sent is deduplicated.`, 'The relay won’t mark it an alias again until an operator does.'],
+        action: 'Not an alias',
+        call: call(a),
+        run: () => run(a),
+        done: `${name} is its own host again`,
       }
     }
     case 'tiercap': {

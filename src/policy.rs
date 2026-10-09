@@ -57,13 +57,15 @@ pub struct Snapshot {
 pub struct HostLimits {
     /// After domain rules: what the host actually runs as.
     pub tier: Tier,
-    /// False for suspended and banned hosts: no socket at all.
+    /// False for suspended, banned and alias hosts: no socket at all.
     pub connect: bool,
-    /// None when `connect` is false. An operator or rule throttle is
+    /// None for suspended and banned hosts. An operator or rule throttle is
     /// already folded into `events_per_sec`.
     pub limits: Option<TierLimits>,
     pub rule: Option<u64>,
     pub policy_version: u64,
+    /// The host it's another name for: no socket, whatever its tier.
+    pub alias_of: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -346,12 +348,14 @@ impl Engine {
             }
             l
         });
+        let alias_of = hp.alias.map(|a| a.of);
         HostLimits {
             tier,
-            connect: limits.is_some(),
+            connect: limits.is_some() && alias_of.is_none(),
             limits,
             rule: rule.map(|r| r.id),
             policy_version: snap.policy.version,
+            alias_of,
         }
     }
 

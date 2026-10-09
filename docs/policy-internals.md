@@ -155,6 +155,18 @@ tier rides the node's next submit to the leader as a proposed row. Everything el
     (`identity::Options::min_refresh`)
   - the host stage doesn't drop the DID from its cache on `#identity` (that made the next lookup a
     fetch), and the leader's refresh updates its cache.
+- Host aliases ([Policy](policy.md#host-aliases)). The leader's `RelayHooks::admit_one` hands
+  `node::aliases::AliasWatch` every event it decides, with its host, upstream seq and DID. A
+  `wrong_host` reject, or a duplicate whose record names another host, starts a watch on the pair.
+  With no watch open, that's one atomic load per event. A match is found in a `HashMap` keyed by
+  (seq, DID hash), and a pair is one stream at 20 matches after a two-minute warm-up with nothing
+  missing on either side. The `node::aliases::confirm` task checks `describeServer` and marks the
+  alias through `PolicyAdmin::host_action`, so it's in the host's trail and the leader's host
+  table like any action. The alias lives in the record's `extra.policy.alias`. `Engine::for_host`
+  gives an alias no socket, and `PolicyHooks::remember` keeps `StateStore::set_host_aliases`
+  current. `check_authority` compares hosts through `StateStore::same_host`, which maps each side
+  to the end of its alias chain (`tiers::ALIAS_HOPS`, 4). Rechecks run on the leader, hourly, for
+  the relay's aliases a day past their last confirmation.
 - A takedown or its reversal is written to `policy/takedowns/audit/` (one object per action,
   If-None-Match) and `policy/takedowns/current/{sha256(did)}.json` (who, when, why, for the
   account page) before the account changes, and logged on `vlrelay::audit`.

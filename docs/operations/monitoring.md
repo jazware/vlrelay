@@ -78,6 +78,8 @@ it reads, the events it submits and its own consumers.
 | `vlrelay_consumers` | gauge | | Connected `subscribeRepos` consumers |
 | `vlrelay_identity_cache_entries` | gauge | | DID documents in the identity cache |
 | `vlrelay_identity_lookups` | gauge | `outcome` | DID document lookups since start: `hit`, `seeded`, `fetched`, and `prefetched` or `prefetch_full` for lookups started ahead of the lanes or skipped with every prefetch slot taken (`--did-lookup-prefetch`) |
+| `vlrelay_host_aliases` | gauge | | Hosts marked another name for a host the relay reads ([Host aliases](../policy.md#host-aliases)). They have no socket of their own |
+| `vlrelay_alias_watches_total` | counter | `outcome` | Host pairs the leader watched as one PDS under two names: `started`, `same` (one stream), `differ`, and `marked` (one service too, marked an alias) |
 | `vlrelay_forced_lookups_refused_total` | counter | | Fresh DID document fetches an event asked for that its host's budget refused (the cached document was used) |
 | `vlrelay_lane_queued` | gauge | | Events queued in front of the pipeline lanes |
 | `vlrelay_upstream_inflight_events` | gauge | | Upstream frames read and not yet done, all hosts |

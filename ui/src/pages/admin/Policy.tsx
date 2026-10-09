@@ -711,6 +711,7 @@ export function DiscoveryPolicy() {
       </form>
       <div className="cx-knobs">
         <Knob path="discovery.plc" label="PDS hosts from the PLC export" why="Admit the PDS endpoints the documents the export reader reads name (needs --plc-export)." />
+        <Knob path="discovery.aliases" label="Find host aliases" why="Read a PDS listed under several hostnames under one of them: a name that streams another's events at the same seqs, with the same describeServer DID, gets no socket of its own." />
         <Knob path="discovery.connectsPerMin" label="Discovery connects" why="New hosts discovery may connect a minute, cluster-wide. Its own budget: requestCrawl keeps the daily one." unit="/min" />
         <Knob path="discovery.requestsPerSec" label="listHosts requests" why="Pages a second to any one seed relay; a 429 or 5xx waits out its Retry-After on top." unit="/s" />
       </div>
