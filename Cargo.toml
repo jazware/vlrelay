@@ -10,12 +10,12 @@ publish = false
 # What vlRelay shares with vlpds: the store, segments and slots, the log
 # layout, the firehose merger and backfill (vlsync); CBOR, CIDs,
 # the MST, CARs, crypto and DID resolution (vlatproto).
-vlsync-store = { git = "https://github.com/jazware/vlsync", rev = "f42dc7eb02494b0cd22250a163271c9ea2291796", features = ["jemalloc"] }
+vlsync-store = { git = "https://github.com/jazware/vlsync", rev = "9ba9edd1b97f8de20965769e195aba294114976d", features = ["jemalloc"] }
 vlatproto = { git = "https://github.com/jazware/vlatproto", rev = "186c75bfd8b10e800f08586cbb69804e709d6ce1" }
-vlsync-firehose = { git = "https://github.com/jazware/vlsync", rev = "f42dc7eb02494b0cd22250a163271c9ea2291796" }
+vlsync-firehose = { git = "https://github.com/jazware/vlsync", rev = "9ba9edd1b97f8de20965769e195aba294114976d" }
 # SlateDB metrics with a `db` label per database, and each one's shape for
 # GET /admin/api/store
-slate-metrics = { git = "https://github.com/jazware/vlsync", rev = "f42dc7eb02494b0cd22250a163271c9ea2291796" }
+slate-metrics = { git = "https://github.com/jazware/vlsync", rev = "9ba9edd1b97f8de20965769e195aba294114976d" }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws", "macros", "http2"] }
@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 # the SlateDB fork every vlsync user builds against (its Cargo.toml lists the patches)
-slatedb = { package = "vlsync-slatedb", git = "https://github.com/jazware/vlsync", rev = "f42dc7eb02494b0cd22250a163271c9ea2291796" }
+slatedb = { package = "vlsync-slatedb", git = "https://github.com/jazware/vlsync", rev = "9ba9edd1b97f8de20965769e195aba294114976d" }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

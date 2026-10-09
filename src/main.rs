@@ -177,6 +177,14 @@ struct Args {
     /// 512); older cursors read the node's log, then the bucket.
     #[arg(long)]
     ring_mb: Option<usize>,
+    /// Segment cache shared by consumers replaying from the bucket, MiB of
+    /// decompressed segments (0: none).
+    #[arg(long, env = "VLRELAY_BACKFILL_CACHE_MB", default_value_t = vlsync_firehose::backfill::DEFAULT_CACHE_BYTES >> 20)]
+    backfill_cache_mb: usize,
+    /// Segment read-ahead of each replay from the bucket, MiB over all logs
+    /// (each log keeps one segment in flight however small this is).
+    #[arg(long, env = "VLRELAY_BACKFILL_READAHEAD_MB", default_value_t = vlsync_firehose::backfill::DEFAULT_READAHEAD_BYTES >> 20)]
+    backfill_readahead_mb: usize,
     /// Pipeline lanes; a DID always maps to the same one.
     #[arg(long, default_value_t = 64)]
     lanes: usize,
@@ -559,6 +567,8 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
     }
     cfg.max_lag_bytes = a.max_lag_mb.map(|mb| mb.max(1) << 20);
     cfg.ring_bytes = a.ring_mb.map(|mb| mb.max(1) << 20);
+    cfg.backfill_cache_bytes = a.backfill_cache_mb << 20;
+    cfg.backfill_readahead_bytes = a.backfill_readahead_mb << 20;
     cfg.lanes = a.lanes.max(1);
     if let Some(n) = a.ingest_threads {
         cfg.ingest_threads = n.max(1);
