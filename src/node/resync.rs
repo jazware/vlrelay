@@ -437,7 +437,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_desynchronized_account_is_resynced_from_its_pds() {
         use crate::verify::synth::{Curve, Repo, Signer};
-        let did = "did:plc:resyncresyncresyncresync";
+        let did = "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz";
         let pds = pds::Pds::start(Repo::new(did, Signer::new(Curve::K256, 7), 3)).await;
         let addr = format!("127.0.0.1:{}", crate::qlog::tests::free_port());
         let mut cfg = crate::node::NodeConfig::new(&pds.url);
