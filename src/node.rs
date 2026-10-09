@@ -85,6 +85,10 @@ pub struct NodeConfig {
     pub ring_bytes: Option<usize>,
     /// None: the firehose's default.
     pub max_lag_bytes: Option<usize>,
+    /// Cursor replays from the bucket: the shared segment cache and each
+    /// replay's read-ahead.
+    pub backfill_cache_bytes: usize,
+    pub backfill_readahead_bytes: usize,
     /// Pipeline lanes (each a task; a DID always maps to the same one).
     pub lanes: usize,
     /// Threads of the runtime the lanes run on.
@@ -126,6 +130,8 @@ impl NodeConfig {
             plc_url: plc_url.into(),
             ring_bytes: None,
             max_lag_bytes: None,
+            backfill_cache_bytes: vlsync_firehose::backfill::DEFAULT_CACHE_BYTES,
+            backfill_readahead_bytes: vlsync_firehose::backfill::DEFAULT_READAHEAD_BYTES,
             lanes: 64,
             ingest_threads: cores.clamp(2, 16),
             lookup_prefetch: 256,
@@ -149,6 +155,8 @@ impl NodeConfig {
             threads: self.serve_threads,
             max_lag_bytes: self.max_lag_bytes.unwrap_or(d.max_lag_bytes),
             ring_bytes: self.ring_bytes.unwrap_or(d.ring_bytes),
+            backfill_cache_bytes: self.backfill_cache_bytes,
+            readahead_bytes: self.backfill_readahead_bytes,
             ..d
         }
     }

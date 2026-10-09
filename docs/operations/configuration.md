@@ -110,6 +110,8 @@ Without `--memory`, the four `--s3-*` values are required (the keys directly or 
 | `--ingest-mem-mb <INGEST_MEM_MB>` | `VLRELAY_INGEST_MEM_MB` | `0` | While the process holds more than this many MiB of anonymous memory (its cgroup's anon; jemalloc's resident bytes outside a cgroup), until it's back under 90%, hosts are read only while the pipeline holds under 10% of the in-flight caps, and paused ones read again under 5%. 0: no limit. Size it under the container's limit with room for the hosts' socket buffers (--upstream-rcvbuf-kb) and the page cache the log reads |
 | `--upstream-rcvbuf-kb <UPSTREAM_RCVBUF_KB>` | `VLRELAY_UPSTREAM_RCVBUF_KB` | `256` | Each upstream socket's receive buffer, KiB (SO_RCVBUF, which the kernel doubles for its overhead). A paused host's backlog waits in it, so it's what every connected host can hold in kernel memory. 0: the kernel's autotuning (up to tcp_rmem's max, 6 MiB by default) |
 | `--ring-mb <RING_MB>` |  |  | The firehose's in-memory ring of recent events, in MiB (default 512); older cursors read the node's log, then the bucket |
+| `--backfill-cache-mb <BACKFILL_CACHE_MB>` | `VLRELAY_BACKFILL_CACHE_MB` | `256` | Segment cache shared by consumers replaying from the bucket, MiB of decompressed segments (0: none) |
+| `--backfill-readahead-mb <BACKFILL_READAHEAD_MB>` | `VLRELAY_BACKFILL_READAHEAD_MB` | `64` | Segment read-ahead of each replay from the bucket, MiB over all logs (each log keeps one segment in flight however small this is) |
 | `--max-lag-mb <MAX_LAG_MB>` |  |  | Dev mode only: how far a live consumer may fall behind before `ConsumerTooSlow`, in MiB (default 128) |
 | `--log-compression <LOG_COMPRESSION>` |  | `-1` | zstd level for log segments: 0 stores them uncompressed, negative levels are zstd's fast ones. Firehose frames are mostly hashes: on production frames -1 compresses 1.8x faster than 1 for 0.6% more bytes (docs/perf.md, "Compression") |
 | `--event-horizon-secs <EVENT_HORIZON_SECS>` |  | `86400` | Per-host limits and spam signals count a host's events by the time it stamped on them, so a replayed backlog costs what the traffic did; a time older than this counts at this horizon |
@@ -217,9 +219,16 @@ a 2 vCPU / 4 GB box:
   node was back at the live rate 11 s and 15 s after it resumed. What fills the buffers is the
   network's rate times the freeze, so the bound matters for long freezes and bursts.
 - A consumer whose cursor is older than the node's disk log is read from the bucket, through a
-  256 MiB segment cache and 64 MiB of read-ahead per backfill, decompressed. On a single node that
-  added ~740 MB to the heap at its peak, so leave room for it above `--ingest-mem-mb`, or a
-  subscriber replaying hours can push the node over its limit.
+  segment cache shared by every replay (`--backfill-cache-mb`, 256 by default) and each replay's
+  read-ahead (`--backfill-readahead-mb`, 64), both counted in decompressed segments. A replay's
+  peak is about the cache, plus the read-ahead, plus the segments being merged (one per log). With
+  the defaults one replay added ~740 MB to a single node's heap at its peak, and each further
+  replay at once adds its own read-ahead. On a 4 GiB box set `--backfill-cache-mb 64` and
+  `--backfill-readahead-mb 16`, which takes 240 MiB off that bound. The cache only saves GETs
+  when several consumers replay the same range together, and a read-ahead smaller than a segment
+  still keeps one GET in flight per log, the next segment loading while the current one is sent.
+  Leave room for what's left above `--ingest-mem-mb`, or a subscriber replaying hours can push the
+  node over its limit.
 - Give it `--plc-export-mem-mb` under `--ingest-mem-mb` (1200 with the numbers above), so the
   export yields before the hosts do. The budget pauses the export and the seed reads while the
   process is over it, and resumes them below 85%. A paused export holds nothing, so if the memory
