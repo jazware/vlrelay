@@ -328,8 +328,8 @@ Not a vlRelay bug: eurosky's migration `#sync`
 ## Dashboard screenshots
 
 The run's screenshots were of the earlier designs' dashboard, and they've left the repository
-with it. The README's screenshots are today's console on a local three-node cluster reading a
-[`fakepds`](loadfleet.md) fleet.
+with it. The README's console screenshots are today's console on a local three-node cluster
+reading a [`fakepds`](loadfleet.md) fleet, and its public page is a production relay's.
 
 ## Running one yourself
 
