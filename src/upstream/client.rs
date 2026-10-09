@@ -81,7 +81,8 @@ impl HostTask {
             }
             // after a sequence restart the durable cursor is 0: the new
             // sequence from its first event
-            let cursor = self.cursor.durable_cursor(&self.entry.host);
+            let cursor =
+                if self.entry.take_start_at_head() { None } else { self.cursor.durable_cursor(&self.entry.host) };
             let was_restarted = std::mem::take(&mut restarted);
             // a fresh socket replays from the durable cursor: anything still
             // queued from the old one would arrive twice

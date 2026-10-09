@@ -212,8 +212,19 @@ name the relay reads. A third host is still a stranger to both. The dashboard sh
 
 **Rechecks.** A day after the relay last confirmed an alias, the leader asks both names'
 `describeServer` again. The same service DID renews it. Another one clears it: the name is a
-different PDS now, so its socket opens again from its own cursor, and its own events go through
-the usual checks. A name that doesn't answer keeps its alias. An operator's alias isn't rechecked.
+different PDS now, so it gets its socket back and its own events go through the usual checks. A
+name that doesn't answer keeps its alias. An operator's alias isn't rechecked.
+
+**A cleared alias starts at the head.** Cleared by a recheck or by an operator, the name's socket
+opens with no cursor, at the PDS's current head, not at the cursor it had when it was marked. Its
+accounts came through the other name all along, so a replay would be duplicates, and after a wrong
+alias that cursor can't be trusted anyway. The action in the host's trail says `cursor reset to
+head`.
+
+**Out of `listHosts`.** `com.atproto.sync.listHosts` leaves aliases out, so a relay that seeds its
+hosts from this one finds each aliased PDS by the one name. `getHostStatus` on an alias answers
+`offline` (`banned` if it's banned). The lexicon has no field to name the host it's an alias of,
+so only the admin API's `aliasOf` says that.
 
 **No failover.** If the name the relay reads goes down, the alias doesn't take over. The two names
 are one server, so it's usually down too. Following the alias's events for the other name's

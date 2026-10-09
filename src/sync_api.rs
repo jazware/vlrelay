@@ -141,18 +141,27 @@ async fn get_latest_commit(State(src): State<Src>, Query(p): Params) -> XResult 
     Ok(Json(json!({ "cid": c.commit.to_string(), "rev": c.rev.to_string() })))
 }
 
+fn is_alias(h: &HostRecord) -> bool {
+    crate::policy::tiers::host_policy(h).alias.is_some()
+}
+
+/// An alias isn't read (docs/policy.md, "Host aliases"): `offline`. The
+/// lexicon has no field to name the host it's an alias of.
 fn host_json(h: &HostRecord) -> Value {
+    let status = if is_alias(h) && h.tier != crate::state::Tier::Banned { "offline" } else { h.lexicon_status() };
     json!({
         "hostname": h.hostname,
         "seq": h.cursor,
         "accountCount": h.account_count.max(0),
-        "status": h.lexicon_status(),
+        "status": status,
     })
 }
 
 async fn list_hosts(State(src): State<Src>, Query(p): Params) -> XResult {
     let page = src.list_hosts(cursor(&p), limit(&p, 200)?).await.map_err(any_err)?;
-    let mut out = json!({ "hosts": page.hosts.iter().map(host_json).collect::<Vec<_>>() });
+    // a relay seeding from this list finds each aliased PDS by the one name
+    let hosts: Vec<Value> = page.hosts.iter().filter(|h| !is_alias(h)).map(host_json).collect();
+    let mut out = json!({ "hosts": hosts });
     if let Some(c) = page.cursor {
         out["cursor"] = json!(c);
     }
@@ -300,5 +309,28 @@ mod tests {
         assert_eq!(v, json!({"hostname": "pds.a", "seq": 77, "accountCount": 5, "status": "active"}));
         let (s, v) = call(&app, "/xrpc/com.atproto.sync.getHostStatus?hostname=nope.example").await;
         assert_eq!((s, v["error"].as_str()), (StatusCode::BAD_REQUEST, Some("HostNotFound")));
+    }
+
+    #[tokio::test]
+    async fn an_alias_is_offline_and_left_out_of_list_hosts() {
+        let st = open(1, MapIdentity::new(), ApplyConfig::default()).await;
+        let hosts = MemHosts::default();
+        for h in ["pds.example", "alias.example"] {
+            let mut rec = HostRecord::new(h, Tier::Default, 1);
+            rec.cursor = 900;
+            if h == "alias.example" {
+                let al = crate::policy::tiers::Alias { of: "pds.example".into(), at: 1, by_operator: false };
+                let hp = crate::policy::tiers::HostPolicy { alias: Some(al), ..Default::default() };
+                crate::policy::tiers::set_host_policy(&mut rec, &hp);
+            }
+            hosts.put_host(&rec).await.unwrap();
+        }
+        let app = router(Arc::new(Src(st, hosts)));
+        let (_, v) = call(&app, "/xrpc/com.atproto.sync.listHosts").await;
+        let names: Vec<&str> = v["hosts"].as_array().unwrap().iter().map(|h| h["hostname"].as_str().unwrap()).collect();
+        assert_eq!(names, ["pds.example"]);
+        let (s, v) = call(&app, "/xrpc/com.atproto.sync.getHostStatus?hostname=alias.example").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v, json!({"hostname": "alias.example", "seq": 900, "accountCount": 0, "status": "offline"}));
     }
 }

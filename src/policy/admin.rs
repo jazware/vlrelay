@@ -396,6 +396,10 @@ impl PolicyAdmin {
                 Box::new(move |cur| {
                     let mut rec = cur?;
                     let from = rec.tier;
+                    let mut entry = entry;
+                    if let (Manual::Unalias { .. }, Some(a)) = (&m, tiers::host_policy(&rec).alias) {
+                        entry.reason = Some(format!("cursor reset to head: its accounts were read through {}", a.of));
+                    }
                     if let Err(e) = tiers::apply_manual(&mut rec, &m, crate::state::now_secs()) {
                         *out = Some(Err(e));
                         return None;

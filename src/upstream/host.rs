@@ -228,6 +228,9 @@ pub struct HostEntry {
     backpressure_left_ms: AtomicI64,
     /// The host's own timeline (`super::clock`), across its sockets.
     clock: Mutex<super::clock::EventClock>,
+    /// Until then (unix ms), the next connect skips the cursor and starts
+    /// at the host's head.
+    head_until_ms: AtomicU64,
 }
 
 /// A reader that has waited this long on its socket with nothing to read
@@ -259,6 +262,7 @@ impl HostEntry {
             read_event_ms: AtomicI64::new(0),
             backpressure: AtomicU8::new(0),
             backpressure_left_ms: AtomicI64::new(0),
+            head_until_ms: AtomicU64::new(0),
             clock: Mutex::new(Default::default()),
         }
     }
@@ -411,6 +415,23 @@ impl HostEntry {
         if self.acked_seq.fetch_max(seq, Ordering::Relaxed) < seq {
             self.dirty.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// The next connect within `for_ms` starts at the host's head, with no
+    /// cursor: what it sent before is known to be read already.
+    pub fn start_at_head(&self, for_ms: u64) {
+        self.head_until_ms.store(now_ms() + for_ms, Ordering::Relaxed);
+    }
+
+    /// Whether this connect starts at the head (once). Its acked cursor
+    /// starts over, so the new socket's acks set it.
+    pub(crate) fn take_start_at_head(&self) -> bool {
+        let until = self.head_until_ms.swap(0, Ordering::Relaxed);
+        let now = until > now_ms();
+        if now {
+            self.reset_cursor();
+        }
+        now
     }
 
     /// A host that reset its sequence (FutureCursor) starts over, from the
@@ -724,6 +745,24 @@ mod tests {
     use super::*;
 
     const H: i64 = 24 * 3_600_000;
+
+    #[test]
+    fn a_start_at_head_is_taken_once_and_expires() {
+        let mut r = HostRecord::new(&Host("pds.example.com".into()), Tier::Default);
+        r.acked_seq = Some(500);
+        let e = HostEntry::from_record(&r);
+        assert!(!e.take_start_at_head());
+        assert_eq!(e.acked_seq(), Some(500));
+        e.start_at_head(60_000);
+        assert!(e.take_start_at_head());
+        assert_eq!(e.acked_seq(), Some(0), "the new socket's acks set it");
+        assert!(!e.take_start_at_head(), "once");
+        // a mark nobody connected under in time does nothing
+        e.ack(700);
+        e.start_at_head(0);
+        assert!(!e.take_start_at_head());
+        assert_eq!(e.acked_seq(), Some(700));
+    }
 
     #[test]
     fn read_lag_counts_held_time_only_while_held() {
