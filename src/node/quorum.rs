@@ -653,10 +653,12 @@ impl RelayHooks {
         let mut ext = Ext { kind: tag, key_changed: false, host: host.0.clone(), useq, did: did.clone() };
         if ext.deduped() {
             if self.committed_dup(&host.0, useq, &did) {
+                tracing::debug!(target: "vlrelay::dup", host = %host.0, did, useq, "committed_dup");
                 self.stats.dup_seen.fetch_add(1, Ordering::Relaxed);
                 return (Verdict::Answer { outcome: Outcome::Duplicate, after: None }, None);
             }
             if let Some(seq) = term.inner.lock().recent.get(&(host.0.clone(), useq, did.clone())).copied() {
+                tracing::debug!(target: "vlrelay::dup", host = %host.0, did, useq, seq, "recent_dup");
                 self.stats.dup_seen.fetch_add(1, Ordering::Relaxed);
                 return (Verdict::Answer { outcome: Outcome::Duplicate, after: Some(seq) }, None);
             }
@@ -732,10 +734,16 @@ impl RelayHooks {
                 (append(term, Vec::new(), None, &ext), None)
             }
             Ok(Applied::Duplicate) => {
+                let rev = match &kind {
+                    CheckedKind::Commit(v) | CheckedKind::Sync(v) => Some(v.rev.to_string()),
+                    _ => None,
+                };
+                tracing::debug!(target: "vlrelay::dup", host = %host.0, did, useq, rev = rev.as_deref(), "head_dup");
                 self.stats.dup_head.fetch_add(1, Ordering::Relaxed);
                 (Verdict::Answer { outcome: Outcome::Duplicate, after: dup_after(term) }, None)
             }
-            Err(state::Reject::Stale { .. }) => {
+            Err(state::Reject::Stale { rev, current }) => {
+                tracing::debug!(target: "vlrelay::dup", host = %host.0, did, useq, rev = %rev, current = %current, "stale_dup");
                 self.stats.dup_stale.fetch_add(1, Ordering::Relaxed);
                 (Verdict::Answer { outcome: Outcome::Duplicate, after: dup_after(term) }, None)
             }

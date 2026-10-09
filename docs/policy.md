@@ -170,6 +170,14 @@ backfill ([Starting a host](#starting-a-host)). Discovery's admissions don't spe
 requestCrawl's: they're paced by their own `discovery.connectsPerMin` (120), so a cold start
 isn't held to the daily budget.
 
+That pace makes a cold start's first run long: a seed list of several thousand hosts takes about
+an hour to admit, in the seed relay's order, which isn't by size. A big PDS listed late starts
+live when its turn comes, so the relay has none of its events from before that. A completeness
+check against another relay's firehose during that hour reports them missing, and an alias's
+copies count as duplicates from when its main name is admitted until the alias is confirmed.
+Wait for the first run's `lastFinishedMs` in `GET /admin/api/discovery` before measuring, or
+compare each host only from its `connectedSinceMs`.
+
 Each source's progress is saved in the bucket (`discovery/state.json`) after every page: a new
 leader resumes a list where the old one stopped. Each host's source (`requestCrawl`,
 `bootstrap:<relay>`, `plc`, `cli`) is kept in the leader's host table and shown on the host and in
