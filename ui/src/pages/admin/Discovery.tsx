@@ -30,7 +30,8 @@ const kindOf = (key: string) => (key === 'plc' ? 'PDS hosts it names' : key.star
 
 function StatusChip({ s }: { s: DiscoverySource }) {
   if (!s.enabled) return <Chip k="idle">off</Chip>
-  if (s.inProgress) return <Chip k="info">running</Chip>
+  if (s.inProgress && s.admitting) return <Chip k="info">admitting by size</Chip>
+  if (s.inProgress) return <Chip k="info">{s.key !== 'plc' && s.admitting === false ? 'listing' : 'running'}</Chip>
   if (s.runRequested) return <Chip k="info">requested</Chip>
   if (s.lastError) return <Chip k="err">error</Chip>
   if (!s.runs && !s.lastFinishedMs) return <Chip k="idle">not run yet</Chip>
@@ -156,7 +157,7 @@ export function Discovery() {
         </span>
       ),
     },
-    { id: 'pages', label: 'Pages', r: true, render: (s) => <span className="mono sm muted">{s.key === 'plc' ? (s.pending ? `${fmtNum(s.pending)} pending` : '—') : fmtNum(s.pages)}</span> },
+    { id: 'pages', label: 'Pages', r: true, render: (s) => <span className="mono sm muted">{s.key === 'plc' ? (s.pending ? `${fmtNum(s.pending)} pending` : '—') : s.pending ? `${fmtNum(s.pages)} · ${fmtNum(s.pending)} queued` : fmtNum(s.pages)}</span> },
     {
       id: 'run',
       label: '',
@@ -300,7 +301,8 @@ registerDetail('dsource', {
               ['Finished', s.lastFinishedMs ? dt(s.lastFinishedMs) : '—'],
               ['Next', s.nextRunMs ? dt(s.nextRunMs) : '—'],
               ...(s.cursor ? ([['Cursor', <span className="mono">{s.cursor}</span>]] as [string, ReactNode][]) : []),
-              ...(s.key === 'plc' ? ([['Pending admission', fmtNum(s.pending)]] as [string, ReactNode][]) : []),
+              ...(s.key === 'plc' || s.pending ? ([['Pending admission', fmtNum(s.pending)]] as [string, ReactNode][]) : []),
+              ...(s.nextAccounts != null ? ([['Next in line', `${fmtNum(s.nextAccounts)} accounts (largest first)`]] as [string, ReactNode][]) : []),
             ]}
           />
           {s.lastError && (
