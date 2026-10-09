@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 #[derive(Parser, Debug)]
 #[command(about = "Diff a relay's firehose against PDS firehoses (read-only)")]
 struct Args {
-    /// Relay host (wss, no path).
+    /// Relay host (wss, no path), or a ws:// or wss:// origin.
     #[arg(long, default_value = "relay1.us-east.bsky.network")]
     relay: String,
     /// PDS hosts to subscribe to directly. Repeatable.
@@ -342,7 +342,9 @@ async fn main() -> Result<()> {
     let (stop_pds_tx, stop_pds) = watch::channel(false);
     let mut tasks = Vec::new();
     for (side, host) in names.iter().enumerate() {
-        let url = format!("wss://{host}/xrpc/com.atproto.sync.subscribeRepos");
+        // a bare host is wss; ws:// or wss:// as given (a local relay)
+        let origin = if host.contains("://") { host.clone() } else { format!("wss://{host}") };
+        let url = format!("{}/xrpc/com.atproto.sync.subscribeRepos", origin.trim_end_matches('/'));
         let stop = if side == 0 { stop_relay.clone() } else { stop_pds.clone() };
         tasks.push(tokio::spawn(run_socket(side, url, clock.clone(), tx.clone(), stop)));
     }

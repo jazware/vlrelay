@@ -127,10 +127,20 @@ a 2 vCPU / 4 GB box:
   over the budget with nothing in flight isn't the pipeline's, and stopping the hosts can't free
   it. `vlrelay_upstream_memory_over` says the process is over the budget, and
   `vlrelay_upstream_memory_paused` that it's holding reads.
-- Keep `--upstream-rcvbuf-kb` at its default of 256. A paused host's backlog waits in its socket's
-  receive buffer, outside the in-flight caps and the ingest budget, and the kernel's autotuning
-  grows each one to 6 MiB: 200 busy hosts held ~500 MB of socket memory that way. At 256 KiB a
-  host holds at most ~512 KiB in the kernel and still reads ~3.5 MB/s at a 70 ms round trip.
+- Set `--upstream-rcvbuf-kb 64`. A paused or frozen node's backlog waits in each host's socket
+  receive buffer, outside the in-flight caps and the ingest budget, and the kernel charges it to
+  the node's cgroup. Left to autotuning each grows to 6 MiB: 200 busy hosts held ~500 MB of socket
+  memory that way. The bound is twice the flag per host: at ~3,400 hosts that's ~1.7 GB at the
+  default of 256 and ~435 MB at 64, against a 2300 MiB limit. A 64 KiB buffer still reads ~1.8 MB/s
+  a host at a 70 ms round trip, where the busiest PDS sends ~50 KB/s live. On a single node
+  following the whole network (~250 events/s, ~3,400 hosts), 64 and 256 read the same rate and kept
+  the same per-host lag. A 36 s SIGSTOP put 14 MB in socket buffers at 64 and 34 MB at 256, and the
+  node was back at the live rate 11 s and 15 s after it resumed. What fills the buffers is the
+  network's rate times the freeze, so the bound matters for long freezes and bursts.
+- A consumer whose cursor is older than the node's disk log is read from the bucket, through a
+  256 MiB segment cache and 64 MiB of read-ahead per backfill, decompressed. On a single node that
+  added ~740 MB to the heap at its peak, so leave room for it above `--ingest-mem-mb`, or a
+  subscriber replaying hours can push the node over its limit.
 - Give it `--plc-export-mem-mb` under `--ingest-mem-mb` (1200 with the numbers above), so the
   export yields before the hosts do. The budget pauses the export and the seed reads while the
   process is over it, and resumes them below 85%. A paused export holds nothing, so if the memory
