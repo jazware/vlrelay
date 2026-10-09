@@ -841,12 +841,23 @@ async fn a_lagging_follower_catches_up_from_disk() {
     }
     let l = c.wait_leader(Duration::from_secs(5)).await;
     let f = c.ids.iter().find(|id| **id != l).unwrap().clone();
+    let behind = c.nodes[&f].node.status().last;
     c.kill(&f);
     let load = Load::start(c.client(), 4, 10, Duration::from_millis(1));
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // until the leader's memory no longer reaches back to the follower,
+    // however slowly this box commits
+    let t = Instant::now();
+    while c.nodes[&l].node.status().base <= behind {
+        assert!(
+            t.elapsed() < Duration::from_secs(30),
+            "the leader's memory still reaches {behind}: {}",
+            status_line(&c)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     c.start(&f).await;
     let acked = load.stop().await;
-    c.converge(Duration::from_secs(10)).await;
+    c.converge(Duration::from_secs(30)).await;
     let st = c.nodes[&f].node.status();
     assert_eq!(st.resets, 0, "the follower was reset past its lag: {st:?}");
     let reads: u64 = c.nodes.values().map(|r| r.node.status().disk_reads).sum();
@@ -1014,19 +1025,35 @@ async fn flush_seals_log_state_and_cursors_at_one_point() {
 /// reservation holds back everything past it, on every node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commit_stops_at_the_reservation() {
-    let c =
-        flushing(|_| flush::Options { interval: Duration::from_secs(3600), headroom: 300, ..flush_opts() }, 64 << 20)
-            .await;
+    let c = flushing_tuned(
+        3,
+        |_| flush::Options { interval: Duration::from_secs(3600), headroom: 300, ..flush_opts() },
+        64 << 20,
+        commitlog::Options::default(),
+        // a takeover's fence flush would move R: one leader throughout, even
+        // when fsyncs crawl
+        |k| k.election_timeout = Duration::from_secs(3),
+    )
+    .await;
     let l = c.wait_leader(Duration::from_secs(5)).await;
     let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // entries past R on every node, so a quorum holds them: only the
+    // reservation keeps them uncommitted
+    let t = Instant::now();
+    loop {
+        let st = c.nodes[&l].node.status();
+        if st.commit == 300 && st.last > 300 && c.nodes.values().all(|r| r.node.status().last == st.last) {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(30), "the load didn't reach R: {}", status_line(&c));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     for r in c.nodes.values() {
         let st = r.node.status();
         assert!(st.commit <= 300 && st.emitted <= 300, "{st:?}");
     }
     let st = c.nodes[&l].node.status();
-    assert_eq!((st.commit, st.reserve), (300, 300), "{st:?}");
-    assert!(st.last > 300, "the load didn't get past R: {st:?}");
+    assert_eq!((st.role, st.commit, st.reserve), (Role::Leader, 300, 300), "{st:?}");
     drop(load);
     c.shutdown();
 }
@@ -2493,9 +2520,29 @@ async fn a_partition_during_a_switch_loses_nothing() {
         members.retain(|m| *m != out);
         members.push(new.to_string());
         members.sort();
-        *armed.lock() = Some(step);
-        let h = c.change_on(&l, &members);
-        let (id, _) = tokio::time::timeout(Duration::from_secs(20), rx.recv()).await.unwrap().unwrap();
+        // on a slow box the change can time out before the step (the
+        // flush before the barrier past switch_timeout, say): again, until
+        // one gets there
+        let t = Instant::now();
+        let (id, h) = loop {
+            let l = c.wait_leader(Duration::from_secs(10)).await;
+            *armed.lock() = Some(step);
+            let mut h = c.change_on(&l, &members);
+            let fired = tokio::select! {
+                biased;
+                r = rx.recv() => Some(r.unwrap().0),
+                r = &mut h => {
+                    armed.lock().take();
+                    eprintln!("change ended before {step:?}: {r:?}");
+                    None
+                }
+                _ = tokio::time::sleep(Duration::from_secs(60)) => panic!("no change reached {step:?}: {}", status_line(&c)),
+            };
+            if let Some(id) = fired {
+                break (id, h);
+            }
+            assert!(t.elapsed() < Duration::from_secs(60), "no change reached {step:?}: {}", status_line(&c));
+        };
         c.isolate(&id);
         let r = h.await.unwrap();
         eprintln!("change with {id} cut off at {step:?}: {r:?}");
@@ -2720,29 +2767,42 @@ async fn a_follower_reset_with_a_stale_f_emits_all_the_bucket_holds() {
 }
 
 async fn follower_reset_past_emitted(stale: bool) {
-    let mut c = flushing(|_| flush_opts(), 64 << 20).await;
+    // one leader throughout, even when fsyncs crawl: the reset the test
+    // plays carries that leader's F
+    let tune = |k: &mut Config| k.election_timeout = Duration::from_secs(3);
+    let mut c = flushing_tuned(3, |_| flush_opts(), 64 << 20, commitlog::Options::default(), tune).await;
     let l = c.wait_leader(Duration::from_secs(5)).await;
     let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
-    wait_flushed(&c, 1, Duration::from_secs(5)).await;
+    wait_flushed(&c, 1, Duration::from_secs(15)).await;
     let f = c.ids.iter().find(|id| **id != l).unwrap().clone();
     let t = Instant::now();
     while c.nodes[&f].node.status().emitted == 0 {
-        assert!(t.elapsed() < Duration::from_secs(5), "{f} emitted nothing: {}", status_line(&c));
+        assert!(t.elapsed() < Duration::from_secs(15), "{f} emitted nothing: {}", status_line(&c));
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     c.isolate(&f);
     // appends already on the wire land
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let behind = c.nodes[&f].node.status().emitted;
-    let early = wait_flushed(&c, behind + 500, Duration::from_secs(10)).await;
+    // and it emits what they committed once its fsync of them returns
+    let t = Instant::now();
+    let behind = loop {
+        let st = c.nodes[&f].node.status();
+        if st.emitted == st.commit && st.durability.unsynced_bytes == 0 {
+            break st.emitted;
+        }
+        assert!(t.elapsed() < Duration::from_secs(15), "{f} didn't settle: {}", status_line(&c));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let early = wait_flushed(&c, behind + 500, Duration::from_secs(30)).await;
     load.stop().await;
     let st = c.nodes[&f].node.status();
     assert_eq!(st.emitted, behind, "{f} emitted while cut off");
+    assert_eq!(c.nodes[&l].node.status().role, Role::Leader, "{}", status_line(&c));
     // The leader flushes on its interval, so F is only fixed once it has
     // flushed its whole log: the follower reads the bucket as it is then.
     let top = c.nodes[&l].node.status().commit;
     c.nodes[&l].node.flush.request(top);
-    let m = wait_flushed(&c, top, Duration::from_secs(10)).await;
+    let m = wait_flushed(&c, top, Duration::from_secs(30)).await;
     assert_eq!(m.flushed, top);
     let told = if stale {
         assert!(early.flushed < m.flushed, "nothing flushed past {}", early.flushed);
@@ -2778,7 +2838,7 @@ async fn follower_reset_past_emitted(stale: bool) {
             break;
         }
         assert!(
-            t.elapsed() < Duration::from_secs(10),
+            t.elapsed() < Duration::from_secs(30),
             "{f} emitted through {} and its stream reached {last}: want {base}, after every seq through F {}",
             st.emitted,
             m.flushed

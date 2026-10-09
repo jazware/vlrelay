@@ -737,8 +737,24 @@ async fn lookups_are_written_in_batches() {
     use futures::TryStreamExt;
     let store = Store::memory(None);
     let l = leader(&store).await;
-    let objects = || async { store.raw.list(None).try_collect::<Vec<_>>().await.unwrap().len() };
-    let before = objects().await;
+    // the tables: the compactor's own start-up writes (its claim on the
+    // manifest and compactions file) land after the open returns
+    let ssts = || async {
+        let all = store.raw.list(None).try_collect::<Vec<_>>().await.unwrap();
+        all.into_iter().map(|m| m.location.to_string()).filter(|k| k.ends_with(".sst")).collect::<Vec<_>>()
+    };
+    let before = ssts().await;
+    let written = |want: u64| {
+        let w = &l.seeds.learned_written;
+        async move {
+            let t = Instant::now();
+            while w.load(Relaxed) < want {
+                assert!(t.elapsed() < Duration::from_secs(30), "{} of {want} documents written", w.load(Relaxed));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(w.load(Relaxed), want);
+        }
+    };
     let batches0 = l.seeds.learned_batches.load(Relaxed);
     let n = 3 * LEARN_BATCH + 10;
     let now = crate::policy::store::now_ms() as u64;
@@ -746,21 +762,22 @@ async fn lookups_are_written_in_batches() {
         let did = format!("did:plc:{i:0>24}");
         l.seeds.learn(&did, Seed::from_lookup(None, now));
     }
-    tokio::time::sleep(LEARN_EVERY * 3).await;
+    written(n as u64).await;
     let batches = l.seeds.learned_batches.load(Relaxed) - batches0;
     assert!((1..=5).contains(&batches), "{batches} batches for {n} documents");
-    assert_eq!(l.seeds.learned_written.load(Relaxed), n as u64);
     // at a cold start's pace, 100 lookups a second: about a batch a second
     let batches0 = l.seeds.learned_batches.load(Relaxed);
+    let t = Instant::now();
     for i in 0..200 {
         l.seeds.learn(&format!("did:plc:{:a>24}", i), Seed::from_lookup(None, now));
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    tokio::time::sleep(LEARN_EVERY * 2).await;
+    written(n as u64 + 200).await;
+    // a busy box stretches the 2 s of lookups, and the batches with them
+    let most = 3 + (t.elapsed().as_millis() / LEARN_EVERY.as_millis()) as u64;
     let batches = l.seeds.learned_batches.load(Relaxed) - batches0;
-    assert!((1..=5).contains(&batches), "{batches} batches for 200 paced lookups");
-    assert_eq!(l.seeds.learned_written.load(Relaxed), n as u64 + 200);
-    assert_eq!(objects().await, before, "learning wrote to the bucket");
+    assert!((1..=most).contains(&batches), "{batches} batches for 200 paced lookups in {:?}", t.elapsed());
+    assert_eq!(ssts().await, before, "learning wrote to the bucket");
     // a follower keeps nothing
     let follower = SeedReader::new(store.clone());
     follower.learn("did:plc:cccccccccccccccccccccccc", Seed::from_lookup(None, now));
