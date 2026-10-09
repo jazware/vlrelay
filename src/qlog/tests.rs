@@ -872,11 +872,23 @@ async fn flushing_with(
     ring_bytes: usize,
     base: commitlog::Options,
 ) -> Cluster {
+    flushing_tuned(n, opts, ring_bytes, base, |_| {}).await
+}
+
+/// As [`flushing_with`], with `tune` applied to each node's config.
+async fn flushing_tuned(
+    n: usize,
+    opts: impl Fn(&str) -> flush::Options + Send + Sync + 'static,
+    ring_bytes: usize,
+    base: commitlog::Options,
+    tune: impl Fn(&mut Config) + Send + Sync + 'static,
+) -> Cluster {
     let o = commitlog::Options { segment_bytes: 256 << 10, retain_bytes: 1 << 20, memory_bytes: 64 << 10, ..base };
     let cfg = move |id: &str, addrs: &HashMap<String, String>| {
         let mut k = config(id, addrs);
         k.retain_bytes = 64 << 10;
         k.flush = Some(opts(id));
+        tune(&mut k);
         k
     };
     Cluster::with_cfg(n, Some((tempfile::tempdir().unwrap(), o)), Some(Arc::new(cfg)), ring_bytes).await
@@ -1733,10 +1745,15 @@ async fn settle_after_wipe(c: &Cluster, within: Duration) -> (Status, flush::Man
 /// past F with their seqs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wiping_two_disks_salvages_the_survivors_log() {
-    let mut c = flushing(
+    let mut c = flushing_tuned(
+        3,
         // long enough that a survivor has committed entries past F
         |_| flush::Options { interval: Duration::from_millis(2500), headroom: 50_000, ..flush_opts() },
         64 << 20,
+        commitlog::Options::default(),
+        // round 0's restart (two fresh commitlogs, fsynced) must fit in it
+        // even on a slow disk
+        |k| k.election_timeout = Duration::from_secs(3),
     )
     .await;
     let load = HostLoad::start(&c, 4, 10, Duration::from_millis(2));
@@ -1744,16 +1761,31 @@ async fn wiping_two_disks_salvages_the_survivors_log() {
     let mut recoveries = 0u64;
     for round in 0..4 {
         let l = c.wait_leader(Duration::from_secs(10)).await;
-        wait_flushed(&c, 1, Duration::from_secs(5)).await;
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        wait_flushed(&c, 1, Duration::from_secs(15)).await;
         let keep = if round < 2 { l.clone() } else { c.ids.iter().find(|id| **id != l).unwrap().clone() };
+        let epoch = c.nodes[&l].node.status().epoch;
+        // the survivor holds committed entries past F, to salvage
+        let t = Instant::now();
+        loop {
+            let f = flush::read_manifest(&c.store).await.unwrap().unwrap().0.flushed;
+            if c.nodes[&keep].node.status().commit > f {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "nothing committed past F {f}: {}", status_line(&c));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         for id in c.ids.clone() {
             if id != keep {
                 c.wipe(&id);
             }
         }
         if round > 0 {
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+            // down for longer than the survivor's election timeout
+            let t = Instant::now();
+            while c.nodes[&keep].node.status().role == Role::Leader {
+                assert!(t.elapsed() < Duration::from_secs(10), "{keep} kept leading: {}", status_line(&c));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         }
         for id in c.ids.clone() {
             if id != keep {
@@ -1761,10 +1793,14 @@ async fn wiping_two_disks_salvages_the_survivors_log() {
             }
         }
         if round == 0 {
-            c.wait_leader(Duration::from_secs(5)).await;
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            let t = Instant::now();
+            while !c.nodes.values().all(|r| r.node.status().intact) {
+                assert!(t.elapsed() < Duration::from_secs(20), "not caught up: {}", status_line(&c));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             assert!(c.recoveries().is_empty(), "{}", status_line(&c));
-            assert_eq!(c.nodes[&keep].node.status().role, Role::Leader, "{}", status_line(&c));
+            let st = c.nodes[&keep].node.status();
+            assert_eq!((st.role, st.epoch), (Role::Leader, epoch), "{}", status_line(&c));
             continue;
         }
         recoveries += 1;
@@ -1774,7 +1810,7 @@ async fn wiping_two_disks_salvages_the_survivors_log() {
             if let Some(r) = c.recoveries().into_iter().find(|r| r.generation == recoveries) {
                 break r;
             }
-            assert!(t.elapsed() < Duration::from_secs(10), "no recovery: {}", status_line(&c));
+            assert!(t.elapsed() < Duration::from_secs(20), "no recovery: {}", status_line(&c));
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         salvaged += rec.salvaged;
