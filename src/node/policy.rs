@@ -573,6 +573,7 @@ impl PolicySource for PolicyHooks {
             tier: tier_to_upstream(l.tier),
             connect: l.connect,
             limits: l.limits.as_ref().map(upstream_limits),
+            backfill: l.backfill,
         })
     }
 }

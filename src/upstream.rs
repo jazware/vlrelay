@@ -79,6 +79,10 @@ pub struct UpstreamConfig {
     /// How far back a host's event times count on its own timeline
     /// (`clock`); older ones count at this horizon.
     pub event_horizon: Duration,
+    /// A host with no saved cursor reads from cursor 0, the oldest event
+    /// its PDS keeps, instead of its live head. An operator's per-host
+    /// choice overrides it.
+    pub backfill_new_hosts: bool,
 }
 
 /// [`UpstreamConfig::event_horizon`]'s default: a relay down for a day still
@@ -106,6 +110,7 @@ impl UpstreamConfig {
             recv_buffer_bytes: 0,
             inflight: flow::FlowLimits::default(),
             event_horizon: EVENT_HORIZON,
+            backfill_new_hosts: false,
         }
     }
 }
@@ -114,9 +119,10 @@ impl UpstreamConfig {
 /// checkpoints; without one the manager uses the registry's acked seq.
 pub trait CursorSource: Send + Sync + 'static {
     fn durable_cursor(&self, host: &Host) -> Option<i64>;
-    /// The host answered our cursor with FutureCursor: its sequence restarted,
-    /// and it's resumed from 0 (the new sequence's start).
-    fn on_future_cursor(&self, _host: &Host) {}
+    /// The host's cursor starts over below where it was: its sequence
+    /// restarted (FutureCursor, resumed from 0) or it was sent to its head.
+    /// Cursors saved before no longer apply to it.
+    fn on_cursor_reset(&self, _host: &Host) {}
 }
 
 /// What the policy engine says about one host. The tier is what the host
@@ -127,6 +133,8 @@ pub struct HostPolicy {
     pub tier: Tier,
     pub connect: bool,
     pub limits: Option<TierLimits>,
+    /// An operator's backfill choice (None: `backfill_new_hosts`).
+    pub backfill: Option<bool>,
 }
 
 /// The policy engine, as the manager sees it. It owns host tiers: the
@@ -225,19 +233,22 @@ impl Manager {
     }
 
     /// Copies the policy's view of the host onto its entry and says whether
-    /// it should have a socket.
-    fn follow_policy(&self, e: &HostEntry) -> bool {
+    /// it should have a socket, and whether this call turned its backfill
+    /// on (once, however many apply it at the same time).
+    fn follow_policy(&self, e: &HostEntry) -> (bool, bool) {
         let p = self.policy.read().clone();
         match p.and_then(|p| p.host_policy(&e.host)) {
             Some(hp) => {
                 e.set_tier(hp.tier);
+                let was = e.set_backfill(hp.backfill).unwrap_or(self.cfg.backfill_new_hosts);
+                let backfill_on = !was && self.backfills(e);
                 e.set_limits(hp.limits.map(|mut l| {
                     l.weight = self.cfg.limits.for_tier(hp.tier).weight;
                     l
                 }));
-                hp.connect
+                (hp.connect, backfill_on)
             }
-            None => e.tier().connects(),
+            None => (e.tier().connects(), false),
         }
     }
 
@@ -245,7 +256,7 @@ impl Manager {
     /// running socket, and a disconnect or a connect when that flips.
     pub async fn apply_policy(self: &Arc<Self>, host: &Host) {
         let Some(e) = self.registry.get(host) else { return };
-        let connect = self.follow_policy(&e);
+        let (connect, backfill_on) = self.follow_policy(&e);
         if !connect {
             if let Some(j) = self.stop_host(host) {
                 tracing::info!(host = %host.0, tier = e.tier().as_str(), "upstream disconnected by policy");
@@ -255,6 +266,11 @@ impl Manager {
         }
         if let Some(r) = self.tasks.lock().get(host) {
             r.queue.set_weight(self.cfg.limits.for_tier(e.tier()).weight);
+            // a socket that started at the head and has read nothing yet
+            // reconnects from 0 now, not at its next drop
+            if backfill_on && e.received_seq().is_none() {
+                r.kick.notify_one();
+            }
         }
         if self.out.lock().is_none() {
             self.spawn_host(e);
@@ -285,11 +301,16 @@ impl Manager {
         }));
         drop(bg);
         for e in self.registry.all() {
-            if self.follow_policy(&e) {
+            if self.follow_policy(&e).0 {
                 self.spawn_host(e);
             }
         }
         Ok(())
+    }
+
+    /// Whether `e`, with no saved cursor, reads from cursor 0.
+    pub fn backfills(&self, e: &HostEntry) -> bool {
+        e.backfill().unwrap_or(self.cfg.backfill_new_hosts)
     }
 
     fn wanted(&self, host: &Host) -> bool {
@@ -350,7 +371,7 @@ impl Manager {
         }
         if self.out.lock().is_none() {
             for e in self.registry.all() {
-                if self.follow_policy(&e) {
+                if self.follow_policy(&e).0 {
                     self.spawn_host(e);
                 }
             }
@@ -387,7 +408,7 @@ impl Manager {
     /// manager is running. Returns whether it was new.
     pub async fn admit(self: &Arc<Self>, host: &Host, tier: Tier) -> anyhow::Result<bool> {
         let (e, new) = self.registry.admit(host, tier).await?;
-        if self.follow_policy(&e) && self.out.lock().is_none() {
+        if self.follow_policy(&e).0 && self.out.lock().is_none() {
             self.spawn_host(e);
         }
         Ok(new)

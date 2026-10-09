@@ -52,6 +52,11 @@ pub struct HostPolicy {
     /// an alias.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub not_alias: bool,
+    /// An operator's choice for this host with no saved cursor: read
+    /// from cursor 0 (true) or the live head (false). None: the node's
+    /// `--backfill-new-hosts`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfill: Option<bool>,
     /// The last tier actions, the operators' and the relay's own, newest
     /// last.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -226,6 +231,8 @@ pub enum Manual {
     Unalias {
         pin: bool,
     },
+    /// The host's backfill choice (None: back to the node's default).
+    Backfill(Option<bool>),
 }
 
 /// Applies an operator action to a record. Errors are the operator's (a
@@ -285,6 +292,7 @@ pub fn apply_manual(rec: &mut HostRecord, m: &Manual, now: u32) -> Result<(), St
             s.alias = None;
             s.not_alias = *pin;
         }
+        Manual::Backfill(b) => s.backfill = *b,
     }
     set_host_policy(rec, &s);
     Ok(())

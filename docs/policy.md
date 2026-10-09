@@ -163,8 +163,8 @@ section of the policy document adds two sources, both run by the leader in the b
 
 Every host found goes through the admission above: the crawl switch aside, the same hostname
 rules, domain bans, allow-list mode, starting tier and `describeServer` probe. Nothing comes from
-the other relay but the name: not its status, bans or tiers. A new host starts live, with no
-backfill. Discovery's admissions don't spend `cluster.newHostsPerDay`, which stays
+the other relay but the name: not its status, bans, tiers or `seq`. A new host starts live, with no
+backfill ([Starting a host](#starting-a-host)). Discovery's admissions don't spend `cluster.newHostsPerDay`, which stays
 requestCrawl's: they're paced by their own `discovery.connectsPerMin` (120), so a cold start
 isn't held to the daily budget.
 
@@ -173,6 +173,39 @@ leader resumes a list where the old one stopped. Each host's source (`requestCra
 `bootstrap:<relay>`, `plc`, `cli`) is kept in the leader's host table and shown on the host and in
 the admission log. `GET /admin/api/discovery` shows each source's last and next run and its counts,
 and `POST /admin/api/discovery/run` starts one now ([Admin API](admin-api.md)).
+
+## Starting a host
+
+Where a host's socket starts depends on whether the relay has a cursor for it:
+
+| The host | Its socket starts | `vlrelay_upstream_connects_total` |
+|---|---|---|
+| Has a saved cursor (the newer of the leader's committed one and the reading node's acks) | after that cursor, on every reconnect, restart and takeover | `cursor` |
+| Has none: new to the relay, or never read past its head | with no cursor, at the PDS's live head. indigo does the same: it sends a cursor only above 0 | `head` |
+| Has none, and backfills | `cursor=0`: every event the PDS still keeps, oldest first (an `OutdatedCursor` info first when its window no longer reaches seq 1) | `start` |
+| Answered our cursor with `FutureCursor` (its sequence restarted) | `cursor=0`, the new sequence from its first event ([Chaos](chaos.md#futurecursor-replay-from-0)) | `start` |
+| A cleared alias | at the head, whatever cursor it had ([Host aliases](#host-aliases)) | `head` |
+
+So a fresh relay reads the network from the moment it connects, at the network's live rate, and
+none of the PDSes' retained backlogs. An account the relay first sees mid-history needs no earlier
+commits: the first commit it sees starts the account's chain.
+
+Backfill is opt-in. `--backfill-new-hosts` makes it every host's default on that node (set it on
+every member), and an operator's `set-backfill` action on a host overrides the default either way
+([Admin API](admin-api.md)). The action is on the host's trail, by the operator who sent it. A host
+whose socket started at its head and hasn't read anything yet reconnects from 0 right away.
+
+A host that already has a saved cursor keeps it, backfill or not, and the action's trail entry
+says `keeps its saved cursor`. Replaying from 0 there would go back over events the relay has
+already passed, and only commits are caught by rev: an old `#account` or `#sync` would overwrite
+the account's newer state. An account that missed events the relay never saw is resynced from its
+PDS on its next commit instead ([The quorum log](quorum.md#the-relay-on-the-log)).
+
+A cursor the relay acks only becomes the leader's once it rides on the next event the log appends.
+The leader keeps each host's highest. When a host's cursor starts over below it (a restarted
+sequence, or a cleared alias at its head), the reading node resumes from its own acks until they
+pass the leader's. A restart before then resumes from the leader's cursor: a restarted sequence
+gets `FutureCursor` and replays from 0 once more, which restates what the relay already has.
 
 ## Host aliases
 

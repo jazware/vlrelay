@@ -1650,11 +1650,14 @@ async fn slot(shared: Arc<Shared>, glue: std::sync::Weak<Glue>, mut rx: mpsc::Un
 }
 
 /// Where a host's socket resumes: a rewind's cursor once, then the newer
-/// of what this node acked and what the leader has committed for it.
+/// of what this node acked and what the leader has committed for it. A
+/// host whose cursor started over resumes from this node's acks alone
+/// until they pass the committed one.
 pub struct QuorumCursors {
     shared: Arc<Shared>,
     hosts: Arc<QuorumHosts>,
     registry: std::sync::OnceLock<Arc<upstream::Registry>>,
+    reset: Mutex<HashSet<Host>>,
 }
 
 impl upstream::CursorSource for QuorumCursors {
@@ -1667,7 +1670,25 @@ impl upstream::CursorSource for QuorumCursors {
             return Some(c);
         }
         let committed = self.hosts.table.read().cursors.get(&host.0).map(|c| *c as i64);
-        entry.and_then(|e| e.acked_seq()).max(committed)
+        let acked = entry.and_then(|e| e.acked_seq());
+        let mut reset = self.reset.lock();
+        if reset.contains(host) {
+            // the leader keeps the highest cursor it was sent, which
+            // belongs to the old sequence (or the old position) until the
+            // new acks pass it. It may not have committed it yet: a cursor
+            // rides on the next event appended.
+            if let (Some(a), Some(c)) = (acked, committed)
+                && a > c
+            {
+                reset.remove(host);
+            }
+            return acked;
+        }
+        acked.max(committed)
+    }
+
+    fn on_cursor_reset(&self, host: &Host) {
+        self.reset.lock().insert(host.clone());
     }
 }
 
@@ -1699,6 +1720,12 @@ impl QuorumHosts {
         if m.len() < 100_000 {
             m.insert(host.to_string(), source.to_string());
         }
+    }
+
+    /// The leader's committed cursor for `host`, as this node last read it.
+    #[cfg(test)]
+    pub(crate) fn committed_cursor(&self, host: &str) -> Option<u64> {
+        self.table.read().cursors.get(host).copied()
     }
 
     /// Where the host table says `host` came from.
@@ -2597,8 +2624,12 @@ impl Node {
             sources: Mutex::new(HashMap::new()),
             changed: std::sync::OnceLock::new(),
         });
-        let cursors =
-            Arc::new(QuorumCursors { shared: shared.clone(), hosts: hosts.clone(), registry: Default::default() });
+        let cursors = Arc::new(QuorumCursors {
+            shared: shared.clone(),
+            hosts: hosts.clone(),
+            registry: Default::default(),
+            reset: Default::default(),
+        });
         let (explicit, cli_hosts) = super::cli_hosts(&cfg)?;
         let mut ucfg = UpstreamConfig::new(cfg.dev_mode);
         ucfg.endpoint = super::endpoint_fn(cfg.dev_mode, explicit);
@@ -2606,6 +2637,7 @@ impl Node {
         ucfg.inflight = cfg.inflight;
         ucfg.recv_buffer_bytes = cfg.upstream_rcvbuf_bytes;
         ucfg.event_horizon = cfg.event_horizon;
+        ucfg.backfill_new_hosts = cfg.backfill_new_hosts;
         let (manager, rx) = Manager::new(ucfg, hosts.clone(), Some(cursors.clone() as Arc<dyn upstream::CursorSource>));
         let _ = cursors.registry.set(manager.registry().clone());
         let crawler = upstream::Crawler::new(manager.clone(), upstream::CrawlPolicy::default());

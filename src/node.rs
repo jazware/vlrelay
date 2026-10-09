@@ -47,6 +47,8 @@ pub mod patience;
 pub mod policy;
 pub mod quorum;
 pub mod resync;
+#[cfg(test)]
+mod start_tests;
 
 use crate::event::{self, Kind, SeqSpan};
 use crate::identity::{HttpFetch, Identity, IdentityCache};
@@ -111,6 +113,8 @@ pub struct NodeConfig {
     /// How far back a host's event times count on its own timeline
     /// (`upstream::clock`).
     pub event_horizon: Duration,
+    /// `--backfill-new-hosts`.
+    pub backfill_new_hosts: bool,
 }
 
 impl NodeConfig {
@@ -135,6 +139,7 @@ impl NodeConfig {
             cli_host_tier: Tier::Trusted,
             lag_cases: lag::LagCaseConfig::default(),
             event_horizon: upstream::EVENT_HORIZON,
+            backfill_new_hosts: false,
         }
     }
 
@@ -373,6 +378,12 @@ impl Node {
         });
         let weak = Arc::downgrade(&node);
         manager.on_connect(Arc::new(move |host: &Host, epoch, cursor, restarted| {
+            let from = match cursor {
+                None => "head",
+                Some(0) => "start",
+                Some(_) => "cursor",
+            };
+            metrics::UPSTREAM_CONNECTS.with_label_values(&[from]).inc();
             if let Some(n) = weak.upgrade() {
                 n.acks.connected(host, epoch, cursor, restarted);
             }

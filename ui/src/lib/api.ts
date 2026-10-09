@@ -204,6 +204,7 @@ export type HostAction =
   | { action: 'set-account-limit'; maxAccounts: number | null }
   | { action: 'alias'; of: string }
   | { action: 'unalias'; pin?: boolean }
+  | { action: 'set-backfill'; backfill: boolean | null }
 
 export type HostDetail = {
   row: HostRow

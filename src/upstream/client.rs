@@ -79,10 +79,7 @@ impl HostTask {
                 }
                 continue;
             }
-            // after a sequence restart the durable cursor is 0: the new
-            // sequence from its first event
-            let cursor =
-                if self.entry.take_start_at_head() { None } else { self.cursor.durable_cursor(&self.entry.host) };
+            let cursor = self.cursor_for_connect();
             let was_restarted = std::mem::take(&mut restarted);
             // a fresh socket replays from the durable cursor: anything still
             // queued from the old one would arrive twice
@@ -148,6 +145,20 @@ impl HostTask {
         }
         self.queue.clear();
         self.entry.set_status(HostStatus::Idle);
+    }
+
+    /// Where this socket starts: the saved cursor (0 after a sequence
+    /// restart: the new sequence from its first event), else the live
+    /// head, as indigo starts a new host, unless the host backfills.
+    fn cursor_for_connect(&self) -> Option<i64> {
+        if self.entry.take_start_at_head() {
+            self.cursor.on_cursor_reset(&self.entry.host);
+            return None;
+        }
+        self.cursor.durable_cursor(&self.entry.host).or_else(|| {
+            let backfill = self.entry.backfill().unwrap_or(self.cfg.backfill_new_hosts);
+            backfill.then_some(0)
+        })
     }
 
     async fn read(&mut self, mut ws: Socket, epoch: u64, cursor: Option<i64>, restarted: &mut bool) -> (End, bool) {
@@ -247,7 +258,7 @@ impl HostTask {
                                 break End::Failed;
                             }
                             self.entry.reset_cursor();
-                            self.cursor.on_future_cursor(&self.entry.host);
+                            self.cursor.on_cursor_reset(&self.entry.host);
                             *restarted = true;
                             break End::Soon;
                         }
@@ -522,6 +533,115 @@ pub(crate) mod tests {
         m.admit(&host, super::super::Tier::Default).await.unwrap();
         let uri = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
         assert_eq!(uri, "/xrpc/com.atproto.sync.subscribeRepos");
+        m.shutdown().await.unwrap();
+    }
+
+    /// A quiet PDS on loopback that passes on each subscription's query
+    /// string.
+    async fn recording_pds() -> (Host, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = Host(format!("127.0.0.1:{}", l.local_addr().unwrap().port()));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut query = String::new();
+                    let cb =
+                        |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                         r: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                            query = req.uri().query().unwrap_or("").to_string();
+                            Ok(r)
+                        };
+                    let Ok(_ws) = tokio_tungstenite::accept_hdr_async(s, cb).await else { return };
+                    let _ = tx.send(query.clone());
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                });
+            }
+        });
+        (host, rx)
+    }
+
+    fn loopback(cfg: &mut UpstreamConfig) {
+        cfg.endpoint = Arc::new(|h: &Host| format!("http://{}", h.0));
+    }
+
+    async fn next_query(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> String {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap()
+    }
+
+    /// `--backfill-new-hosts`: a host with no saved cursor reads from 0, and
+    /// one with a saved cursor still resumes from it.
+    #[tokio::test]
+    async fn backfill_starts_a_new_host_at_zero_and_keeps_a_saved_cursor() {
+        let (new, mut new_rx) = recording_pds().await;
+        let (known, mut known_rx) = recording_pds().await;
+        let store = Arc::new(super::super::MemHostStore::default());
+        let mut rec = super::super::HostRecord::new(&known, super::super::Tier::Default);
+        rec.acked_seq = Some(42);
+        super::super::HostStore::put(&*store, vec![rec]).await.unwrap();
+        let mut cfg = UpstreamConfig::new(true);
+        loopback(&mut cfg);
+        cfg.backfill_new_hosts = true;
+        let (m, _rx) = super::super::Manager::new(cfg, store, None);
+        m.start().await.unwrap();
+        m.admit(&new, super::super::Tier::Default).await.unwrap();
+        assert_eq!(next_query(&mut new_rx).await, "cursor=0");
+        assert_eq!(next_query(&mut known_rx).await, "cursor=42");
+        m.shutdown().await.unwrap();
+    }
+
+    struct Choice(Option<bool>);
+
+    impl super::super::PolicySource for Choice {
+        fn host_policy(&self, _: &Host) -> Option<super::super::HostPolicy> {
+            Some(super::super::HostPolicy {
+                tier: super::super::Tier::Default,
+                connect: true,
+                limits: None,
+                backfill: self.0,
+            })
+        }
+    }
+
+    /// An operator's per-host choice wins over the node's default, either
+    /// way.
+    #[tokio::test]
+    async fn a_per_host_backfill_choice_overrides_the_default() {
+        for (default, choice, want) in
+            [(false, Some(true), "cursor=0"), (true, Some(false), ""), (true, None, "cursor=0")]
+        {
+            let (host, mut rx) = recording_pds().await;
+            let mut cfg = UpstreamConfig::new(true);
+            loopback(&mut cfg);
+            cfg.backfill_new_hosts = default;
+            let (m, _rx) = super::super::Manager::new(cfg, Arc::new(super::super::MemHostStore::default()), None);
+            m.set_policy_source(Arc::new(Choice(choice)));
+            m.start().await.unwrap();
+            m.admit(&host, super::super::Tier::Default).await.unwrap();
+            assert_eq!(next_query(&mut rx).await, want, "default {default}, choice {choice:?}");
+            m.shutdown().await.unwrap();
+        }
+    }
+
+    /// A host that started at its head and read up to seq 3 resumes from 3
+    /// after a restart: neither from 0 nor at the head again.
+    #[tokio::test]
+    async fn a_restart_resumes_from_the_saved_cursor() {
+        let (host, mut rx) = recording_pds().await;
+        let store = Arc::new(super::super::MemHostStore::default());
+        let mut cfg = UpstreamConfig::new(true);
+        loopback(&mut cfg);
+        let (m, _out) = super::super::Manager::new(cfg.clone(), store.clone(), None);
+        m.start().await.unwrap();
+        m.admit(&host, super::super::Tier::Default).await.unwrap();
+        assert_eq!(next_query(&mut rx).await, "");
+        m.ack(&host, 3);
+        m.shutdown().await.unwrap();
+
+        let (m, _out) = super::super::Manager::new(cfg, store, None);
+        m.start().await.unwrap();
+        assert_eq!(next_query(&mut rx).await, "cursor=3");
         m.shutdown().await.unwrap();
     }
 

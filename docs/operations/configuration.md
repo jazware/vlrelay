@@ -81,6 +81,7 @@ Without `--memory`, the four `--s3-*` values are required (the keys directly or 
 | `--host <HOSTS>` |  |  | An upstream to subscribe to (repeatable). `http://` means plain `ws://` (dev mode); a bare hostname means `wss://` |
 | `--crawl` |  |  | Accept com.atproto.sync.requestCrawl |
 | `--host-tier <HOST_TIER>` |  | `trusted` | The tier a --host upstream starts at the first time it's seen. After that its record's tier holds (operators, auto-throttle) |
+| `--backfill-new-hosts` | `VLRELAY_BACKFILL_NEW_HOSTS` |  | A host with no saved cursor (new to the relay, or never read past its head) reads from cursor 0, every event its PDS still keeps, instead of starting at its live head. An operator's per-host `set-backfill` overrides it. A host with a saved cursor resumes from it either way. Set it on every member |
 | `--plc-url <PLC_URL>` | `VLRELAY_PLC_URL` | `https://plc.directory` | The PLC directory `did:plc` documents are resolved against |
 | `--plc-export` | `VLRELAY_PLC_EXPORT` |  | Seed DID documents in bulk from the PLC directory's /export: the quorum log's leader reads the history, then follows the tail, into a database in the bucket every member reads, so a cold relay doesn't resolve each account |
 | `--plc-export-url <PLC_EXPORT_URL>` | `VLRELAY_PLC_EXPORT_URL` |  | The directory --plc-export reads (default: --plc-url) |

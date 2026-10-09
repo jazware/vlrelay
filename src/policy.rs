@@ -66,6 +66,8 @@ pub struct HostLimits {
     pub policy_version: u64,
     /// The host it's another name for: no socket, whatever its tier.
     pub alias_of: Option<String>,
+    /// The operator's backfill choice for the host (`tiers::HostPolicy`).
+    pub backfill: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -356,6 +358,7 @@ impl Engine {
             rule: rule.map(|r| r.id),
             policy_version: snap.policy.version,
             alias_of,
+            backfill: hp.backfill,
         }
     }
 
