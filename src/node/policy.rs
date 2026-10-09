@@ -316,6 +316,7 @@ impl PolicyHooks {
         let limits = self.engine.for_host(rec);
         let hp = policy::tiers::host_policy(rec);
         let mut c = self.cache.lock();
+        let mut cleared = false;
         let aliases_moved = match c.get_mut(&rec.hostname) {
             Some(st) => {
                 st.limits = limits.clone();
@@ -324,6 +325,7 @@ impl PolicyHooks {
                 st.admitted_since_sync = 0;
                 st.not_alias = hp.not_alias;
                 let moved = st.alias.as_ref().map(|a| &a.of) != hp.alias.as_ref().map(|a| &a.of);
+                cleared = st.alias.is_some() && hp.alias.is_none();
                 st.alias = hp.alias;
                 moved
             }
@@ -352,6 +354,13 @@ impl PolicyHooks {
             let m = alias_map(&c);
             super::metrics::HOST_ALIASES.set(m.len() as i64);
             self.state.set_host_aliases(m);
+        }
+        drop(c);
+        // its accounts came through the other name all along: a replay from
+        // its old cursor would be duplicates, and after a wrong alias that
+        // cursor can't be trusted
+        if cleared && let Some(m) = self.manager.get().and_then(Weak::upgrade) {
+            m.start_at_head(&Host(rec.hostname.clone()));
         }
         limits
     }

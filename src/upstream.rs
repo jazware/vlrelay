@@ -423,6 +423,16 @@ impl Manager {
         }
     }
 
+    /// `host`'s next socket, if this node reads it and it opens within a
+    /// minute, starts at the host's head instead of its cursor.
+    pub fn start_at_head(&self, host: &Host) {
+        if self.wanted(host)
+            && let Some(e) = self.registry.get(host)
+        {
+            e.start_at_head(60_000);
+        }
+    }
+
     /// Drops `host`'s socket; it reconnects from its durable cursor.
     pub fn kick(&self, host: &Host) {
         if let Some(r) = self.tasks.lock().get(host) {

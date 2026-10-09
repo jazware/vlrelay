@@ -125,7 +125,7 @@ function spec(verb: HostVerb, h: HostRow, arg?: string): ConfirmSpec | undefined
         tone: 'warn',
         primary: true,
         title: `Read ${name} as its own PDS?`,
-        items: [`Its socket opens again and resumes from its own cursor; whatever ${h.aliasOf ?? 'the other name'} already sent is deduplicated.`, 'The relay won’t mark it an alias again until an operator does.'],
+        items: [`Its socket opens again at the PDS’s head: its accounts came through ${h.aliasOf ?? 'the other name'} all along.`, 'The relay won’t mark it an alias again until an operator does.'],
         action: 'Not an alias',
         call: call(a),
         run: () => run(a),

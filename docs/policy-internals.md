@@ -166,7 +166,11 @@ tier rides the node's next submit to the leader as a proposed row. Everything el
   gives an alias no socket, and `PolicyHooks::remember` keeps `StateStore::set_host_aliases`
   current. `check_authority` compares hosts through `StateStore::same_host`, which maps each side
   to the end of its alias chain (`tiers::ALIAS_HOPS`, 4). Rechecks run on the leader, hourly, for
-  the relay's aliases a day past their last confirmation.
+  the relay's aliases a day past their last confirmation. A cleared alias's next socket starts at
+  the head: `PolicyHooks::remember` sees the alias go and calls `Manager::start_at_head`, which
+  marks the host's registry entry (on the node that reads it, for a minute), and the host task
+  connects with no cursor once and starts its acked cursor over. `sync_api` leaves aliases out of
+  `listHosts` and reports them `offline`.
 - A takedown or its reversal is written to `policy/takedowns/audit/` (one object per action,
   If-None-Match) and `policy/takedowns/current/{sha256(did)}.json` (who, when, why, for the
   account page) before the account changes, and logged on `vlrelay::audit`.

@@ -592,11 +592,12 @@ mod tests {
     mod pds {
         use crate::verify::synth::Repo;
         use axum::extract::ws::{Message, WebSocketUpgrade};
-        use axum::extract::{Path, State};
+        use axum::extract::{Path, Query, State};
         use axum::response::{IntoResponse, Response};
         use axum::routing::get;
         use bytes::Bytes;
         use parking_lot::Mutex;
+        use std::collections::HashMap;
         use std::sync::Arc;
         use tokio::sync::watch;
 
@@ -606,6 +607,8 @@ mod tests {
             pub repos: Mutex<Vec<(Repo, String)>>,
             frames: Mutex<Vec<(i64, Bytes)>>,
             head: watch::Sender<i64>,
+            /// Each subscription: the Host it asked for, and its cursor.
+            pub subs: Mutex<Vec<(String, Option<i64>)>>,
         }
 
         impl Pds {
@@ -621,6 +624,7 @@ mod tests {
                     repos: Mutex::new(repos.into_iter().map(|(r, h)| (r, h.to_string())).collect()),
                     frames: Mutex::new(Vec::new()),
                     head: watch::channel(0).0,
+                    subs: Mutex::new(Vec::new()),
                 });
                 let app = axum::Router::new()
                     .route("/xrpc/com.atproto.sync.subscribeRepos", get(subscribe))
@@ -647,9 +651,16 @@ mod tests {
             }
         }
 
-        // live only, as a relay's first subscription is
-        async fn subscribe(State(p): State<Arc<Pds>>, ws: WebSocketUpgrade) -> Response {
-            let mut at = *p.head.borrow();
+        async fn subscribe(
+            State(p): State<Arc<Pds>>,
+            Query(q): Query<HashMap<String, String>>,
+            headers: axum::http::HeaderMap,
+            ws: WebSocketUpgrade,
+        ) -> Response {
+            let cursor = q.get("cursor").and_then(|c| c.parse::<i64>().ok());
+            let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or_default().to_string();
+            p.subs.lock().push((host, cursor));
+            let mut at = cursor.unwrap_or(*p.head.borrow());
             ws.on_upgrade(move |mut sock| async move {
                 let mut head = p.head.subscribe();
                 loop {
@@ -778,5 +789,26 @@ mod tests {
             let head = pds.repos.lock().iter().find(|(r, _)| r.did == did).unwrap().0.rev;
             assert_eq!(node.state.get(did).await.unwrap().unwrap().chain.map(|c| c.rev), Some(head), "{did}");
         }
+
+        // an operator clears it: the name reconnects at the PDS's head, not
+        // from the cursor it had when it was marked
+        let subs_before = pds.subs.lock().len();
+        hooks.admin.host_action(&alias, HostAction::Unalias { pin: true }, "op").await.unwrap();
+        hooks.refresh_host(&alias).await.unwrap();
+        until("the alias's socket again", 30, || node.manager.is_running(&Host(alias.clone()))).await;
+        until("its subscription", 30, || pds.subs.lock()[subs_before..].iter().any(|(h, _)| *h == alias)).await;
+        let sub = pds.subs.lock()[subs_before..].iter().find(|(h, _)| *h == alias).cloned().unwrap();
+        assert_eq!(sub.1, None, "started at the head");
+        let rec = hooks.hosts.get_host(&alias).await.unwrap().unwrap();
+        let last = crate::policy::admin::PolicyAdmin::host_actions(&rec).pop().unwrap();
+        assert!(last.reason.as_deref().is_some_and(|r| r.starts_with("cursor reset to head")), "{:?}", last.reason);
+        // and it reads on from there
+        pds.commit(0);
+        let s = pds.frames_len() as i64;
+        until("the next event from both names", 30, || {
+            let p = node.passed.lock();
+            p.iter().any(|n| n.upstream_seq == s)
+        })
+        .await;
     }
 }
