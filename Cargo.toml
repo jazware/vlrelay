@@ -67,6 +67,16 @@ crc32fast = "1"
 # SlateDB checkpoint ids (the qlog flush manifest names one)
 uuid = "1"
 
+# tokio-console (TOKIO_CONSOLE_BIND, docs/operations/tokio-console.md) in
+# builds with --cfg tokio_unstable: the images set it. Plain builds don't
+# compile it in.
+[target.'cfg(tokio_unstable)'.dependencies]
+console-subscriber = { version = "0.5", default-features = false }
+tokio = { version = "1", features = ["tracing"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
+
 [features]
 # jemalloc built with heap profiling: off until the process starts with
 # _RJEM_MALLOC_CONF=prof:true,... (docs/operations/configuration.md "A small box")

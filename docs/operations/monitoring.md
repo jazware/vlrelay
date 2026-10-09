@@ -175,3 +175,27 @@ fsync, so `disk.fsync_us` in `/qlog/status` sets much of it there.
 `vlrelay_stage_busy_us_total` divided by `vlrelay_events_in_total` is CPU per event in each
 stage. About a third of a node's CPU per event is signature verification
 ([Performance](../perf.md)).
+
+## tokio-console
+
+The image carries [tokio-console](https://github.com/tokio-rs/console)'s subscriber, off by
+default. Start the relay with `TOKIO_CONSOLE_BIND=127.0.0.1:6669` and it serves the console's
+gRPC API there and logs `tokio-console listening`. Then `tokio-console http://127.0.0.1:6669` shows
+every task: what it waits on, its polls, wakes and busy time, and the timers and locks it holds.
+Logs keep their format and level filter.
+
+- **Loopback only.** The console's API has no auth and names every task and the code that spawned
+  it. The relay refuses any other address, keeps the console off and logs why. In a container
+  that's the container's own loopback, so reach it from inside the container's network namespace
+  (`nsenter -t <pid> -n`) or tunnel to it.
+- **Off.** The image is built with `--cfg tokio_unstable` and tokio's `tracing` feature, which the
+  console needs. With the console off, no subscriber layer is added, but tokio still runs its
+  instrumented paths: about 60 ns more per task spawn, 55 ns per timer and 3 ns per channel
+  message in a spawn-only microbenchmark (+21% there). An HTTP endpoint under keep-alive load
+  measured within noise.
+- **On.** The console records every task and resource (each channel, timer and lock), and keeps
+  finished tasks for an hour. Code that sends a lot through channels pays most: the same
+  microbenchmark's channel ping-pong ran 24x slower with the console on and its spawns 3.4x, while
+  the HTTP benchmark didn't move. On a busy node, turn it on briefly and off again.
+- A binary built without `--cfg tokio_unstable` (a plain `cargo build`) logs that
+  `TOKIO_CONSOLE_BIND` is set and stays off.

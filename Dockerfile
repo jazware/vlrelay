@@ -38,6 +38,9 @@ COPY src ./src
 # No debug info in the image (Cargo.toml keeps debug = 1 for local profiling).
 # Symbols stay, so panics and backtraces still name functions.
 ENV CARGO_PROFILE_RELEASE_DEBUG=0
+# tokio-console compiled in, off until TOKIO_CONSOLE_BIND is set (docs/operations/monitoring.md).
+# --build-arg RUSTFLAGS= builds without it.
+ARG RUSTFLAGS="--cfg tokio_unstable"
 # --build-arg VLRELAY_TOOLS=1 adds fakepds (a synthetic upstream fleet and
 # firehose consumer, docs/loadfleet.md) and e2e_check (docs/devloop.md). One
 # cargo invocation, so they reuse the compiled lib.
