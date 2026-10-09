@@ -231,6 +231,8 @@ pub struct HostEntry {
     /// Until then (unix ms), the next connect skips the cursor and starts
     /// at the host's head.
     head_until_ms: AtomicU64,
+    /// An operator's per-host backfill choice (0: none, 1: no, 2: yes).
+    backfill: AtomicU8,
 }
 
 /// A reader that has waited this long on its socket with nothing to read
@@ -263,6 +265,7 @@ impl HostEntry {
             backpressure: AtomicU8::new(0),
             backpressure_left_ms: AtomicI64::new(0),
             head_until_ms: AtomicU64::new(0),
+            backfill: AtomicU8::new(0),
             clock: Mutex::new(Default::default()),
         }
     }
@@ -423,15 +426,37 @@ impl HostEntry {
         self.head_until_ms.store(now_ms() + for_ms, Ordering::Relaxed);
     }
 
-    /// Whether this connect starts at the head (once). Its acked cursor
-    /// starts over, so the new socket's acks set it.
+    /// Whether this connect starts at the head (once). It has no cursor
+    /// until the new socket's acks set one: a reconnect before the first
+    /// can't know the head's seq either.
     pub(crate) fn take_start_at_head(&self) -> bool {
         let until = self.head_until_ms.swap(0, Ordering::Relaxed);
         let now = until > now_ms();
         if now {
-            self.reset_cursor();
+            self.acked_seq.store(NO_SEQ, Ordering::Relaxed);
+            self.received_seq.store(NO_SEQ, Ordering::Relaxed);
+            self.dirty.store(true, Ordering::Relaxed);
         }
         now
+    }
+
+    /// The operator's backfill choice for this host (None: the node's
+    /// `--backfill-new-hosts`).
+    pub fn backfill(&self) -> Option<bool> {
+        match self.backfill.load(Ordering::Relaxed) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Returns the choice it replaced.
+    pub(crate) fn set_backfill(&self, b: Option<bool>) -> Option<bool> {
+        match self.backfill.swap(b.map_or(0, |b| 1 + b as u8), Ordering::Relaxed) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
     }
 
     /// A host that reset its sequence (FutureCursor) starts over, from the
@@ -755,7 +780,7 @@ mod tests {
         assert_eq!(e.acked_seq(), Some(500));
         e.start_at_head(60_000);
         assert!(e.take_start_at_head());
-        assert_eq!(e.acked_seq(), Some(0), "the new socket's acks set it");
+        assert_eq!(e.acked_seq(), None, "the new socket's acks set it");
         assert!(!e.take_start_at_head(), "once");
         // a mark nobody connected under in time does nothing
         e.ack(700);

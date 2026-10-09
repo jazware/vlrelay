@@ -255,6 +255,11 @@ sequence from its first event (`src/upstream/client.rs`):
   (host, upstream seq, DID) until the host's cursor passes it. Copies past that are emitted again.
   They restate state, so a consumer sees a repeat and never a wrong state.
 - The cost is one full replay of the host's window, which the in-flight caps bound in memory.
+- On the quorum log the leader keeps each host's highest cursor, which is the old sequence's until
+  the new one passes it. The node reading the host resumes from its own acks meanwhile. Before
+  that, every reconnect resumed from the old sequence's cursor, got `FutureCursor` again and never
+  read the host (`node::start_tests::a_restarted_sequence_resumes_from_its_own_acks`). A restart
+  in that window still resumes from the leader's cursor and replays the new sequence once more.
 
 The alternative, marking the affected accounts for resync, needs to know which accounts the gap
 touched, which we can't know without the missing events. Replaying from 0 loses nothing the host

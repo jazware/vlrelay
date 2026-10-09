@@ -412,7 +412,7 @@ pub async fn recheck(hooks: &PolicyHooks, upstream: &UpstreamConfig, now: u32) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn cfg() -> AliasConfig {
@@ -589,7 +589,7 @@ mod tests {
     /// One PDS with two accounts on one sequence, reachable as both
     /// 127.0.0.1 and localhost; one account's DID document names each. Its
     /// PLC directory is on the same port.
-    mod pds {
+    pub(crate) mod pds {
         use crate::verify::synth::Repo;
         use axum::extract::ws::{Message, WebSocketUpgrade};
         use axum::extract::{Path, Query, State};
@@ -635,6 +635,13 @@ mod tests {
                 p
             }
 
+            /// The PDS's sequencer starts over (a wiped one): the next
+            /// commit is seq 1, and a cursor past it gets FutureCursor.
+            pub fn restart_sequence(&self) {
+                self.frames.lock().clear();
+                self.head.send_replace(0);
+            }
+
             /// The next commit of account `i`.
             pub fn commit(&self, i: usize) {
                 let mut frames = self.frames.lock();
@@ -661,7 +668,13 @@ mod tests {
             let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or_default().to_string();
             p.subs.lock().push((host, cursor));
             let mut at = cursor.unwrap_or(*p.head.borrow());
+            let future = at > *p.head.borrow();
             ws.on_upgrade(move |mut sock| async move {
+                if future {
+                    let f = vlatproto::events::error_frame("FutureCursor", "cursor in the future");
+                    let _ = sock.send(Message::Binary(f.into())).await;
+                    return;
+                }
                 let mut head = p.head.subscribe();
                 loop {
                     let next: Vec<(i64, Bytes)> = p.frames.lock().iter().filter(|(s, _)| *s > at).cloned().collect();
@@ -706,7 +719,7 @@ mod tests {
         }
     }
 
-    async fn until(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
+    pub(crate) async fn until(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
         let t = Instant::now();
         while !f() {
             assert!(t.elapsed() < Duration::from_secs(secs), "waiting for {what}");

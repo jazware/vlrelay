@@ -115,6 +115,20 @@ Should vlRelay support relay-as-upstream? Not as an upstream mode. Host authorit
 - Bootstrap a host list by reading another relay's `listHosts` and subscribing to those PDSes directly. This needs no trust in the relay, and it's built: `--bootstrap-relay` and the policy's `discovery.seedRelays` read the list and never ask the other relay to crawl anything ([Policy](policy.md#discovering-hosts)).
 - Mirror a vlRelay, which every member of a cluster already does.
 
+### A new host's first subscription
+
+Same as indigo: a fresh relay starts every new host at its live head, not at cursor 0. indigo's
+slurper starts a host from its stored `LastSeq` and only adds `?cursor=` when it's above 0
+(`cmd/relay/relay/slurper.go:L306-L323`), and a new host's is 0. vlRelay subscribes a host with no
+saved cursor without one, whether it came from `--host`, requestCrawl, a seed relay's `listHosts`
+or the PLC export. It never takes the other relay's `seq` for a host as a starting cursor. A saved
+cursor is used on every reconnect and restart, which indigo does too. The difference is that
+vlRelay can backfill on purpose: `--backfill-new-hosts`, or `set-backfill` per host, subscribes a
+host with no saved cursor at `cursor=0`, which the lexicon's "last known event seq number to
+backfill from" makes everything the PDS keeps ([Policy](policy.md#starting-a-host)). Regression
+tests: `upstream::client::tests::a_new_host_is_subscribed_without_a_cursor` and the quorum-log
+ones in `node::start_tests`.
+
 ### Host authority
 
 indigo checks the account's host on `#commit`, `#sync` and `#account`, and passes `#identity` from any host. On a mismatch it purges the DID document and resolves it again, on every mismatched event. `#identity` purges it too. vlRelay checks the same events, and re-resolves a mismatch at most once per DID per 30 s, so a host sending events for accounts it doesn't hold can't spend PLC lookups per event.

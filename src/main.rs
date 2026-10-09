@@ -213,6 +213,13 @@ struct Args {
     /// did; a time older than this counts at this horizon.
     #[arg(long, default_value_t = 86_400)]
     event_horizon_secs: u64,
+    /// A host with no saved cursor (new to the relay, or never read past
+    /// its head) reads from cursor 0, every event its PDS still keeps,
+    /// instead of starting at its live head. An operator's per-host
+    /// `set-backfill` overrides it. A host with a saved cursor resumes from
+    /// it either way. Set it on every member.
+    #[arg(long, env = "VLRELAY_BACKFILL_NEW_HOSTS")]
+    backfill_new_hosts: bool,
     /// A host's reader this far behind its stream (in minutes) opens a
     /// read-lag case, once it has stayed there --lag-case-sustain-secs
     /// while the relay had room for it.
@@ -596,6 +603,7 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
     };
     cfg.upstream_rcvbuf_bytes = a.upstream_rcvbuf_kb << 10;
     cfg.event_horizon = Duration::from_secs(a.event_horizon_secs);
+    cfg.backfill_new_hosts = a.backfill_new_hosts;
     cfg.lag_cases = vlrelay::node::lag::LagCaseConfig {
         threshold: Duration::from_secs(a.lag_case_minutes.max(1) * 60),
         sustain: Duration::from_secs(a.lag_case_sustain_secs),

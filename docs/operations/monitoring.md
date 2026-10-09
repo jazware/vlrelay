@@ -82,6 +82,7 @@ it reads, the events it submits and its own consumers.
 | `vlrelay_alias_watches_total` | counter | `outcome` | Host pairs the leader watched as one PDS under two names: `started`, `same` (one stream), `differ`, and `marked` (one service too, marked an alias) |
 | `vlrelay_forced_lookups_refused_total` | counter | | Fresh DID document fetches an event asked for that its host's budget refused (the cached document was used) |
 | `vlrelay_lane_queued` | gauge | | Events queued in front of the pipeline lanes |
+| `vlrelay_upstream_connects_total` | counter | `from` | Upstream sockets opened, by where they started: `head` (no cursor, the live stream: a new host, [Starting a host](../policy.md#starting-a-host)), `cursor` (a saved cursor) or `start` (cursor 0: a backfill, or a host whose sequence restarted). A fresh relay is all `head` at first; a steady `start` rate is a host restarting its sequence |
 | `vlrelay_upstream_inflight_events` | gauge | | Upstream frames read and not yet done, all hosts |
 | `vlrelay_upstream_inflight_bytes` | gauge | | The same in bytes |
 | `vlrelay_upstream_host_inflight_events_max` | gauge | | The most frames any one host has in flight |

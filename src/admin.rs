@@ -372,6 +372,12 @@ pub enum HostAction {
         #[serde(default)]
         pin: bool,
     },
+    /// Whether the host, with no saved cursor, reads from cursor 0 (true)
+    /// or its live head (false). None: the node's `--backfill-new-hosts`.
+    SetBackfill {
+        #[serde(default)]
+        backfill: Option<bool>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

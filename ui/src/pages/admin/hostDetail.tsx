@@ -36,6 +36,8 @@ function describe(a: HostAction): string {
       return `alias of ${a.of}`
     case 'unalias':
       return a.pin ? 'not an alias (pinned)' : 'alias cleared'
+    case 'set-backfill':
+      return a.backfill == null ? "backfill back to the node's default" : a.backfill ? 'backfill from cursor 0 without a saved cursor' : 'start at the head without a saved cursor'
   }
 }
 

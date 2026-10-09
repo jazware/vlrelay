@@ -367,6 +367,7 @@ impl PolicyAdmin {
                 Manual::Alias { of, by_operator: by != tiers::RELAY_ACTOR }
             }
             HostAction::Unalias { pin } => Manual::Unalias { pin: *pin },
+            HostAction::SetBackfill { backfill } => Manual::Backfill(*backfill),
             HostAction::Reconnect => {
                 return Err(AdminError::BadRequest("reconnect is an upstream action, not a policy one".into()));
             }
@@ -399,6 +400,11 @@ impl PolicyAdmin {
                     let mut entry = entry;
                     if let (Manual::Unalias { .. }, Some(a)) = (&m, tiers::host_policy(&rec).alias) {
                         entry.reason = Some(format!("cursor reset to head: its accounts were read through {}", a.of));
+                    }
+                    if let (Manual::Backfill(Some(true)), c) = (&m, rec.cursor)
+                        && c > 0
+                    {
+                        entry.reason = Some(format!("keeps its saved cursor {c}: a backfill starts only without one"));
                     }
                     if let Err(e) = tiers::apply_manual(&mut rec, &m, crate::state::now_secs()) {
                         *out = Some(Err(e));

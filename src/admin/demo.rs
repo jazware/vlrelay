@@ -1485,6 +1485,7 @@ impl AdminSource for Demo {
                     h.redial_at = Some(now + 2_000);
                 }
             }
+            HostAction::SetBackfill { .. } => {}
             HostAction::Reconnect => {
                 if matches!(h.status, HostStatus::Banned | HostStatus::Suspended) {
                     return Err(AdminError::BadRequest(
