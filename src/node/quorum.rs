@@ -124,7 +124,7 @@ impl QuorumSetup {
             auto_recover: true,
             admin_token: None,
             retain_horizon: Some(Duration::from_secs(72 * 3600)),
-            retain_every: Duration::from_secs(600),
+            retain_every: Duration::from_secs(3600),
             host_failover: Duration::from_secs(2),
             host_poll: Duration::from_millis(500),
             cursor_every: Duration::from_secs(1),

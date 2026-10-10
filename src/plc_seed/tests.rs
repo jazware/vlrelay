@@ -143,6 +143,7 @@ impl Fake {
         cfg.tail_poll = Duration::from_millis(50);
         cfg.apply_every = Duration::from_millis(200);
         cfg.checkpoint_every = Duration::from_millis(300);
+        cfg.cursor_every = Duration::from_millis(300);
         cfg.start_ms = self.start_ms;
         cfg
     }
@@ -211,6 +212,43 @@ async fn an_older_op_never_replaces_a_newer_one() {
     w.close().await;
     let w = SeedWriter::open(&store).await.unwrap();
     assert_eq!(w.get(did).await.unwrap().unwrap().pds.as_deref(), Some("d.test"));
+    w.close().await;
+}
+
+/// Following a busy tail, every checkpoint flushes the rows but the
+/// cursors are written at most once per `cursor_every` (each is a Class A
+/// PUT), and the run's end writes the last ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursors_are_written_once_per_cursor_every() {
+    let f = fake(2, 50).await;
+    let counted =
+        vlsync_store::objstats::counted(Arc::new(object_store::memory::InMemory::new()), "vlpds", "cursor_test");
+    let store = Store { raw: counted, prefix: "vlpds".into(), latency: None };
+    let w = Arc::new(SeedWriter::open(&store).await.unwrap());
+    let mut cfg = f.cfg(1);
+    cfg.checkpoint_every = Duration::from_millis(100);
+    cfg.cursor_every = Duration::from_secs(1);
+    let ing = Ingester::new(cfg, store.clone(), Arc::new(Writes(w.clone())));
+    let plc = f.plc.clone();
+    let tail = tokio::spawn(async move {
+        for v in 1.. {
+            plc.append(0, v % 50, v, export::now_ms());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let t0 = Instant::now();
+    ing.clone().supervise(Arc::new(move || t0.elapsed() < Duration::from_secs(4))).await;
+    tail.abort();
+    let puts =
+        vlsync_store::metrics::OBJ_REQUESTS.with_label_values(&["put", "plc_checkpoint", "cursor_test", "ok"]).get();
+    let checkpoints = ing.stats.checkpoints.load(Relaxed);
+    assert!(checkpoints >= 15, "{checkpoints} checkpoints");
+    // one a second, the first and the last
+    assert!((3..=7).contains(&puts), "{puts} cursor writes for {checkpoints} checkpoints");
+    // ~200 ops a second: without the end's write the cursors would trail
+    // by up to a second of them (pages still queued at the stop never count)
+    let (written, read) = (Checkpoint::load(&store).await.unwrap().unwrap().ops(), ing.stats.ops.load(Relaxed));
+    assert!(read - written < 60, "the cursors hold {written} of {read} ops read");
     w.close().await;
 }
 

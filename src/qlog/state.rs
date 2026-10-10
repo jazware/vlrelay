@@ -286,7 +286,26 @@ pub(crate) fn settings(l0_bytes: usize, b: Bounds) -> slatedb::Settings {
             }),
             ..Default::default()
         }),
+        garbage_collector_options: Some(gc_options()),
         ..Default::default()
+    }
+}
+
+/// SlateDB's GC every 30 minutes rather than 10: each pass LISTs its
+/// directory and advances a boundary file, Class A requests, and only
+/// garbage waits the longer (min_age, what keeps a reader's files, is
+/// unchanged).
+fn gc_options() -> slatedb::config::GarbageCollectorOptions {
+    use slatedb::config::GarbageCollectorDirectoryOptions as Dir;
+    let every = |d: Option<Dir>| d.map(|d| Dir { interval: Some(std::time::Duration::from_secs(30 * 60)), ..d });
+    let d = slatedb::config::GarbageCollectorOptions::default();
+    slatedb::config::GarbageCollectorOptions {
+        manifest_options: every(d.manifest_options),
+        wal_options: every(d.wal_options),
+        wal_fence_options: every(d.wal_fence_options),
+        compacted_options: every(d.compacted_options),
+        compactions_options: every(d.compactions_options),
+        ..d
     }
 }
 

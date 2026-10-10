@@ -138,7 +138,7 @@ Every member uses the same bucket and `--prefix`. A node with no `--qlog-peer` i
 | `--qlog-admin-token-file <QLOG_ADMIN_TOKEN_FILE>` | `QLOG_ADMIN_TOKEN_FILE` |  | --qlog-admin-token from a file, less one trailing newline |
 | `--qlog-retain-hours <QLOG_RETAIN_HOURS>` |  | `72` | Bucket retention, run by the leader: segments older than this go (0: never) |
 | `--qlog-retain-secs <QLOG_RETAIN_SECS>` |  |  | Dev: retention in seconds instead |
-| `--qlog-retain-every-secs <QLOG_RETAIN_EVERY_SECS>` |  | `600` | How often the leader runs a retention pass |
+| `--qlog-retain-every-secs <QLOG_RETAIN_EVERY_SECS>` |  | `3600` | How often the leader runs a retention pass. Each one LISTs every segment in the bucket (72 h of them is a dozen pages), Class A requests, for an hour's worth of segments to delete at most |
 | `--qlog-host-failover-ms <QLOG_HOST_FAILOVER_MS>` |  | `2000` | A member silent this long loses its hosts to the others |
 | `--qlog-host-poll-ms <QLOG_HOST_POLL_MS>` |  | `500` | How often a member reads the host table and the hosts' cursors from the leader |
 | `--qlog-election-ms <QLOG_ELECTION_MS>` |  | `1000` | Silence from the leader that starts an election |

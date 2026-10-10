@@ -117,7 +117,7 @@ in `discovery/state.json`, and `--plc-export` adds `plc/seeds` and `plc/export-c
 ([Policy](../policy.md#discovering-hosts)).
 
 The leader deletes segments older than `--qlog-retain-hours` (72) every
-`--qlog-retain-every-secs` (600). At Bluesky's average of ~330 events/s, 72 hours is ~390 GB of
+`--qlog-retain-every-secs` (3600). At Bluesky's average of ~330 events/s, 72 hours is ~390 GB of
 raw events, and less after zstd (`--log-compression`). At today's rate the bucket sees about 0.5
 writes and 1.7 reads a second. [Cost](../cost.md) has the bill per provider.
 

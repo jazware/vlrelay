@@ -801,7 +801,7 @@ Every node keeps its upstream sockets, verify and lanes.
   gets one request at a time and at most 5 accounts a second, 8 hosts are fetched from at once,
   and an account is asked for at most once a minute (`src/node/resync.rs`,
   `vlrelay_resyncs_total`).
-- Retention is a loop. Each leader term runs a retention pass every `--qlog-retain-every-secs` (600)
+- Retention is a loop. Each leader term runs a retention pass every `--qlog-retain-every-secs` (3600)
   with `--qlog-retain-hours` (72, 0 turns it off). It deletes segments past the horizon oldest first,
   after publishing the new floor (`pruned_seq` in `retain/qlog`), and old state paths that nothing
   lists any more.

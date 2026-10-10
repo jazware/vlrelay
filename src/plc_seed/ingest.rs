@@ -9,10 +9,11 @@
 //! windows, which the newest-wins write absorbs. The last window has no end
 //! and becomes the live tail once it catches up.
 //!
-//! A checkpoint is written only after the sink has made everything before
-//! it durable (`Sink::flush`), so a restart or a new leader re-reads at most
-//! one interval. Any sink error ends the run, and the job starts over from
-//! the last checkpoint.
+//! A checkpoint makes everything applied durable (`Sink::flush`), and at
+//! most once a minute also writes the cursors, which only ever trail the
+//! flushed rows: a restart or a new leader re-reads at most that minute.
+//! Any sink error ends the run, and the job starts over from the last
+//! cursors written.
 
 use super::{ExportOp, LineError, Seed, format_ms, parse_line, parse_ms};
 use crate::policy::store as obj;
@@ -42,7 +43,16 @@ pub struct Config {
     /// `batch` DIDs.
     pub apply_every: Duration,
     pub batch: usize,
+    /// How often the applied rows are flushed (durable, and in the
+    /// changelog the members' tables follow).
     pub checkpoint_every: Duration,
+    /// How often a checkpoint also writes the cursors
+    /// ([`CHECKPOINT`]), at most: they may lag the flushed rows, and a new
+    /// leader reads again what's after them (newest-wins makes that
+    /// harmless), so each PUT, a Class A request, only moves the restart
+    /// point. The last checkpoint of a run and the end of the history
+    /// always write them.
+    pub cursor_every: Duration,
     /// History starts here (the first op on plc.directory is from
     /// 2022-11-17).
     pub start_ms: u64,
@@ -66,6 +76,7 @@ impl Config {
             apply_every: Duration::from_secs(2),
             batch: 50_000,
             checkpoint_every: Duration::from_secs(10),
+            cursor_every: Duration::from_secs(60),
             start_ms: 1_668_643_200_000,
             mem_budget_mb: 0,
             mem_hold_retry: Duration::from_secs(60),
@@ -370,9 +381,12 @@ impl Ingester {
     /// false (after a last checkpoint), or on the first error.
     pub async fn run(&self, keep_going: Arc<dyn Fn() -> bool + Send + Sync>) -> anyhow::Result<()> {
         let now = crate::policy::store::now_ms() as u64;
-        let mut ck = match Checkpoint::load(&self.store).await? {
-            Some(c) if !c.windows.is_empty() => c,
-            _ => Checkpoint::fresh(&self.cfg, now),
+        let (mut ck, mut saved) = match Checkpoint::load(&self.store).await? {
+            Some(c) if !c.windows.is_empty() => {
+                let w = c.windows.clone();
+                (c, Some((Instant::now(), w)))
+            }
+            _ => (Checkpoint::fresh(&self.cfg, now), None),
         };
         tracing::info!(windows = ck.windows.len(), ops = ck.ops(), url = %self.cfg.url, "PLC export ingest starting");
         let pace = Arc::new(Pace {
@@ -444,8 +458,9 @@ impl Ingester {
                 self.stats.written.fetch_add(n as u64, Relaxed);
                 last_apply = Instant::now();
             }
-            if dirty && (last_ck.elapsed() >= self.cfg.checkpoint_every || ck.windows.iter().all(|w| w.done)) {
-                self.checkpoint(&mut acc, &mut ck).await?;
+            let all_done = ck.windows.iter().all(|w| w.done);
+            if dirty && (last_ck.elapsed() >= self.cfg.checkpoint_every || all_done) {
+                self.checkpoint(&mut acc, &mut ck, &mut saved, all_done).await?;
                 dirty = false;
                 last_ck = Instant::now();
             }
@@ -471,13 +486,22 @@ impl Ingester {
             }
         }
         readers.abort_all();
-        if dirty {
-            self.checkpoint(&mut acc, &mut ck).await?;
+        if dirty || saved.as_ref().is_none_or(|(_, w)| *w != ck.windows) {
+            self.checkpoint(&mut acc, &mut ck, &mut saved, true).await?;
         }
         Ok(())
     }
 
-    async fn checkpoint(&self, acc: &mut HashMap<String, Seed>, ck: &mut Checkpoint) -> anyhow::Result<()> {
+    /// Flushes what's applied, then writes the cursors if they moved since
+    /// `saved` (the cursors as last written, and when) and `force` or
+    /// [`Config::cursor_every`] has passed.
+    async fn checkpoint(
+        &self,
+        acc: &mut HashMap<String, Seed>,
+        ck: &mut Checkpoint,
+        saved: &mut Option<(Instant, Vec<Window>)>,
+        force: bool,
+    ) -> anyhow::Result<()> {
         if !acc.is_empty() {
             let t = Instant::now();
             let n = self.sink.apply(acc.drain().collect()).await?;
@@ -486,8 +510,15 @@ impl Ingester {
         }
         let t = Instant::now();
         self.sink.flush().await?;
-        ck.updated_ms = crate::policy::store::now_ms();
-        ck.save(&self.store).await?;
+        let due = match saved {
+            None => true,
+            Some((at, w)) => *w != ck.windows && (force || at.elapsed() >= self.cfg.cursor_every),
+        };
+        if due {
+            ck.updated_ms = crate::policy::store::now_ms();
+            ck.save(&self.store).await?;
+            *saved = Some((Instant::now(), ck.windows.clone()));
+        }
         add_us(&self.stats.phases.checkpoint_us, t);
         self.stats.checkpoints.fetch_add(1, Relaxed);
         Ok(())

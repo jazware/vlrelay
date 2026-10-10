@@ -356,8 +356,10 @@ struct QuorumArgs {
     /// Dev: retention in seconds instead.
     #[arg(long)]
     qlog_retain_secs: Option<u64>,
-    /// How often the leader runs a retention pass.
-    #[arg(long, default_value_t = 600)]
+    /// How often the leader runs a retention pass. Each one LISTs every
+    /// segment in the bucket (72 h of them is a dozen pages), Class A
+    /// requests, for an hour's worth of segments to delete at most.
+    #[arg(long, default_value_t = 3600)]
     qlog_retain_every_secs: u64,
     /// A member silent this long loses its hosts to the others.
     #[arg(long, default_value_t = 2_000)]
