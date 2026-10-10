@@ -2333,15 +2333,26 @@ async fn learners_never_count_and_removed_members_never_lead() {
         }
     })
     .await;
-    let l = c.wait_leader(Duration::from_secs(5)).await;
+    c.wait_leader(Duration::from_secs(5)).await;
     let load = Load::start(c.client(), 4, 10, Duration::from_millis(2));
     tokio::time::sleep(Duration::from_millis(300)).await;
     c.start("n4").await;
     // the change stops after the learner caught up: it stays a learner
     *armed.lock() = Some(Step::SwitchBeforePause);
     let all4: Vec<String> = ["n1", "n2", "n3", "n4"].iter().map(|s| s.to_string()).collect();
-    let r = c.change_on(&l, &all4).await.unwrap();
-    assert!(r.is_err(), "{r:?}");
+    let t = Instant::now();
+    let l = loop {
+        let l = c.wait_leader(Duration::from_secs(5)).await;
+        let r = c.change_on(&l, &all4).await.unwrap();
+        assert!(r.is_err(), "{r:?}");
+        if armed.lock().is_none() {
+            break l;
+        }
+        // A takeover on a loaded box can depose `l` before the change
+        // records n4, so it never reaches the crash: again on the new leader.
+        assert!(t.elapsed() < Duration::from_secs(30), "no change reached the crash: {r:?}");
+        eprintln!("change ended before the crash: {r:?}");
+    };
     c.kill(&l);
     c.start(&l).await;
     let l = c.wait_leader(Duration::from_secs(5)).await;
@@ -2352,12 +2363,16 @@ async fn learners_never_count_and_removed_members_never_lead() {
     // only the leader and the learner
     let ids = ["n1", "n2", "n3"];
     let rest = others(&ids, &[&l]);
+    let dead: Vec<Arc<Node>> = rest.iter().map(|id| c.nodes[*id].node.clone()).collect();
     c.kill(rest[0]);
     c.kill(rest[1]);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Commits can still move after the kill (an ack already in, the
+    // leader's own fsync, a follower hearing the commit late), so bound
+    // them by what the dead members hold rather than expecting a freeze.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let held = dead.iter().map(|n| n.status().last).max().unwrap();
     let (cl, c4) = (c.commit_of(&l), c.commit_of("n4"));
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    assert_eq!((c.commit_of(&l), c.commit_of("n4")), (cl, c4), "a learner counted: {}", status_line(&c));
+    assert!(cl <= held && c4 <= held, "a learner counted: held {held}, {}", status_line(&c));
     c.start(rest[0]).await;
     c.start(rest[1]).await;
     let l = c.wait_leader(Duration::from_secs(5)).await;
