@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
-use vlsync_lease::cas;
+use vlsync_lease::{cas, peers};
 use vlsync_store::store::Store;
 
 #[derive(Clone, Debug)]
@@ -168,9 +168,7 @@ impl Config {
     }
 }
 
-pub fn quorum(members: usize) -> usize {
-    members / 2 + 1
-}
+pub use vlsync_lease::peers::quorum;
 
 /// `qlog/leader`: one leader per epoch, decided by the bucket's CAS.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -368,24 +366,9 @@ struct Ticket {
     cut: u64,
 }
 
-/// In-process partitions for tests: requests to and from a blocked peer
-/// are dropped (a blackhole, not a refusal).
-#[derive(Default)]
-pub struct Faults {
-    blocked: parking_lot::RwLock<HashSet<String>>,
-}
-
-impl Faults {
-    pub fn block(&self, peers: &[&str]) {
-        self.blocked.write().extend(peers.iter().map(|p| p.to_string()));
-    }
-    pub fn heal(&self) {
-        self.blocked.write().clear();
-    }
-    pub fn blocked(&self, peer: &str) -> bool {
-        self.blocked.read().contains(peer)
-    }
-}
+/// In-process partitions for tests (requests to and from a blocked peer
+/// are dropped), shared with vlsync-lease's peer client.
+pub use vlsync_lease::rpc::Faults;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -867,13 +850,8 @@ impl Node {
             return None;
         }
         let now = Instant::now();
-        Some(
-            c.members
-                .iter()
-                .filter(|m| **m == self.cfg.id || c.acked_at.get(*m).is_some_and(|t| now.duration_since(*t) < within))
-                .cloned()
-                .collect(),
-        )
+        let age = |m: &str| c.acked_at.get(m).map(|t| now.duration_since(*t));
+        Some(peers::heard_within(&c.members, &self.cfg.id, age, within).cloned().collect())
     }
 
     /// The address this node dials `id` at, if it knows one.
@@ -1841,15 +1819,8 @@ impl Node {
                 self.durability.set_floor(floor);
                 match c.role {
                     Role::Leader => {
-                        let alive = c
-                            .members
-                            .iter()
-                            .filter(|m| {
-                                **m == self.cfg.id
-                                    || c.acked_at.get(*m).is_some_and(|t| t.elapsed() < self.cfg.election_timeout)
-                            })
-                            .count();
-                        if alive < quorum(c.members.len()) {
+                        let age = |m: &str| c.acked_at.get(m).map(|t| t.elapsed());
+                        if !peers::has_quorum(&c.members, &self.cfg.id, age, self.cfg.election_timeout) {
                             self.step_down(&mut c, "no quorum heard within the election timeout");
                         }
                         None
@@ -2989,74 +2960,8 @@ impl Drop for SwitchGuard {
     }
 }
 
-#[derive(Debug)]
-pub enum CallError {
-    /// The port refused the connection: the process is gone.
-    Refused,
-    Timeout,
-    Io(String),
-    Blocked,
-}
+pub use vlsync_lease::rpc::CallError;
 
-/// One connection to a peer, one request at a time.
-pub struct Rpc {
-    peer: String,
-    addr: String,
-    conn: tokio::sync::Mutex<Option<TcpStream>>,
-    rid: AtomicU64,
-    faults: Arc<Faults>,
-}
-
-impl Rpc {
-    pub fn new(peer: &str, addr: &str, faults: Arc<Faults>) -> Rpc {
-        Rpc {
-            peer: peer.to_string(),
-            addr: addr.to_string(),
-            conn: tokio::sync::Mutex::new(None),
-            rid: AtomicU64::new(1),
-            faults,
-        }
-    }
-
-    pub async fn call(&self, m: &Msg, timeout: Duration) -> Result<Msg, CallError> {
-        if self.faults.blocked(&self.peer) {
-            tokio::time::sleep(timeout).await;
-            return Err(CallError::Blocked);
-        }
-        let mut g = self.conn.lock().await;
-        let rid = self.rid.fetch_add(1, Ordering::Relaxed);
-        let r = tokio::time::timeout(timeout, async {
-            if g.is_none() {
-                let s = TcpStream::connect(&self.addr).await.map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                        CallError::Refused
-                    } else {
-                        CallError::Io(e.to_string())
-                    }
-                })?;
-                let _ = s.set_nodelay(true);
-                *g = Some(s);
-            }
-            let s = g.as_mut().expect("connected above");
-            wire::write_msg(s, rid, m).await.map_err(|e| CallError::Io(e.to_string()))?;
-            loop {
-                let (r, resp) = wire::read_msg(s).await.map_err(|e| CallError::Io(e.to_string()))?;
-                if r == rid {
-                    return Ok(resp);
-                }
-            }
-        })
-        .await;
-        match r {
-            Ok(Ok(m)) => Ok(m),
-            Ok(Err(e)) => {
-                *g = None;
-                Err(e)
-            }
-            Err(_) => {
-                *g = None;
-                Err(CallError::Timeout)
-            }
-        }
-    }
-}
+/// One connection to a peer, one request at a time (vlsync-lease's client,
+/// which the heartbeats share).
+pub type Rpc = vlsync_lease::rpc::Rpc<Msg>;

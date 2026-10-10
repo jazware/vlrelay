@@ -3,7 +3,7 @@
 
 use super::log::Entry;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 const MAX_FRAME: usize = 256 << 20;
 
@@ -512,19 +512,25 @@ pub fn decode(body: Bytes) -> R<(u64, Msg)> {
     Ok((rid, m))
 }
 
-pub async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<(u64, Msg)> {
-    let n = r.read_u32().await? as usize;
-    if n > MAX_FRAME {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "qlog: frame too large"));
+impl vlsync_lease::rpc::Wire for Msg {
+    const MAX_FRAME: usize = MAX_FRAME;
+    const NAME: &'static str = "qlog";
+
+    fn encode(&self, rid: u64) -> Bytes {
+        encode(rid, self)
     }
-    let mut buf = BytesMut::zeroed(n);
-    r.read_exact(&mut buf).await?;
-    decode(buf.freeze()).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+
+    fn decode(body: Bytes) -> R<(u64, Self)> {
+        decode(body)
+    }
+}
+
+pub async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<(u64, Msg)> {
+    vlsync_lease::rpc::read_frame(r).await
 }
 
 pub async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, rid: u64, m: &Msg) -> std::io::Result<()> {
-    w.write_all(&encode(rid, m)).await?;
-    w.flush().await
+    vlsync_lease::rpc::write_frame(w, rid, m).await
 }
 
 /// A frame as the leader writes it: `prefix`, the `seq` key and value, `suffix`.
