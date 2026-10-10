@@ -90,6 +90,14 @@ struct Args {
     /// with room for the kernel's socket buffers and the allocator's slack.
     #[arg(long, env = "VLRELAY_PLC_EXPORT_MEM_MB", default_value_t = 0)]
     plc_export_mem_mb: u64,
+    /// How often the leader flushes the PLC seeds it has applied (export
+    /// ops and fetched documents) to the bucket, seconds. Each flush is an
+    /// L0 SST, a manifest write and its share of compactions, ~4 Class A
+    /// requests. A crash loses at most this much of the fetched documents
+    /// (the export's ops are read again), and the members' local tables
+    /// see new seeds this much later.
+    #[arg(long, env = "VLRELAY_PLC_EXPORT_FLUSH_SECS", default_value_t = 10)]
+    plc_export_flush_secs: u64,
     /// Memory bounds of the PLC seeds' SlateDB on the leader, as
     /// `key=value,...`: compactions at once, subcompactions each,
     /// fetch-tasks and fetch-kb of read-ahead per input SST, sst-mb per
@@ -623,6 +631,7 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
         pc.rate = a.plc_export_rate;
         pc.streams = a.plc_export_streams.max(1);
         pc.mem_budget_mb = a.plc_export_mem_mb;
+        pc.checkpoint_every = Duration::from_secs(a.plc_export_flush_secs.max(1));
         q.plc_export = Some(pc);
         q.plc_seeds_dir = a.plc_seeds_dir.clone();
         vlrelay::qlog::cache::set_seeds_local(a.plc_seeds_dir.is_some());
