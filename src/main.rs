@@ -698,7 +698,7 @@ async fn run(mut a: Args, settings: vlrelay::admin::SettingsView) -> anyhow::Res
 }
 
 /// `GET /debug/pprof/heap` (docs/operations/monitoring.md, "Heap profiles"):
-/// for a peer on the container's loopback (agent's scrapes and forwards),
+/// for a peer on the container's loopback (the node's scraper, a forward),
 /// the admin token, or an operator the admin listener's proxy signed in.
 fn heap_profile_route(token: Option<String>) -> axum::Router {
     let route = move |req: axum::extract::Request| {
