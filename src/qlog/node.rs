@@ -17,7 +17,6 @@ use super::wire::{self, Append, AppendResp, Item, Msg, Outcome, PromiseResp};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use object_store::path::Path;
-use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -26,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
+use vlsync_lease::cas;
 use vlsync_store::store::Store;
 
 #[derive(Clone, Debug)]
@@ -199,26 +199,15 @@ fn leader_path(store: &Store) -> Path {
 }
 
 pub async fn read_leader(store: &Store) -> anyhow::Result<Option<(LeaderRecord, Option<String>)>> {
-    match store.raw.get(&leader_path(store)).await {
-        Ok(r) => {
-            let etag = r.meta.e_tag.clone();
-            Ok(Some((serde_json::from_slice(&r.bytes().await?)?, etag)))
-        }
-        Err(object_store::Error::NotFound { .. }) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    Ok(cas::read_at(store.raw.as_ref(), &leader_path(store)).await?.map(|v| (v.value, v.etag)))
 }
 
 /// Writes `rec` if `qlog/leader` is still the version read (`None`: absent).
 pub async fn cas_leader(store: &Store, rec: &LeaderRecord, read: Option<Option<String>>) -> anyhow::Result<bool> {
-    let mode = match read {
-        None => PutMode::Create,
-        Some(e_tag) => PutMode::Update(UpdateVersion { e_tag, version: None }),
-    };
-    let body = PutPayload::from(serde_json::to_vec(rec)?);
-    match store.raw.put_opts(&leader_path(store), body, PutOptions { mode, ..Default::default() }).await {
+    let expect = read.map_or(cas::Expect::Absent, cas::Expect::Version);
+    match cas::write_at(store.raw.as_ref(), &leader_path(store), rec, expect).await {
         Ok(_) => Ok(true),
-        Err(object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. }) => Ok(false),
+        Err(e) if cas::is_conflict(&e) => Ok(false),
         Err(e) => Err(e.into()),
     }
 }

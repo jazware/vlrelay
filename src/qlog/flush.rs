@@ -27,7 +27,7 @@ use super::state::{self, State, StateRef};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use object_store::path::Path;
-use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use vlsync_firehose::log;
 use vlsync_firehose::log::Head;
+use vlsync_lease::{cas, epoch};
 use vlsync_store::segment::{self, SegmentBuilder};
 use vlsync_store::slots::ShardId;
 use vlsync_store::store::Store;
@@ -213,38 +214,30 @@ impl Manifest {
     }
 }
 
+const MANIFEST: &str = "qlog/manifest";
+
 fn manifest_path(store: &Store) -> Path {
-    Path::from(format!("{}/qlog/manifest", store.prefix))
+    cas::path(store, MANIFEST)
 }
 
 pub async fn read_manifest(store: &Store) -> anyhow::Result<Option<(Manifest, Option<String>)>> {
-    match store.raw.get(&manifest_path(store)).await {
-        Ok(r) => {
-            let etag = r.meta.e_tag.clone();
-            Ok(Some((serde_json::from_slice(&r.bytes().await?)?, etag)))
-        }
-        Err(object_store::Error::NotFound { .. }) => Ok(None),
+    Ok(cas::read_at(store.raw.as_ref(), &manifest_path(store)).await?.map(|v| (v.value, v.etag)))
+}
+
+/// Writes `m` if the manifest is still the version read (`None`: absent).
+/// Ok(None): it moved (an If-Match PUT of a missing key is a 404 on S3).
+async fn cas_manifest(store: &Store, m: &Manifest, read: Option<Option<String>>) -> anyhow::Result<Option<String>> {
+    let expect = read.map_or(cas::Expect::Absent, cas::Expect::Version);
+    match cas::write_at(store.raw.as_ref(), &manifest_path(store), m, expect).await {
+        Ok(etag) => Ok(Some(etag.unwrap_or_default())),
+        Err(e) if cas::moved(&e) => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
 
-/// Writes `m` if the manifest is still the version read (`None`: absent).
-/// Ok(None): it moved.
-async fn cas_manifest(store: &Store, m: &Manifest, read: Option<Option<String>>) -> anyhow::Result<Option<String>> {
-    let mode = match read {
-        None => PutMode::Create,
-        Some(e_tag) => PutMode::Update(UpdateVersion { e_tag, version: None }),
-    };
-    let body = PutPayload::from(serde_json::to_vec(m)?);
-    match store.raw.put_opts(&manifest_path(store), body, PutOptions { mode, ..Default::default() }).await {
-        Ok(r) => Ok(Some(r.e_tag.unwrap_or_default())),
-        // an If-Match PUT of a missing key is a 404 on S3
-        Err(
-            object_store::Error::Precondition { .. }
-            | object_store::Error::AlreadyExists { .. }
-            | object_store::Error::NotFound { .. },
-        ) => Ok(None),
-        Err(e) => Err(e.into()),
+impl epoch::Epoched for Manifest {
+    fn epoch(&self) -> u64 {
+        self.epoch
     }
 }
 
@@ -392,16 +385,12 @@ impl Shared {
 
 /// Makes the manifest this epoch's. None: a newer epoch already wrote it.
 async fn fence(store: &Store, id: &str, epoch: u64, headroom: u64) -> anyhow::Result<Option<(Manifest, String)>> {
-    loop {
-        let (next, read) = match read_manifest(store).await? {
-            None => (Manifest { epoch, leader: id.to_string(), reserve: headroom, ..Default::default() }, None),
-            Some((m, _)) if m.epoch > epoch => return Ok(None),
-            Some((m, etag)) => (Manifest { epoch, leader: id.to_string(), ..m }, Some(etag)),
-        };
-        if let Some(etag) = cas_manifest(store, &next, read).await? {
-            return Ok(Some((next, etag)));
-        }
-    }
+    let raised = epoch::raise(store, MANIFEST, epoch, |cur| match cur {
+        None => Manifest { epoch, leader: id.to_string(), reserve: headroom, ..Default::default() },
+        Some(m) => Manifest { epoch, leader: id.to_string(), ..m },
+    })
+    .await?;
+    Ok(raised.map(|v| (v.value, v.etag.unwrap_or_default())))
 }
 
 /// The leader's flush loop for `epoch`: fences the manifest, opens the
