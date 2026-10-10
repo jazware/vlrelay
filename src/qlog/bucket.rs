@@ -167,10 +167,9 @@ mod tests {
         let c = |k: &str| r.by_component.get(k).cloned().unwrap_or_default();
         assert_eq!(c("test/qlog_leader"), Counts { a: 1, b: 1, free: 0 });
         assert_eq!(c("test/qlog_manifest"), Counts { a: 1, b: 0, free: 0 });
-        // object_store sends even a single delete as a DeleteObjects POST,
-        // counted as a `delete_batch` (Class A) plus the free `delete`
-        assert_eq!(c("test/log_segment"), Counts { a: 2, b: 1, free: 1 });
-        assert_eq!(r.by_purpose["test"], Counts { a: 4, b: 2, free: 1 });
+        // a single DELETE, free (never a DeleteObjects POST, Class A)
+        assert_eq!(c("test/log_segment"), Counts { a: 1, b: 1, free: 1 });
+        assert_eq!(r.by_purpose["test"], Counts { a: 3, b: 2, free: 1 });
         assert_eq!(r.by_op["test/put"], 3);
     }
 }
