@@ -36,6 +36,9 @@
   font-display: swap;
 }
 
+/* Text tokens (ink2, ink3, and the tones used as text) keep 4.5:1 or better against every surface
+   they sit on in both themes, washes included (WCAG AA for small text). idle is mostly a glyph:
+   3:1 everywhere, 4.5:1 on sheet and raised, where it's also a word. */
 .cx {
   --paper: #eceef3;
   --sheet: #f7f8fb;
@@ -44,7 +47,7 @@
   --hover: #e7eaf1;
   --ink: #11152a;
   --ink2: #454d68;
-  --ink3: #6b7390;
+  --ink3: #5a6280;
   --rule: #cacfdc;
   --rule2: #dce0e9;
   --accent: #2a4bd3;
@@ -52,12 +55,12 @@
   --accent-wash: #dde4fb;
   --signal: #b4237e;
   --signal-wash: #f6dcec;
-  --ok: #2e7a35;
-  --warn: #8f6100;
+  --ok: #2a7031;
+  --warn: #855a00;
   --err: #b3311d;
   --err-ink: #ffffff;
-  --info: #0e7790;
-  --idle: #79809a;
+  --info: #0b6c83;
+  --idle: #646c88;
   --violet: #7048c2;
   --c1: #4b5fd6;
   --c2: #12867c;
@@ -87,7 +90,7 @@
     --hover: #181d2c;
     --ink: #e3e6f0;
     --ink2: #a1a8c0;
-    --ink3: #747c97;
+    --ink3: #868ea9;
     --rule: #252b40;
     --rule2: #1b2032;
     --accent: #8aa2ff;
@@ -122,7 +125,7 @@
   --hover: #181d2c;
   --ink: #e3e6f0;
   --ink2: #a1a8c0;
-  --ink3: #747c97;
+  --ink3: #868ea9;
   --rule: #252b40;
   --rule2: #1b2032;
   --accent: #8aa2ff;

@@ -102,5 +102,6 @@ A real relay with a tail and real actions: `fakepds run --hosts 5 --dids 200 --r
 
 - Status is a colour and a glyph, always both: `ok ●`, `warn ▲`, `err ■`, `info ◆`, `idle ○`.
 - Cobalt (`--accent`) is for action, magenta (`--signal`) only for the live stream (the seq, the commit, the firehose line, the lit jack) and for the unsaved policy draft, which isn't live yet.
+- Text tokens hold WCAG AA (4.5:1) on every surface they sit on in both themes, the washes included. `--idle` is mostly a glyph and holds 3:1 on the washes.
 - The fonts are self-hosted in `public/fonts` (the page CSP allows no other origin).
 - Use example.com-style names in fixtures and placeholders, and show what the server says (its hostname is the page's own). The docs and UI are public.
