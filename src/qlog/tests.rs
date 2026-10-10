@@ -2606,7 +2606,12 @@ async fn a_single_node_grows_to_three_and_back() {
     c.shutdown();
 }
 
-async fn wipe_all_and_recover(c: &mut Cluster, generation: u64) {
+/// At least one recovery, not exactly one: with the nodes starting one by
+/// one on a slow runner, a recovery's leader can lose its term before a
+/// quorum's logs are intact again, and the next leader recovers too
+/// (recoveries in a row are expected: `Manifest::continues`).
+async fn wipe_all_and_recover(c: &mut Cluster) {
+    let before = flush::read_manifest(&c.store).await.unwrap().map_or(0, |(m, _)| m.generation());
     for id in c.ids.clone() {
         c.wipe(&id);
     }
@@ -2615,7 +2620,7 @@ async fn wipe_all_and_recover(c: &mut Cluster, generation: u64) {
     }
     let l = c.wait_leader(Duration::from_secs(10)).await;
     let st = c.nodes[&l].node.status();
-    assert_eq!(st.generation, generation, "{st:?}");
+    assert!(st.generation > before, "generation {before} before: {st:?}");
 }
 
 /// `qlog retain --apply` deletes what the report marks deletable and
@@ -2631,10 +2636,10 @@ async fn retention_deletes_only_what_it_reports_and_recovery_still_works() {
     c.wait_leader(Duration::from_secs(5)).await;
     let load = HostLoad::start(&c, 4, 10, Duration::from_millis(2));
     // two recoveries: the current state is a clone of a clone
-    for g in 1..=2 {
+    for _ in 0..2 {
         wait_flushed(&c, 1, Duration::from_secs(5)).await;
         tokio::time::sleep(Duration::from_millis(700)).await;
-        wipe_all_and_recover(&mut c, g).await;
+        wipe_all_and_recover(&mut c).await;
     }
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let m = flush::read_manifest(&c.store).await.unwrap().unwrap().0;
@@ -2652,6 +2657,19 @@ async fn retention_deletes_only_what_it_reports_and_recovery_still_works() {
     assert!(!plan.deletable.is_empty(), "{plan:#?}");
     let by_path = |p: &str| plan.states.iter().find(|s| s.path == p).unwrap_or_else(|| panic!("{p}: {plan:#?}"));
     assert!(by_path(&lost).deletable && !by_path(&running).deletable && !by_path(&current).deletable);
+    let ordinals = || async {
+        let p = object_store::path::Path::from(format!("{}/log/{}", c.store.prefix, flush::LOG_ID));
+        let mut out = std::collections::BTreeSet::new();
+        let mut s = c.store.raw.list(Some(&p));
+        while let Some(m) = futures::StreamExt::next(&mut s).await {
+            let m = m.unwrap();
+            if let Some(o) = m.location.filename().and_then(|f| f.strip_suffix(".seg")).and_then(|f| f.parse().ok()) {
+                out.insert(o);
+            }
+        }
+        out
+    };
+    let before: std::collections::BTreeSet<u64> = ordinals().await;
     let a = retain::apply(&c.store, &plan).await.unwrap();
     eprintln!("{a:#?}");
     assert_eq!(a.segments, plan.deletable.len() as u64);
@@ -2662,7 +2680,13 @@ async fn retention_deletes_only_what_it_reports_and_recovery_still_works() {
     for s in &plan.deletable {
         assert!(matches!(c.store.raw.head(&seg(s.ordinal)).await, Err(object_store::Error::NotFound { .. })));
     }
-    assert!(c.store.raw.head(&seg(plan.deletable.last().unwrap().ordinal + 1)).await.is_ok());
+    // Every other segment stays. Not "the one after the last deletable": when
+    // no flush landed within the horizon (a loaded runner), every segment the
+    // manifest names is deletable and that ordinal is the next flush's.
+    let deleted: std::collections::BTreeSet<u64> = plan.deletable.iter().map(|s| s.ordinal).collect();
+    let after = ordinals().await;
+    let gone: Vec<&u64> = before.difference(&deleted).filter(|o| !after.contains(o)).collect();
+    assert!(gone.is_empty(), "deleted but not deletable: {gone:?}; {plan:#?}");
     for sp in &plan.states {
         let admin =
             slatedb::admin::Admin::builder(super::state::db_path(&c.store, &sp.path), c.store.raw.clone()).build();
@@ -2673,7 +2697,7 @@ async fn retention_deletes_only_what_it_reports_and_recovery_still_works() {
     assert!(v.ok && v.pruned == a.pruned_seq, "after the deletes: {v:#?}");
 
     // a recovery from the pruned bucket, under load
-    wipe_all_and_recover(&mut c, 3).await;
+    wipe_all_and_recover(&mut c).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
     let (acked, expected) = load.stop().await;
     c.converge(Duration::from_secs(20)).await;
