@@ -3,7 +3,8 @@
 //!
 //! Every request goes through vlpds's `Store::counted`, which counts it in
 //! `vlpds_object_store_requests_total` by op, key component (the path:
-//! `log_segment`, `qlog_manifest`, `qlog_leader`, `state_*`, ...) and
+//! `log_segment`, `qlog_manifest`, `qlog_leader`, `state_*`, `plc_seeds_*`,
+//! `plc_checkpoint`, `discovery_state`, ...) and
 //! client. The client is `qlog_{purpose}`:
 //!
 //! - `flush`: the leader's fence, segments, manifest CAS and checkpoint

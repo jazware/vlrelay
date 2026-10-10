@@ -39,6 +39,16 @@ const COMPONENT: Record<string, string> = {
   state_compactions: 'state DB compactions',
   state_gc_boundary: 'state DB GC boundary',
   state_other: 'state DB, other files',
+  qlog: 'qlog/ listing',
+  plc_seeds_manifest: 'seeds DB manifest',
+  plc_seeds_sst: 'seeds DB SSTs',
+  plc_seeds_wal: 'seeds DB WAL',
+  plc_seeds_compactions: 'seeds DB compactions',
+  plc_seeds_gc_boundary: 'seeds DB GC boundary',
+  plc_seeds_other: 'seeds DB, other files',
+  plc_checkpoint: 'PLC export checkpoint',
+  discovery_state: 'discovery state',
+  policy: 'policy',
 }
 const COMPONENT_WHAT: Record<string, string> = {
   log_segment: "the log's segment objects",
@@ -51,6 +61,16 @@ const COMPONENT_WHAT: Record<string, string> = {
   state_compactions: "SlateDB's compaction state",
   state_gc_boundary: "SlateDB's GC boundary files, read with every manifest or compaction read",
   state_other: "SlateDB's other files",
+  qlog: "a LIST of all of qlog/, bucket retention's look for old state paths",
+  plc_seeds_manifest: "the PLC seeds' SlateDB manifest (plc/seeds)",
+  plc_seeds_sst: "the PLC seeds' sorted tables, from export checkpoints and compactions",
+  plc_seeds_wal: "the PLC seeds' write-ahead log (off; listed by its GC)",
+  plc_seeds_compactions: "the PLC seeds' compaction state",
+  plc_seeds_gc_boundary: "the PLC seeds' GC boundary files",
+  plc_seeds_other: "the PLC seeds' other files",
+  plc_checkpoint: "plc/export-checkpoint.json: the export's cursors",
+  discovery_state: 'discovery/state.json',
+  policy: 'policy/: the moderation policy, domain rules and their audit logs',
 }
 // keys the component list has no name for, by the purpose that sends them
 const OTHER: Record<string, string> = { plc: 'DID document seeds, export checkpoint', discovery: 'discovery state' }
