@@ -37,7 +37,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # No debug info in the image (Cargo.toml keeps debug = 1 for local profiling).
 # Symbols stay, so panics and backtraces still name functions.
-ENV CARGO_PROFILE_RELEASE_DEBUG=0
+ENV CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_DIST_DEBUG=0
+# release (thin LTO) by default; the image workflow builds tags with dist (fat
+# LTO, one codegen unit: Cargo.toml), which takes several times as long.
+ARG CARGO_PROFILE=release
 # tokio-console compiled in, off until TOKIO_CONSOLE_BIND is set (docs/operations/monitoring.md).
 # --build-arg RUSTFLAGS= builds without it.
 ARG RUSTFLAGS="--cfg tokio_unstable"
@@ -52,10 +55,10 @@ ARG VLRELAY_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked --bin vlrelay ${VLRELAY_TOOLS:+--bin fakepds --bin e2e_check} ${VLRELAY_FEATURES:+--features $VLRELAY_FEATURES} \
+    cargo build --profile "$CARGO_PROFILE" --locked --bin vlrelay ${VLRELAY_TOOLS:+--bin fakepds --bin e2e_check} ${VLRELAY_FEATURES:+--features $VLRELAY_FEATURES} \
     && mkdir -p /out \
-    && cp target/release/vlrelay /out/ \
-    && if [ -n "$VLRELAY_TOOLS" ]; then cp target/release/fakepds target/release/e2e_check /out/; fi \
+    && cp target/$CARGO_PROFILE/vlrelay /out/ \
+    && if [ -n "$VLRELAY_TOOLS" ]; then cp target/$CARGO_PROFILE/fakepds target/$CARGO_PROFILE/e2e_check /out/; fi \
     && /out/vlrelay --help >/dev/null
 
 # --- runtime ------------------------------------------------------------------

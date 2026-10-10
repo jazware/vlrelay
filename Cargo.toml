@@ -109,6 +109,14 @@ lto = "thin"
 codegen-units = 16
 debug = 1
 
+# Published releases (the image workflow on v* tags, CARGO_PROFILE=dist in the
+# Dockerfile): fat LTO and one codegen unit, as vlpds's dist. Thin LTO cut
+# an image build from ~5 min to ~1.5, so only tagged builds pay for fat.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
 [profile.dev-release]
 inherits = "release"
 opt-level = 2

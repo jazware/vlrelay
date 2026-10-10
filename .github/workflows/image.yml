@@ -37,6 +37,14 @@ jobs:
         run: |
           echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
           echo "GIT_REV=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          # Releases get the dist profile (fat LTO, one codegen unit:
+          # Cargo.toml); main's images stay on release, which builds in a
+          # fraction of the time.
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            echo "CARGO_PROFILE=dist" >> "$GITHUB_ENV"
+          else
+            echo "CARGO_PROFILE=release" >> "$GITHUB_ENV"
+          fi
 
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -56,13 +64,15 @@ jobs:
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
+          build-args: CARGO_PROFILE=${{ env.CARGO_PROFILE }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: true
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          # per profile, so a release's layers don't evict main's
+          cache-from: type=gha,scope=${{ matrix.arch }}-${{ env.CARGO_PROFILE }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}-${{ env.CARGO_PROFILE }}
 
       - name: Export digest
         run: |

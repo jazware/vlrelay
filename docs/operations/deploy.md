@@ -57,8 +57,9 @@ The crate pulls [vlsync](https://github.com/jazware/vlsync) and
 [vlatproto](https://github.com/jazware/vlatproto) as git dependencies, so the repository root is
 the whole build context. The
 image has three stages. A node stage builds the dashboard and the docs into
-`/usr/share/vlrelay/ui`. A Rust stage builds the release binary (thin LTO and no
-`target-cpu=native`). The runtime is `debian:bookworm-slim` running as uid 10001 under `tini`. The
+`/usr/share/vlrelay/ui`. A Rust stage builds the binary without `target-cpu=native`: with thin
+LTO (the `release` profile) by default, and with fat LTO (`dist`, as release images are built)
+under `--build-arg CARGO_PROFILE=dist`. The runtime is `debian:bookworm-slim` running as uid 10001 under `tini`. The
 UI is the last layer, so a UI-only or docs-only change rebuilds in seconds.
 
 The entrypoint is `vlrelay --ui-dir /usr/share/vlrelay/ui`, so the container takes the relay's
