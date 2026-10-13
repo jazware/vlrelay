@@ -231,7 +231,7 @@ async fn cursors_are_written_once_per_cursor_every() {
     let ing = Ingester::new(cfg, store.clone(), Arc::new(Writes(w.clone())));
     let plc = f.plc.clone();
     let tail = tokio::spawn(async move {
-        for v in 1.. {
+        for v in 1..=u32::MAX {
             plc.append(0, v % 50, v, export::now_ms());
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

@@ -1933,18 +1933,24 @@ async fn no_recovery_while_a_silent_member_could_be_intact() {
 async fn recovery_adopts_orphan_segments() {
     use flush::Step;
     let armed = Arc::new(AtomicBool::new(false));
+    // From the crash until the wipe, every flush step of every node dies
+    // too: under load an election can hand the lead to a node whose flush
+    // adopts the orphans (or one of the wipe's kills can), leaving recovery
+    // nothing to adopt.
+    let held = Arc::new(AtomicBool::new(false));
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let a = armed.clone();
+    let (a, h) = (armed.clone(), held.clone());
     let mut c = flushing(
         move |id| {
-            let (a, t, id) = (a.clone(), tx.clone(), id.to_string());
+            let (a, h, t, id) = (a.clone(), h.clone(), tx.clone(), id.to_string());
             flush::Options {
                 crash: Some(Arc::new(move |s| {
                     if s == Step::BeforeManifest && a.swap(false, Ordering::AcqRel) {
+                        h.store(true, Ordering::Release);
                         let _ = t.send(id.clone());
                         return true;
                     }
-                    false
+                    h.load(Ordering::Acquire)
                 })),
                 headroom: 5_000,
                 ..flush_opts()
@@ -1963,6 +1969,7 @@ async fn recovery_adopts_orphan_segments() {
     for id in c.ids.clone() {
         c.wipe(&id);
     }
+    held.store(false, Ordering::Release);
     for id in c.ids.clone() {
         c.start(&id).await;
     }
