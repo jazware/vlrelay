@@ -68,6 +68,8 @@ pub struct QuorumSetup {
     pub flush: Duration,
     pub headroom: u64,
     pub flush_segment_bytes: usize,
+    /// DIDs' state records the leader keeps decoded (`ShardState`'s LRU).
+    pub record_cache_entries: usize,
     pub commitlog_segment_bytes: u64,
     pub disk_retain_bytes: u64,
     /// Committed log kept in memory (default: 64 MiB with a commitlog).
@@ -118,6 +120,7 @@ impl QuorumSetup {
             flush: Duration::from_secs(30),
             headroom: 8_640_000,
             flush_segment_bytes: 64 << 20,
+            record_cache_entries: state::ApplyConfig::default().cache_entries_per_shard,
             commitlog_segment_bytes: 64 << 20,
             disk_retain_bytes: 4 << 30,
             memory_bytes: None,
@@ -2505,7 +2508,7 @@ impl Node {
         let state = Arc::new(state::StateStore::new(
             super::adapters::VerifyChain,
             Arc::new(super::adapters::CacheIdentity(identity.clone(), patience.clone())),
-            state::ApplyConfig::default(),
+            state::ApplyConfig { cache_entries_per_shard: q.record_cache_entries.max(1), ..Default::default() },
         ));
         let plc = q.plc_export.clone().map(|c| {
             let st = crate::qlog::bucket::counted(&store, "plc");

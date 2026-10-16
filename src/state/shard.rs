@@ -208,6 +208,11 @@ impl ShardState {
         }
     }
 
+    /// Records in the cache.
+    pub fn cached_len(&self) -> usize {
+        self.cache.iter().map(|w| w.lock().len()).sum()
+    }
+
     pub fn pending_len(&self) -> (usize, usize) {
         let p = self.pending.lock();
         (p.by_did.len(), p.by_ticket.len())

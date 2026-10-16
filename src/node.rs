@@ -818,6 +818,13 @@ impl Node {
                 metrics::IDENTITY_LOOKUPS.with_label_values(&[k]).set(v.load(Ordering::Relaxed) as i64);
             }
             metrics::IDENTITY_CACHE.set(self.identity.len() as i64);
+            if let Some(sh) = self.state.shard() {
+                metrics::RECORD_CACHE.set(sh.cached_len() as i64);
+                let st = &sh.stats;
+                for (k, v) in [("hit", &st.cache_hits), ("load", &st.loads), ("absent", &st.load_misses)] {
+                    metrics::RECORD_LOOKUPS.with_label_values(&[k]).set(v.load(Ordering::Relaxed) as i64);
+                }
+            }
             let lags: Vec<i64> = hosts.iter().filter_map(|h| h.read_lag_ms).collect();
             metrics::HOST_READ_LAG_MAX.set(lags.iter().map(|l| l / 1000).max().unwrap_or(0));
             metrics::HOSTS_LAGGING.set(lags.iter().filter(|&&l| l > 60_000).count() as i64);

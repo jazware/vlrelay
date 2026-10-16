@@ -21,7 +21,7 @@ SECTIONS = [
         "Upstreams and identity",
         "`--host` and `--crawl` work on any member: a host admitted anywhere goes into the leader's host table, "
         "and the leader gives it to a member.",
-        ["host", "crawl", "host-tier", "backfill-new-hosts", "plc-url", "plc-export", "plc-export-url", "plc-export-rate", "plc-export-streams", "plc-seeds-slatedb", "plc-seeds-dir", "plc-seed-reads", "plc-export-mem-mb", "bootstrap-relay", "dev-mode", "did-lookups-per-sec", "did-lookup-prefetch", "did-web-seed-ttl-secs"],
+        ["host", "crawl", "host-tier", "backfill-new-hosts", "plc-url", "plc-export", "plc-export-url", "plc-export-rate", "plc-export-streams", "plc-seeds-slatedb", "plc-seeds-dir", "plc-seed-reads", "plc-export-mem-mb", "plc-export-flush-secs", "bootstrap-relay", "dev-mode", "did-lookups-per-sec", "did-lookup-prefetch", "did-web-seed-ttl-secs"],
     ),
     ("Pipeline and serving", "", ["lanes", "ingest-threads", "host-inflight-events", "host-inflight-mb", "inflight-events", "inflight-mb", "ingest-mem-mb", "upstream-rcvbuf-kb", "ring-mb", "backfill-cache-mb", "backfill-readahead-mb", "max-lag-mb", "log-compression",
                               "event-horizon-secs", "lag-case-minutes", "lag-case-sustain-secs", "lag-case-grace-secs",
@@ -33,9 +33,9 @@ SECTIONS = [
         ["node-id", "qlog-listen", "qlog-peer", "qlog-members", "qlog-dir", "qlog-flush-ms", "qlog-headroom",
          "qlog-admin-token", "qlog-admin-token-file", "qlog-retain-hours", "qlog-retain-secs", "qlog-retain-every-secs",
          "qlog-host-failover-ms", "qlog-host-poll-ms", "qlog-election-ms", "qlog-heartbeat-ms",
-         "qlog-state-compactor-poll-ms", "qlog-state-slatedb", "qlog-no-auto-recover", "qlog-segment-mb", "qlog-disk-retain-mb", "durability", "durability-sync-ms", "slatedb-cache-mb",
+         "qlog-state-compactor-poll-ms", "qlog-state-slatedb", "qlog-no-auto-recover", "qlog-segment-mb", "qlog-flush-segment-mb", "qlog-disk-retain-mb", "durability", "durability-sync-ms", "slatedb-cache-mb",
          "slatedb-meta-mb", "slatedb-disk-cache-dir", "slatedb-disk-cache-mb",
-         "qlog-memory-mb"],
+         "qlog-memory-mb", "record-cache-entries"],
     ),
     (
         "Logs",
@@ -158,6 +158,16 @@ a 2 vCPU / 4 GB box:
   serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of it,
   about 7 s for the default 4 GiB.
 - Keep `--slatedb-cache-mb` at its default of 320. The state's and the seeds' databases share it.
+- Set `--record-cache-entries 262144`. The leader keeps that many accounts' state records decoded
+  in memory, ~400 B each with their keys and the cache's own table. The default 1M fills within a
+  day on the whole network and holds ~400 MB. A miss reads the state's SlateDB, through
+  `--slatedb-cache-mb` and the disk cache. `vlrelay_record_cache_entries` and
+  `vlrelay_record_lookups` show how full it is and how often it misses.
+- Set `--qlog-flush-segment-mb 32`. A flush builds a segment, compresses it and keeps up to four
+  compressed ones uploading at once, ~4x the segment size at its peak over the node's baseline.
+  At 64 MiB a flush added ~430 MB of resident memory for ~20 s, which is what pushed a node
+  sitting at 1.85 GB past a 2300 MiB limit. 32 MiB halves that for twice the segment PUTs (~200k
+  a month at ~2.7 MB/s of raw log).
 - To see where the heap goes, read `GET /debug/pprof/heap` ([Monitoring](monitoring.md#heap-profiles)):
   the heap in use as pprof, from jemalloc's sampler, which runs from the start. First check
   `vlpds_jemalloc_bytes`: a growing `allocated` is live data, and a growing gap between

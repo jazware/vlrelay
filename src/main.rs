@@ -396,6 +396,11 @@ struct QuorumArgs {
     /// Commitlog file size on the local disk.
     #[arg(long, default_value_t = 64)]
     qlog_segment_mb: u64,
+    /// Raw log a bucket segment holds. A flush holds one segment being
+    /// built, its compressed copy, and up to four compressed ones uploading:
+    /// ~4x this at its peak, over the node's baseline.
+    #[arg(long, default_value_t = 64)]
+    qlog_flush_segment_mb: usize,
     /// Flushed commitlog kept on the local disk, for followers catching up
     /// and cursors older than the ring. A start reads all of it (~7 s for
     /// 4 GiB); older cursors read the bucket instead.
@@ -404,6 +409,11 @@ struct QuorumArgs {
     /// Committed log kept in memory (default 64 with --qlog-dir, else 512).
     #[arg(long)]
     qlog_memory_mb: Option<usize>,
+    /// Accounts' state records the leader keeps decoded in memory, ahead of
+    /// the state's SlateDB. ~400 bytes each: the default holds ~400 MiB
+    /// once the network's active accounts fill it, within a day of a start.
+    #[arg(long, env = "VLRELAY_RECORD_CACHE_ENTRIES", default_value_t = 1 << 20)]
+    record_cache_entries: usize,
     /// Chaos: kill -9 at this flush step (or `any`), with --qlog-crash-prob.
     #[arg(long)]
     qlog_crash_at: Option<String>,
@@ -480,9 +490,11 @@ fn quorum_setup(q: &QuorumArgs, node_id: &str) -> anyhow::Result<vlrelay::node::
     s.election_timeout = Duration::from_millis(q.qlog_election_ms.max(100));
     s.heartbeat = Duration::from_millis(q.qlog_heartbeat_ms.max(10));
     s.auto_recover = !q.qlog_no_auto_recover;
+    s.flush_segment_bytes = q.qlog_flush_segment_mb.max(1) << 20;
     s.commitlog_segment_bytes = q.qlog_segment_mb.max(1) << 20;
     s.disk_retain_bytes = q.qlog_disk_retain_mb.max(1) << 20;
     s.memory_bytes = q.qlog_memory_mb.map(|m| m.max(1) << 20);
+    s.record_cache_entries = q.record_cache_entries.max(1);
     s.power_cut_on_usr1 = q.qlog_power_cut_on_usr1;
     let members = if s.members.is_empty() { s.peers.len() + 1 } else { s.members.len() };
     s.durability = vlrelay::qlog::commitlog::DurabilityMode::choose(

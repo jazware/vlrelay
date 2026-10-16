@@ -148,6 +148,7 @@ Every member uses the same bucket and `--prefix`. A node with no `--qlog-peer` i
 | `--qlog-state-slatedb <QLOG_STATE_SLATEDB>` | `VLRELAY_QLOG_STATE_SLATEDB` | `compactions=2,subcompactions=1,fetch-tasks=2,fetch-kb=1024,sst-mb=256,memtable-mb=256,codec=zstd` | Memory bounds of the state's SlateDB, as --plc-seeds-slatedb spells them. Two compactions keep L0s draining while a long merge runs: a seal waits once 32 L0s are queued |
 | `--qlog-no-auto-recover` |  |  | A lost quorum waits for an operator instead of recovering from the bucket |
 | `--qlog-segment-mb <QLOG_SEGMENT_MB>` |  | `64` | Commitlog file size on the local disk |
+| `--qlog-flush-segment-mb <QLOG_FLUSH_SEGMENT_MB>` |  | `64` | Raw log a bucket segment holds. A flush holds one segment being built, its compressed copy, and up to four compressed ones uploading: ~4x this at its peak, over the node's baseline |
 | `--qlog-disk-retain-mb <QLOG_DISK_RETAIN_MB>` |  | `4096` | Flushed commitlog kept on the local disk, for followers catching up and cursors older than the ring. A start reads all of it (~7 s for 4 GiB); older cursors read the bucket instead |
 | `--durability <DURABILITY>` | `VLRELAY_DURABILITY` |  | When an entry counts on this node: `fsync` (after its fdatasync), `page-cache` (once written to the commitlog, fdatasync'd every --durability-sync-ms; a power cut on a majority within that window is a bucket recovery) or `memory` (no commitlog). Default: page-cache for three members or more, fsync below; a single node only runs fsync |
 | `--durability-sync-ms <DURABILITY_SYNC_MS>` |  | `100` | Page-cache mode's background fdatasync interval |
@@ -156,6 +157,7 @@ Every member uses the same bucket and `--prefix`. A node with no `--qlog-peer` i
 | `--slatedb-disk-cache-dir <SLATEDB_DISK_CACHE_DIR>` | `VLRELAY_SLATEDB_DISK_CACHE_DIR` |  | Keeps the state's and the PLC seeds' SSTs on this local disk (SlateDB's object-store cache), so reads past the memory cache don't go to the bucket. Unset: no disk cache |
 | `--slatedb-disk-cache-mb <SLATEDB_DISK_CACHE_MB>` | `VLRELAY_SLATEDB_DISK_CACHE_MB` | `16384` | The disk cache's size in MiB, both databases together (an eighth, at least 64 MiB, for the state; all of it with --plc-seeds-dir) |
 | `--qlog-memory-mb <QLOG_MEMORY_MB>` |  |  | Committed log kept in memory (default 64 with --qlog-dir, else 512) |
+| `--record-cache-entries <RECORD_CACHE_ENTRIES>` | `VLRELAY_RECORD_CACHE_ENTRIES` | `1048576` | Accounts' state records the leader keeps decoded in memory, ahead of the state's SlateDB. ~400 bytes each: the default holds ~400 MiB once the network's active accounts fill it, within a day of a start |
 
 ## Logs
 
@@ -240,6 +242,16 @@ a 2 vCPU / 4 GB box:
   serves cursors older than `--ring-mb`, and older ones read the bucket. A start reads all of it,
   about 7 s for the default 4 GiB.
 - Keep `--slatedb-cache-mb` at its default of 320. The state's and the seeds' databases share it.
+- Set `--record-cache-entries 262144`. The leader keeps that many accounts' state records decoded
+  in memory, ~400 B each with their keys and the cache's own table. The default 1M fills within a
+  day on the whole network and holds ~400 MB. A miss reads the state's SlateDB, through
+  `--slatedb-cache-mb` and the disk cache. `vlrelay_record_cache_entries` and
+  `vlrelay_record_lookups` show how full it is and how often it misses.
+- Set `--qlog-flush-segment-mb 32`. A flush builds a segment, compresses it and keeps up to four
+  compressed ones uploading at once, ~4x the segment size at its peak over the node's baseline.
+  At 64 MiB a flush added ~430 MB of resident memory for ~20 s, which is what pushed a node
+  sitting at 1.85 GB past a 2300 MiB limit. 32 MiB halves that for twice the segment PUTs (~200k
+  a month at ~2.7 MB/s of raw log).
 - To see where the heap goes, read `GET /debug/pprof/heap` ([Monitoring](monitoring.md#heap-profiles)):
   the heap in use as pprof, from jemalloc's sampler, which runs from the start. First check
   `vlpds_jemalloc_bytes`: a growing `allocated` is live data, and a growing gap between

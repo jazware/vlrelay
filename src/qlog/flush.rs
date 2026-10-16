@@ -784,7 +784,7 @@ impl Leader {
                 },
                 None => {}
             }
-            let mut b = SegmentBuilder::for_log(LOG_ID);
+            let mut b = builder(self.o.segment_bytes);
             let mut last = from - 1;
             'fill: while last < f {
                 let chunk = match self.node.committed_chunk(last + 1, f, 4 << 20).await {
@@ -1217,6 +1217,18 @@ impl std::error::Error for Crash {}
 /// a follower caught up from the bucket).
 const SIDE_KEY: &[u8] = b"qside";
 
+/// A segment's builder with room for all of it up front. Grown by
+/// doubling, a 64 MiB segment ended in a 128 MiB buffer after copying
+/// ~64 MiB through smaller ones, whose freed pages jemalloc held until the
+/// next purge: the biggest part of a flush's peak, which took a small node
+/// ~430 MB over its baseline and past its memory limit.
+fn builder(segment_bytes: usize) -> SegmentBuilder {
+    let mut b = SegmentBuilder::for_log(LOG_ID);
+    // the entry that crosses `segment_bytes` still fits, unless it's huge
+    b.body.reserve_exact((segment_bytes + segment_bytes / 8).saturating_sub(b.body.len()));
+    b
+}
+
 fn push(b: &mut SegmentBuilder, e: &Entry) {
     let side = super::log::encode_side(&e.cursors, &e.meta);
     let muts = if side.is_empty() {
@@ -1615,7 +1627,7 @@ pub async fn recover(
         st.apply(&chunk).await?;
         stats.salvaged += chunk.len() as u64;
         for e in &chunk {
-            let (b, _) = seg.get_or_insert_with(|| (SegmentBuilder::for_log(LOG_ID), e.seq));
+            let (b, _) = seg.get_or_insert_with(|| (builder(o.segment_bytes), e.seq));
             push(b, e);
             if b.len() >= o.segment_bytes {
                 let (b, first) = seg.take().expect("just filled");
