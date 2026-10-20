@@ -1974,7 +1974,10 @@ async fn recovery_adopts_orphan_segments() {
         c.start(&id).await;
     }
     c.wait_leader(Duration::from_secs(10)).await;
-    let rec = c.recoveries().pop().unwrap();
+    // The first recovery adopts the orphans. Under load an election can
+    // depose it before a wiped follower catches up, and the next one finds
+    // nothing past its R.
+    let rec = c.recoveries().into_iter().find(|r| r.generation == 1).expect("the first recovery's stats");
     assert!(rec.orphan_segments > 0 && rec.orphans_to > rec.manifest_flushed, "{rec:?}");
     let (v, r, _) = settle_recovered(&c, load).await;
     eprintln!("{rec:?}\n{v:?}\n{r:?}");

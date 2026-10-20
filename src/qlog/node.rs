@@ -2223,9 +2223,13 @@ impl Node {
         }
         let _order = self.emit_order.lock();
         let mut c = self.core.lock();
+        // The manifest is ours, so this node ran the recovery (the log
+        // jumped to R) whether or not it still leads.
+        self.stats.recoveries.fetch_add(1, Ordering::Relaxed);
+        stats.total_ms = t0.elapsed().as_millis() as u64;
+        self.recovered.lock().push(stats.clone());
         if c.role != Role::Candidate || c.epoch != epoch {
-            // the manifest is ours and fences older leaders; whoever leads
-            // next reads it
+            // the manifest fences older leaders; whoever leads next reads it
             return Ok(());
         }
         if !catch_up.is_empty() && catch_up[0].seq == m.past_gaps(c.emitted) + 1 {
@@ -2251,8 +2255,6 @@ impl Node {
         c.reserve = c.reserve.max(m.reserve);
         c.generation = c.generation.max(rec.generation);
         c.recovery_cursors = Some((rec.generation, encode_cursors(&rec.cursors)));
-        self.stats.recoveries.fetch_add(1, Ordering::Relaxed);
-        stats.total_ms = t0.elapsed().as_millis() as u64;
         tracing::warn!(
             id = %self.cfg.id, epoch, generation = rec.generation, f = stats.manifest_flushed, after, base,
             salvaged = stats.salvaged, orphans = stats.orphan_segments, read_ms = stats.read_ms,
@@ -2260,7 +2262,6 @@ impl Node {
             manifest_ms = stats.manifest_ms, ms = stats.total_ms, end_ms = chrono::Utc::now().timestamp_millis(),
             "qlog recovery: the bucket's log adopted, resuming above R"
         );
-        self.recovered.lock().push(stats);
         self.become_leader_by(&mut c, epoch, "recovery");
         Ok(())
     }
