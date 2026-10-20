@@ -3529,7 +3529,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slate-metrics"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlsync?rev=1351ffeaab251adaeb619e6bbfdb893fce3809b6#1351ffeaab251adaeb619e6bbfdb893fce3809b6"
+source = "git+https://github.com/jazware/vlsync?rev=abe7059248bfb45510b6bd89d9e7336fd9daf0d6#abe7059248bfb45510b6bd89d9e7336fd9daf0d6"
 dependencies = [
  "parking_lot",
  "prometheus",
@@ -4416,7 +4416,7 @@ dependencies = [
 [[package]]
 name = "vlsync-firehose"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlsync?rev=1351ffeaab251adaeb619e6bbfdb893fce3809b6#1351ffeaab251adaeb619e6bbfdb893fce3809b6"
+source = "git+https://github.com/jazware/vlsync?rev=abe7059248bfb45510b6bd89d9e7336fd9daf0d6#abe7059248bfb45510b6bd89d9e7336fd9daf0d6"
 dependencies = [
  "anyhow",
  "axum",
@@ -4440,7 +4440,7 @@ dependencies = [
 [[package]]
 name = "vlsync-heapprof"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlsync?rev=1351ffeaab251adaeb619e6bbfdb893fce3809b6#1351ffeaab251adaeb619e6bbfdb893fce3809b6"
+source = "git+https://github.com/jazware/vlsync?rev=abe7059248bfb45510b6bd89d9e7336fd9daf0d6#abe7059248bfb45510b6bd89d9e7336fd9daf0d6"
 dependencies = [
  "axum",
  "backtrace",
@@ -4456,7 +4456,7 @@ dependencies = [
 [[package]]
 name = "vlsync-lease"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlsync?rev=1351ffeaab251adaeb619e6bbfdb893fce3809b6#1351ffeaab251adaeb619e6bbfdb893fce3809b6"
+source = "git+https://github.com/jazware/vlsync?rev=abe7059248bfb45510b6bd89d9e7336fd9daf0d6#abe7059248bfb45510b6bd89d9e7336fd9daf0d6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4474,7 +4474,7 @@ dependencies = [
 [[package]]
 name = "vlsync-slatedb"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlsync?rev=1351ffeaab251adaeb619e6bbfdb893fce3809b6#1351ffeaab251adaeb619e6bbfdb893fce3809b6"
+source = "git+https://github.com/jazware/vlsync?rev=abe7059248bfb45510b6bd89d9e7336fd9daf0d6#abe7059248bfb45510b6bd89d9e7336fd9daf0d6"
 dependencies = [
  "slatedb",
  "slatedb-common",
@@ -4483,7 +4483,7 @@ dependencies = [
 [[package]]
 name = "vlsync-store"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlsync?rev=1351ffeaab251adaeb619e6bbfdb893fce3809b6#1351ffeaab251adaeb619e6bbfdb893fce3809b6"
+source = "git+https://github.com/jazware/vlsync?rev=abe7059248bfb45510b6bd89d9e7336fd9daf0d6#abe7059248bfb45510b6bd89d9e7336fd9daf0d6"
 dependencies = [
  "anyhow",
  "async-trait",

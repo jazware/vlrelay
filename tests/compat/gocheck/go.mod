@@ -1,6 +1,6 @@
 module vlrelay-compat/gocheck
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/bluesky-social/indigo v0.0.0
