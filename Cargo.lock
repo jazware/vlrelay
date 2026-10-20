@@ -3165,9 +3165,9 @@ checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -3529,7 +3529,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slate-metrics"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlsync?rev=5a6a472c98bd0c5fbc57e0705e45b9806509c28f#5a6a472c98bd0c5fbc57e0705e45b9806509c28f"
+source = "git+https://github.com/jazware/vlsync?rev=3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc#3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc"
 dependencies = [
  "parking_lot",
  "prometheus",
@@ -3778,7 +3778,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4332,7 +4332,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vlatproto"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlatproto?rev=c87d069b8d98a00c8aeadbc7e5b9dfa3b4853e28#c87d069b8d98a00c8aeadbc7e5b9dfa3b4853e28"
+source = "git+https://github.com/jazware/vlatproto?rev=71d3b351a04b07063cb82b5b67064efb5dceb6c6#71d3b351a04b07063cb82b5b67064efb5dceb6c6"
 dependencies = [
  "anyhow",
  "axum",
@@ -4410,13 +4410,13 @@ dependencies = [
  "vlsync-lease",
  "vlsync-slatedb",
  "vlsync-store",
- "webpki-roots 1.0.6",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
 name = "vlsync-firehose"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlsync?rev=5a6a472c98bd0c5fbc57e0705e45b9806509c28f#5a6a472c98bd0c5fbc57e0705e45b9806509c28f"
+source = "git+https://github.com/jazware/vlsync?rev=3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc#3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc"
 dependencies = [
  "anyhow",
  "axum",
@@ -4440,7 +4440,7 @@ dependencies = [
 [[package]]
 name = "vlsync-heapprof"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlsync?rev=5a6a472c98bd0c5fbc57e0705e45b9806509c28f#5a6a472c98bd0c5fbc57e0705e45b9806509c28f"
+source = "git+https://github.com/jazware/vlsync?rev=3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc#3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc"
 dependencies = [
  "axum",
  "backtrace",
@@ -4456,7 +4456,7 @@ dependencies = [
 [[package]]
 name = "vlsync-lease"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlsync?rev=5a6a472c98bd0c5fbc57e0705e45b9806509c28f#5a6a472c98bd0c5fbc57e0705e45b9806509c28f"
+source = "git+https://github.com/jazware/vlsync?rev=3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc#3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4474,7 +4474,7 @@ dependencies = [
 [[package]]
 name = "vlsync-slatedb"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlsync?rev=5a6a472c98bd0c5fbc57e0705e45b9806509c28f#5a6a472c98bd0c5fbc57e0705e45b9806509c28f"
+source = "git+https://github.com/jazware/vlsync?rev=3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc#3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc"
 dependencies = [
  "slatedb",
  "slatedb-common",
@@ -4483,7 +4483,7 @@ dependencies = [
 [[package]]
 name = "vlsync-store"
 version = "0.1.0"
-source = "git+https://github.com/jazware/vlsync?rev=5a6a472c98bd0c5fbc57e0705e45b9806509c28f#5a6a472c98bd0c5fbc57e0705e45b9806509c28f"
+source = "git+https://github.com/jazware/vlsync?rev=3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc#3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4641,9 +4641,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -4654,14 +4654,14 @@ version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "webpki-roots 1.0.6",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.6"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]

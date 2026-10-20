@@ -10,15 +10,15 @@ publish = false
 # What vlRelay shares with vlpds: the store, segments and slots, the log
 # layout, the firehose merger and backfill (vlsync); CBOR, CIDs,
 # the MST, CARs, crypto and DID resolution (vlatproto).
-vlsync-store = { git = "https://github.com/jazware/vlsync", rev = "5a6a472c98bd0c5fbc57e0705e45b9806509c28f", features = ["jemalloc"] }
-vlatproto = { git = "https://github.com/jazware/vlatproto", rev = "c87d069b8d98a00c8aeadbc7e5b9dfa3b4853e28" }
-vlsync-firehose = { git = "https://github.com/jazware/vlsync", rev = "5a6a472c98bd0c5fbc57e0705e45b9806509c28f" }
+vlsync-store = { git = "https://github.com/jazware/vlsync", rev = "3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc", features = ["jemalloc"] }
+vlatproto = { git = "https://github.com/jazware/vlatproto", rev = "71d3b351a04b07063cb82b5b67064efb5dceb6c6" }
+vlsync-firehose = { git = "https://github.com/jazware/vlsync", rev = "3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc" }
 # SlateDB metrics with a `db` label per database, and each one's shape for
 # GET /admin/api/store
-slate-metrics = { git = "https://github.com/jazware/vlsync", rev = "5a6a472c98bd0c5fbc57e0705e45b9806509c28f" }
+slate-metrics = { git = "https://github.com/jazware/vlsync", rev = "3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc" }
 # CAS on the bucket's JSON records and the epoch fence (`qlog/leader`,
 # `qlog/manifest`)
-vlsync-lease = { git = "https://github.com/jazware/vlsync", rev = "5a6a472c98bd0c5fbc57e0705e45b9806509c28f" }
+vlsync-lease = { git = "https://github.com/jazware/vlsync", rev = "3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc" }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws", "macros", "http2"] }
@@ -30,7 +30,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 # the SlateDB fork every vlsync user builds against (its Cargo.toml lists the patches)
-slatedb = { package = "vlsync-slatedb", git = "https://github.com/jazware/vlsync", rev = "5a6a472c98bd0c5fbc57e0705e45b9806509c28f" }
+slatedb = { package = "vlsync-slatedb", git = "https://github.com/jazware/vlsync", rev = "3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc" }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -43,7 +43,7 @@ tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 # the flush hands its freed segment buffers back (arena.<all>.purge)
 tikv-jemalloc-sys = { version = "0.7", default-features = false }
 # GET /debug/pprof/heap: jemalloc's heap sampler, on from the start, as pprof
-vlsync-heapprof = { git = "https://github.com/jazware/vlsync", rev = "5a6a472c98bd0c5fbc57e0705e45b9806509c28f", features = ["axum"] }
+vlsync-heapprof = { git = "https://github.com/jazware/vlsync", rev = "3d99a3b6116ed3ccda6efc5972c1c9941cbfe9dc", features = ["axum"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # dev tools (src/bin/e2e_check.rs, src/bin/devnet.rs). Features match
 # vlsync's exactly: a different feature set would rebuild these and vlsync.
